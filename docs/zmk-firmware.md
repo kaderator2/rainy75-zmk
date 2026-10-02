@@ -612,6 +612,10 @@ We revive this functionality with a clean implementation:
 2. **Our own shim** (`b91_bt.c`) that declares blob functions as `extern` with standard C types — no SDK headers needed
 3. **Zephyr v4.1 device-model API** (`DEVICE_API(bt_hci, ...)`) instead of the removed legacy API
 
+### Open controller (experimental)
+
+An open-source link layer (`zmk/drivers/bluetooth/openll/`) can replace the blob behind the same `b91_bt.h` seam. It is selected with `CONFIG_BT_HCI_B91_CTLR_OPEN=y` (`./build.sh -p --iso --openll`); the blob stays the default. Slice 1 brings up `bt_enable()` and legacy connectable advertising without linking `liblt_9518_zephyr.a`, but does not follow connections yet, so BLE typing needs the blob build for now. Architecture, measurements, sniffer workflow and roadmap: [open-ble-controller.md](open-ble-controller.md).
+
 ### Driver architecture
 
 | File | Role | Lines |

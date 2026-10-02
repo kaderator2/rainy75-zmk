@@ -23,6 +23,7 @@ Fully reverse engineer the firmware and hardware of the Wobkey Rainy 75 Pro ISO 
 
 All technical findings are in `docs/`:
 - [docs/zmk-firmware.md](docs/zmk-firmware.md) — ZMK firmware build, BLE HCI driver, board definition, workspace layout
+- [docs/open-ble-controller.md](docs/open-ble-controller.md) — open BLE link layer (issue #13): architecture, build, status, sniffer workflow
 - [docs/rainy-rgb.md](docs/rainy-rgb.md) — rainy_rgb out-of-tree lighting engine: 12 effects + opt-in walker diagnostic, XY calibration, functional indicators (CapsLock/Fn-highlight/battery), controls, build/flash
 - [docs/architecture.md](docs/architecture.md) — MCU, USB, HID interfaces, RGB, battery, connection modes
 - [docs/gpio-matrix.md](docs/gpio-matrix.md) — GPIO pins, matrix scan, timing, keymap, Fn combos
@@ -40,6 +41,7 @@ zmk/                             # Zephyr module — our custom firmware code
   west.yml                       # west manifest (fetches ZMK + hal_telink + mcuboot)
   boards/rainy75/                # HWMv2 board definition (DTS, keymap, defconfig)
   drivers/bluetooth/             # BLE HCI driver (b91_bt.c shim) + deep sleep PM hooks
+    openll/                      # open BLE link layer (BT_HCI_B91_CTLR_OPEN, ./build.sh --openll): HCI subset, legacy adv, rf.c wrapper; host tests in tests/
   drivers/usb/                   # USB DC driver (legacy usb_dc.h API, linked and enabled)
   drivers/led_strip/             # WS2812 LED strip driver (PSPI + DMA, b91_pspi.h registers)
   drivers/sensor/                # Battery ADC driver (SAR ADC sensor + channel scanner)
@@ -242,8 +244,8 @@ reverse/
 
 ### Next — Open BLE Controller (issue #13, branch `feat/open-ble-controller`)
 Own peripheral-only link layer behind the `b91_bt.h` seam on hal_telink `rf.c` (Apache-2.0); the blob is the only prebuilt binary in the image.
-- **Slice 0**: nRF52840 dongle as nRF Sniffer + Wireshark, blob reference captures (`reverse/captures/`, gitignored)
-- **Slice 1**: blob-free `bt_enable()` + connectable advertising, SCAN_RSP, CONNECT_IND parse (Kconfig `BT_HCI_B91_CTLR_OPEN`)
+- **Slice 0 (DONE)**: nRF52840 dongle flashed with nRF Sniffer 4.1.1 via `nrfutil device program`, captures with `nrfutil ble-sniffer sniff` (tshark -i blocked in distrobox), blob reference captures (`reverse/captures/`, gitignored), `reverse/tools/ble_adv_report.py`. CLI follow mode unreliable (about 1 in 9 tries).
+- **Slice 1 (DONE)**: blob-free build (`./build.sh -p --iso --openll`, 0 `liblt` in map vs 48). `bt_enable()` OK on first flash. ADV_IND on air with AdvData byte-identical to the blob, interval 100 ms + 0..10 ms (mean 105.07 ms; blob uses 150 ms). Scanners show "Rainy 75 Pro" (name in ADV_IND). CONNECT_IND decoded (Interval 12, Latency 30, Timeout 400, static fields match the sniffer); AA-matched sniffer/log pair still missing. SCAN_RSP on air but T_IFS about 209 us (59 us late): software-triggered TX cannot meet T_IFS, so slice 2 must use hardware brx/btx turnaround. Open issues for slice 2: ChSel 0 vs blob's 1, about 6 % log-clock vs wall-clock discrepancy. Blob build regression OK. See [docs/open-ble-controller.md](docs/open-ble-controller.md)
 - **Slice 2**: connection follow + empty-PDU keepalive (anchor tracking, window widening, CSA#1, SN/NESN, supervision timeout)
 - **Slice 3**: LLCP subset (VERSION/FEATURE/CONN_UPDATE/CHANNEL_MAP, UNKNOWN_RSP incl. PHY update) + ACL data + HCI flow control
 - **Slice 4**: link encryption (LL_ENC/START_ENC, hardware AES-CCM, LTK reply) → SMP pairing + HID over GATT
