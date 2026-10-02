@@ -1,0 +1,25 @@
+From 0dccc9fad76732f3eb63e2df13de6879469093b7 Mon Sep 17 00:00:00 2001
+From: rainy75 build <build@localhost>
+Date: Fri, 2 Oct 2026 16:23:55 +0200
+Subject: [PATCH] build sys.c unless the blob controller is selected
+
+---
+ tlsr9/CMakeLists.txt | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/tlsr9/CMakeLists.txt b/tlsr9/CMakeLists.txt
+index b35d4c1..c70b678 100644
+--- a/tlsr9/CMakeLists.txt
++++ b/tlsr9/CMakeLists.txt
+@@ -12,7 +12,7 @@ zephyr_include_directories(drivers/B91/reg_include)
+ zephyr_include_directories(drivers/B91)
+ 
+ # soc.c referance sources
+-if (NOT CONFIG_PM AND NOT CONFIG_BT_B91 AND NOT CONFIG_BT_HCI_B91)
++if (NOT CONFIG_PM AND NOT CONFIG_BT_B91 AND NOT CONFIG_BT_HCI_B91_CTLR_BLOB)
+ zephyr_library_sources(drivers/B91/sys.c)
+ endif() # no PM and no BLE external dependency
+ zephyr_library_sources(drivers/B91/pm.c)
+-- 
+2.53.0
+

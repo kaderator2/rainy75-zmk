@@ -4,6 +4,9 @@ zephyr_library_sources_ifdef(CONFIG_BT_HCI_B91_CTLR_BLOB b91_bt.c)
 
 if(CONFIG_BT_HCI_B91_CTLR_OPEN)
   set(B91_DRV ${ZEPHYR_HAL_TELINK_MODULE_DIR}/tlsr9/drivers/B91)
+  # openll/*.c include "b91_bt.h" / "b91_mac.h" (one directory up) by quoted
+  # path; add this directory so that relative include resolves.
+  zephyr_library_include_directories(${CMAKE_CURRENT_SOURCE_DIR})
   zephyr_library_sources(
     openll/ll_glue.c
     openll/ll_hci.c

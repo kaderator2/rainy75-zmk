@@ -10,6 +10,7 @@
 #   -a  all: MCUboot + app + combined + OTA + bridge
 #   --iso / --ansi   physical layout, REQUIRED for any app build (no default)
 #                    e.g. ./build.sh -pa --iso   or   ./build.sh -pa --ansi
+#   --openll  use the open BLE link layer instead of the Telink blob (issue #13)
 
 set -e
 
@@ -27,6 +28,7 @@ BUILD_BRIDGE=0
 BUILD_APP=1
 LAYOUT=""             # "iso" or "ansi" — REQUIRED for app builds, no default
 ANSI_DTFLAG=""        # set when LAYOUT=ansi
+APP_CONF="$(pwd)/conf/app.conf"
 
 # ── Apply upstream patches if needed ──────────────────────────
 #
@@ -78,13 +80,14 @@ apply_patches zmk-src zmk-src
 
 # Allow long forms --iso / --ansi as aliases for -I / -A.
 ARGS=(); for a in "$@"; do case "$a" in
-    --iso)  ARGS+=("-I");;
-    --ansi) ARGS+=("-A");;
-    *)      ARGS+=("$a");;
+    --iso)    ARGS+=("-I");;
+    --ansi)   ARGS+=("-A");;
+    --openll) ARGS+=("-O");;
+    *)        ARGS+=("$a");;
 esac; done
 set -- "${ARGS[@]}"
 
-while getopts "pvmcobaIA" opt; do
+while getopts "pvmcobaIAO" opt; do
     case $opt in
         p) PRISTINE="-p" ;;
         v) VERBOSE_CMAKE="-DCMAKE_VERBOSE_MAKEFILE=ON" ;;
@@ -95,7 +98,8 @@ while getopts "pvmcobaIA" opt; do
         a) BUILD_MCUBOOT=1; BUILD_COMBINED=1; BUILD_OTA=1; BUILD_BRIDGE=1; BUILD_APP=1 ;;
         I) [ "$LAYOUT" = ansi ] && { echo "Error: --iso and --ansi are mutually exclusive" >&2; exit 1; }; LAYOUT="iso" ;;
         A) [ "$LAYOUT" = iso  ] && { echo "Error: --iso and --ansi are mutually exclusive" >&2; exit 1; }; LAYOUT="ansi"; ANSI_DTFLAG="-DDTS_EXTRA_CPPFLAGS=-DRAINY75_ANSI -DCONFIG_RAINY_RGB_ANSI_LEDMAP=y" ;;
-        *) echo "Usage: $0 [-p] [-v] [-m] [-c] [-o] [-b] [-a] (--iso | --ansi)"; exit 1 ;;
+        O) APP_CONF="$APP_CONF;$(pwd)/conf/openll.conf" ;;
+        *) echo "Usage: $0 [-p] [-v] [-m] [-c] [-o] [-b] [-a] (--iso | --ansi) [--openll]"; exit 1 ;;
     esac
 done
 
@@ -133,7 +137,7 @@ if [ "$BUILD_APP" -eq 1 ]; then
     west build $PRISTINE -b rainy75 zmk-src/app -- \
         -DZMK_CONFIG="$(pwd)/zmk/boards/rainy75" \
         -DZMK_EXTRA_MODULES="$(pwd)/zmk" \
-        -DEXTRA_CONF_FILE="$(pwd)/conf/app.conf" \
+        -DEXTRA_CONF_FILE="$APP_CONF" \
         -DEXTRA_DTC_OVERLAY_FILE="$(pwd)/zmk/boards/rainy75/rainy75.keymap;$(pwd)/conf/mcumgr.overlay" \
         $ANSI_DTFLAG \
         $VERBOSE_CMAKE
