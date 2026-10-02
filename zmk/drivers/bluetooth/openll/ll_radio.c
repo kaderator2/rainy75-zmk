@@ -14,6 +14,7 @@
 #include <zephyr/kernel.h>
 #include <zephyr/irq.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/sys/atomic.h>
 #include "types.h"            /* u8/u16 used by ext_rf.h */
 #include "rf.h"
 #include "stimer.h"
@@ -25,6 +26,11 @@ LOG_MODULE_DECLARE(openll, CONFIG_BT_HCI_DRIVER_LOG_LEVEL);
 
 #define RF_IRQ                 (IRQ_TO_L2(15) | 11)
 #define DMA_BUF_SIZE           64   /* multiple of 16; 4 + 2 + 37 + 16 trailer = 59 */
+/* Worst case the DMA could write if the baseband does not enforce
+ * rf_set_rx_maxlen (noise packet with a full 255-byte length field; maxlen
+ * enforcement is unverified on this hardware): 4 DMA length word + 4 header/
+ * len + 2 + 255 payload + 16 trailer, rounded up to a multiple of 16. */
+#define RX_BUF_SIZE            288  /* (4 + 4 + 2 + 255 + 16) rounded up to 16 */
 #define ADV_RX_MAXLEN          37
 #define TX_SETTLE_ADV_US       84   /* SPIKE: ext_rf.h LL_TX_STL_ADV_1M */
 #define TX_SETTLE_RSP_US       78   /* SPIKE: ext_rf.h LL_SCANRSP_TX_SETTLE */
@@ -40,9 +46,11 @@ static int32_t rsp_adj_ticks;
 
 static uint8_t tx_buf[DMA_BUF_SIZE] __aligned(4);
 static uint8_t rsp_buf[DMA_BUF_SIZE] __aligned(4);
-static uint8_t rx_buf[DMA_BUF_SIZE] __aligned(4);
+static uint8_t rx_buf[RX_BUF_SIZE] __aligned(4);
 static ll_radio_cb_t radio_cb;
 static volatile bool rsp_in_flight;
+
+static atomic_t cnt_tx2rx, cnt_rx_ok, cnt_rx_crc, cnt_rx_timeout, cnt_rsp_tx;
 
 static void load(uint8_t *dma, const uint8_t *pdu, uint8_t len)
 {
@@ -66,14 +74,17 @@ static void rf_isr(const void *arg)
 		uint8_t *p = rx_buf;
 
 		if (!RF_BLE_PACKET_VALIDITY_CHECK(p)) {
+			atomic_inc(&cnt_rx_crc);
 			radio_cb(LL_RADIO_RX_CRC_ERR, NULL, 0, 0);
 			return;
 		}
 		uint32_t ts = ll_get_le32(&p[DMA_RFRX_OFFSET_TIME_STAMP(p)]);
 
+		atomic_inc(&cnt_rx_ok);
 		radio_cb(LL_RADIO_RX_OK, &p[DMA_RFRX_OFFSET_HEADER], p[DMA_RFRX_OFFSET_RFLEN] + 2,
 			 ts + RX_TS_TO_END_TICKS(p[DMA_RFRX_OFFSET_RFLEN]));
 	} else if (st & (FLD_RF_IRQ_RX_TIMEOUT | FLD_RF_IRQ_FIRST_TIMEOUT)) {
+		atomic_inc(&cnt_rx_timeout);
 		radio_cb(LL_RADIO_RX_TIMEOUT, NULL, 0, 0);
 	} else if ((st & FLD_RF_IRQ_TX) && rsp_in_flight) {
 		rsp_in_flight = false;
@@ -89,7 +100,7 @@ int ll_radio_init(ll_radio_cb_t cb)
 	rf_set_ble_1M_mode();
 	rf_set_power_level_index((rf_power_level_index_e)POWER_INDEX_0DBM);
 	rf_set_tx_dma(2, DMA_BUF_SIZE);
-	rf_set_rx_dma(rx_buf, 0, DMA_BUF_SIZE);   /* SPIKE: single RX FIFO entry */
+	rf_set_rx_dma(rx_buf, 0, RX_BUF_SIZE);   /* SPIKE: single RX FIFO entry */
 	rf_set_rx_maxlen(ADV_RX_MAXLEN);
 	rf_set_ble_access_code_adv();
 	rf_set_ble_crc_adv();
@@ -121,6 +132,7 @@ void ll_radio_tx_then_rx(const uint8_t *pdu, uint8_t len, uint32_t start_tick,
 	rsp_in_flight = false;
 	rf_tx_settle_us(TX_SETTLE_ADV_US);
 	rf_ble_set_rx_timeout(rx_window_us);
+	atomic_inc(&cnt_tx2rx);
 	rf_start_stx2rx(tx_buf, start_tick);
 }
 
@@ -133,7 +145,17 @@ void ll_radio_tx_rsp_at(uint32_t tick)
 {
 	rsp_in_flight = true;
 	rf_tx_settle_us(TX_SETTLE_RSP_US);
+	atomic_inc(&cnt_rsp_tx);
 	rf_start_stx(rsp_buf, tick - TX_SETTLE_RSP_US * LL_TICKS_PER_US + rsp_adj_ticks);
+}
+
+void ll_radio_get_stats(struct ll_radio_stats *s)
+{
+	s->tx2rx = (uint32_t)atomic_get(&cnt_tx2rx);
+	s->rx_ok = (uint32_t)atomic_get(&cnt_rx_ok);
+	s->rx_crc = (uint32_t)atomic_get(&cnt_rx_crc);
+	s->rx_timeout = (uint32_t)atomic_get(&cnt_rx_timeout);
+	s->rsp_tx = (uint32_t)atomic_get(&cnt_rsp_tx);
 }
 
 void ll_radio_stop(void)

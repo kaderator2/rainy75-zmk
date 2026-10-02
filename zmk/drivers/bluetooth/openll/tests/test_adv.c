@@ -8,6 +8,7 @@
 /* ---- fakes ---- */
 static uint32_t now_tick = 1000000;
 static uint32_t sched_tick; static ll_sched_cb_t sched_cb; static int sched_cancels;
+static int sched_calls;
 static uint8_t radio_ch; static uint8_t tx_pdu[64]; static uint8_t tx_len;
 static uint32_t tx_start; static int txrx_calls;
 static uint8_t rsp_pdu[64]; static uint8_t rsp_len; static uint32_t rsp_tick; static int rsp_calls;
@@ -23,7 +24,7 @@ void ll_radio_prepare_rsp(const uint8_t *p, uint8_t l) { memcpy(rsp_pdu, p, l); 
 void ll_radio_tx_rsp_at(uint32_t t) { rsp_tick = t; rsp_calls++; }
 void ll_radio_stop(void) { radio_stops++; }
 void ll_sched_init(void) {}
-void ll_sched_at(uint32_t t, ll_sched_cb_t cb) { sched_tick = t; sched_cb = cb; }
+void ll_sched_at(uint32_t t, ll_sched_cb_t cb) { sched_tick = t; sched_cb = cb; sched_calls++; }
 void ll_sched_cancel(void) { sched_cancels++; sched_cb = NULL; }
 uint32_t ll_plat_rand32(void) { return 1234567; }
 unsigned int ll_plat_lock(void) { return 0; }
@@ -56,6 +57,7 @@ int main(void)
 	p = params(0, 7); p.own_addr_type = 1; CHECK(ll_adv_set_params(&p) == LL_ST_UNSUPPORTED);
 	p = params(0, 7); p.filter_policy = 1; CHECK(ll_adv_set_params(&p) == LL_ST_UNSUPPORTED);
 	CHECK(ll_adv_set_data(NULL, 32) == LL_ST_INVALID_PARAM);
+	CHECK(ll_adv_set_data(NULL, 5) == LL_ST_INVALID_PARAM);  /* data NULL, len != 0 */
 
 	/* valid ADV_IND on all channels */
 	p = params(0, 7);
@@ -66,6 +68,7 @@ int main(void)
 	CHECK(ll_adv_set_scan_rsp(sr, 3) == LL_ST_SUCCESS);
 
 	CHECK(ll_adv_enable(true) == LL_ST_SUCCESS);
+	CHECK(ll_adv_is_enabled());
 	CHECK(sched_cb != NULL);
 	uint32_t ev0 = sched_tick;
 	CHECK(ev0 > now_tick);
@@ -123,6 +126,7 @@ int main(void)
 	/* disable: cancel + stop, later radio events ignored */
 	int before = txrx_calls;
 	CHECK(ll_adv_enable(false) == LL_ST_SUCCESS);
+	CHECK(!ll_adv_is_enabled());
 	CHECK(sched_cancels >= 1 && radio_stops >= 1);
 	ll_adv_radio_evt(LL_RADIO_RX_TIMEOUT, NULL, 0, 0);
 	CHECK(txrx_calls == before);
@@ -139,6 +143,34 @@ int main(void)
 	ll_adv_radio_evt(LL_RADIO_RX_OK, ci_pdu, 36, 9000000);
 	CHECK(conn_calls == 1);
 	CHECK(sched_cb != NULL);  /* event ended after 39 */
+
+	/* in_event guard: a radio event arriving after the event already ended
+	 * (e.g. a late/extra RX timeout) must not schedule or transmit again */
+	int sc_before = sched_calls;
+	int txrx_before = txrx_calls;
+	ll_adv_radio_evt(LL_RADIO_RX_TIMEOUT, NULL, 0, 0);
+	CHECK(sched_calls == sc_before);
+	CHECK(txrx_calls == txrx_before);
+
+	/* catch-up after a stall: if the MCU missed the window for a long time,
+	 * the next event_tick is re-based on now instead of staying far in the past */
+	uint32_t ev_prev = sched_tick;
+	fire_sched();
+	CHECK(radio_ch == 37);
+	uint32_t interval = (uint32_t)0x00A0 * 625u * LL_TICKS_PER_US;
+	now_tick = ev_prev + 10 * interval;
+	ll_adv_radio_evt(LL_RADIO_RX_TIMEOUT, NULL, 0, 0);
+	CHECK(radio_ch == 39);
+	ll_adv_radio_evt(LL_RADIO_RX_TIMEOUT, NULL, 0, 0);
+	CHECK(sched_tick == now_tick + interval + 1234567u % (10000 * LL_TICKS_PER_US + 1));
+
+	/* in_event guard on the RX-timeout end path: an extra timeout after the
+	 * last channel neither reschedules nor transmits */
+	sc_before = sched_calls;
+	txrx_before = txrx_calls;
+	ll_adv_radio_evt(LL_RADIO_RX_TIMEOUT, NULL, 0, 0);
+	CHECK(sched_calls == sc_before);
+	CHECK(txrx_calls == txrx_before);
 
 	/* reset disables and restores defaults */
 	ll_adv_reset();

@@ -31,6 +31,7 @@ uint8_t ll_adv_set_params(const struct ll_adv_params *p);
 uint8_t ll_adv_set_data(const uint8_t *data, uint8_t len);
 uint8_t ll_adv_set_scan_rsp(const uint8_t *data, uint8_t len);
 uint8_t ll_adv_enable(bool enable);
+bool ll_adv_is_enabled(void);
 
 /* Radio completion handler; registered with ll_radio_init(). ISR context. */
 void ll_adv_radio_evt(enum ll_radio_evt evt, const uint8_t *pdu, uint8_t len,

@@ -37,6 +37,7 @@ static struct {
 	uint8_t rsp_pdu[LL_ADV_PDU_MAX];
 	uint8_t rsp_pdu_len;
 	volatile bool enabled;
+	volatile bool in_event; /* true from the first tx_current() until the event ends */
 	uint8_t ch_idx;       /* 0..2 = channel 37..39 */
 	uint32_t event_tick;  /* start of the current advertising event */
 } adv;
@@ -93,6 +94,11 @@ static void schedule_next_event(void)
 	uint32_t delay = ll_plat_rand32() % (ADV_DELAY_MAX_TICKS + 1);
 
 	adv.event_tick += interval + delay;
+	if ((int32_t)(adv.event_tick - ll_radio_now()) < 0) {
+		/* missed the window for a long time (e.g. stalled radio); re-base
+		 * on now instead of scheduling an event far in the past */
+		adv.event_tick = ll_radio_now() + interval + delay;
+	}
 	ll_sched_at(adv.event_tick, start_event);
 }
 
@@ -105,6 +111,7 @@ static void next_channel(void)
 			return;
 		}
 	}
+	adv.in_event = false;
 	schedule_next_event();
 }
 
@@ -120,6 +127,7 @@ static void start_event(void)
 	while (!(adv.prm.chan_map & (1 << adv.ch_idx))) {
 		adv.ch_idx++;
 	}
+	adv.in_event = true;
 	tx_current();
 }
 
@@ -141,11 +149,17 @@ uint8_t ll_adv_enable(bool enable)
 		ll_sched_at(adv.event_tick, start_event);
 	} else if (!enable && adv.enabled) {
 		adv.enabled = false;
+		adv.in_event = false;
 		ll_sched_cancel();
 		ll_radio_stop();
 	}
 	ll_plat_unlock(key);
 	return LL_ST_SUCCESS;
+}
+
+bool ll_adv_is_enabled(void)
+{
+	return adv.enabled;
 }
 
 void ll_adv_reset(void)
@@ -182,7 +196,7 @@ uint8_t ll_adv_set_params(const struct ll_adv_params *p)
 
 static uint8_t set_buf(uint8_t *dst, uint8_t *dst_len, const uint8_t *data, uint8_t len)
 {
-	if (len > LL_ADV_DATA_MAX) {
+	if ((data == NULL && len != 0) || len > LL_ADV_DATA_MAX) {
 		return LL_ST_INVALID_PARAM;
 	}
 	unsigned int key = ll_plat_lock();
@@ -211,7 +225,7 @@ void ll_adv_radio_evt(enum ll_radio_evt evt, const uint8_t *pdu, uint8_t len,
 {
 	struct ll_connect_ind ci;
 
-	if (!adv.enabled) {
+	if (!adv.enabled || !adv.in_event) {
 		return;
 	}
 	if (evt == LL_RADIO_RX_OK) {
@@ -225,6 +239,7 @@ void ll_adv_radio_evt(enum ll_radio_evt evt, const uint8_t *pdu, uint8_t len,
 			}
 			/* Slice 1 does not follow the connection: end this event and
 			 * keep advertising. Slice 2 replaces this with the conn state. */
+			adv.in_event = false;
 			schedule_next_event();
 			return;
 		}

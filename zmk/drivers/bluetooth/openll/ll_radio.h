@@ -34,4 +34,15 @@ void ll_radio_prepare_rsp(const uint8_t *pdu, uint8_t len);
 void ll_radio_tx_rsp_at(uint32_t tick);
 void ll_radio_stop(void);
 
+/* Stall visibility: cumulative counts since boot, read from the controller
+ * thread for periodic logging. Not used by the host-tested ll_adv.c. */
+struct ll_radio_stats {
+	uint32_t tx2rx;
+	uint32_t rx_ok;
+	uint32_t rx_crc;
+	uint32_t rx_timeout;
+	uint32_t rsp_tx;
+};
+void ll_radio_get_stats(struct ll_radio_stats *s);
+
 #endif /* LL_RADIO_H_ */

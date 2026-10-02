@@ -10,6 +10,7 @@
 #include <string.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/sys/atomic.h>
 #include "b91_bt.h"
 #include "b91_mac.h"
 #include "trng.h"
@@ -73,7 +74,7 @@ static void get_bd_addr(uint8_t addr[6])
 
 static void unknown_opcode(uint16_t op)
 {
-	static uint16_t seen[16];
+	static uint16_t seen[32];
 	static uint8_t n;
 
 	for (uint8_t i = 0; i < n; i++) {
@@ -83,14 +84,22 @@ static void unknown_opcode(uint16_t op)
 	}
 	if (n < ARRAY_SIZE(seen)) {
 		seen[n++] = op;
+		LOG_WRN("unsupported HCI opcode 0x%04x", op);
+		return;
 	}
-	LOG_WRN("unsupported HCI opcode 0x%04x", op);
+	/* table full: still report it, but at DBG so a device that sends many
+	 * distinct unsupported opcodes cannot spam the log at WRN forever */
+	LOG_DBG("unsupported HCI opcode 0x%04x (opcode table full)", op);
 }
 
 static void evt_sink(const uint8_t *h4, uint16_t len)
 {
 	struct evt_item it;
 
+	if (len > LL_HCI_EVT_MAX) {
+		LOG_ERR("event too large (%u bytes), dropped", len);
+		return;
+	}
 	it.len = len;
 	memcpy(it.data, h4, len);
 	if (k_msgq_put(&evt_q, &it, K_NO_WAIT) != 0) {
@@ -98,9 +107,14 @@ static void evt_sink(const uint8_t *h4, uint16_t len)
 	}
 }
 
+static atomic_t conn_drops;
+
 static void on_connect_ind(const struct ll_connect_ind *ci)
 {
-	(void)k_msgq_put(&conn_q, ci, K_NO_WAIT); /* ISR context: log later */
+	/* ISR context: log later, from the controller thread */
+	if (k_msgq_put(&conn_q, ci, K_NO_WAIT) != 0) {
+		atomic_inc(&conn_drops);
+	}
 }
 
 static void log_connect_ind(const struct ll_connect_ind *ci)
@@ -127,10 +141,36 @@ static const struct ll_hci_ops hci_ops = {
 	.unknown = unknown_opcode,
 };
 
+/* Periodic radio health log: one line every 2 s while there is anything to
+ * report, plus a stall warning if advertising is enabled but tx2rx is not
+ * advancing. Helps spot a wedged radio from the log alone on first bring-up. */
+static void report_radio_stats(struct ll_radio_stats *last)
+{
+	struct ll_radio_stats st;
+
+	ll_radio_get_stats(&st);
+	if (memcmp(&st, last, sizeof(st)) != 0 || ll_adv_is_enabled()) {
+		LOG_INF("radio: tx2rx %u rx_ok %u crc %u timeout %u rsp %u",
+			st.tx2rx, st.rx_ok, st.rx_crc, st.rx_timeout, st.rsp_tx);
+	}
+	if (ll_adv_is_enabled() && st.tx2rx == last->tx2rx) {
+		LOG_WRN("radio stalled");
+	}
+	*last = st;
+
+	uint32_t drops = (uint32_t)atomic_clear(&conn_drops);
+
+	if (drops != 0) {
+		LOG_WRN("dropped %u CONNECT_IND event(s) (queue full)", drops);
+	}
+}
+
 static void ctrl_thread_fn(void *p1, void *p2, void *p3)
 {
 	struct evt_item it;
 	struct ll_connect_ind ci;
+	int64_t next_stats = 0;
+	struct ll_radio_stats last_stats = {0};
 
 	ARG_UNUSED(p1);
 	ARG_UNUSED(p2);
@@ -142,6 +182,13 @@ static void ctrl_thread_fn(void *p1, void *p2, void *p3)
 		}
 		while (k_msgq_get(&conn_q, &ci, K_NO_WAIT) == 0) {
 			log_connect_ind(&ci);
+		}
+
+		int64_t now = k_uptime_get();
+
+		if (now >= next_stats) {
+			next_stats = now + 2000;
+			report_radio_stats(&last_stats);
 		}
 	}
 }
