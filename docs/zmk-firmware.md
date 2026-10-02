@@ -92,6 +92,8 @@ rainy75/                            # workspace root
 │       ├── bluetooth/              # BLE HCI driver + deep sleep PM
 │       │   ├── b91_bt.h            # shim API header
 │       │   ├── b91_bt.c            # shim: blob bridge + init + thread + PM hooks
+│       │   ├── b91_mac.c / .h      # MAC from flash, shared by blob and open controller
+│       │   ├── openll/             # open link layer (experimental, --openll)
 │       │   ├── hci_b91.c           # Zephyr HCI device-model driver
 │       │   ├── Kconfig
 │       │   └── CMakeLists.txt
@@ -620,8 +622,9 @@ An open-source link layer (`zmk/drivers/bluetooth/openll/`) can replace the blob
 
 | File | Role | Lines |
 |------|------|-------|
-| `hci_b91.c` | Zephyr HCI device driver — `open`/`send`/`close` + HCI packet parsing | 250 |
-| `b91_bt.c` | Shim — blob init, controller thread, IRQ handlers, FIFO management | 320 |
+| `hci_b91.c` | Zephyr HCI device driver — `open`/`send`/`close` + HCI packet parsing | 270 |
+| `b91_bt.c` | Shim — blob init, controller thread, IRQ handlers, FIFO management | 680 |
+| `b91_mac.c` | MAC address from flash (`0xFF000`) with random static fallback, shared by both controllers | 60 |
 | `b91_bt.h` | Public API — `controller_init`, `send_packet`, `callback_register` | 25 |
 
 **Data flow (host → controller):**

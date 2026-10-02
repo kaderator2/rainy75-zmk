@@ -41,6 +41,7 @@ zmk/                             # Zephyr module — our custom firmware code
   west.yml                       # west manifest (fetches ZMK + hal_telink + mcuboot)
   boards/rainy75/                # HWMv2 board definition (DTS, keymap, defconfig)
   drivers/bluetooth/             # BLE HCI driver (b91_bt.c shim) + deep sleep PM hooks
+    b91_mac.c                    # MAC from flash (0xFF000) or random static fallback, shared by blob and open controller
     openll/                      # open BLE link layer (BT_HCI_B91_CTLR_OPEN, ./build.sh --openll): HCI subset, legacy adv, rf.c wrapper; host tests in tests/
   drivers/usb/                   # USB DC driver (legacy usb_dc.h API, linked and enabled)
   drivers/led_strip/             # WS2812 LED strip driver (PSPI + DMA, b91_pspi.h registers)
@@ -56,12 +57,13 @@ zmk/                             # Zephyr module — our custom firmware code
   lib/liblt_9518_zephyr.a        # BLE controller blob (2.8 MB) — proprietary/NDA, fetched by fetch_ble_blob.sh, gitignored (NOT committed)
 conf/                            # build configuration overlays
   app.conf                       # ZMK app config (BLE, USB, mcumgr, WDT, RGB)
+  openll.conf                    # selects the open BLE controller (CONFIG_BT_HCI_B91_CTLR_OPEN=y), added by ./build.sh --openll
   ota-bridge.conf                # OTA bridge config (monolithic, USB+mcumgr+flash_mgmt)
   mcuboot.conf                   # MCUboot bootloader config
   mcuboot.overlay                # MCUboot DTS overlay (disables peripherals)
 zmk-src/                         # ZMK upstream (fetched by west)
 zephyr/                          # Zephyr upstream (fetched by west)
-modules/hal/hal_telink/          # Telink HAL (fetched by west, patched for BT_HCI_B91)
+modules/hal/hal_telink/          # Telink HAL (fetched by west, patched for BT_HCI_B91: patches/hal_telink/0001 sys.c exclusion, 0002 sys.c for the open controller)
 bootloader/mcuboot/              # MCUboot v2.2.0 (fetched by west)
 install_zmk.sh                   # stock → ZMK one-command installer (OTA bridge + flash_mgmt)
 restore_stock.sh                 # ZMK → stock one-command restorer (flash_mgmt + reset)
@@ -242,10 +244,10 @@ reverse/
 - **Stage 4**: ADC channel scan → battery sensor (via mcumgr DFU)
 - **Stage 5 (COMPLETE)**: Deep sleep — `DEEPSLEEP_MODE` (0x30, cold boot on wakeup), GPIO keypress wakeup. `z_sys_poweroff()` in `zmk/src/poweroff.c`: RGB off, USB detach, analog pull-downs on columns (100K) + pull-ups on rows (1M), `pm_set_gpio_wakeup()` on all 6 row pins. Wakeup on any keypress → cold boot through MCUboot (~1-2s). Retention mode (0x03) incompatible with MCUboot (boot ROM overwrites retained ILM). Patches: 0004 (HAS_POWEROFF Kconfig) + 0005 (start.S retention skip, dead code). `CONFIG_ZMK_SLEEP=y`, 15min idle timeout.
 
-### Next — Open BLE Controller (issue #13, branch `feat/open-ble-controller`)
+### Next — Open BLE Controller (issue #13)
 Own peripheral-only link layer behind the `b91_bt.h` seam on hal_telink `rf.c` (Apache-2.0); the blob is the only prebuilt binary in the image.
 - **Slice 0 (DONE)**: nRF52840 dongle flashed with nRF Sniffer 4.1.1 via `nrfutil device program`, captures with `nrfutil ble-sniffer sniff` (tshark -i blocked in distrobox), blob reference captures (`reverse/captures/`, gitignored), `reverse/tools/ble_adv_report.py`. CLI follow mode unreliable (about 1 in 9 tries).
-- **Slice 1 (DONE)**: blob-free build (`./build.sh -p --iso --openll`, 0 `liblt` in map vs 48). `bt_enable()` OK on first flash. ADV_IND on air with AdvData byte-identical to the blob, interval 100 ms + 0..10 ms (mean 105.07 ms; blob uses 150 ms). Scanners show "Rainy 75 Pro" (name in ADV_IND). CONNECT_IND decoded (Interval 12, Latency 30, Timeout 400, static fields match the sniffer); AA-matched sniffer/log pair still missing. SCAN_RSP on air but T_IFS about 209 us (59 us late): software-triggered TX cannot meet T_IFS, so slice 2 must use hardware brx/btx turnaround. Open issues for slice 2: ChSel 0 vs blob's 1, about 6 % log-clock vs wall-clock discrepancy. Blob build regression OK. See [docs/open-ble-controller.md](docs/open-ble-controller.md)
+- **Slice 1 (DONE)**: blob-free build (`./build.sh -p --iso --openll`, 0 `liblt` in map vs 48). `bt_enable()` OK on first flash. ADV_IND on air with AdvData byte-identical to the blob, interval 100 ms + 0..10 ms (mean 105.07 ms; blob uses 150 ms). Scanners show "Rainy 75 Pro" (name in ADV_IND). CONNECT_IND decoded (Interval 12, Latency 30, Timeout 400, static fields match the sniffer); AA-matched sniffer/log pair still missing. SCAN_RSP on air but T_IFS about 209 us (59 us late): software-triggered TX cannot meet T_IFS, so slice 2 must use hardware brx/btx turnaround. Open issues for slice 2: ChSel 0 vs blob's 1, about 6 % log-clock vs wall-clock discrepancy. Default blob build flashed and reconnects to the bonded host by itself; BLE typing confirmation pending. See [docs/open-ble-controller.md](docs/open-ble-controller.md)
 - **Slice 2**: connection follow + empty-PDU keepalive (anchor tracking, window widening, CSA#1, SN/NESN, supervision timeout)
 - **Slice 3**: LLCP subset (VERSION/FEATURE/CONN_UPDATE/CHANNEL_MAP, UNKNOWN_RSP incl. PHY update) + ACL data + HCI flow control
 - **Slice 4**: link encryption (LL_ENC/START_ENC, hardware AES-CCM, LTK reply) → SMP pairing + HID over GATT

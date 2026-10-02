@@ -74,7 +74,9 @@ Wiring:
 - **Radio** (`ll_radio.h`): `ll_radio_set_adv_channel(ch)`,
   `ll_radio_tx_then_rx(pdu, len, start_tick, rx_window_us)` (hardware TX then
   RX, `rf_start_stx2rx`), `ll_radio_prepare_rsp()` plus `ll_radio_tx_rsp_at(tick)`
-  for SCAN_RSP, `ll_radio_stop()`, `ll_radio_now()`. Completions come back
+  for SCAN_RSP (returns false and sends nothing when the TX trigger would be
+  less than 10 us in the future; the advertiser then moves to the next channel
+  at once), `ll_radio_stop()`, `ll_radio_now()`. Completions come back
   through one callback in ISR context with `TX_DONE`, `RX_OK` (PDU, length and
   the tick at the end of the packet), `RX_TIMEOUT` or `RX_CRC_ERR`.
 - **Scheduler** (`ll_sched.h`): `ll_sched_at(tick, cb)` and `ll_sched_cancel()`.
@@ -121,10 +123,13 @@ Added before the first hardware run, since a radio bug shows up as silence:
 - `ll_adv` ignores radio events that arrive after an advertising event ended
   (no double scheduling), re-bases the next event on "now" after a stall instead
   of firing a burst of late events, and rejects NULL data with a nonzero length.
-- `ll_radio` counts `tx2rx`, `rx_ok`, `crc`, `timeout` and `rsp` (SCAN_RSP sent).
-  `ll_glue` logs them every 2 s as
-  `radio: tx2rx N rx_ok N crc N timeout N rsp N` and warns `radio stalled`
-  when advertising is enabled but `tx2rx` does not advance.
+- `ll_radio` counts `tx2rx`, `rx_ok`, `crc`, `timeout`, `rsp` (SCAN_RSP TX
+  triggered, not confirmed on air) and `rsp_late` (SCAN_RSP refused because the
+  TX trigger tick was less than 10 us ahead or already past; a trigger in the
+  past would leave the radio waiting and stall advertising). `ll_glue` logs them
+  every 2 s as `radio: tx2rx N rx_ok N crc N timeout N rsp N rsp_late N` and
+  warns `radio stalled` when advertising is enabled but `tx2rx` does not
+  advance.
 - Oversized events are dropped with an error, dropped CONNECT_INDs are counted.
 - CONNECT_IND logging is rate limited: the first one and then at most one full
   dump every 10 s, with `N since last dump`. Without this the log flood
@@ -142,12 +147,13 @@ usual (`image upload`, `image test`, `reset`). MCUboot keeps the previous image
 in slot 1, so going back to the blob is `image test <slot-1 hash>` plus
 `reset`, or a fresh `./build.sh -p --iso` and upload.
 
-Measured sizes (ISO, same config otherwise):
+Image sizes from the "Memory region" summary of the final builds (ISO,
+`conf/app.conf`, deep sleep on, nothing else changed):
 
 | Variant | ROM | RAM | RAM_ILM |
 |---|---|---|---|
 | Blob (`./build.sh -p --iso`) | 328088 B | 85160 B | 40288 B |
-| Open (`--openll`, sleep off) | 263680 B | 83400 B | 6204 B |
+| Open (`./build.sh -p --iso --openll`) | 263396 B | 83416 B | 6204 B |
 
 Practical notes:
 
@@ -170,20 +176,21 @@ Measured on the keyboard on 2026-10-02.
 |---|---|
 | Blob not linked | Pass. `grep -c liblt zmk.map` = 0 (blob build: 48). |
 | `bt_enable()` | Pass on first flash. Identity address matches the MAC from flash. Only unsupported opcode seen: `0xfc01` (Zephyr vendor Read Version Info, warning only). |
-| ADV_IND on air | Pass. Channels 37/38/39, CRC valid (CRC24 recomputed independently), 0 CRC errors in the first 30 s capture. AdvData, AdvA and length byte-identical to the blob. |
-| Advertising interval | 100 ms + 0..10 ms advDelay: mean 105.07 ms, min 99.80, max 110.00 over 228 single intervals. ZMK requests 100..150 ms; the blob picks 150 ms (mean 152.76 ms). Both are valid. |
+| ADV_IND on air | Pass. Channels 37/38/39, CRC valid (CRC24 recomputed independently). 0 CRC errors in one 30 s capture, 6 isolated ones (0.6 %) in another, with the other channels of the same events good. AdvData, AdvA and length byte-identical to the blob. |
+| Advertising interval | 100 ms + 0..10 ms advDelay: mean 105.07 ms, min 99.80, max 110.00 over 228 single intervals. ZMK requests 100..150 ms; the blob picks 150 ms (mean 152.75 ms). Both are valid. |
 | Channel step inside an event | 0.906 ms (blob 0.725 ms). Each ADV_IND is about 376 us on air. |
 | Scanners see the device | Pass. `bluetoothctl` lists "Rainy 75 Pro". The name is in ADV_IND (ZMK's scan response is empty), so this does not depend on SCAN_RSP. |
 | SCAN_RSP | Partial. On air with valid CRC, but T_IFS is about 209 us instead of 150 +/- 2 us. See below. |
 | CONNECT_IND parsing | Pass on all fields observable so far. The bonded PC sends about 2.6 CONNECT_INDs per second and every one is decoded. Static fields match the sniffer capture (after CRC reconstruction, see below). A capture of the same CONNECT_IND by both sniffer and device log (matched Access Address) is still missing because follow mode is unreliable. |
-| Blob build regression | Pass. Default build flashed after the work, reconnects to the bonded host by itself. |
+| Blob build regression | Default blob build flashed after the work and reconnects to the bonded host by itself. Confirmation that BLE typing works is pending. |
 
 Fields decoded by the device and seen on air, from a Linux/BlueZ central:
 Interval 12 (15 ms), Latency 30, Timeout 400 (4 s), WinSize 1, WinOffset
 0..11, ChM `ff ff ff ff 1f`, Hop 5..15, SCA 1, ChSel 1, with a fresh Access
 Address and CRCInit on every attempt.
 
-Typical radio counters after about 7 minutes with the bonded PC retrying:
+Radio counters after about 7 minutes with the bonded PC retrying (before
+`rsp_late` existed):
 `tx2rx 10076 rx_ok 1114 crc 87 timeout 8875 rsp 5`. Most RX windows time out,
 which is normal for advertising. RX CRC errors are mostly other devices'
 packets or collisions in our window.
@@ -217,6 +224,13 @@ interval, so the connection path must use the hardware brx/btx automatic
 turnaround of the B91 FSM, not a software-triggered TX. Unexplored options for
 SCAN_RSP: a shorter TX settle on the STX path, `txwait`/`tx_stl` tuning for the
 rx2tx path, and a RAM-resident ISR.
+
+A response whose TX trigger tick would be less than 10 us ahead is now not
+started at all and is counted in `rsp_late` instead. The trigger slack at
+baseline was estimated at about +26..-3 us (from the slack measured with a
+-59 us correction), so part of the SCAN_REQs now get no response. This trades
+some responses for an advertising state machine that cannot stall on a
+trigger in the past.
 
 Scanners treat our late responses as missing and back off (Core Vol 6 Part B
 4.4.3.2), so a PC sends few SCAN_REQs to the keyboard (about one per minute
@@ -273,7 +287,7 @@ timeout 40 cat "$(readlink -f /dev/serial/by-id/*Rainy_75*)"
 `--follow <ADDRESS IN CAPS>` makes the sniffer follow one advertiser, which is
 needed to see CONNECT_INDs addressed to it. From the CLI it is unreliable: it
 worked about once in nine tries in one session and zero times in four tries in
-another. Usually the sniffer stalls (0 to 21 packets in 30 s) or keeps hopping
+another. Usually the sniffer stalls (0 to 21 packets in 25 to 30 s) or keeps hopping
 without catching the CONNECT_IND. Without follow mode, no CONNECT_IND to the
 keyboard was ever captured, even while the device logged several per second.
 The Wireshark GUI (extcap "Device" control) is the next thing to try.
@@ -330,7 +344,8 @@ Builds and runs `test_hci` (opcode handling, event encoding, parameter
 validation, unknown opcodes), `test_pdu` (PDU encoding, SCAN_REQ match,
 CONNECT_IND parsing against captured bytes) and `test_adv` (state machine
 against a fake radio: channel sequence, interval and delay, SCAN_RSP trigger,
-CONNECT_IND callback, late events and stall catch-up) with the host gcc.
+refused late SCAN_RSP, CONNECT_IND callback, late events and stall
+catch-up) with the host gcc.
 
 ## Known limitations
 
