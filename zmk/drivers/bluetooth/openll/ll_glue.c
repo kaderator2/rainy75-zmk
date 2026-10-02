@@ -117,11 +117,31 @@ static void on_connect_ind(const struct ll_connect_ind *ci)
 	}
 }
 
+/* A bonded central retries CONNECT_IND many times per second while slice 1
+ * has no connection state; dumping every one floods the log (dropped lines,
+ * NMP timeouts on the shared CDC ACM port). Dump the first one, then at most
+ * one every CONNECT_IND_LOG_MS, with the count received since the last dump. */
+#define CONNECT_IND_LOG_MS 10000
+
 static void log_connect_ind(const struct ll_connect_ind *ci)
 {
-	LOG_INF("CONNECT_IND from %02x:%02x:%02x:%02x:%02x:%02x (%s)",
+	static bool dumped;
+	static int64_t next_dump;
+	static uint32_t since_dump;
+	int64_t now = k_uptime_get();
+
+	since_dump++;
+	if (dumped && now < next_dump) {
+		return;
+	}
+	dumped = true;
+	next_dump = now + CONNECT_IND_LOG_MS;
+
+	LOG_INF("CONNECT_IND from %02x:%02x:%02x:%02x:%02x:%02x (%s), %u since last dump",
 		ci->init_a[5], ci->init_a[4], ci->init_a[3], ci->init_a[2],
-		ci->init_a[1], ci->init_a[0], ci->init_addr_random ? "random" : "public");
+		ci->init_a[1], ci->init_a[0], ci->init_addr_random ? "random" : "public",
+		since_dump);
+	since_dump = 0;
 	LOG_INF("  AA 0x%08x CRCInit 0x%06x WinSize %u WinOffset %u",
 		ci->aa, ci->crc_init, ci->win_size, ci->win_offset);
 	LOG_INF("  Interval %u Latency %u Timeout %u Hop %u SCA %u ChSel %u",
