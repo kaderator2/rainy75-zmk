@@ -21,6 +21,7 @@
 #include <string.h>
 
 #include "b91_bt.h"
+#include "b91_mac.h"
 
 #define LOG_LEVEL CONFIG_BT_HCI_DRIVER_LOG_LEVEL
 #include <zephyr/logging/log.h>
@@ -304,9 +305,6 @@ static u8 app_hci_rxAclfifo[HCI_RX_ACL_FIFO_SIZE * HCI_RX_ACL_FIFO_NUM];
 /* 32k RC calibration interval (seconds) */
 #define RC_CAL_INTERVAL_SEC   10
 
-/* MAC address flash offset — 1MB flash uses 0xFF000 */
-#define MAC_FLASH_ADDR 0xFF000
-
 #define BLE_SUCCESS 0
 
 #define BYTES_TO_UINT16(n, p) do { (n) = ((u16)(p)[0] + ((u16)(p)[1] << 8)); } while (0)
@@ -315,56 +313,6 @@ static u8 app_hci_rxAclfifo[HCI_RX_ACL_FIFO_SIZE * HCI_RX_ACL_FIFO_NUM];
 static struct {
 	b91_bt_host_callback_t callbacks;
 } b91_ctrl;
-
-/* -------------------------------------------------------------------------
- * MAC address init — ported from hal_telink b91_bt_init.c
- * ----------------------------------------------------------------------- */
-static void b91_bt_blc_mac_init(int flash_addr, u8 *mac_public,
-				u8 *mac_random_static)
-{
-	if (flash_addr == 0) {
-		return;
-	}
-
-	u8 mac_read[8];
-
-	flash_read_page(flash_addr, 8, mac_read);
-
-	u8 value_rand[5];
-
-	generateRandomNum(5, value_rand);
-
-	u8 ff_six_byte[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
-
-	if (memcmp(mac_read, ff_six_byte, 6)) {
-		memcpy(mac_public, mac_read, 6);
-	} else {
-		mac_public[0] = value_rand[0];
-		mac_public[1] = value_rand[1];
-		mac_public[2] = value_rand[2];
-		mac_public[3] = 0x38; /* company id: 0xA4C138 */
-		mac_public[4] = 0xC1;
-		mac_public[5] = 0xA4;
-
-		flash_write_page(flash_addr, 6, mac_public);
-	}
-
-	mac_random_static[0] = mac_public[0];
-	mac_random_static[1] = mac_public[1];
-	mac_random_static[2] = mac_public[2];
-	mac_random_static[5] = 0xC0; /* random static marker */
-
-	u16 high_2_byte = (mac_read[6] | mac_read[7] << 8);
-
-	if (high_2_byte != 0xFFFF) {
-		memcpy(&mac_random_static[3], &mac_read[6], 2);
-	} else {
-		mac_random_static[3] = value_rand[3];
-		mac_random_static[4] = value_rand[4];
-
-		flash_write_page(flash_addr + 6, 2, &mac_random_static[3]);
-	}
-}
 
 /* -------------------------------------------------------------------------
  * HCI TX handler — blob calls this to send data to host
@@ -509,7 +457,7 @@ static int b91_bt_blc_init(void *prx, void *ptx)
 	u8 mac_public[6];
 	u8 mac_random_static[6];
 
-	b91_bt_blc_mac_init(MAC_FLASH_ADDR, mac_public, mac_random_static);
+	b91_mac_init(B91_MAC_FLASH_ADDR, generateRandomNum, mac_public, mac_random_static);
 
 	/* Core init */
 	blc_ll_initBasicMCU();

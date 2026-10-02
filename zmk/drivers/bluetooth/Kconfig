@@ -17,3 +17,23 @@ config BT_HCI_B91_RX_PRIO
 	int "B91 BLE RX thread priority"
 	depends on BT_HCI_B91
 	default 2
+
+choice BT_HCI_B91_CONTROLLER
+	prompt "B91 BLE controller implementation"
+	depends on BT_HCI_B91
+	default BT_HCI_B91_CTLR_BLOB
+
+config BT_HCI_B91_CTLR_BLOB
+	bool "Telink binary controller (liblt_9518_zephyr.a)"
+	help
+	  Proprietary controller blob from telink-semi. Full peripheral
+	  feature set, but the resulting image may not be redistributed.
+
+config BT_HCI_B91_CTLR_OPEN
+	bool "Open-source link layer (experimental)"
+	help
+	  Our own peripheral-only link layer on hal_telink rf.c. Slice 1:
+	  bt_enable() and legacy advertising only; connections are not
+	  followed yet. No binary blobs are linked.
+
+endchoice
