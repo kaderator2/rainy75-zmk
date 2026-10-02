@@ -284,13 +284,29 @@ timeout 40 cat "$(readlink -f /dev/serial/by-id/*Rainy_75*)"
 
 ### Following a connection
 
-`--follow <ADDRESS IN CAPS>` makes the sniffer follow one advertiser, which is
-needed to see CONNECT_INDs addressed to it. From the CLI it is unreliable: it
-worked about once in nine tries in one session and zero times in four tries in
-another. Usually the sniffer stalls (0 to 21 packets in 25 to 30 s) or keeps hopping
-without catching the CONNECT_IND. Without follow mode, no CONNECT_IND to the
-keyboard was ever captured, even while the device logged several per second.
-The Wireshark GUI (extcap "Device" control) is the next thing to try.
+Following one advertiser is needed to see CONNECT_INDs addressed to it and the
+connection after it. `nrfutil ble-sniffer sniff --follow` is unreliable (about once
+in nine tries, zero in four in another session): it only sends the follow request
+if the device is advertising at the moment it starts.
+
+What works headlessly is Nordic's Python SnifferAPI, driven by
+`reverse/tools/ble_follow_capture.py`. Install the AUR package `nrf-sniffer-ble`
+(4.1.1, matches the dongle firmware) in the arch box, for example with
+`git clone https://aur.archlinux.org/nrf-sniffer-ble.git && cd nrf-sniffer-ble && makepkg -si`,
+then:
+
+```bash
+python3 reverse/tools/ble_follow_capture.py --follow XX:XX:XX:XX:XX:XX \
+    --seconds 40 --out reverse/captures/conn.pcapng
+```
+
+Trigger a reconnect while it runs (for example `bluetoothctl disconnect` on the
+bonded host, which reconnects by itself). In two of two runs it captured the
+CONNECT_IND and the full connection (about 2700 packets in 25 s, none missed
+over the UART). The blob's LLCP sequence after connecting is FEATURE_REQ/RSP,
+PERIPHERAL_FEATURE_REQ, LENGTH_REQ/RSP, then ENC_REQ/RSP and START_ENC_REQ;
+everything after that is encrypted. Live capture with tshark or the Wireshark
+GUI also works from the arch box via `newgrp wireshark` (Arch has no `sg`).
 
 ### Sniffer display quirks
 
