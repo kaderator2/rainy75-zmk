@@ -240,6 +240,17 @@ reverse/
 - **Stage 4**: ADC channel scan → battery sensor (via mcumgr DFU)
 - **Stage 5 (COMPLETE)**: Deep sleep — `DEEPSLEEP_MODE` (0x30, cold boot on wakeup), GPIO keypress wakeup. `z_sys_poweroff()` in `zmk/src/poweroff.c`: RGB off, USB detach, analog pull-downs on columns (100K) + pull-ups on rows (1M), `pm_set_gpio_wakeup()` on all 6 row pins. Wakeup on any keypress → cold boot through MCUboot (~1-2s). Retention mode (0x03) incompatible with MCUboot (boot ROM overwrites retained ILM). Patches: 0004 (HAS_POWEROFF Kconfig) + 0005 (start.S retention skip, dead code). `CONFIG_ZMK_SLEEP=y`, 15min idle timeout.
 
+### Next — Open BLE Controller (issue #13, branch `feat/open-ble-controller`)
+Own peripheral-only link layer behind the `b91_bt.h` seam on hal_telink `rf.c` (Apache-2.0); the blob is the only prebuilt binary in the image.
+- **Slice 0**: nRF52840 dongle as nRF Sniffer + Wireshark, blob reference captures (`reverse/captures/`, gitignored)
+- **Slice 1**: blob-free `bt_enable()` + connectable advertising, SCAN_RSP, CONNECT_IND parse (Kconfig `BT_HCI_B91_CTLR_OPEN`)
+- **Slice 2**: connection follow + empty-PDU keepalive (anchor tracking, window widening, CSA#1, SN/NESN, supervision timeout)
+- **Slice 3**: LLCP subset (VERSION/FEATURE/CONN_UPDATE/CHANNEL_MAP, UNKNOWN_RSP incl. PHY update) + ACL data + HCI flow control
+- **Slice 4**: link encryption (LL_ENC/START_ENC, hardware AES-CCM, LTK reply) → SMP pairing + HID over GATT
+- **Slice 5**: power management (sleep between connection events, deep-sleep coordination, 32k RC cal)
+- **Slice 6**: privacy (LE Set Random Address/RPA), optional 2M PHY, Data Length Extension
+- Parallel: email Telink for blob redistribution permission
+
 ### Next — Other
 - Continue SRAM variable analysis (~216 gp refs remain as Tier-4 annotations, 7 `DAT_ram_` unnamed — 75% coverage)
 
