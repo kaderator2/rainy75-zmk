@@ -29,6 +29,7 @@ BUILD_APP=1
 LAYOUT=""             # "iso" or "ansi" — REQUIRED for app builds, no default
 ANSI_DTFLAG=""        # set when LAYOUT=ansi
 APP_CONF="$(pwd)/conf/app.conf"
+USE_OPENLL=0          # set by --openll
 
 # ── Apply upstream patches if needed ──────────────────────────
 #
@@ -75,9 +76,6 @@ apply_patches mcuboot bootloader/mcuboot
 apply_patches hal_telink modules/hal/hal_telink
 apply_patches zmk-src zmk-src
 
-# ── Fetch the (non-redistributable) Telink BLE blob if missing ──
-./fetch_ble_blob.sh
-
 # Allow long forms --iso / --ansi as aliases for -I / -A.
 ARGS=(); for a in "$@"; do case "$a" in
     --iso)    ARGS+=("-I");;
@@ -98,7 +96,7 @@ while getopts "pvmcobaIAO" opt; do
         a) BUILD_MCUBOOT=1; BUILD_COMBINED=1; BUILD_OTA=1; BUILD_BRIDGE=1; BUILD_APP=1 ;;
         I) [ "$LAYOUT" = ansi ] && { echo "Error: --iso and --ansi are mutually exclusive" >&2; exit 1; }; LAYOUT="iso" ;;
         A) [ "$LAYOUT" = iso  ] && { echo "Error: --iso and --ansi are mutually exclusive" >&2; exit 1; }; LAYOUT="ansi"; ANSI_DTFLAG="-DDTS_EXTRA_CPPFLAGS=-DRAINY75_ANSI -DCONFIG_RAINY_RGB_ANSI_LEDMAP=y" ;;
-        O) APP_CONF="$APP_CONF;$(pwd)/conf/openll.conf" ;;
+        O) APP_CONF="$APP_CONF;$(pwd)/conf/openll.conf"; USE_OPENLL=1 ;;
         *) echo "Usage: $0 [-p] [-v] [-m] [-c] [-o] [-b] [-a] (--iso | --ansi) [--openll]"; exit 1 ;;
     esac
 done
@@ -110,6 +108,13 @@ if [ "$BUILD_APP" -eq 1 ] && [ -z "$LAYOUT" ]; then
     echo "  ./build.sh -pa --iso    # ISO DE  (the original board)" >&2
     echo "  ./build.sh -pa --ansi   # ANSI    (community-verified)" >&2
     exit 1
+fi
+
+# ── Fetch the (non-redistributable) Telink BLE blob if missing ──
+# Only the default app build links it. MCUboot, the bridge (CONFIG_BT=n) and
+# an --openll app build do not.
+if [ "$BUILD_APP" -eq 1 ] && [ "$USE_OPENLL" -eq 0 ]; then
+    ./fetch_ble_blob.sh
 fi
 
 # ── MCUboot build ──────────────────────────────────────────────

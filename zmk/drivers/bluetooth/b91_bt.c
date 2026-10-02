@@ -157,10 +157,6 @@ extern void rf_drv_ble_init(void);
 extern void trng_init(void);
 extern void rf_set_power_level_index(int level);
 
-/* Flash */
-extern void flash_read_page(u32 addr, u32 len, u8 *buf);
-extern void flash_write_page(u32 addr, u32 len, u8 *buf);
-
 /* Random */
 extern void generateRandomNum(int len, u8 *data);
 
