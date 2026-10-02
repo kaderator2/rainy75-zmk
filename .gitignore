@@ -107,6 +107,9 @@ docs/demo-cheatsheet.md
 docs/plans/
 docs/superpowers/
 
+# BLE capture files (raw pcapng from nRF Sniffer, not tracked)
+reverse/captures/
+
 # Shell config (dotfiles, not project files)
 .bash_profile
 .bashrc
