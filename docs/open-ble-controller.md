@@ -182,7 +182,7 @@ Measured on the keyboard on 2026-10-02.
 | Scanners see the device | Pass. `bluetoothctl` lists "Rainy 75 Pro". The name is in ADV_IND (ZMK's scan response is empty), so this does not depend on SCAN_RSP. |
 | SCAN_RSP | Partial. On air with valid CRC, but T_IFS is about 209 us instead of 150 +/- 2 us. See below. |
 | CONNECT_IND parsing | Pass on all fields observable so far. The bonded PC sends about 2.6 CONNECT_INDs per second and every one is decoded. Static fields match the sniffer capture (after CRC reconstruction, see below). A capture of the same CONNECT_IND by both sniffer and device log (matched Access Address) is still missing because follow mode is unreliable. |
-| Blob build regression | Default blob build flashed after the work and reconnects to the bonded host by itself. Confirmation that BLE typing works is pending. |
+| Blob build regression | Pass. Default blob build flashed after the work, reconnects to the bonded host by itself, and BLE typing works (confirmed by the user). |
 
 Fields decoded by the device and seen on air, from a Linux/BlueZ central:
 Interval 12 (15 ms), Latency 30, Timeout 400 (4 s), WinSize 1, WinOffset
