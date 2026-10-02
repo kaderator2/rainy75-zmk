@@ -230,8 +230,10 @@ void ll_adv_radio_evt(enum ll_radio_evt evt, const uint8_t *pdu, uint8_t len,
 	}
 	if (evt == LL_RADIO_RX_OK) {
 		if (scannable() && ll_pdu_is_scan_req_for(pdu, len, adv.adva)) {
-			ll_radio_tx_rsp_at(end_tick + LL_T_IFS_US * LL_TICKS_PER_US);
-			return; /* continue on LL_RADIO_TX_DONE */
+			if (ll_radio_tx_rsp_at(end_tick + LL_T_IFS_US * LL_TICKS_PER_US)) {
+				return; /* continue on LL_RADIO_TX_DONE */
+			}
+			/* too late to answer; no TX_DONE will come, so move on now */
 		}
 		if (connectable() && ll_pdu_parse_connect_ind(pdu, len, adv.adva, &ci) == 0) {
 			if (adv.on_connect) {

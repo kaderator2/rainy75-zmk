@@ -9,6 +9,6 @@ build_run() {
     "/tmp/openll_$t"
 }
 build_run test_hci ../ll_hci.c
-[ -f test_pdu.c ] && build_run test_pdu ../ll_pdu.c
-[ -f test_adv.c ] && build_run test_adv ../ll_adv.c ../ll_pdu.c
+build_run test_pdu ../ll_pdu.c
+build_run test_adv ../ll_adv.c ../ll_pdu.c
 exit 0

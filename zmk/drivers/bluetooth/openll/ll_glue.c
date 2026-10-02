@@ -170,8 +170,8 @@ static void report_radio_stats(struct ll_radio_stats *last)
 
 	ll_radio_get_stats(&st);
 	if (memcmp(&st, last, sizeof(st)) != 0 || ll_adv_is_enabled()) {
-		LOG_INF("radio: tx2rx %u rx_ok %u crc %u timeout %u rsp %u",
-			st.tx2rx, st.rx_ok, st.rx_crc, st.rx_timeout, st.rsp_tx);
+		LOG_INF("radio: tx2rx %u rx_ok %u crc %u timeout %u rsp %u rsp_late %u",
+			st.tx2rx, st.rx_ok, st.rx_crc, st.rx_timeout, st.rsp_tx, st.rsp_late);
 	}
 	if (ll_adv_is_enabled() && st.tx2rx == last->tx2rx) {
 		LOG_WRN("radio stalled");

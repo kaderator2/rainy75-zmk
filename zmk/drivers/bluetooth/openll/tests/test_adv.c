@@ -12,7 +12,7 @@ static int sched_calls;
 static uint8_t radio_ch; static uint8_t tx_pdu[64]; static uint8_t tx_len;
 static uint32_t tx_start; static int txrx_calls;
 static uint8_t rsp_pdu[64]; static uint8_t rsp_len; static uint32_t rsp_tick; static int rsp_calls;
-static int radio_stops;
+static int radio_stops; static bool rsp_ok = true;
 static int conn_calls; static struct ll_connect_ind conn;
 
 int ll_radio_init(ll_radio_cb_t cb) { (void)cb; return 0; }
@@ -21,7 +21,7 @@ void ll_radio_set_adv_channel(uint8_t ch) { radio_ch = ch; }
 void ll_radio_tx_then_rx(const uint8_t *p, uint8_t l, uint32_t t, uint32_t w)
 { (void)w; memcpy(tx_pdu, p, l); tx_len = l; tx_start = t; txrx_calls++; }
 void ll_radio_prepare_rsp(const uint8_t *p, uint8_t l) { memcpy(rsp_pdu, p, l); rsp_len = l; }
-void ll_radio_tx_rsp_at(uint32_t t) { rsp_tick = t; rsp_calls++; }
+bool ll_radio_tx_rsp_at(uint32_t t) { rsp_tick = t; rsp_calls++; return rsp_ok; }
 void ll_radio_stop(void) { radio_stops++; }
 void ll_sched_init(void) {}
 void ll_sched_at(uint32_t t, ll_sched_cb_t cb) { sched_tick = t; sched_cb = cb; sched_calls++; }
@@ -176,6 +176,29 @@ int main(void)
 	ll_adv_reset();
 	p = params(0, 7);
 	CHECK(ll_adv_set_params(&p) == LL_ST_SUCCESS);
+
+	/* SCAN_RSP trigger too late: the radio refuses it (returns false) and no
+	 * TX_DONE will follow, so the next channel must be used immediately */
+	CHECK(ll_adv_enable(true) == LL_ST_SUCCESS);
+	fire_sched();
+	CHECK(radio_ch == 37);
+	int rsp_before = rsp_calls;
+	txrx_before = txrx_calls;
+	rsp_ok = false;
+	ll_adv_radio_evt(LL_RADIO_RX_OK, req, 14, 9500000);
+	rsp_ok = true;
+	CHECK(rsp_calls == rsp_before + 1);
+	CHECK(radio_ch == 38);
+	CHECK(txrx_calls == txrx_before + 1);
+	/* a refused response on the last channel ends the event */
+	ll_adv_radio_evt(LL_RADIO_RX_TIMEOUT, NULL, 0, 0);
+	CHECK(radio_ch == 39);
+	sc_before = sched_calls;
+	rsp_ok = false;
+	ll_adv_radio_evt(LL_RADIO_RX_OK, req, 14, 9600000);
+	rsp_ok = true;
+	CHECK(sched_calls == sc_before + 1 && sched_cb != NULL);
+	CHECK(ll_adv_enable(false) == LL_ST_SUCCESS);
 
 	DONE();
 }
