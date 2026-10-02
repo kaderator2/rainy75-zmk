@@ -16,9 +16,12 @@ FIELDS = ["frame.time_relative", "nordic_ble.channel",
 
 def parse_fields_line(line):
     t, ch, pdu, adva, crc = (line.rstrip("\n").split("\t") + [""] * 5)[:5]
-    # nordic_ble.crcok: 1 = CRC good, 0 = CRC bad (empty treated as good)
+    # nordic_ble.crcok: tshark 4.x prints the boolean field as "True"/"False";
+    # older tshark releases printed "1"/"0". Treat "0" or "false" (any case) as
+    # a bad CRC, everything else (including empty) as good.
+    crc_ok = crc.strip().lower() not in ("0", "false")
     return {"t": float(t), "ch": int(ch), "pdu": int(pdu, 0),
-            "adva": adva.lower(), "crc_ok": crc.strip() != "0"}
+            "adva": adva.lower(), "crc_ok": crc_ok}
 
 
 def summarize(rows, adva=None):

@@ -12,6 +12,13 @@ class ParseTest(unittest.TestCase):
         self.assertEqual(r["adva"], "")
         self.assertFalse(r["crc_ok"])
 
+    def test_parse_line_crc_text_true_false(self):
+        # tshark 4.x prints nordic_ble.crcok as "True"/"False" rather than "1"/"0"
+        good = parse_fields_line("3.0\t37\t0x00\taa:bb:cc:dd:ee:ff\tTrue")
+        bad = parse_fields_line("3.0\t37\t0x00\taa:bb:cc:dd:ee:ff\tFalse")
+        self.assertTrue(good["crc_ok"])
+        self.assertFalse(bad["crc_ok"])
+
 class SummarizeTest(unittest.TestCase):
     def rows(self):
         a = "aa:bb:cc:dd:ee:ff"
