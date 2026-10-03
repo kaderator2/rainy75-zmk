@@ -7,11 +7,29 @@
  * timeout, termination. Drives the radio via ll_radio.h, the alarm via
  * ll_sched.h, and calls the ll_txq / ll_rxq per-event hooks.
  *
- * Timing uses stimer ticks only (LL_TICKS_PER_US). Peripheral latency is
- * accepted (CONNECT_IND, connection update) but not used before slice 5:
- * every connection event is listened to. Window widening above
+ * Timing uses stimer ticks only (LL_TICKS_PER_US). Window widening above
  * connInterval / 2 - T_IFS is clamped; the supervision timeout then ends
  * the link.
+ *
+ * Peripheral latency (Vol 6 Part B 4.5.1, 4.5.7; slice 5): after an event
+ * the next one is planned up to connPeripheralLatency events ahead (the
+ * latency from CONNECT_IND or the last applied connection update) when all
+ * of these hold, else the next event is listened to:
+ *  - ll_txq_backlog() == 0 (nothing queued, nothing unacked);
+ *  - ops.busy() is false (no LLCP procedure waiting) and no local
+ *    termination is running;
+ *  - no channel map / connection update instant is pending in the
+ *    candidate window [next, next + latency] (the instant event is always
+ *    listened to, so no skip at all until it was);
+ *  - the event just closed re-anchored (its first packet was received in
+ *    the RX window): never skip after a miss, a late alarm or a first
+ *    packet that was not the anchor;
+ *  - the listened event's anchor stays <= last RX + connSupervisionTimeout
+ *    - 2 * connInterval (defensive: with spec-valid parameters, timeout >
+ *    (1 + latency) * interval * 2, this never limits the skip).
+ * Skipped events still advance the event counter and CSA#1; window
+ * widening uses the real time since the last anchor (at most 500 intervals
+ * of growth, never reaching the clamp). New TX data calls ll_conn_kick().
  */
 #ifndef LL_CONN_H_
 #define LL_CONN_H_
@@ -88,6 +106,13 @@ struct ll_conn_ops {
 	 * hook (ll_llcp_ctrl_tx) also takes the ll_plat_tx_lock() mutex, so it
 	 * may block: never call it from an ISR or with ll_plat_lock() held. */
 	int (*ctrl_tx)(const uint8_t *payload, uint8_t len);
+	/* Peripheral latency: true while an LL control procedure waits on us
+	 * or on the central (encryption start, a response not queued yet).
+	 * Called from ISR context when the next event is planned, so it must
+	 * not block or take ll_plat_tx_lock(); reading a flag is enough (a
+	 * stale answer costs at most one skip window, the response itself
+	 * kicks via ll_conn_kick()). NULL: never busy. */
+	bool (*busy)(void);
 };
 
 /* ops is copied. */
@@ -129,8 +154,18 @@ void ll_conn_terminate(uint8_t reason);
 void ll_conn_end(uint8_t reason);
 bool ll_conn_active(void);
 /* Counter of the next connection event not yet completed (the one on air,
- * if any). Instants are relative to this. */
+ * if any). Instants are relative to this. While a latency skip is planned
+ * this is the first skipped event (conservative: an instant for a skipped
+ * event re-plans the listen to it, or is passed if that event is no
+ * longer reachable). */
 uint16_t ll_conn_event_counter(void);
+/* New TX data was queued (call after a successful ll_txq_push; the
+ * ll_plat_lock() it takes nests, so the caller may hold it): if the planned event lies beyond the next regular
+ * event that can still be prepared (alarm LL_CONN_ARM_LEAD_US before its
+ * RX opens), re-plan to that event. No-op without a connection, during an
+ * event (the next plan sees the backlog) or when that event is already the
+ * planned one. ISR-safe; takes ll_plat_lock(). */
+void ll_conn_kick(void);
 
 struct ll_conn_stats {
 	uint32_t events;      /* events issued to the radio */
@@ -142,6 +177,16 @@ struct ll_conn_stats {
 	uint32_t first_bad;   /* events whose first packet had a bad CRC (no re-anchor) */
 	uint32_t first_nodata; /* events whose first packet was not delivered (no re-anchor) */
 	uint32_t first_outside; /* first delivered packet after the RX window (no re-anchor) */
+	/* Peripheral latency (slice 5). planned: listen alarms armed (a
+	 * re-plan of the same listen counts once); planned - listened = late
+	 * events + plans ended by the link end. listened: events issued to the
+	 * radio (same as events, named for the power counters). skipped: events
+	 * skipped by latency (net of kick / instant re-plans). kicks:
+	 * ll_conn_kick() calls that re-planned. */
+	uint32_t planned;
+	uint32_t listened;
+	uint32_t skipped;
+	uint32_t kicks;
 };
 /* Cumulative since boot. */
 void ll_conn_get_stats(struct ll_conn_stats *s);

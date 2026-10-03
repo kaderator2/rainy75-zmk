@@ -144,6 +144,13 @@ static void on_txq_done(enum ll_txq_kind kind, uint8_t op)
 	}
 }
 
+static bool busy_flag;
+
+static bool hook_busy(void)
+{
+	return busy_flag;
+}
+
 static int hook_ctrl_tx(const uint8_t *payload, uint8_t len)
 {
 	cbs.ctrl_tx_calls++;
@@ -164,9 +171,11 @@ static void reset_all(bool hook)
 		.evt = on_evt,
 		.txq_done = on_txq_done,
 		.ctrl_tx = hook ? hook_ctrl_tx : NULL,
+		.busy = hook_busy,
 	};
 
 	now = 0;
+	busy_flag = false;
 	memset(&rad, 0, sizeof(rad));
 	memset(&sch, 0, sizeof(sch));
 	memset(&cbs, 0, sizeof(cbs));
@@ -647,12 +656,15 @@ static void test_conn_update(void)
 	a_new = ws + T(7500) + T(300);
 	rx(a_new, 0x01, 0);
 	done(1);
+	/* slice 5: the new latency 2 is honoured: events +1 and +2 skipped,
+	 * widening over 22.5 ms: 6.75 -> 7 + 16 */
 	fire_alarm();
-	CHECK(rad.open == a_new + T(7500) - T(widen(300, 7500) + 60));
-	CHECK(rad.fst == 2 * (19 + 60) + 40);
+	CHECK(rad.open == a_new + T(22500) - T(widen(300, 22500) + 60));
+	CHECK(rad.fst == 2 * (23 + 60) + 40);
 	done(0);
-	/* new supervision timeout (500 ms) in force: 66 * 7.5 ms = 495 ms ok */
-	for (int k = 2; k <= 66; k++) {
+	/* new supervision timeout (500 ms) in force: 66 * 7.5 ms = 495 ms ok;
+	 * after the miss every event is listened to again */
+	for (int k = 4; k <= 66; k++) {
 		ev_miss();
 	}
 	CHECK(ll_conn_active());
@@ -1118,6 +1130,497 @@ static void test_start_validation(void)
 	CHECK(!ll_conn_active() && cbs.connected == 0 && rad.setups == 0);
 }
 
+/* ---------------- peripheral latency (slice 5) ---------------- */
+
+/* open tick of the event k intervals (15 ms, 300 ppm) after the anchor a */
+static uint32_t open_at(uint32_t a, uint32_t k)
+{
+	return a + T(15000 * k) - T(widen(300, 15000 * k) + LL_CONN_RX_MARGIN_US);
+}
+
+/* Start a 15 ms connection with the given latency and timeout (SCA 1, 300
+ * ppm), receive event 0 (window event) at the returned anchor. ref follows
+ * the CSA#1 sequence (event 0 consumed). */
+static uint32_t start_lat(uint16_t latency, uint16_t timeout, struct ll_csa1 *ref, bool hook)
+{
+	struct ll_connect_ind ci = mk_ci(12, timeout, 1, 1, 0);
+	const uint32_t t0 = 1000000;
+	uint32_t a0 = t0 + T(1250 + 300);
+
+	ci.latency = latency;
+	reset_all(hook);
+	ll_csa1_init(ref, 7, all37);
+	CHECK(ll_conn_start(&ci, t0) == 0);
+	fire_alarm();
+	CHECK(rad.ch == ll_csa1_next(ref));
+	rx(a0, 0x01, 0);
+	done(1);
+	return a0;
+}
+
+/* advance ref by n events, return the channel of the last */
+static uint8_t ref_skip(struct ll_csa1 *ref, uint32_t n)
+{
+	uint8_t ch = 0;
+
+	for (uint32_t i = 0; i < n; i++) {
+		ch = ll_csa1_next(ref);
+	}
+	return ch;
+}
+
+/* Idle and synced: events 1..4 are skipped, event 5 is listened to; the
+ * counter and CSA#1 advance over the skipped events, widening grows over
+ * the real time since the anchor. Stats count it. */
+static void test_latency_skip(void)
+{
+	struct ll_conn_stats s0, s1;
+	struct ll_csa1 ref;
+	uint32_t a0;
+
+	ll_conn_get_stats(&s0);
+	a0 = start_lat(4, 400, &ref, false);
+	/* instants are judged against the first skipped event */
+	CHECK(ll_conn_event_counter() == 1);
+	fire_alarm();
+	CHECK(rad.ch == ref_skip(&ref, 5));
+	CHECK(rad.open == open_at(a0, 5));
+	CHECK(rad.fst == 2 * (widen(300, 75000) + 60) + 40);
+	check_alarm_lead();
+	CHECK(ll_conn_event_counter() == 5);
+	rx(a0 + T(75000), 0x01, 0);
+	done(1);
+	CHECK(ll_conn_event_counter() == 6);
+	fire_alarm();
+	CHECK(rad.ch == ref_skip(&ref, 5));
+	CHECK(rad.open == open_at(a0 + T(75000), 5));
+	CHECK(ll_conn_event_counter() == 10);
+	done(0);
+	ll_conn_get_stats(&s1);
+	CHECK(s1.skipped - s0.skipped == 8);
+	CHECK(s1.listened - s0.listened == 3);
+	CHECK(s1.events - s0.events == 3);
+	/* events 0, 5, 10 and the armed (never fired) event 11 after the miss */
+	CHECK(s1.planned - s0.planned == 4);
+	CHECK(s1.kicks == s0.kicks);
+	ll_conn_end(LL_ST_REMOTE_TERM);
+}
+
+/* Data queued or unacked: no skip. The next event is listened to; once
+ * everything is acked skipping resumes. */
+static void test_latency_refused_txq(void)
+{
+	const uint8_t pdu[3] = {0x01, 0x02, 0x03};
+	struct ll_csa1 ref;
+	uint32_t a1;
+
+	ll_csa1_init(&ref, 7, all37);
+	reset_all(false);
+	{
+		struct ll_connect_ind ci = mk_ci(12, 400, 1, 1, 0);
+
+		ci.latency = 4;
+		CHECK(ll_conn_start(&ci, 1000000) == 0);
+	}
+	fire_alarm();
+	(void)ll_csa1_next(&ref);
+	rx(1000000 + T(1250 + 300), 0x01, 0);
+	/* the host queues data during event 0 */
+	CHECK(ll_txq_push(LL_TXQ_ACL, LL_LLID_START, pdu, sizeof(pdu), 0) == 0);
+	done(1);
+	a1 = 1000000 + T(1250 + 300 + 15000);
+	fire_alarm();
+	CHECK(rad.ch == ref_skip(&ref, 1));
+	CHECK(rad.open == open_at(a1 - T(15000), 1));
+	/* event 1: not acked yet (central's NESN unchanged): still listening */
+	rx(a1, 0x01, 0);
+	done(1);
+	CHECK(ll_txq_backlog() > 0);
+	fire_alarm();
+	CHECK(rad.ch == ref_skip(&ref, 1));
+	CHECK(rad.open == open_at(a1, 1));
+	/* event 2: acked */
+	rx(a1 + T(15000), 0x01 | HDR_NESN, 0);
+	rad.rptr = rad.wptr;
+	done(1);
+	CHECK(ll_txq_backlog() == 0);
+	fire_alarm();
+	CHECK(rad.ch == ref_skip(&ref, 5));
+	CHECK(rad.open == open_at(a1 + T(15000), 5));
+	done(0);
+	ll_conn_end(LL_ST_REMOTE_TERM);
+}
+
+/* LLCP busy (ops.busy) and a local termination in progress: no skip */
+static void test_latency_refused_busy_term(void)
+{
+	struct ll_csa1 ref;
+	uint32_t a0, a;
+
+	a0 = start_lat(4, 400, &ref, true);
+	/* event 1..4 skipped already planned; busy from now on */
+	busy_flag = true;
+	fire_alarm();
+	CHECK(rad.open == open_at(a0, 5));
+	rx(a0 + T(75000), 0x01, 0);
+	done(1);
+	a = a0 + T(75000);
+	for (int k = 1; k <= 3; k++) {
+		fire_alarm();
+		CHECK(rad.open == open_at(a, 1));
+		a += T(15000);
+		rx(a, 0x01, 0);
+		done(1);
+	}
+	busy_flag = false;
+	fire_alarm();
+	CHECK(rad.open == open_at(a, 1));
+	a += T(15000);
+	rx(a, 0x01, 0);
+	done(1);
+	/* not busy any more: skip again */
+	fire_alarm();
+	CHECK(rad.open == open_at(a, 5));
+	a += T(75000);
+	rx(a, 0x01, 0);
+	/* local termination (the hook queues nothing): no skip while it runs */
+	ll_conn_terminate(0x13);
+	CHECK(cbs.ctrl_tx_calls == 1 && ll_txq_backlog() == 0);
+	done(1);
+	fire_alarm();
+	CHECK(rad.open == open_at(a, 1));
+	done(0);
+	ll_conn_end(LL_ST_REMOTE_TERM);
+}
+
+/* Never skip right after an event without a re-anchor: a missed event, a
+ * late (skipped) alarm, an event whose first packet had a bad CRC. */
+static void test_latency_no_skip_unsynced(void)
+{
+	struct ll_csa1 ref;
+	uint32_t a0, a;
+
+	a0 = start_lat(4, 400, &ref, false);
+	fire_alarm();
+	CHECK(rad.open == open_at(a0, 5));
+	CHECK(rad.ch == ref_skip(&ref, 5));
+	done(0);                       /* event 5 missed */
+	fire_alarm();
+	CHECK(rad.open == open_at(a0, 6));
+	CHECK(rad.ch == ref_skip(&ref, 1));
+	a = a0 + T(90000);
+	rx(a, 0x01, 0);                /* event 6 synced again */
+	done(1);
+	fire_alarm();
+	CHECK(rad.open == open_at(a, 5));   /* event 11 */
+	CHECK(rad.ch == ref_skip(&ref, 5));
+	/* event 11: bad first packet, a valid chained one: no re-anchor */
+	rx_bad(a + T(75000));
+	rx(a + T(75400), 0x01, 0);
+	done(1);
+	fire_alarm();
+	CHECK(rad.open == open_at(a, 6));   /* event 12 */
+	CHECK(rad.ch == ref_skip(&ref, 1));
+	a += T(90000);
+	rx(a, 0x01, 0);
+	done(1);
+	/* event 17 planned; its alarm is delivered too late: event 18 next,
+	 * not skipped */
+	CHECK(sch.tick == open_at(a, 5) - T(LL_CONN_ARM_LEAD_US));
+	sch.tick = open_at(a, 5) - T(LL_CONN_MIN_PREP_US) + 1;
+	fire_alarm();
+	CHECK(ll_conn_event_counter() == 18);
+	fire_alarm();
+	CHECK(rad.open == open_at(a, 6));
+	(void)ref_skip(&ref, 5);
+	CHECK(rad.ch == ref_skip(&ref, 1));
+	done(0);
+	ll_conn_end(LL_ST_REMOTE_TERM);
+}
+
+/* A pending instant in or right after the skip window: no skip until the
+ * instant event was listened to (it is applied there), then skipping
+ * resumes with the new map. */
+static void test_latency_instant_pending(void)
+{
+	struct ll_csa1 ref;
+	struct ll_connect_ind ci = mk_ci(12, 400, 1, 1, 0);
+	uint32_t a;
+
+	ci.latency = 4;
+	reset_all(false);
+	ll_csa1_init(&ref, 7, all37);
+	CHECK(ll_conn_start(&ci, 1000000) == 0);
+	fire_alarm();
+	(void)ll_csa1_next(&ref);
+	a = 1000000 + T(1250 + 300);
+	rx(a, 0x01, 0);
+	/* LL_CHANNEL_MAP_IND received in event 0, instant 3 */
+	CHECK(ll_conn_chmap_at(3, no0to9) == 0);
+	done(1);
+	for (uint16_t e = 1; e <= 3; e++) {
+		if (e == 3) {
+			ll_csa1_set_map(&ref, no0to9);
+		}
+		fire_alarm();
+		CHECK(ll_conn_event_counter() == e);
+		CHECK(rad.open == open_at(a, 1));
+		CHECK(rad.ch == ll_csa1_next(&ref));
+		a += T(15000);
+		rx(a, 0x01, 0);
+		done(1);
+	}
+	/* instant passed: skip again (events 4..7), listen at 8 */
+	fire_alarm();
+	CHECK(ll_conn_event_counter() == 8);
+	CHECK(rad.open == open_at(a, 5));
+	CHECK(rad.ch == ref_skip(&ref, 5));
+	CHECK(rad.ch >= 10);
+	done(0);
+	ll_conn_end(LL_ST_REMOTE_TERM);
+
+	/* an instant exactly at the end of the window (event 5) also blocks */
+	reset_all(false);
+	ll_csa1_init(&ref, 7, all37);
+	CHECK(ll_conn_start(&ci, 1000000) == 0);
+	fire_alarm();
+	(void)ll_csa1_next(&ref);
+	a = 1000000 + T(1250 + 300);
+	rx(a, 0x01, 0);
+	CHECK(ll_conn_chmap_at(5, no0to9) == 0);
+	done(1);
+	fire_alarm();
+	CHECK(ll_conn_event_counter() == 1);
+	CHECK(rad.open == open_at(a, 1));
+	done(0);
+	ll_conn_end(LL_ST_REMOTE_TERM);
+}
+
+/* An instant that arrives while a skip is planned and falls into the
+ * skipped part: re-planned to listen at the instant; if that event is no
+ * longer reachable, the instant has passed (0x28). */
+static void test_latency_instant_in_window(void)
+{
+	struct ll_csa1 ref;
+	struct ll_conn_stats s0, s1;
+	uint32_t a0;
+
+	ll_conn_get_stats(&s0);
+	a0 = start_lat(4, 400, &ref, false);
+	/* skip to event 5 planned; the thread now handles a map update for
+	 * instant 3 */
+	CHECK(ll_conn_chmap_at(3, no0to9) == 0);
+	fire_alarm();
+	CHECK(ll_conn_event_counter() == 3);
+	CHECK(rad.open == open_at(a0, 3));
+	(void)ref_skip(&ref, 2);
+	ll_csa1_set_map(&ref, no0to9);
+	CHECK(rad.ch == ll_csa1_next(&ref));
+	done(0);
+	ll_conn_get_stats(&s1);
+	CHECK(s1.skipped - s0.skipped == 2);
+	ll_conn_end(LL_ST_REMOTE_TERM);
+
+	/* the instant event lies in the past already */
+	a0 = start_lat(4, 400, &ref, false);
+	now = a0 + T(31000);   /* events 1 and 2 have passed */
+	CHECK(ll_conn_chmap_at(2, no0to9) == LL_ST_INSTANT_PASSED);
+	CHECK(!ll_conn_active() && cbs.disconnected == 1);
+	CHECK(cbs.reason == LL_ST_INSTANT_PASSED);
+
+	/* an instant before the first skipped event is passed as before */
+	a0 = start_lat(4, 400, &ref, false);
+	CHECK(ll_conn_chmap_at(0, no0to9) == LL_ST_INSTANT_PASSED);
+	CHECK(cbs.disconnected == 1);
+
+	/* an instant after the planned event: nothing re-planned */
+	a0 = start_lat(4, 400, &ref, false);
+	CHECK(ll_conn_chmap_at(6, no0to9) == 0);
+	fire_alarm();
+	CHECK(ll_conn_event_counter() == 5);
+	CHECK(rad.open == open_at(a0, 5));
+	rx(a0 + T(75000), 0x01, 0);
+	done(1);
+	/* instant 6 pending: listened */
+	fire_alarm();
+	CHECK(ll_conn_event_counter() == 6);
+	done(0);
+	ll_conn_end(LL_ST_REMOTE_TERM);
+}
+
+/* Supervision: with any valid parameter set (timeout > (1 + latency) *
+ * interval * 2), skipping latency events from a synced event leaves at
+ * least latency + 1 listened events before the timeout; a miss after the
+ * skip is followed by listening on every event. Latency 4, 15 ms, timeout
+ * 160 ms (the smallest valid one). */
+static void test_latency_supervision(void)
+{
+	struct ll_csa1 ref;
+	uint32_t a0;
+	int listened = 0;
+
+	a0 = start_lat(4, 16, &ref, false);
+	fire_alarm();
+	CHECK(rad.open == open_at(a0, 5));
+	/* listened anchor + 2 intervals stays within the timeout */
+	CHECK(rad.open + T(2 * 15000) < a0 + T(160000));
+	done(0);
+	listened++;
+	for (uint32_t k = 6; ll_conn_active() && k < 20; k++) {
+		fire_alarm();
+		CHECK(rad.open == open_at(a0, k));
+		done(0);
+		listened++;
+	}
+	CHECK(!ll_conn_active() && cbs.reason == LL_ST_CONN_TIMEOUT);
+	/* events 5..11 issued: 10 ends at about 150 ms, 11 at 165 ms ends
+	 * the link */
+	CHECK(listened == 7);
+}
+
+/* ll_conn_kick: new TX data re-plans to the next regular event that can
+ * still be prepared; no-op when that is already the planned one */
+static void test_kick(void)
+{
+	struct ll_csa1 ref;
+	struct ll_conn_stats s0, s1;
+	uint32_t a0, a1, tick;
+	int cancels;
+
+	/* no connection: nothing happens */
+	reset_all(false);
+	ll_conn_kick();
+	CHECK(locks == 0 && sch.cb == NULL);
+
+	ll_conn_get_stats(&s0);
+	a0 = start_lat(4, 400, &ref, false);
+	ll_conn_kick();
+	CHECK(locks == 0);
+	fire_alarm();
+	CHECK(ll_conn_event_counter() == 1);
+	CHECK(rad.open == open_at(a0, 1));
+	CHECK(rad.ch == ref_skip(&ref, 1));
+	/* kick while the event is on air: nothing */
+	cancels = sch.cancels;
+	ll_conn_kick();
+	CHECK(sch.cancels == cancels && sch.cb == NULL);
+	a1 = a0 + T(15000);
+	rx(a1, 0x01, 0);
+	done(1);
+	ll_conn_get_stats(&s1);
+	CHECK(s1.kicks - s0.kicks == 1);
+	/* 4 skipped, given back by the kick, 4 skipped again (events 2..5) */
+	CHECK(s1.skipped - s0.skipped == 4);
+	CHECK(s1.planned - s0.planned == 3);   /* re-planned: counted once */
+
+	/* skip planned (base 2, listen 6); 31 ms later events 2 and 3 have
+	 * passed: kick -> event 4 */
+	now = a1 + T(31000);
+	ll_conn_kick();
+	fire_alarm();
+	CHECK(ll_conn_event_counter() == 4);
+	CHECK(rad.open == open_at(a1, 3));
+	CHECK(rad.ch == ref_skip(&ref, 3));
+	ll_conn_get_stats(&s1);
+	CHECK(s1.skipped - s0.skipped == 2);   /* events 2, 3 only */
+	rx(a1 + T(45000), 0x01, 0);
+	done(1);
+	a1 += T(45000);
+
+	/* kick exactly when event 5's alarm is due: event 6 */
+	now = open_at(a1, 1) - T(LL_CONN_ARM_LEAD_US) + 1;
+	ll_conn_kick();
+	fire_alarm();
+	CHECK(ll_conn_event_counter() == 6);
+	CHECK(rad.open == open_at(a1, 2));
+	CHECK(rad.ch == ref_skip(&ref, 2));
+	rx(a1 + T(30000), 0x01, 0);
+	done(1);
+	a1 += T(30000);
+
+	/* the first kick re-plans to event 7, the second is a no-op */
+	ll_conn_kick();
+	tick = sch.tick;
+	cancels = sch.cancels;
+	ll_conn_kick();
+	CHECK(sch.cancels == cancels && sch.tick == tick);
+	fire_alarm();
+	CHECK(rad.open == open_at(a1, 1));
+	done(0);
+	ll_conn_end(LL_ST_REMOTE_TERM);
+
+	/* latency 0: always a no-op */
+	a0 = start_lat(0, 400, &ref, false);
+	cancels = sch.cancels;
+	ll_conn_kick();
+	CHECK(sch.cancels == cancels);
+	fire_alarm();
+	CHECK(rad.open == open_at(a0, 1));
+	done(0);
+	ll_conn_get_stats(&s1);
+	CHECK(s1.kicks - s0.kicks == 4);
+	ll_conn_end(LL_ST_REMOTE_TERM);
+}
+
+/* The latency in force comes from the last applied connection update */
+static void test_latency_from_update(void)
+{
+	struct ll_conn_params p3 = {.interval = 12, .latency = 3, .timeout = 400};
+	struct ll_conn_params p0 = {.interval = 12, .latency = 0, .timeout = 400};
+	struct ll_csa1 ref;
+	uint32_t a0, a, ws;
+
+	/* 0 -> 3 */
+	a0 = start_lat(0, 400, &ref, false);
+	CHECK(ll_conn_update_at(3, 1, 0, &p3) == 0);
+	a = a0;
+	for (int e = 1; e <= 2; e++) {
+		fire_alarm();
+		CHECK(rad.open == open_at(a, 1));
+		a += T(15000);
+		rx(a, 0x01, 0);
+		done(1);
+	}
+	/* instant 3: window at the old anchor, packet 100 us into it */
+	fire_alarm();
+	CHECK(cbs.updated == 1 && cbs.p.latency == 3);
+	ws = a + T(15000);
+	rx(ws + T(100), 0x01, 0);
+	done(1);
+	fire_alarm();
+	CHECK(ll_conn_event_counter() == 7);
+	CHECK(rad.open == open_at(ws + T(100), 4));
+	done(0);
+	ll_conn_end(LL_ST_REMOTE_TERM);
+
+	/* 4 -> 0 */
+	a0 = start_lat(4, 400, &ref, false);
+	CHECK(ll_conn_update_at(8, 1, 0, &p0) == 0);
+	fire_alarm();
+	CHECK(ll_conn_event_counter() == 5);
+	a = a0 + T(75000);
+	rx(a, 0x01, 0);
+	done(1);
+	/* 6, 7 listened (instant pending), 8 = instant window */
+	for (int e = 6; e <= 7; e++) {
+		fire_alarm();
+		CHECK(ll_conn_event_counter() == e);
+		a += T(15000);
+		rx(a, 0x01, 0);
+		done(1);
+	}
+	fire_alarm();
+	CHECK(ll_conn_event_counter() == 8 && cbs.p.latency == 0);
+	ws = a + T(15000);
+	rx(ws + T(100), 0x01, 0);
+	done(1);
+	fire_alarm();
+	CHECK(ll_conn_event_counter() == 9);
+	CHECK(rad.open == open_at(ws + T(100), 1));
+	done(0);
+	ll_conn_end(LL_ST_REMOTE_TERM);
+}
+
 int main(void)
 {
 	test_first_events();
@@ -1145,5 +1648,14 @@ int main(void)
 	test_long_interval();
 	test_update_validation();
 	test_event_cap();
+	test_latency_skip();
+	test_latency_refused_txq();
+	test_latency_refused_busy_term();
+	test_latency_no_skip_unsynced();
+	test_latency_instant_pending();
+	test_latency_instant_in_window();
+	test_latency_supervision();
+	test_kick();
+	test_latency_from_update();
 	DONE();
 }

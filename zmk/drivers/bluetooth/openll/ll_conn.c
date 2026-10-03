@@ -2,8 +2,8 @@
  * Copyright (c) 2026 scholzri
  * SPDX-License-Identifier: Apache-2.0
  *
- * Connection state machine, peripheral role, one connection, CSA#1, no
- * peripheral latency. Core Spec Vol 6 Part B: 4.5.1 connection events,
+ * Connection state machine, peripheral role, one connection, CSA#1,
+ * peripheral latency (rules in ll_conn.h). Core Spec Vol 6 Part B: 4.5.1 connection events,
  * 4.5.2 supervision (6 events before the first packet), 4.5.3 transmit
  * window, 4.5.4 window widening, 4.5.5 connection setup, 5.1.1 connection
  * update, 5.1.2 channel map update, 5.1.3 termination.
@@ -26,6 +26,12 @@
  * hardware has acked it: the link then ends with 0x08 at CONN_DONE.
  * CONN_DONE: ll_txq_event_end(), counter++, termination
  * and supervision checks, plan the next event (applying instants).
+ *
+ * Peripheral latency: plan() decides how many events to skip (skip_n),
+ * advances counter and CSA#1 over them and plans the listen at skip_base +
+ * skip_n. skip_base and csa_base keep the state before the skip, so a
+ * re-plan (ll_conn_kick, an instant for a skipped or the planned event)
+ * can restore it and plan an earlier event of the window instead.
  *
  * Everything runs in ISR context except the public calls documented as
  * thread calls, which take ll_plat_lock(). No allocation, no blocking.
@@ -60,6 +66,7 @@ static struct {
 	bool established;     /* a packet was received in this connection */
 	bool rx_this_event;   /* a CRC-valid packet was received in this event */
 	bool first_seen;      /* the event's first packet (valid or not) was seen */
+	bool anchored;        /* the last closed event re-anchored (latency rule) */
 	struct ll_connect_ind ci;
 	struct ll_conn_params p;
 	uint32_t interval_ticks;
@@ -67,8 +74,10 @@ static struct {
 	uint16_t ppm;         /* central SCA + own */
 	uint32_t widen_max_us; /* interval / 2 - T_IFS (exceeds 16 bits) */
 	struct ll_csa1 csa;
-	struct ll_csa1 csa_prev; /* before the planned event's channel (re-plan) */
-	uint16_t counter;     /* next event not yet completed */
+	struct ll_csa1 csa_base; /* before the skipped events and the planned one */
+	uint16_t counter;     /* next event not yet completed (planned: the listened one) */
+	uint16_t skip_base;   /* first event after the last closed one */
+	uint16_t skip_n;      /* events skipped before the planned one */
 	uint32_t ref_tick;
 	uint16_t ref_counter;
 	uint32_t win_us;
@@ -185,32 +194,124 @@ static void apply_instants(void)
 	}
 }
 
-/* Plan event `counter`: channel, RX window, alarm. */
-static void plan(void)
+/* RX open tick of event `counter` (current timing state); widening out. */
+static uint32_t open_of(uint16_t counter, uint32_t *widen_out)
 {
-	uint32_t base, widen, margin;
+	uint32_t base = anchor_of(counter);
+	uint32_t widen = widening_us(base + US(c.win_us) - c.sync_tick);
+	uint32_t margin = c.win_us ? LL_CONN_WIN_MARGIN_US : LL_CONN_RX_MARGIN_US;
+
+	if (widen_out) {
+		*widen_out = widen;
+	}
+	return base - US(widen + margin);
+}
+
+/* Plan event `counter` (listened to): instants, channel, RX window, alarm. */
+static void plan_event(void)
+{
+	uint32_t widen, margin;
 
 	apply_instants();
-	c.csa_prev = c.csa;
 	c.ch = ll_csa1_next(&c.csa);
-	base = anchor_of(c.counter);
-	widen = widening_us(base + US(c.win_us) - c.sync_tick);
+	c.open_tick = open_of(c.counter, &widen);
 	if (widen > stats.widen_max_us) {
 		stats.widen_max_us = widen;
 	}
 	margin = c.win_us ? LL_CONN_WIN_MARGIN_US : LL_CONN_RX_MARGIN_US;
-	c.open_tick = base - US(widen + margin);
 	c.fst_us = c.win_us + 2u * (widen + margin) + LL_CONN_SYNC_US;
 	c.planned = true;
 	ll_sched_at(c.open_tick - US(LL_CONN_ARM_LEAD_US), prepare);
 }
 
-/* Re-plan the planned (not yet issued) event after a new instant for it. */
-static void replan(void)
+/* An instant in [counter, counter + n]: its event must be listened to. */
+static bool instant_within(bool pending, uint16_t instant, uint16_t n)
 {
+	return pending && (uint16_t)(instant - c.counter) <= n;
+}
+
+/* Peripheral latency: events to skip before the next listened one (rules
+ * in ll_conn.h). c.counter is the first candidate. */
+static uint16_t skip_count(void)
+{
+	uint16_t n = c.p.latency;
+	uint32_t deadline;
+	int32_t room;
+
+	if (n == 0 || !c.anchored || c.term_local || ll_txq_backlog() != 0 ||
+	    (c.ops.busy && c.ops.busy())) {
+		return 0;
+	}
+	if (instant_within(c.chm_pending, c.chm_instant, n) ||
+	    instant_within(c.upd_pending, c.upd_instant, n)) {
+		return 0;
+	}
+	/* supervision: listened anchor <= last RX + timeout - 2 * interval */
+	deadline = c.sup_tick + c.sup_ticks - 2u * c.interval_ticks;
+	room = (int32_t)(deadline - anchor_of(c.counter));
+	if (room < 0) {
+		return 0;
+	}
+	if ((uint32_t)room / c.interval_ticks < n) {
+		n = (uint16_t)((uint32_t)room / c.interval_ticks);
+	}
+	return n;
+}
+
+/* Plan the next event, skipping idle events where allowed. */
+static void plan(void)
+{
+	uint16_t n = skip_count();
+
+	c.skip_base = c.counter;
+	c.csa_base = c.csa;
+	c.skip_n = n;
+	for (uint16_t i = 0; i < n; i++) {
+		(void)ll_csa1_next(&c.csa);
+	}
+	c.counter = (uint16_t)(c.counter + n);
+	stats.skipped += n;
+	stats.planned++;
+	plan_event();
+}
+
+/* Re-plan the planned (not yet issued) listen to event `target` in
+ * [skip_base, counter]: restore the state before the skip, advance over
+ * the events before target, plan it (applying its instants). */
+static void replan_to(uint16_t target)
+{
+	uint16_t k = (uint16_t)(target - c.skip_base);
+
 	ll_sched_cancel();
-	c.csa = c.csa_prev;
-	plan();
+	c.csa = c.csa_base;
+	for (uint16_t i = 0; i < k; i++) {
+		(void)ll_csa1_next(&c.csa);
+	}
+	stats.skipped -= (uint32_t)(c.skip_n - k);
+	c.skip_n = k;
+	c.counter = target;
+	plan_event();
+}
+
+/* Index (from skip_base) of the first event of the planned window whose
+ * alarm (LL_CONN_ARM_LEAD_US before its RX opens) is still ahead; skip_n
+ * if none before the planned one is. Caller holds the lock, c.planned. */
+static uint16_t first_reachable(void)
+{
+	uint32_t now = ll_radio_now();
+	int32_t elapsed = (int32_t)(now - anchor_of(c.skip_base));
+	uint32_t i = 0;
+
+	/* events whose anchor already passed cannot be reached: start there */
+	if (elapsed > 0) {
+		i = (uint32_t)elapsed / c.interval_ticks;
+	}
+	while (i < c.skip_n &&
+	       (int32_t)(open_of((uint16_t)(c.skip_base + i), NULL) - US(LL_CONN_ARM_LEAD_US) -
+			 now) <= 0) {
+		i++;
+	}
+	return i < c.skip_n ? (uint16_t)i : c.skip_n;
 }
 
 /* An event ended (or was skipped): advance, check, plan the next one. */
@@ -265,6 +366,7 @@ static void prepare(void)
 		return;
 	}
 	c.planned = false;
+	c.anchored = false;
 	now = ll_radio_now();
 	if ((int32_t)(c.open_tick - now) < (int32_t)US(LL_CONN_MIN_PREP_US)) {
 		stats.late++;
@@ -277,6 +379,7 @@ static void prepare(void)
 	c.first_seen = false;
 	c.in_event = true;
 	stats.events++;
+	stats.listened++;
 	ll_radio_conn_event(c.ch, c.open_tick, c.fst_us, event_max_us());
 }
 
@@ -351,6 +454,7 @@ static void on_rx(const uint8_t *pdu, uint8_t len, uint32_t tick)
 	c.sync_tick = anchor;
 	c.sup_tick = anchor;
 	c.established = true;
+	c.anchored = true;
 }
 
 void ll_conn_radio_evt(enum ll_radio_evt evt, const uint8_t *pdu, uint8_t len, uint32_t tick)
@@ -473,19 +577,32 @@ int ll_conn_start(const struct ll_connect_ind *ci, uint32_t connect_ind_end_tick
 	return 0;
 }
 
-/* 0, or LL_ST_INSTANT_PASSED (connection ending) */
+/* 0, or LL_ST_INSTANT_PASSED (connection ending). With a latency skip
+ * planned, an instant for a skipped event whose alarm time has gone by is
+ * passed too (that event can no longer be listened to). */
 static int check_instant(uint16_t instant)
 {
-	uint16_t d = (uint16_t)(instant - c.counter);
+	uint16_t cur = c.planned ? c.skip_base : c.counter;
+	uint16_t d = (uint16_t)(instant - cur);
 
 	/* d == 0 with the event already on air: its timing and channel were
 	 * issued with the old values, so the instant cannot be honoured any
 	 * more; treat it like a passed instant. */
-	if (d > INSTANT_PAST || (d == 0 && c.in_event)) {
+	if (d > INSTANT_PAST || (d == 0 && c.in_event) ||
+	    (c.planned && d < c.skip_n && d < first_reachable())) {
 		request_end(LL_ST_INSTANT_PASSED);
 		return LL_ST_INSTANT_PASSED;
 	}
 	return 0;
+}
+
+/* A new instant for the planned event or one of the skipped events before
+ * it: listen at the instant (re-plan). check_instant() passed. */
+static void instant_replan(uint16_t instant)
+{
+	if (c.planned && (uint16_t)(instant - c.skip_base) <= c.skip_n) {
+		replan_to(instant);
+	}
 }
 
 int ll_conn_update_at(uint16_t instant, uint8_t win_size, uint16_t win_offset,
@@ -510,9 +627,7 @@ int ll_conn_update_at(uint16_t instant, uint8_t win_size, uint16_t win_offset,
 			c.upd_win_size = win_size;
 			c.upd_win_offset = win_offset;
 			c.upd_p = *p;
-			if (c.planned && instant == c.counter) {
-				replan();
-			}
+			instant_replan(instant);
 		}
 	}
 	ll_plat_unlock(key);
@@ -530,9 +645,7 @@ int ll_conn_chmap_at(uint16_t instant, const uint8_t chm[5])
 			c.chm_pending = true;
 			c.chm_instant = instant;
 			memcpy(c.chm, chm, sizeof(c.chm));
-			if (c.planned && instant == c.counter) {
-				replan();
-			}
+			instant_replan(instant);
 		}
 	}
 	ll_plat_unlock(key);
@@ -581,7 +694,22 @@ bool ll_conn_active(void)
 
 uint16_t ll_conn_event_counter(void)
 {
-	return c.counter;
+	return c.planned ? c.skip_base : c.counter;
+}
+
+void ll_conn_kick(void)
+{
+	unsigned int key = ll_plat_lock();
+
+	if (c.active && c.planned && c.skip_n > 0) {
+		uint16_t i = first_reachable();
+
+		if (i < c.skip_n) {
+			replan_to((uint16_t)(c.skip_base + i));
+			stats.kicks++;
+		}
+	}
+	ll_plat_unlock(key);
 }
 
 void ll_conn_get_stats(struct ll_conn_stats *s)
