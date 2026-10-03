@@ -34,8 +34,10 @@ config BT_HCI_B91_CTLR_BLOB
 config BT_HCI_B91_CTLR_OPEN
 	bool "Open-source link layer (experimental)"
 	help
-	  Our own peripheral-only link layer on hal_telink rf.c. Slice 1:
-	  bt_enable() and legacy advertising only; connections are not
-	  followed yet. No binary blobs are linked.
+	  Our own peripheral-only link layer on hal_telink rf.c: legacy
+	  advertising, one connection (CSA#1, 1M PHY, no peripheral latency
+	  skipping), responder LL control procedures, ACL data and LE link
+	  encryption (AES-CCM on the hal AES engine). No binary blobs are
+	  linked.
 
 endchoice

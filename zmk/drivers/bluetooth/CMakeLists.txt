@@ -14,8 +14,20 @@ if(CONFIG_BT_HCI_B91_CTLR_OPEN)
     openll/ll_adv.c
     openll/ll_radio.c
     openll/ll_sched.c
+    openll/ll_csa1.c
+    openll/ll_crypt.c
+    openll/ll_txq.c
+    openll/ll_rxq.c
+    openll/ll_conn.c
+    openll/ll_llcp.c
     ${B91_DRV}/rf.c
   )
+  # hal AES (link encryption, ll_plat_aes_ecb). hal_telink compiles aes.c only
+  # with its own CONFIG_BT_B91 BLE path, which neither build uses, so there is
+  # no duplicate; the blob build does not need it.
+  if(NOT CONFIG_BT_B91)
+    zephyr_library_sources(${B91_DRV}/aes.c)
+  endif()
   if(NOT CONFIG_ENTROPY_TELINK_B91_TRNG)
     zephyr_library_sources(${B91_DRV}/trng.c)
   endif()
