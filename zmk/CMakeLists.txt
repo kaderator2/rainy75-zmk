@@ -37,6 +37,14 @@ if(CONFIG_USB_DC_B91 AND CONFIG_ZMK_USB)
   zephyr_library_sources(src/usb_cdc_recover.c)
 endif()
 
+if(CONFIG_OPENLL_MGMT)
+  zephyr_library_named(openll_mgmt)
+  zephyr_library_include_directories(
+    ${CMAKE_CURRENT_SOURCE_DIR}/drivers/bluetooth
+    ${CMAKE_CURRENT_SOURCE_DIR}/drivers/bluetooth/openll)
+  zephyr_library_sources(src/openll_mgmt.c)
+endif()
+
 if(CONFIG_RGB_MGMT)
   zephyr_library_named(rgb_mgmt)
   zephyr_library_include_directories(${CMAKE_CURRENT_SOURCE_DIR}/src)

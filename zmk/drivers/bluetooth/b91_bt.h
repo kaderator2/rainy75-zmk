@@ -22,4 +22,8 @@ void b91_bt_host_callback_register(const b91_bt_host_callback_t *callback);
 void b91_bt_host_send_packet(uint8_t type, uint8_t *data, uint16_t len);
 int b91_bt_controller_init(void);
 
+/* Open controller only (BT_HCI_B91_CTLR_OPEN): controller-thread wakeups since
+ * boot, a power counter read by openll_mgmt. */
+uint32_t b91_bt_controller_wakeups(void);
+
 #endif /* B91_BT_H_ */

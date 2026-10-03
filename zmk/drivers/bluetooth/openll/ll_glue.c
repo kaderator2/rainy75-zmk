@@ -142,6 +142,7 @@ static bool mic_failed;                  /* MIC failure logged for this connecti
 
 static atomic_t cnt_tx_acked, cnt_acl_in, cnt_acl_out, cnt_acl_drop, cnt_evt_drop, conn_drops;
 static atomic_t cnt_guard_escalations;
+static atomic_t cnt_wakeups;             /* controller thread passes (power counter) */
 static uint32_t lock_depth, lock_t0, lock_max_ticks, acl_tx_lock_max_ticks, aes_max_ticks;
 static volatile bool in_acl_tx;          /* controller thread is inside ll_llcp_tx() for ACL */
 static bool aes_reversed;                /* hal AES needs reversed byte order (self-test) */
@@ -806,6 +807,7 @@ static void ctrl_thread_fn(void *p1, void *p2, void *p3)
 
 	while (1) {
 		(void)k_sem_take(&wake, K_FOREVER);
+		atomic_inc(&cnt_wakeups);
 
 		if (atomic_test_bit(&pend, PEND_CONNECTED)) {
 			handle_connected();
@@ -837,6 +839,11 @@ static void ctrl_thread_fn(void *p1, void *p2, void *p3)
 			report_stats(&last_stats, &last_conn);
 		}
 	}
+}
+
+uint32_t b91_bt_controller_wakeups(void)
+{
+	return (uint32_t)atomic_get(&cnt_wakeups);
 }
 
 int b91_bt_controller_init(void)

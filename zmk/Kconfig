@@ -34,6 +34,16 @@ config FLASH_MGMT
 	  commands. Used to restore original firmware via USB without SWS
 	  hardware. Protected region >= 0xFE000 is always refused.
 
+config OPENLL_MGMT
+	bool "Power counters via mcumgr (open BLE controller)"
+	default n
+	depends on MCUMGR && BT_HCI_B91_CTLR_OPEN
+	help
+	  Adds a custom mcumgr group (ID 66) with one read command that returns
+	  uptime, connection events planned / listened / skipped, kicks,
+	  controller-thread wakeups and battery mV. Readable over BLE and USB
+	  SMP; see reverse/tools/openll_stats.py.
+
 config RAINY_RGB
 	bool "Rainy 75 out-of-tree RGB lighting engine"
 	depends on LED_STRIP_B91_SPI
