@@ -36,7 +36,16 @@ typedef void (*ll_txq_done_cb_t)(enum ll_txq_kind kind, uint8_t ctrl_opcode);
  * LL_START_ENC_RSP leaves after it, so on-air order equals the order in
  * which ll_llcp assigned TX packet counters. */
 
-/* Per connection, after ll_radio_conn_setup() (reset_sn_nesn). */
+/* Calling context: ll_txq_reset() runs in ISR context, from ll_conn_start()
+ * in the RX ISR of the CONNECT_IND (before the first event, so no
+ * event_start/event_end of the new connection can be running); push runs in
+ * thread context under ll_plat_lock(); event_start/rx/event_end run in the
+ * radio/stimer ISRs. ll_conn guarantees that every ll_txq_event_end()
+ * follows an ll_txq_event_start() of the same event (it handles
+ * LL_RADIO_CONN_DONE only while an issued event is open, and a skipped late
+ * event calls neither), so the per-event state is always initialized. */
+
+/* Per connection, after ll_radio_conn_setup() (reset_sn_nesn). ISR. */
 void ll_txq_reset(ll_txq_done_cb_t done);
 /* Queue one data PDU into the backlog. payload is already encrypted if
  * needed (len includes the MIC then). ctrl_opcode is the plaintext opcode

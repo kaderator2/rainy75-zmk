@@ -428,7 +428,14 @@ uint8_t ll_llcp_ltk_reply(const uint8_t ltk[16])
 		 * (5.1.3.1), only empty PDUs, which ll_rxq never decrypts.
 		 * Anything non-empty arriving in between would fail its MIC
 		 * and end the link (0x3D), which is the right outcome for such
-		 * a protocol violation. */
+		 * a protocol violation.
+		 * One legal exception: the central may send LL_TERMINATE_IND
+		 * at any time (e.g. its host disconnects during pairing). Sent
+		 * before it has our LL_START_ENC_REQ, it is plaintext, fails
+		 * the MIC here, and the link ends with 0x3D: our host then
+		 * sees Disconnection Complete with 0x3D (MIC failure) instead
+		 * of the central's reason. The link ends either way; accepted
+		 * rather than special-casing a plaintext TERMINATE_IND. */
 		unsigned int key = ll_plat_lock();
 
 		memcpy(s.crypt.sk, sk, sizeof(sk));
