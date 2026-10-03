@@ -15,6 +15,15 @@
 #define LL_ST_DISALLOWED     0x0C
 #define LL_ST_UNSUPPORTED    0x11
 #define LL_ST_INVALID_PARAM  0x12
+#define LL_ST_PIN_KEY_MISSING 0x06
+#define LL_ST_CONN_TIMEOUT    0x08
+#define LL_ST_REMOTE_TERM     0x13
+#define LL_ST_LOCAL_TERM      0x16
+#define LL_ST_UNSUPP_REMOTE   0x1A
+#define LL_ST_LMP_TIMEOUT     0x22
+#define LL_ST_INSTANT_PASSED  0x28
+#define LL_ST_MIC_FAILURE     0x3D
+#define LL_ST_CONN_FAIL_EST   0x3E
 
 /* Advertising physical channel PDU types (Vol 6 Part B 2.3) */
 #define LL_PDU_ADV_IND          0x0
@@ -27,6 +36,15 @@
 
 #define LL_ADV_DATA_MAX   31
 #define LL_ADV_PDU_MAX    (2 + 6 + LL_ADV_DATA_MAX)
+
+/* Data channel PDUs (Vol 6 Part B 2.4), single connection, no DLE */
+#define LL_CONN_HANDLE    0x0000
+#define LL_DATA_PDU_MAX   27     /* payload bytes */
+#define LL_MIC_LEN        4
+#define LL_LLID_CONT      0x1    /* ACL continuation fragment or empty PDU */
+#define LL_LLID_START     0x2    /* ACL start fragment or complete message */
+#define LL_LLID_CTRL      0x3    /* LL control PDU */
+#define LL_OWN_SCA_PPM    50     /* own sleep clock accuracy (crystal) */
 
 /* Controller identity reported via Read Local Version Information */
 #define LL_HCI_VERSION    0x09   /* Bluetooth Core 5.0 */
