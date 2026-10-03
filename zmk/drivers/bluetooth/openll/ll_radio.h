@@ -20,6 +20,7 @@ enum ll_radio_evt {
 	LL_RADIO_CONN_RX,     /* one CRC-valid data PDU from the central */
 	LL_RADIO_CONN_DONE,   /* the connection event (BRX command) ended */
 	LL_RADIO_CONN_RX_CRC_ERR, /* a packet with a bad CRC in a connection event */
+	LL_RADIO_CONN_RX_NODATA,  /* a packet received without an RX entry (Task 10) */
 };
 
 /* ISR context. pdu points at the 2-byte PDU header; end_tick is the system
@@ -36,6 +37,13 @@ enum ll_radio_evt {
  *   timestamp. Reported in packet order with the CONN_RX callbacks, so the
  *   receiver knows which packet was the event's first (only that one marks
  *   the anchor).
+ * - LL_RADIO_CONN_RX_NODATA: an RX IRQ with no new RX DMA entry, before
+ *   any entry of the event: the hardware received a CRC-valid packet it
+ *   does not deliver, in practice the central's retransmission of a packet
+ *   we already have (acked via NESN, not written to the RX FIFO). pdu =
+ *   NULL, len = 0, end_tick = stimer tick at the IRQ. Like CONN_RX_CRC_ERR
+ *   it tells the receiver that the event's first packet (the anchor) has
+ *   passed, so a later chained packet does not re-anchor.
  * - LL_RADIO_CONN_DONE: pdu = NULL, len = number of CRC-valid packets
  *   received in this event (0: first-RX timeout, nothing received),
  *   end_tick = stimer tick when the event ended. Exactly one per

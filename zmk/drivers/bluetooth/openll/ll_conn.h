@@ -120,6 +120,8 @@ struct ll_conn_stats {
 	uint32_t rx_pkts;     /* CRC-valid packets */
 	uint32_t widen_max_us;
 	uint32_t first_bad;   /* events whose first packet had a bad CRC (no re-anchor) */
+	uint32_t first_nodata; /* events whose first packet was not delivered (no re-anchor) */
+	uint32_t first_outside; /* first delivered packet after the RX window (no re-anchor) */
 };
 /* Cumulative since boot. */
 void ll_conn_get_stats(struct ll_conn_stats *s);

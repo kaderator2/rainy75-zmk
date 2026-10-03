@@ -19,7 +19,10 @@
  * Per event: alarm LL_CONN_ARM_LEAD_US before the RX opens -> prepare():
  * ll_txq_event_start(), BRX via ll_radio_conn_event(). Each CONN_RX:
  * ll_txq_rx(), ll_rxq_isr_put(), the first one re-syncs the anchor and the
- * supervision timer. CONN_DONE: ll_txq_event_end(), counter++, termination
+ * supervision timer, unless the event's first packet was not delivered
+ * (bad CRC, or an acked retransmission without an RX entry) or the packet
+ * starts after the RX window (it is then a chained packet, not the
+ * anchor). CONN_DONE: ll_txq_event_end(), counter++, termination
  * and supervision checks, plan the next event (applying instants).
  *
  * Everything runs in ISR context except the public calls documented as
@@ -271,6 +274,17 @@ static void on_rx_bad(void)
 	}
 }
 
+/* A packet the hardware received but did not deliver (the central resent a
+ * packet we have; Task 10): same as a bad first packet. With MD the event
+ * continues with a new packet some 400..700 us after the anchor. */
+static void on_rx_nodata(void)
+{
+	if (!c.first_seen) {
+		c.first_seen = true;
+		stats.first_nodata++;
+	}
+}
+
 static void on_rx(const uint8_t *pdu, uint8_t len, uint32_t tick)
 {
 	uint32_t anchor;
@@ -285,6 +299,14 @@ static void on_rx(const uint8_t *pdu, uint8_t len, uint32_t tick)
 	c.rx_this_event = true;
 	first = !c.first_seen;
 	c.first_seen = true;
+	/* The hardware syncs the event's first packet only inside the RX
+	 * window (first-RX timeout); a packet whose access address ends after
+	 * it (plus one sync time of slack) is a chained one whose anchor
+	 * packet was not reported (e.g. both in one late ISR). */
+	if (first && (int32_t)(tick - (c.open_tick + US(c.fst_us + LL_CONN_SYNC_US))) > 0) {
+		stats.first_outside++;
+		first = false;
+	}
 	if (!first) {
 		/* later packet of the event: proof of life only (4.5.2); it is
 		 * not at the anchor, so timing stays as it was */
@@ -313,6 +335,9 @@ void ll_conn_radio_evt(enum ll_radio_evt evt, const uint8_t *pdu, uint8_t len, u
 		break;
 	case LL_RADIO_CONN_RX_CRC_ERR:
 		on_rx_bad();
+		break;
+	case LL_RADIO_CONN_RX_NODATA:
+		on_rx_nodata();
 		break;
 	case LL_RADIO_CONN_DONE:
 		c.in_event = false;

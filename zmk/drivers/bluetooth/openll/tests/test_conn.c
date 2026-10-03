@@ -229,6 +229,15 @@ static void rx_bad(uint32_t anchor)
 	ll_conn_radio_evt(LL_RADIO_CONN_RX_CRC_ERR, NULL, 0, now);
 }
 
+/* the hardware received a CRC-valid packet but wrote no RX entry (an
+ * acked retransmission of the central), with its access address ending at
+ * anchor + sync */
+static void rx_nodata(uint32_t anchor)
+{
+	now = anchor + T(LL_CONN_SYNC_US);
+	ll_conn_radio_evt(LL_RADIO_CONN_RX_NODATA, NULL, 0, now);
+}
+
 static void done(uint8_t n_rx)
 {
 	if ((int32_t)(rad.open + T(rad.fst) - now) > 0) {
@@ -398,6 +407,81 @@ static void test_first_packet_bad_crc(void)
 	ll_conn_get_stats(&st);
 	CHECK(st.first_bad - st0.first_bad == 8);
 	CHECK(st.rx_events - st0.rx_events == 9);
+	ll_conn_end(LL_ST_REMOTE_TERM);
+}
+
+/* Task 10 (device + sniffer, forced NACKs): the central resends its packet
+ * at the anchor, the hardware acks it without an RX entry, and with MD the
+ * event continues with a new packet about 400..700 us later. That packet
+ * is not the anchor packet: re-anchoring on it moved the RX window late,
+ * and the link was deaf for 40..130 events until widening caught up. */
+static void test_first_packet_retransmission(void)
+{
+	struct ll_connect_ind ci = mk_ci(12, 400, 1, 1, 0);
+	struct ll_rx_pdu out;
+	uint32_t a1;
+
+	reset_all(false);
+	CHECK(ll_conn_start(&ci, 500000) == 0);
+	a1 = 500000 + T(1250 + 300);
+	ev_rx(a1);
+	/* event 1: retransmitted anchor packet, then a new chained one */
+	fire_alarm();
+	rx_nodata(a1 + T(15000));
+	rx(a1 + T(15000 + 600), LL_LLID_START | HDR_SN, 4);
+	done(1);
+	/* not re-anchored: event 2 still planned from a1 (2 intervals of
+	 * widening: 25 us); the chained PDU still reaches ll_rxq */
+	fire_alarm();
+	CHECK(rad.open == a1 + T(30000) - T(25 + LL_CONN_RX_MARGIN_US));
+	CHECK(ll_rxq_get(&out) == LL_RXQ_OK && out.len == 4);
+	/* a normal event re-anchors again */
+	rx(a1 + T(30001), 0x01, 0);
+	done(1);
+	fire_alarm();
+	CHECK(rad.open == a1 + T(45001) - T(21 + LL_CONN_RX_MARGIN_US));
+	done(0);
+	ll_conn_end(LL_ST_REMOTE_TERM);
+}
+
+/* The same situation when the radio reports only the chained packet (the
+ * retransmission not seen, e.g. both handled in one late ISR): a first
+ * valid packet whose access address ends after the RX window closed cannot
+ * be the anchor packet (the hardware syncs the first packet only inside
+ * the window). It refreshes the supervision timer but does not re-anchor. */
+static void test_first_packet_after_window(void)
+{
+	struct ll_connect_ind ci = mk_ci(12, 10, 1, 1, 0);   /* 100 ms timeout */
+	uint32_t a1;
+
+	reset_all(false);
+	CHECK(ll_conn_start(&ci, 500000) == 0);
+	a1 = 500000 + T(1250 + 300);
+	ev_rx(a1);
+	/* window of event 1: open = a1 + 15 ms - (21 + 60), fst = 2 * 81 + 40,
+	 * so it closes at a1 + 15 ms + 81 + 40 us */
+	fire_alarm();
+	CHECK(rad.fst == 2 * (21 + 60) + 40);
+	rx(a1 + T(15000 + 500), 0x01, 0);
+	done(1);
+	fire_alarm();
+	CHECK(rad.open == a1 + T(30000) - T(25 + LL_CONN_RX_MARGIN_US));
+	done(0);
+	/* a packet at the window edge is still the anchor packet */
+	fire_alarm();
+	rx(a1 + T(45000 + 29 + 60), 0x01, 0);
+	done(1);
+	fire_alarm();
+	CHECK(rad.open == a1 + T(60000 + 29 + 60) - T(21 + LL_CONN_RX_MARGIN_US));
+	done(0);
+	/* supervision: only late (non-anchor) packets for > 100 ms keep the
+	 * link up */
+	for (uint32_t k = 5; k <= 12; k++) {
+		fire_alarm();
+		rx(rad.open + T(rad.fst + 300), 0x01, 0);
+		done(1);
+		CHECK(ll_conn_active());
+	}
 	ll_conn_end(LL_ST_REMOTE_TERM);
 }
 
@@ -946,6 +1030,8 @@ int main(void)
 	test_rx_path();
 	test_start_keeps_rxq();
 	test_first_packet_bad_crc();
+	test_first_packet_retransmission();
+	test_first_packet_after_window();
 	test_six_interval_rule();
 	test_supervision();
 	test_widening_clamp();

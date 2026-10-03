@@ -206,13 +206,15 @@ static void adv_isr(uint16_t st)
  * the ISR was late). Each packet is handed to the callback (ll_conn copies
  * it into ll_rxq) before the ISR returns, i.e. long before the DMA wraps
  * around to its entry again (4 packets later, >= 4 * 230 us).
- * Unverified on hardware (Task 9): that the hardware rx wptr counts every
- * received packet. The rx rptr is not written: advertising (one entry,
- * mask 0) never touched it either and kept receiving, and writing it has
- * clear semantics for bit 7 (rf_clr_rx_rptr). If RX stops after 4 packets
- * of a connection, a FIFO-full condition on wptr - rptr is the suspect.
- * Anomalies are counted in rx_ptr_odd. Also called (rx_irq false) when the
- * event ends, in case the wptr advanced after an RX IRQ was handled. */
+ * The hardware writes only new packets: a retransmission of the central
+ * (its SN is not our NESN init) is acked but not written, so its RX IRQ
+ * finds no new entry (counted in rx_ptr_odd; Task 10 device + sniffer).
+ * When that is the event's first packet it was the anchor packet, and it
+ * is reported as LL_RADIO_CONN_RX_NODATA so a chained packet does not
+ * re-anchor. The rx rptr is not written: advertising (one entry, mask 0)
+ * never touched it either and kept receiving (Task 9: no FIFO-full rule).
+ * Also called (rx_irq false) when the event ends, in case the wptr
+ * advanced after an RX IRQ was handled. */
 static void conn_rx(bool rx_irq)
 {
 	uint8_t raw = rf_get_rx_wptr();
@@ -225,6 +227,10 @@ static void conn_rx(bool rx_irq)
 	if (n == 0) {
 		if (rx_irq) {
 			atomic_inc(&cnt_rx_ptr_odd);   /* RX IRQ without a new entry */
+			if (cn.n_any == 0) {
+				cn.n_any++;   /* the anchor packet, see above */
+				radio_cb(LL_RADIO_CONN_RX_NODATA, NULL, 0, ll_radio_now());
+			}
 		}
 		return;
 	}

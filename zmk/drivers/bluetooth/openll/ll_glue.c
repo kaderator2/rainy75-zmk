@@ -685,8 +685,9 @@ static void report_stats(struct ll_radio_stats *last, struct ll_conn_stats *last
 		LOG_INF("conn: tx %u acked %u tifs<=150 %u 151-152 %u >152 %u rxq_of %u ptr_odd %u",
 			st.conn_tx, (uint32_t)atomic_get(&cnt_tx_acked), st.tifs_le150,
 			st.tifs_151_152, st.tifs_gt152, ll_rxq_overflow_count(), st.rx_ptr_odd);
-		LOG_INF("conn: first_bad %u ptr_skip %u wptr_max %u fst_capped %u guard_esc %u",
-			cs.first_bad, st.rx_ptr_skip, st.rx_wptr_max, st.fst_capped,
+		LOG_INF("conn: first_bad %u nodata %u outside %u ptr_skip %u wptr_max %u fst_capped %u guard_esc %u",
+			cs.first_bad, cs.first_nodata, cs.first_outside, st.rx_ptr_skip,
+			st.rx_wptr_max, st.fst_capped,
 			(uint32_t)atomic_get(&cnt_guard_escalations));
 		LOG_INF("conn: acl in %u out %u drop %u evt_drop %u lock max %u us acl_tx %u us aes %u us",
 			(uint32_t)atomic_get(&cnt_acl_in), (uint32_t)atomic_get(&cnt_acl_out),
