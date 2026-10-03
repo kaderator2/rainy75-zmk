@@ -773,9 +773,11 @@ void b91_bt_host_send_packet(uint8_t type, uint8_t *data, uint16_t len)
 		if (r != 0) {
 			LOG_WRN("host ACL rejected (%d, %u bytes)", r, len);
 			atomic_inc(&cnt_acl_drop);
-			if (r == -EINVAL && conn_up) {
-				/* our handle: the host counted it against its
-				 * buffers, give the credit back */
+			if ((r == -EINVAL || r == -ENOTCONN) && conn_up) {
+				/* the host counted it against its LE ACL
+				 * buffers (one pool for the controller, the
+				 * only connection is ours): give the credit
+				 * back */
 				atomic_inc(&nocp_pending);
 				k_sem_give(&wake);
 			}
