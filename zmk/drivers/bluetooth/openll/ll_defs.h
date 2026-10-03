@@ -12,6 +12,7 @@
 /* HCI status codes (Core Spec Vol 1 Part F) */
 #define LL_ST_SUCCESS        0x00
 #define LL_ST_UNKNOWN_CMD    0x01
+#define LL_ST_UNKNOWN_CONN_ID 0x02
 #define LL_ST_DISALLOWED     0x0C
 #define LL_ST_UNSUPPORTED    0x11
 #define LL_ST_INVALID_PARAM  0x12
@@ -21,6 +22,7 @@
 #define LL_ST_LOCAL_TERM      0x16
 #define LL_ST_UNSUPP_REMOTE   0x1A
 #define LL_ST_LMP_TIMEOUT     0x22
+#define LL_ST_LMP_PDU_NOT_ALLOWED 0x24
 #define LL_ST_INVALID_LL_PARAM 0x1E
 #define LL_ST_INSTANT_PASSED  0x28
 #define LL_ST_MIC_FAILURE     0x3D
@@ -46,6 +48,12 @@
 #define LL_LLID_START     0x2    /* ACL start fragment or complete message */
 #define LL_LLID_CTRL      0x3    /* LL control PDU */
 #define LL_OWN_SCA_PPM    50     /* own sleep clock accuracy (crystal) */
+
+/* LL feature set (Vol 6 Part B 4.6), byte 0; bytes 1..7 are 0. Used by
+ * LL_FEATURE_RSP and HCI LE Read Local Supported Features. */
+#define LL_FEAT_LE_ENC        0x01   /* bit 0: LE Encryption */
+#define LL_FEAT_EXT_REJ_IND   0x04   /* bit 2: Extended Reject Indication (peer's bit only) */
+#define LL_FEATURES_LOW       LL_FEAT_LE_ENC
 
 /* Controller identity reported via Read Local Version Information */
 #define LL_HCI_VERSION    0x09   /* Bluetooth Core 5.0 */

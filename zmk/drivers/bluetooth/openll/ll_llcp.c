@@ -1,0 +1,446 @@
+/*
+ * Copyright (c) 2026 scholzri
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Responder LL control procedures (spec "LLCP (responder)" table), PDU
+ * formats per Core Spec Vol 6 Part B 2.4.2.
+ *
+ * Encryption start (Vol 6 Part B 5.1.3.1, peripheral side):
+ *   RX LL_ENC_REQ (Rand, EDIV, SKDm, IVm)  -> data PDUs paused,
+ *      TX LL_ENC_RSP (SKDs, IVs) plaintext, LTK request to the host
+ *   LTK reply  -> SK = e(LTK, SKDs || SKDm), rx decryption on,
+ *      TX LL_START_ENC_REQ plaintext
+ *   RX LL_START_ENC_RSP (arrives encrypted, ll_rxq decrypted it)
+ *      -> tx encryption on, TX LL_START_ENC_RSP encrypted, data PDUs
+ *      resume, Encryption Change to the host
+ *   LTK negative reply -> LL_REJECT_EXT_IND(LL_ENC_REQ, 0x06), or
+ *      LL_REJECT_IND(0x06) when the central did not report Extended Reject
+ *      Indication in its LL_FEATURE_REQ; data PDUs resume unencrypted.
+ * The 40 s procedure response timer (5.2) restarts whenever we queue a
+ * control PDU of the procedure (LL_ENC_RSP, LL_START_ENC_REQ) and stops
+ * when it completes; it expiring ends the link with 0x22.
+ *
+ * All outgoing data PDUs go through ll_llcp_tx(): encrypt (when enc_tx)
+ * and push under ll_plat_lock(), so the TX packet counter order equals the
+ * queue order whichever thread queues.
+ */
+#include <errno.h>
+#include <string.h>
+
+#include "ll_conn.h"
+#include "ll_crypt.h"
+#include "ll_defs.h"
+#include "ll_llcp.h"
+#include "ll_plat.h"
+#include "ll_radio.h"
+#include "ll_rxq.h"
+#include "ll_txq.h"
+
+/* LL control PDU opcodes (Vol 6 Part B 2.4.2) */
+#define OP_CONN_UPDATE_IND   0x00
+#define OP_CHANNEL_MAP_IND   0x01
+#define OP_TERMINATE_IND     0x02
+#define OP_ENC_REQ           0x03
+#define OP_ENC_RSP           0x04
+#define OP_START_ENC_REQ     0x05
+#define OP_START_ENC_RSP     0x06
+#define OP_UNKNOWN_RSP       0x07
+#define OP_FEATURE_REQ       0x08
+#define OP_FEATURE_RSP       0x09
+#define OP_PAUSE_ENC_REQ     0x0A
+#define OP_PAUSE_ENC_RSP     0x0B
+#define OP_VERSION_IND       0x0C
+#define OP_REJECT_IND        0x0D
+#define OP_CONN_PARAM_RSP    0x10
+#define OP_REJECT_EXT_IND    0x11
+#define OP_PING_RSP          0x13
+#define OP_LENGTH_RSP        0x15
+#define OP_PHY_RSP           0x17
+
+/* payload length incl. the opcode */
+#define LEN_CONN_UPDATE_IND  12
+#define LEN_CHANNEL_MAP_IND  8
+#define LEN_TERMINATE_IND    2
+#define LEN_ENC_REQ          23
+#define LEN_FEATURE_REQ      9
+#define LEN_VERSION_IND      6
+#define LEN_START_ENC_RSP    1
+#define LEN_PAUSE_ENC_REQ    1
+
+#define RSP_TIMEOUT_TICKS    (40000000u * LL_TICKS_PER_US)
+
+enum enc_state {
+	ENC_IDLE,
+	ENC_WAIT_LTK,        /* LL_ENC_RSP queued, LTK request at the host */
+	ENC_WAIT_START_RSP,  /* LL_START_ENC_REQ queued */
+};
+
+static struct ll_llcp_ops ops;
+
+static struct {
+	struct ll_crypt crypt;
+	enum enc_state enc;
+	bool paused;          /* data PDUs held back (encryption procedure) */
+	bool version_sent;
+	bool peer_feat_valid;
+	uint8_t peer_feat0;   /* byte 0 of the central's LL_FEATURE_REQ */
+	uint8_t skdm[8];
+	uint8_t skds[8];
+	bool tmr_on;
+	uint32_t tmr_start;
+} s;
+
+static int tx_locked(enum ll_txq_kind kind, uint8_t llid, const uint8_t *payload, uint8_t len)
+{
+	uint8_t buf[LL_DATA_PDU_MAX + LL_MIC_LEN];
+	uint8_t n = len;
+	int ret;
+
+	if (len == 0 || len > LL_DATA_PDU_MAX) {
+		return -EINVAL;
+	}
+	if (kind == LL_TXQ_ACL && s.paused) {
+		return -EAGAIN;
+	}
+	memcpy(buf, payload, len);
+	if (s.crypt.enc_tx) {
+		/* the AAD only uses the LLID of hdr0 */
+		n = (uint8_t)ll_crypt_encrypt(&s.crypt, llid, buf, len);
+	}
+	ret = ll_txq_push(kind, llid, buf, n, kind == LL_TXQ_CTRL ? payload[0] : 0);
+	if (ret != 0 && s.crypt.enc_tx) {
+		s.crypt.tx_ctr--;   /* not queued: the counter value is reused */
+	}
+	return ret;
+}
+
+int ll_llcp_tx(enum ll_txq_kind kind, uint8_t llid, const uint8_t *payload, uint8_t len)
+{
+	unsigned int key = ll_plat_lock();
+	int ret = tx_locked(kind, llid, payload, len);
+
+	ll_plat_unlock(key);
+	return ret;
+}
+
+int ll_llcp_ctrl_tx(const uint8_t *payload, uint8_t len)
+{
+	return ll_llcp_tx(LL_TXQ_CTRL, LL_LLID_CTRL, payload, len);
+}
+
+/* Responses are not retried when the backlog is full: the central's own
+ * response timeout then ends the link. */
+static void ctrl(const uint8_t *pdu, uint8_t len)
+{
+	(void)ll_llcp_ctrl_tx(pdu, len);
+}
+
+static void unknown_rsp(uint8_t op)
+{
+	const uint8_t pdu[2] = {OP_UNKNOWN_RSP, op};
+
+	ctrl(pdu, sizeof(pdu));
+}
+
+/* LL_REJECT_EXT_IND if the central reported Extended Reject Indication,
+ * else LL_REJECT_IND (Vol 6 Part B 2.4.2.18 / 5.1.3.1). */
+static void reject(uint8_t op, uint8_t err)
+{
+	if (s.peer_feat_valid && (s.peer_feat0 & LL_FEAT_EXT_REJ_IND)) {
+		const uint8_t pdu[3] = {OP_REJECT_EXT_IND, op, err};
+
+		ctrl(pdu, sizeof(pdu));
+	} else {
+		const uint8_t pdu[2] = {OP_REJECT_IND, err};
+
+		ctrl(pdu, sizeof(pdu));
+	}
+}
+
+/* caller holds the lock */
+static void timer_start(void)
+{
+	s.tmr_on = true;
+	s.tmr_start = ll_radio_now();
+}
+
+static void put_le32(uint8_t *p, uint32_t v)
+{
+	ll_put_le16(p, (uint16_t)v);
+	ll_put_le16(p + 2, (uint16_t)(v >> 16));
+}
+
+static void rx_enc_req(const uint8_t *p)
+{
+	uint8_t rsp[13];
+	unsigned int key;
+	bool ok;
+
+	key = ll_plat_lock();
+	/* a running procedure, or an encrypted link without the pause
+	 * procedure (unsupported): not allowed */
+	ok = s.enc == ENC_IDLE && !s.crypt.enc_tx;
+	if (ok) {
+		memset(&s.crypt, 0, sizeof(s.crypt));
+		memcpy(s.skdm, &p[11], 8);
+		memcpy(&s.crypt.iv[0], &p[19], 4);   /* IVm */
+		put_le32(&s.skds[0], ll_plat_rand32());
+		put_le32(&s.skds[4], ll_plat_rand32());
+		put_le32(&s.crypt.iv[4], ll_plat_rand32());   /* IVs */
+		rsp[0] = OP_ENC_RSP;
+		memcpy(&rsp[1], s.skds, 8);
+		memcpy(&rsp[9], &s.crypt.iv[4], 4);
+		s.enc = ENC_WAIT_LTK;
+		s.paused = true;
+		(void)tx_locked(LL_TXQ_CTRL, LL_LLID_CTRL, rsp, sizeof(rsp));
+		timer_start();
+	}
+	ll_plat_unlock(key);
+	if (!ok) {
+		reject(OP_ENC_REQ, LL_ST_LMP_PDU_NOT_ALLOWED);
+		return;
+	}
+	/* same thread as the ll_rxq consumer; enc_rx is still off */
+	ll_rxq_set_crypt(&s.crypt);
+	if (ops.ltk_req) {
+		ops.ltk_req(&p[1], ll_get_le16(&p[9]));
+	}
+}
+
+static void rx_start_enc_rsp(void)
+{
+	static const uint8_t rsp[1] = {OP_START_ENC_RSP};
+	unsigned int key = ll_plat_lock();
+	bool done = false;
+
+	if (s.enc == ENC_WAIT_START_RSP) {
+		s.crypt.enc_tx = true;
+		if (tx_locked(LL_TXQ_CTRL, LL_LLID_CTRL, rsp, sizeof(rsp)) == 0) {
+			s.enc = ENC_IDLE;
+			s.paused = false;
+			s.tmr_on = false;
+			done = true;
+		} else {
+			/* backlog full: stay in the procedure, the
+			 * response timer ends the link */
+			s.crypt.enc_tx = false;
+		}
+	}
+	ll_plat_unlock(key);
+	if (done && ops.enc_change) {
+		ops.enc_change(LL_ST_SUCCESS, true);
+	}
+}
+
+static void rx_feature_req(const uint8_t *p)
+{
+	uint8_t rsp[9] = {OP_FEATURE_RSP};
+	unsigned int key = ll_plat_lock();
+
+	s.peer_feat_valid = true;
+	s.peer_feat0 = p[1];
+	ll_plat_unlock(key);
+	/* byte 0: the features used on this link (ours AND the central's),
+	 * the other bytes are ours (none) */
+	rsp[1] = LL_FEATURES_LOW & p[1];
+	ctrl(rsp, sizeof(rsp));
+}
+
+static void rx_version_ind(void)
+{
+	static const uint8_t rsp[6] = {OP_VERSION_IND, LL_HCI_VERSION,
+				       LL_COMPANY_ID & 0xFF, LL_COMPANY_ID >> 8,
+				       LL_SUBVERSION & 0xFF, LL_SUBVERSION >> 8};
+	unsigned int key = ll_plat_lock();
+
+	/* answered once per connection (Vol 6 Part B 5.1.5) */
+	if (!s.version_sent && tx_locked(LL_TXQ_CTRL, LL_LLID_CTRL, rsp, sizeof(rsp)) == 0) {
+		s.version_sent = true;
+	}
+	ll_plat_unlock(key);
+}
+
+static void rx_conn_update(const uint8_t *p)
+{
+	struct ll_conn_params cp = {
+		.interval = ll_get_le16(&p[4]),
+		.latency = ll_get_le16(&p[6]),
+		.timeout = ll_get_le16(&p[8]),
+	};
+	int r = ll_conn_update_at(ll_get_le16(&p[10]), p[1], ll_get_le16(&p[2]), &cp);
+
+	/* LL_ST_INSTANT_PASSED: ll_conn already ends the link */
+	if (r == LL_ST_INVALID_LL_PARAM) {
+		ll_conn_end(LL_ST_INVALID_LL_PARAM);
+	}
+}
+
+/* length the request must have, 0 = not a request we answer by content */
+static uint8_t expected_len(uint8_t op)
+{
+	switch (op) {
+	case OP_CONN_UPDATE_IND: return LEN_CONN_UPDATE_IND;
+	case OP_CHANNEL_MAP_IND: return LEN_CHANNEL_MAP_IND;
+	case OP_TERMINATE_IND:   return LEN_TERMINATE_IND;
+	case OP_ENC_REQ:         return LEN_ENC_REQ;
+	case OP_FEATURE_REQ:     return LEN_FEATURE_REQ;
+	case OP_VERSION_IND:     return LEN_VERSION_IND;
+	case OP_PAUSE_ENC_REQ:   return LEN_PAUSE_ENC_REQ;
+	default:                 return 0;
+	}
+}
+
+/* responses to procedures we never start: dropped silently (never answer
+ * an LL_UNKNOWN_RSP / reject with another one) */
+static bool ignored(uint8_t op)
+{
+	switch (op) {
+	case OP_START_ENC_RSP:   /* only expected inside the procedure */
+	case OP_UNKNOWN_RSP:
+	case OP_FEATURE_RSP:
+	case OP_PAUSE_ENC_RSP:
+	case OP_REJECT_IND:
+	case OP_CONN_PARAM_RSP:
+	case OP_REJECT_EXT_IND:
+	case OP_PING_RSP:
+	case OP_LENGTH_RSP:
+	case OP_PHY_RSP:
+		return true;
+	default:
+		return false;
+	}
+}
+
+void ll_llcp_rx(const uint8_t *payload, uint8_t len)
+{
+	uint8_t op, want;
+
+	if (len == 0) {
+		return;
+	}
+	op = payload[0];
+	if (op == OP_START_ENC_RSP && len == LEN_START_ENC_RSP) {
+		rx_start_enc_rsp();
+		return;
+	}
+	if (ignored(op)) {
+		return;
+	}
+	want = expected_len(op);
+	if (want == 0 || len != want) {
+		/* unsupported (LENGTH, PHY, PING, PERIPHERAL_FEATURE,
+		 * CONN_PARAM, ...) or malformed */
+		unknown_rsp(op);
+		return;
+	}
+	switch (op) {
+	case OP_CONN_UPDATE_IND:
+		rx_conn_update(payload);
+		break;
+	case OP_CHANNEL_MAP_IND:
+		/* LL_ST_INSTANT_PASSED: ll_conn already ends the link */
+		(void)ll_conn_chmap_at(ll_get_le16(&payload[6]), &payload[1]);
+		break;
+	case OP_TERMINATE_IND:
+		ll_conn_end(payload[1]);
+		break;
+	case OP_ENC_REQ:
+		rx_enc_req(payload);
+		break;
+	case OP_FEATURE_REQ:
+		rx_feature_req(payload);
+		break;
+	case OP_VERSION_IND:
+		rx_version_ind();
+		break;
+	case OP_PAUSE_ENC_REQ:
+		/* encryption pause / key refresh not supported */
+		reject(OP_PAUSE_ENC_REQ, LL_ST_UNSUPP_REMOTE);
+		break;
+	default:
+		break;
+	}
+}
+
+uint8_t ll_llcp_ltk_reply(const uint8_t ltk[16])
+{
+	static const uint8_t req[1] = {OP_START_ENC_REQ};
+	unsigned int key = ll_plat_lock();
+	uint8_t st = LL_ST_DISALLOWED;
+
+	if (s.enc == ENC_WAIT_LTK) {
+		ll_crypt_session_key(ltk, s.skdm, s.skds, s.crypt.sk);
+		s.crypt.tx_ctr = 0;
+		s.crypt.rx_ctr = 0;
+		s.crypt.enc_tx = false;
+		/* the central answers LL_START_ENC_REQ encrypted */
+		s.crypt.enc_rx = true;
+		s.enc = ENC_WAIT_START_RSP;
+		(void)tx_locked(LL_TXQ_CTRL, LL_LLID_CTRL, req, sizeof(req));
+		timer_start();
+		st = LL_ST_SUCCESS;
+	}
+	ll_plat_unlock(key);
+	return st;
+}
+
+uint8_t ll_llcp_ltk_neg_reply(void)
+{
+	unsigned int key = ll_plat_lock();
+	bool ok = s.enc == ENC_WAIT_LTK;
+
+	if (ok) {
+		s.enc = ENC_IDLE;
+		s.paused = false;
+		s.tmr_on = false;
+	}
+	ll_plat_unlock(key);
+	if (!ok) {
+		return LL_ST_DISALLOWED;
+	}
+	reject(OP_ENC_REQ, LL_ST_PIN_KEY_MISSING);
+	return LL_ST_SUCCESS;
+}
+
+uint8_t ll_llcp_terminate(uint8_t reason)
+{
+	if (!ll_conn_active()) {
+		return LL_ST_UNKNOWN_CONN_ID;
+	}
+	ll_conn_terminate(reason);
+	return LL_ST_SUCCESS;
+}
+
+void ll_llcp_tick(uint32_t now_tick)
+{
+	unsigned int key = ll_plat_lock();
+	bool expired = s.tmr_on &&
+		       (int32_t)(now_tick - s.tmr_start) >= (int32_t)RSP_TIMEOUT_TICKS;
+
+	if (expired) {
+		s.tmr_on = false;
+		s.enc = ENC_IDLE;
+		s.paused = false;
+	}
+	ll_plat_unlock(key);
+	if (expired) {
+		ll_conn_end(LL_ST_LMP_TIMEOUT);
+	}
+}
+
+void ll_llcp_init(const struct ll_llcp_ops *o)
+{
+	memset(&ops, 0, sizeof(ops));
+	if (o) {
+		ops = *o;
+	}
+	ll_llcp_reset();
+}
+
+void ll_llcp_reset(void)
+{
+	unsigned int key = ll_plat_lock();
+
+	memset(&s, 0, sizeof(s));   /* also wipes the session key */
+	ll_plat_unlock(key);
+}
