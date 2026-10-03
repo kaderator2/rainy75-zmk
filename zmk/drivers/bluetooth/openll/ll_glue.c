@@ -52,9 +52,12 @@ LOG_MODULE_REGISTER(openll, CONFIG_BT_HCI_DRIVER_LOG_LEVEL);
 #define STATS_PERIOD_MS  2000
 #define RX_BUDGET        16    /* PDUs per wakeup (= ll_rxq ring depth) */
 #define RESET_WAIT_MS    200   /* HCI Reset: wait for the connection to end */
-/* Consecutive guard-ended events after which the radio is considered
- * wedged: the connection is ended with a supervision timeout (0x08); the
- * next advertising enable does the baseband reset (ll_radio_adv_restore). */
+/* Consecutive guard-ended events without any CRC-valid packet after which
+ * the radio is considered wedged: the connection is ended with a
+ * supervision timeout (0x08); the next advertising enable does the baseband
+ * reset (ll_radio_adv_restore). A guard that cuts a long central MD burst
+ * (packets received; the cap is interval based, see LL_CONN_EVENT_SAFETY_US)
+ * resets the streak, so a healthy link is never ended by it. */
 #define GUARD_STREAK_MAX 3
 
 struct evt_item {

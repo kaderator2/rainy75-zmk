@@ -74,11 +74,17 @@ void ll_radio_conn_setup(uint32_t aa, uint32_t crc_init);
  * opens at open_tick; if nothing is received within first_timeout_us the
  * event ends. The hardware then chains RX/TX exchanges while MD. Ends with
  * LL_RADIO_CONN_DONE: from the radio's end IRQ, or from a guard alarm
- * (ll_sched_guard_at, open_tick + first_timeout_us + a maximum event length)
- * that stops the FSM if no end IRQ arrives, so the event always ends. */
-void ll_radio_conn_event(uint8_t ch, uint32_t open_tick, uint32_t first_timeout_us);
-/* Consecutive connection events ended by the guard alarm (0 after any
- * event that ended with a radio IRQ, and per connection). ISR context. */
+ * (ll_sched_guard_at, open_tick + max_event_us) that stops the FSM if no end
+ * IRQ arrives, so the event always ends. The guard also cuts a central MD
+ * burst that would run into the next event; max_event_us comes from ll_conn
+ * (interval based, LL_CONN_EVENT_SAFETY_US) and exceeds first_timeout_us. */
+void ll_radio_conn_event(uint8_t ch, uint32_t open_tick, uint32_t first_timeout_us,
+			 uint32_t max_event_us);
+/* Consecutive guard-ended connection events that received no CRC-valid
+ * packet: the radio-wedge indicator (the glue ends the link at 3). A guard
+ * that cut a long MD burst (packets received) is a healthy event and resets
+ * the streak to 0, as does any event that ended with a radio IRQ and a new
+ * connection. ISR context. */
 uint8_t ll_radio_conn_guard_streak(void);
 /* SN of our last transmitted packet, programmed before every BRX. */
 void ll_radio_conn_set_sn_init(uint8_t sn);

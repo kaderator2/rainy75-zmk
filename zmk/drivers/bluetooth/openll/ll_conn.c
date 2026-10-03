@@ -242,6 +242,20 @@ static void event_closed(uint32_t now)
 	plan();
 }
 
+/* Event length cap for the radio guard (see LL_CONN_EVENT_SAFETY_US): the
+ * next event opens no earlier than one interval after this one, minus the
+ * widening growth over that interval (no re-sync in this event). */
+static uint32_t event_max_us(void)
+{
+	uint32_t ival_us = (uint32_t)c.p.interval * UNIT_US;
+	uint32_t growth = (uint32_t)(((uint64_t)c.ppm * ival_us + 999999u) / 1000000u);
+	uint32_t reserve = growth + LL_CONN_ARM_LEAD_US + LL_CONN_EVENT_SAFETY_US;
+	uint32_t floor_us = c.fst_us + LL_CONN_GUARD_MIN_TAIL_US;
+	uint32_t cap = ival_us > reserve ? ival_us - reserve : 0;
+
+	return cap > floor_us ? cap : floor_us;
+}
+
 /* Alarm: issue the BRX for the planned event. */
 static void prepare(void)
 {
@@ -263,7 +277,7 @@ static void prepare(void)
 	c.first_seen = false;
 	c.in_event = true;
 	stats.events++;
-	ll_radio_conn_event(c.ch, c.open_tick, c.fst_us);
+	ll_radio_conn_event(c.ch, c.open_tick, c.fst_us, event_max_us());
 }
 
 /* A packet with a bad CRC: if it is the event's first, it still was the
@@ -485,6 +499,12 @@ int ll_conn_update_at(uint16_t instant, uint8_t win_size, uint16_t win_offset,
 	} else if (c.active && !c.end_pending) {
 		ret = check_instant(instant);
 		if (ret == 0) {
+			/* A second LL_CONNECTION_UPDATE_IND while one is
+			 * pending replaces it (instant and parameters). The
+			 * central may only start one procedure at a time, so
+			 * this is a protocol violation for which the spec
+			 * allows ending the link; following the latest one is
+			 * accepted as the more forgiving choice. */
 			c.upd_pending = true;
 			c.upd_instant = instant;
 			c.upd_win_size = win_size;

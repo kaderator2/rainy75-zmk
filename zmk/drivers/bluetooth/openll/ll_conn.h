@@ -38,6 +38,19 @@
  * ms interval were skipped as late, with 500 us none in 10 min. */
 #define LL_CONN_ARM_LEAD_US    500
 #define LL_CONN_MIN_PREP_US    120   /* alarm later than this before RX open: skip */
+/* Event length cap, passed to ll_radio_conn_event() as max_event_us (the
+ * radio's guard alarm fires at open + max_event_us and stops the BRX). It
+ * is derived from the interval: interval - the widening growth over one
+ * interval - LL_CONN_ARM_LEAD_US - LL_CONN_EVENT_SAFETY_US, so a long MD
+ * burst of the central (SMP image upload, rgb_mgmt writes) may use almost
+ * the whole interval but the guard always ends it before the next event's
+ * alarm. The safety covers the larger margin of a transmit-window event at
+ * an update instant (LL_CONN_WIN_MARGIN_US - LL_CONN_RX_MARGIN_US = 140 us)
+ * and the guard ISR's own latency. The cap never cuts into the first RX
+ * window: it is at least first_timeout_us + LL_CONN_GUARD_MIN_TAIL_US (one
+ * exchange of maximum-length PDUs is about 0.8 ms). */
+#define LL_CONN_EVENT_SAFETY_US   300
+#define LL_CONN_GUARD_MIN_TAIL_US 1000
 
 struct ll_conn_params {
 	uint16_t interval;   /* 1.25 ms units */

@@ -44,6 +44,7 @@ static struct {
 	uint8_t ch;
 	uint32_t open;
 	uint32_t fst;
+	uint32_t max_ev;
 	uint8_t sn_init;
 	uint8_t rptr, wptr;
 	uint8_t fifo[4][LL_DATA_PDU_MAX + LL_MIC_LEN];
@@ -66,12 +67,14 @@ void ll_radio_conn_setup(uint32_t aa, uint32_t crc_init)
 	rad.aa = aa;
 	rad.crc = crc_init;
 }
-void ll_radio_conn_event(uint8_t ch, uint32_t open_tick, uint32_t first_timeout_us)
+void ll_radio_conn_event(uint8_t ch, uint32_t open_tick, uint32_t first_timeout_us,
+			 uint32_t max_event_us)
 {
 	rad.events++;
 	rad.ch = ch;
 	rad.open = open_tick;
 	rad.fst = first_timeout_us;
+	rad.max_ev = max_event_us;
 }
 void ll_radio_conn_set_sn_init(uint8_t sn) { rad.sn_init = sn; }
 void ll_radio_conn_set_nesn_init(uint8_t nesn) { (void)nesn; }
@@ -701,6 +704,53 @@ static void test_long_interval(void)
 	ll_conn_end(0x13);
 }
 
+/* Event length cap (guard): interval minus the widening growth over one
+ * interval, the alarm lead and LL_CONN_EVENT_SAFETY_US, so a long MD burst
+ * may run but never overruns the next event's alarm; never below the first
+ * RX window plus LL_CONN_GUARD_MIN_TAIL_US. */
+static void test_event_cap(void)
+{
+	struct ll_connect_ind ci = mk_ci(6, 3200, 1, 1, 0);   /* 7.5 ms, 300 ppm */
+	struct ll_connect_ind ci2 = mk_ci(12, 400, 1, 1, 0);  /* 15 ms */
+	struct ll_connect_ind ci3 = mk_ci(6, 3200, 0, 1, 0);  /* 7.5 ms, 500 ppm */
+	uint32_t a = 1000000 + T(1250 + 100);
+
+	/* 300 ppm * 7500 us = 2.25 -> 3 us growth */
+	reset_all(false);
+	CHECK(ll_conn_start(&ci, 1000000) == 0);
+	ev_rx(a);
+	fire_alarm();
+	CHECK(rad.max_ev == 7500 - 3 - LL_CONN_ARM_LEAD_US - LL_CONN_EVENT_SAFETY_US);
+	CHECK(rad.max_ev > rad.fst + LL_CONN_GUARD_MIN_TAIL_US);
+	/* the guard (open + max_ev) ends before the next event's alarm */
+	CHECK(rad.open + T(rad.max_ev) < rad.open + T(7500) - T(LL_CONN_ARM_LEAD_US));
+	done(0);
+	ll_conn_end(LL_ST_REMOTE_TERM);
+
+	/* 15 ms: 300 ppm * 15000 us = 4.5 -> 5 us growth */
+	reset_all(false);
+	CHECK(ll_conn_start(&ci2, 1000000) == 0);
+	ev_rx(a);
+	fire_alarm();
+	CHECK(rad.max_ev == 15000 - 5 - LL_CONN_ARM_LEAD_US - LL_CONN_EVENT_SAFETY_US);
+	done(0);
+	ll_conn_end(LL_ST_REMOTE_TERM);
+
+	/* clamped widening: the first RX window alone exceeds the interval,
+	 * the guard still leaves it plus the minimum tail */
+	reset_all(false);
+	CHECK(ll_conn_start(&ci3, 3000000) == 0);
+	ev_rx(3000000 + T(1250 + 100));
+	for (int k = 0; k < 1000; k++) {
+		ev_miss();
+	}
+	fire_alarm();
+	CHECK(rad.fst == 2 * (3600 + 60) + 40);
+	CHECK(rad.max_ev == rad.fst + LL_CONN_GUARD_MIN_TAIL_US);
+	done(0);
+	ll_conn_end(LL_ST_REMOTE_TERM);
+}
+
 /* LL_CONNECTION_UPDATE_IND parameters are validated; invalid ones are
  * refused with LL_ST_INVALID_LL_PARAM and change nothing */
 static void test_update_validation(void)
@@ -1094,5 +1144,6 @@ int main(void)
 	test_start_validation();
 	test_long_interval();
 	test_update_validation();
+	test_event_cap();
 	DONE();
 }

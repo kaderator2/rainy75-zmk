@@ -83,11 +83,13 @@ LOG_MODULE_DECLARE(openll, CONFIG_BT_HCI_DRIVER_LOG_LEVEL);
 /* RX settle of rf_set_ble_1M_mode() (0x80140a0c = 0x50); the first-RX
  * timeout counts from the command trigger including it (brx spike). */
 #define RX_SETTLE_US           80
-/* Guard: an event that has produced no end IRQ by open + first timeout +
- * this is ended by the guard alarm. A chained (MD) event of 27-byte PDUs
- * takes about 0.7 ms per exchange; 6 ms bounds it below the 7.5 ms minimum
- * interval minus the next event's preparation. */
-#define CONN_EVENT_MAX_US      6000
+/* Guard: an event that has produced no end IRQ by open + max_event_us
+ * (from ll_conn: interval minus the next event's alarm lead and a safety
+ * margin, at least the first RX window plus one exchange) is ended by the
+ * guard alarm. A chained (MD) event of 27-byte PDUs takes about 0.7 ms per
+ * exchange, so a long central burst may legitimately reach the cap; only a
+ * guard-ended event without any CRC-valid packet counts as a wedge sign
+ * (guard_streak). */
 /* TX timestamp register (with FLD_RF_EN_TS_TX): md-spike round 2, on-air
  * T_IFS = (tx_ts - rx_ts) / 16 us + 13.5 us - 8 us per central payload
  * byte (the RX timestamp marks the end of the access address). */
@@ -146,7 +148,7 @@ static atomic_t cnt_conn_events, cnt_conn_rx, cnt_conn_tx, cnt_conn_fto, cnt_con
 static atomic_t cnt_rx_ptr_odd, cnt_tifs_le150, cnt_tifs_151_152, cnt_tifs_gt152, cnt_restores;
 static atomic_t cnt_rx_ptr_skip, cnt_fst_capped;
 static uint8_t rx_wptr_max;      /* largest raw hardware rx wptr seen */
-static uint8_t guard_streak;     /* consecutive events ended by the guard */
+static uint8_t guard_streak;     /* consecutive guard-ended events without a valid packet */
 static uint16_t restore_ptrs_before, restore_ptrs_after;
 
 static void load(uint8_t *dma, const uint8_t *pdu, uint8_t len)
@@ -319,19 +321,23 @@ static void conn_done(void)
 
 /* Guard alarm (stimer ISR, same priority as the RF ISR, so never nested
  * with it): the BRX produced no end IRQ. Stop the FSM and end the event as
- * the hardware would have, with the packets seen so far. */
+ * the hardware would have, with the packets seen so far. An event that
+ * received CRC-valid packets was a healthy MD burst cut at the cap: it
+ * resets the wedge streak instead of counting toward it. */
 static void conn_guard(void)
 {
 	if (!cn.evt_open) {
 		return;
 	}
 	atomic_inc(&cnt_conn_guard);
-	if (guard_streak < UINT8_MAX) {
-		guard_streak++;
-	}
 	rf_set_tx_rx_off_auto_mode();
 	rf_clr_irq_status(FLD_RF_IRQ_ALL);
 	conn_rx(false);
+	if (cn.n_valid != 0) {
+		guard_streak = 0;
+	} else if (guard_streak < UINT8_MAX) {
+		guard_streak++;
+	}
 	conn_done();
 }
 
@@ -520,7 +526,8 @@ void ll_radio_conn_setup(uint32_t aa, uint32_t crc_init)
 	irq_unlock(key);
 }
 
-void ll_radio_conn_event(uint8_t ch, uint32_t open_tick, uint32_t first_timeout_us)
+void ll_radio_conn_event(uint8_t ch, uint32_t open_tick, uint32_t first_timeout_us,
+			 uint32_t max_event_us)
 {
 	uint32_t fst = first_timeout_us + RX_SETTLE_US;
 	uint32_t trigger = open_tick - RX_SETTLE_US * LL_TICKS_PER_US;
@@ -555,8 +562,7 @@ void ll_radio_conn_event(uint8_t ch, uint32_t open_tick, uint32_t first_timeout_
 	reg_rf_ll_cmd_schedule = trigger;
 	reg_rf_ll_ctrl3 |= FLD_RF_R_CMD_SCHDULE_EN;
 	reg_rf_ll_cmd = FSM_BRX;
-	ll_sched_guard_at(open_tick + (first_timeout_us + CONN_EVENT_MAX_US) * LL_TICKS_PER_US,
-			  conn_guard);
+	ll_sched_guard_at(open_tick + max_event_us * LL_TICKS_PER_US, conn_guard);
 }
 
 uint8_t ll_radio_conn_guard_streak(void)
