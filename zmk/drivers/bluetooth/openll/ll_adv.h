@@ -40,6 +40,20 @@ uint8_t ll_adv_set_scan_rsp(const uint8_t *data, uint8_t len);
 uint8_t ll_adv_enable(bool enable);
 bool ll_adv_is_enabled(void);
 
+/* ll_arb owner callbacks for advertising (id LL_ARB_ADV): start runs the
+ * adv event (cap ignored, the event has a fixed length), bumped re-plans
+ * it into the next gap. */
+void ll_adv_arb_start(uint32_t cap_us);
+void ll_adv_arb_bumped(void);
+
+struct ll_adv_stats {
+	uint32_t events;    /* adv events started */
+	uint32_t slid;      /* events moved into a gap by the arbiter */
+	uint32_t dropped;   /* events dropped: no gap before the next interval */
+};
+/* Cumulative since boot. */
+void ll_adv_get_stats(struct ll_adv_stats *s);
+
 /* Radio completion handler; registered with ll_radio_init(). ISR context. */
 void ll_adv_radio_evt(enum ll_radio_evt evt, const uint8_t *pdu, uint8_t len,
 		      uint32_t end_tick);

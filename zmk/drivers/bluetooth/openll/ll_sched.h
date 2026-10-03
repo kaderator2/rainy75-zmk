@@ -5,7 +5,8 @@
  * One-shot alarms on the system timer. Callbacks run in ISR context.
  *
  * Two independent slots share the one stimer compare: the main alarm
- * (ll_sched_at, used by ll_adv / ll_conn to start events) and the guard
+ * (ll_sched_at, used only by ll_arb, which starts the events of ll_adv and
+ * ll_conn) and the guard
  * alarm (ll_sched_guard_at, used by ll_radio to end a connection event whose
  * completion IRQ never arrived). The compare is programmed with the earlier
  * of the two; a slot whose tick is already due when the other fires runs in

@@ -20,10 +20,10 @@
  * ll_radio_conn_select() (the link's AA and CRC init), ll_txq_event_start()
  * (ring rebuilt for this link), BRX via ll_radio_conn_event(); the link
  * becomes the event owner (ev_owner), and the radio callbacks of the event
- * go to it. The main alarm is armed for the earliest planned event of all
- * links (arm(); the arbiter replaces this in slice 6a Task 5): an alarm
- * that fires while another link's event is on air skips its event
- * (stats.collisions). Each CONN_RX:
+ * go to it. Every planned event is a request to the arbiter (ll_arb.h),
+ * which owns the main alarm and calls ll_conn_arb_start() with the event
+ * cap (max_event_us, clipped before the next accepted request). Each
+ * CONN_RX:
  * ll_txq_rx(), ll_rxq_isr_put(), the first one re-syncs the anchor and the
  * supervision timer, unless the event's first packet was not delivered
  * (bad CRC, or an acked retransmission without an RX entry) or the packet
@@ -39,19 +39,33 @@
  * re-plan (ll_conn_kick, an instant for a skipped or the planned event)
  * can restore it and plan an earlier event of the window instead.
  *
+ * Arbitration (slice 6a, owner re-plan rule): each planned event is
+ * requested with a priority (MUST: transmit-window or instant event;
+ * SUPERVISION: its RX opens later than last RX + timeout - 2 * interval;
+ * ACTIVE: TX backlog or ops.busy; else IDLE). If the arbiter refuses it,
+ * or displaces it later (bumped), the link first dodges: it tries the
+ * other events of its latency window, latest first at planning, earliest
+ * first for a kick (no collision counted). Without latency freedom, or
+ * when every candidate is refused, it yields: the next event, and the
+ * next, ... until one is accepted; each yielded event advances counter and
+ * CSA#1 like a skip and counts in stats.collisions, and it does not clear
+ * `anchored` (a yield is not a miss for the latency rule). An event
+ * started with a cap too small for its first RX window plus one exchange
+ * is yielded the same way.
+ *
  * Everything runs in ISR context except the public calls documented as
  * thread calls, which take ll_plat_lock(). No allocation, no blocking.
  */
 #include <errno.h>
 #include <string.h>
 
+#include "ll_arb.h"
 #include "ll_conn.h"
 #include "ll_csa1.h"
 #include "ll_defs.h"
 #include "ll_plat.h"
 #include "ll_radio.h"
 #include "ll_rxq.h"
-#include "ll_sched.h"
 #include "ll_txq.h"
 
 #define US(t)            ((uint32_t)(t) * LL_TICKS_PER_US)
@@ -60,6 +74,9 @@
 #define NOT_ESTAB_EVENTS 6
 #define OP_TERMINATE_IND 0x02
 #define INSTANT_PAST     32767u   /* passed: (instant - counter) mod 65536 > this */
+/* Yields in a row before the link is given up (the arbiter holds at most
+ * LL_ARB_IDS - 1 other requests, each blocking one or two events). */
+#define YIELD_MAX        64
 
 /* SCA field -> worst-case ppm (Vol 6 Part B 2.3.3.1, Table 2.17) */
 static const uint16_t sca_ppm[8] = {500, 250, 150, 100, 75, 50, 30, 20};
@@ -87,6 +104,7 @@ struct ll_link {
 	 * skip_n == 0 after a re-plan (replan_to): the state after the
 	 * instants applied at the planned event */
 	struct ll_csa1 csa_base;
+	struct ll_csa1 csa_evt; /* CSA#1 state before the planned event's channel */
 	uint16_t counter;     /* next event not yet completed (planned: the listened one) */
 	/* first event after the last closed one; with skip_n == 0 after a
 	 * re-plan: the planned (target) event itself */
@@ -101,6 +119,8 @@ struct ll_link {
 	uint8_t ch;
 	uint32_t open_tick;
 	uint32_t fst_us;
+	bool inst_evt;        /* an instant was applied at event inst_counter */
+	uint16_t inst_counter;
 	/* instants */
 	bool upd_pending;
 	uint16_t upd_instant;
@@ -124,13 +144,8 @@ static struct ll_conn_ops ops;
 static struct ll_conn_stats stats[LL_MAX_CONN];
 /* Link whose BRX is on air (radio callbacks go to it), -1: none. */
 static int8_t ev_owner = -1;
-/* Link whose alarm is armed with ll_sched_at, -1: none (until Task 5). */
-static int8_t alarm_link = -1;
 
 #define ST(c) (&stats[(c)->id])
-
-static void arm(void);
-static void prepare(struct ll_link *c);
 
 static struct ll_link *link_of(uint8_t link)
 {
@@ -144,47 +159,6 @@ static void report(struct ll_link *c, enum ll_conn_evt what, const void *arg)
 	}
 }
 
-/* The main alarm follows the earliest planned event of all links (until
- * the arbiter, Task 5). Alarm ticks of planned events lie within one
- * supervision timeout (at most 32 s) of each other, so a signed tick
- * difference orders them. */
-static uint32_t alarm_tick(const struct ll_link *c)
-{
-	return c->open_tick - US(LL_CONN_ARM_LEAD_US);
-}
-
-static void alarm_fired(void)
-{
-	int8_t id = alarm_link;
-
-	alarm_link = -1;
-	if (id >= 0) {
-		prepare(&links[id]);
-	}
-	arm();
-}
-
-static void arm(void)
-{
-	struct ll_link *best = NULL;
-
-	for (uint8_t i = 0; i < LL_MAX_CONN; i++) {
-		struct ll_link *l = &links[i];
-
-		if (l->active && l->planned &&
-		    (!best || (int32_t)(alarm_tick(l) - alarm_tick(best)) < 0)) {
-			best = l;
-		}
-	}
-	if (best) {
-		alarm_link = (int8_t)best->id;
-		ll_sched_at(alarm_tick(best), alarm_fired);
-	} else if (alarm_link >= 0) {
-		alarm_link = -1;
-		ll_sched_cancel();
-	}
-}
-
 static void end(struct ll_link *c, uint8_t reason)
 {
 	c->active = false;
@@ -195,7 +169,12 @@ static void end(struct ll_link *c, uint8_t reason)
 	if (ev_owner == (int8_t)c->id) {
 		ev_owner = -1;
 	}
-	arm();
+	{
+		unsigned int key = ll_plat_lock();
+
+		ll_arb_cancel(c->id);
+		ll_plat_unlock(key);
+	}
 	c->end_r = reason;
 	report(c, LL_CONN_EVT_DISCONNECTED, &c->end_r);
 }
@@ -239,12 +218,16 @@ static void set_params(struct ll_link *c, const struct ll_conn_params *p)
 	c->widen_max_us = (uint32_t)p->interval * UNIT_US / 2u - LL_T_IFS_US;
 }
 
-/* Instants of the event about to be planned (counter == instant). */
-static void apply_instants(struct ll_link *c)
+/* Instants of the event about to be planned (counter == instant). Returns
+ * true if one was applied. */
+static bool apply_instants(struct ll_link *c)
 {
+	bool applied = false;
+
 	if (c->chm_pending && c->chm_instant == c->counter) {
 		c->chm_pending = false;
 		ll_csa1_set_map(&c->csa, c->chm);
+		applied = true;
 	}
 	if (c->upd_pending && c->upd_instant == c->counter) {
 		/* 5.1.1: the transmit window starts WinOffset after the anchor
@@ -255,6 +238,7 @@ static void apply_instants(struct ll_link *c)
 			       c->upd_p.timeout != c->p.timeout;
 
 		c->upd_pending = false;
+		applied = true;
 		c->ref_tick = old_anchor + (uint32_t)c->upd_win_offset * US(UNIT_US);
 		c->ref_counter = c->counter;
 		c->win_us = (uint32_t)c->upd_win_size * UNIT_US;
@@ -264,6 +248,7 @@ static void apply_instants(struct ll_link *c)
 			report(c, LL_CONN_EVT_UPDATED, &c->p);
 		}
 	}
+	return applied;
 }
 
 /* RX open tick of event `counter` (current timing state); widening out. */
@@ -279,16 +264,21 @@ static uint32_t open_of(const struct ll_link *c, uint16_t counter, uint32_t *wid
 	return base - US(widen + margin);
 }
 
-/* Plan event `counter` (listened to): instants, channel, RX window, alarm. */
+/* Plan event `counter` (listened to): instants, channel, RX window. The
+ * caller requests it from the arbiter. */
 static void plan_event(struct ll_link *c)
 {
 	uint32_t widen, margin;
 
-	apply_instants(c);
+	if (apply_instants(c)) {
+		c->inst_evt = true;
+		c->inst_counter = c->counter;
+	}
 	if (c->skip_n == 0) {
 		/* re-plan point: the state after this event's instants */
 		c->csa_base = c->csa;
 	}
+	c->csa_evt = c->csa;
 	c->ch = ll_csa1_next(&c->csa);
 	c->open_tick = open_of(c, c->counter, &widen);
 	if (widen > ST(c)->widen_max_us) {
@@ -297,7 +287,6 @@ static void plan_event(struct ll_link *c)
 	margin = c->win_us ? LL_CONN_WIN_MARGIN_US : LL_CONN_RX_MARGIN_US;
 	c->fst_us = c->win_us + 2u * (widen + margin) + LL_CONN_SYNC_US;
 	c->planned = true;
-	arm();
 }
 
 /* An instant in [counter, counter + n]: its event must be listened to. */
@@ -334,6 +323,121 @@ static uint16_t skip_count(struct ll_link *c)
 	return n;
 }
 
+/* Event length cap for the radio guard (see LL_CONN_EVENT_SAFETY_US): the
+ * next event opens no earlier than one interval after this one, minus the
+ * widening growth over that interval (no re-sync in this event). */
+static uint32_t event_max_us(const struct ll_link *c)
+{
+	uint32_t ival_us = (uint32_t)c->p.interval * UNIT_US;
+	uint32_t growth = (uint32_t)(((uint64_t)c->ppm * ival_us + 999999u) / 1000000u);
+	uint32_t reserve = growth + LL_CONN_ARM_LEAD_US + LL_CONN_EVENT_SAFETY_US;
+	uint32_t floor_us = c->fst_us + LL_CONN_GUARD_MIN_TAIL_US;
+	uint32_t cap = ival_us > reserve ? ival_us - reserve : 0;
+
+	return cap > floor_us ? cap : floor_us;
+}
+
+/* Arbiter priority of the planned event (rules at the top of the file). */
+static uint8_t prio_of(struct ll_link *c)
+{
+	uint32_t deadline;
+
+	if (c->win_us != 0 || (c->inst_evt && c->inst_counter == c->counter)) {
+		return LL_ARB_PRIO_MUST;
+	}
+	deadline = c->sup_tick + c->sup_ticks - 2u * c->interval_ticks;
+	if ((int32_t)(c->open_tick - deadline) > 0) {
+		return LL_ARB_PRIO_SUPERVISION;
+	}
+	if (ll_txq_backlog(c->id) != 0 || (ops.busy && ops.busy(c->id))) {
+		return LL_ARB_PRIO_ACTIVE;
+	}
+	return LL_ARB_PRIO_IDLE;
+}
+
+/* Request the planned event. Span: the alarm LL_CONN_ARM_LEAD_US before
+ * the RX opens, to the first RX window + one exchange
+ * (LL_CONN_GUARD_MIN_TAIL_US) + the arbiter's clipping reserve, so an
+ * accepted event is never started with a cap below its floor. */
+static int request(struct ll_link *c)
+{
+	struct ll_arb_req r = {
+		.alarm_tick = c->open_tick - US(LL_CONN_ARM_LEAD_US),
+		.open_tick = c->open_tick,
+		.min_len_us = c->fst_us + LL_CONN_GUARD_MIN_TAIL_US + LL_CONN_EVENT_SAFETY_US +
+			      LL_CONN_ARM_LEAD_US,
+		.max_len_us = event_max_us(c),
+		.prio = prio_of(c),
+	};
+	unsigned int key = ll_plat_lock();
+	int ret = ll_arb_request(c->id, &r);
+
+	ll_plat_unlock(key);
+	return ret;
+}
+
+/* Plan event skip_base + k of the current window (k <= the window's
+ * skip_n, so no instant lies before it in the window; one at k itself is
+ * idempotent here). Not requested yet. */
+static void set_window(struct ll_link *c, uint16_t k)
+{
+	c->csa = c->csa_base;
+	for (uint16_t i = 0; i < k; i++) {
+		(void)ll_csa1_next(&c->csa);
+	}
+	c->counter = (uint16_t)(c->skip_base + k);
+	c->skip_n = k;
+	plan_event(c);
+}
+
+/* The planned event becomes the new re-plan base (skip_n 0): used after a
+ * yield or a kick, see replan_to(). */
+static void rebase(struct ll_link *c)
+{
+	c->skip_base = c->counter;
+	c->skip_n = 0;
+	c->csa_base = c->csa_evt;
+}
+
+/* Yield the planned event and the following ones until the arbiter
+ * accepts one (each counts as a collision, advances like a skip). Every
+ * step applies the instants of the event it plans. */
+static void yield_on(struct ll_link *c)
+{
+	for (int i = 0; i < YIELD_MAX; i++) {
+		ST(c)->collisions++;
+		c->counter++;
+		c->skip_base = c->counter;
+		c->skip_n = 0;
+		plan_event(c);
+		if (request(c) == 0) {
+			return;
+		}
+	}
+	/* never seen: the arbiter found no room for YIELD_MAX events */
+	end(c, LL_ST_CONN_TIMEOUT);
+}
+
+/* Request the latest event of [skip_base + lo, skip_base + hi] the arbiter
+ * accepts (a dodge inside the latency window), else yield after hi.
+ * stats.skipped follows the event taken. On success nothing else is
+ * touched afterwards: a nested bump may already have re-planned. */
+static void place_latest(struct ll_link *c, uint16_t lo, uint16_t hi)
+{
+	uint16_t orig = c->skip_n;
+
+	for (int k = hi; k >= (int)lo; k--) {
+		set_window(c, (uint16_t)k);
+		if (request(c) == 0) {
+			ST(c)->skipped -= (uint32_t)(orig - k);
+			return;
+		}
+	}
+	set_window(c, hi);
+	ST(c)->skipped -= (uint32_t)(orig - hi);
+	yield_on(c);
+}
+
 /* Plan the next event, skipping idle events where allowed. */
 static void plan(struct ll_link *c)
 {
@@ -342,13 +446,9 @@ static void plan(struct ll_link *c)
 	c->skip_base = c->counter;
 	c->csa_base = c->csa;
 	c->skip_n = n;
-	for (uint16_t i = 0; i < n; i++) {
-		(void)ll_csa1_next(&c->csa);
-	}
-	c->counter = (uint16_t)(c->counter + n);
 	ST(c)->skipped += n;
 	ST(c)->planned++;
-	plan_event(c);
+	place_latest(c, 0, n);
 }
 
 /* Re-plan the planned (not yet issued) listen to event `target` in
@@ -429,37 +529,20 @@ static void event_closed(struct ll_link *c, uint32_t now)
 	plan(c);
 }
 
-/* Event length cap for the radio guard (see LL_CONN_EVENT_SAFETY_US): the
- * next event opens no earlier than one interval after this one, minus the
- * widening growth over that interval (no re-sync in this event). */
-static uint32_t event_max_us(const struct ll_link *c)
+/* Arbiter start: issue the BRX for the planned event of link c. */
+static void prepare(struct ll_link *c, uint32_t cap_us)
 {
-	uint32_t ival_us = (uint32_t)c->p.interval * UNIT_US;
-	uint32_t growth = (uint32_t)(((uint64_t)c->ppm * ival_us + 999999u) / 1000000u);
-	uint32_t reserve = growth + LL_CONN_ARM_LEAD_US + LL_CONN_EVENT_SAFETY_US;
-	uint32_t floor_us = c->fst_us + LL_CONN_GUARD_MIN_TAIL_US;
-	uint32_t cap = ival_us > reserve ? ival_us - reserve : 0;
+	uint32_t now = ll_radio_now();
 
-	return cap > floor_us ? cap : floor_us;
-}
-
-/* Alarm: issue the BRX for the planned event of link c. */
-static void prepare(struct ll_link *c)
-{
-	uint32_t now;
-
-	if (!c->active || !c->planned) {
-		return;
-	}
 	c->planned = false;
-	c->anchored = false;
-	now = ll_radio_now();
-	if (ev_owner >= 0) {
-		/* another link's event is on air (no arbiter yet): skip */
+	if (ev_owner >= 0 || cap_us < c->fst_us + LL_CONN_GUARD_MIN_TAIL_US) {
+		/* another event is on air (it overran its cap), or no room
+		 * before the next request: yield this event (not a miss) */
 		ST(c)->collisions++;
 		event_closed(c, now);
 		return;
 	}
+	c->anchored = false;
 	if ((int32_t)(c->open_tick - now) < (int32_t)US(LL_CONN_MIN_PREP_US)) {
 		ST(c)->late++;
 		ST(c)->missed++;
@@ -474,7 +557,54 @@ static void prepare(struct ll_link *c)
 	ev_owner = (int8_t)c->id;
 	ST(c)->events++;
 	ST(c)->listened++;
-	ll_radio_conn_event(c->ch, c->open_tick, c->fst_us, event_max_us(c));
+	ll_radio_conn_event(c->ch, c->open_tick, c->fst_us, cap_us);
+}
+
+void ll_conn_arb_start(uint8_t link, uint32_t cap_us)
+{
+	struct ll_link *c = link_of(link);
+
+	if (!c || !c->active || !c->planned) {
+		/* stale request (never expected): drop it */
+		unsigned int key = ll_plat_lock();
+
+		ll_arb_cancel(link);
+		ll_plat_unlock(key);
+		return;
+	}
+	prepare(c, cap_us);
+}
+
+void ll_conn_arb_bumped(uint8_t link)
+{
+	struct ll_link *c = link_of(link);
+	unsigned int key;
+
+	if (!c) {
+		return;
+	}
+	key = ll_plat_lock();
+	if (c->active && c->planned) {
+		uint16_t orig = c->skip_n;
+		uint16_t lo = orig > 0 ? first_reachable(c) : 0;
+		bool placed = false;
+
+		/* dodge: an earlier event of the window, latest first (the
+		 * bumped one is never requested again) */
+		for (int k = (int)orig - 1; k >= (int)lo; k--) {
+			set_window(c, (uint16_t)k);
+			if (request(c) == 0) {
+				ST(c)->skipped -= (uint32_t)(orig - k);
+				placed = true;
+				break;
+			}
+		}
+		if (!placed) {
+			set_window(c, orig);
+			yield_on(c);
+		}
+	}
+	ll_plat_unlock(key);
 }
 
 /* A packet with a bad CRC: if it is the event's first, it still was the
@@ -609,15 +739,18 @@ static void link_clear(uint8_t i)
 
 void ll_conn_init(const struct ll_conn_ops *o)
 {
+	unsigned int key = ll_plat_lock();
+
 	for (uint8_t i = 0; i < LL_MAX_CONN; i++) {
+		ll_arb_cancel(i);
 		link_clear(i);
 	}
+	ll_plat_unlock(key);
 	memset(&ops, 0, sizeof(ops));
 	if (o) {
 		ops = *o;
 	}
 	ev_owner = -1;
-	alarm_link = -1;
 	ll_txq_init(txq_done);
 }
 
@@ -733,6 +866,9 @@ static void instant_replan(struct ll_link *c, uint16_t instant)
 		uint16_t i = c->skip_n > 0 ? first_reachable(c) : 0;
 
 		replan_to(c, (uint16_t)(c->skip_base + (i < d ? i : d)));
+		if (request(c) != 0) {
+			yield_on(c);
+		}
 	}
 }
 
@@ -886,11 +1022,31 @@ void ll_conn_kick(uint8_t link)
 	}
 	key = ll_plat_lock();
 	if (c->active && c->planned && c->skip_n > 0) {
+		uint16_t orig = c->skip_n;
 		uint16_t i = first_reachable(c);
 
-		if (i < c->skip_n) {
-			replan_to(c, (uint16_t)(c->skip_base + i));
-			ST(c)->kicks++;
+		bool placed = false;
+
+		/* the earliest reachable event the arbiter accepts (the
+		 * planned one at the latest); an earlier one becomes the
+		 * re-plan base (replan_to semantics) */
+		for (uint16_t k = i; k <= orig && i < orig && !placed; k++) {
+			set_window(c, k);
+			if (request(c) == 0) {
+				placed = true;
+				ST(c)->skipped -= (uint32_t)(orig - k);
+				if (k < orig) {
+					ST(c)->kicks++;
+					if (c->planned &&
+					    c->counter == (uint16_t)(c->skip_base + k)) {
+						rebase(c);
+					}
+				}
+			}
+		}
+		if (i < orig && !placed) {
+			set_window(c, orig);
+			yield_on(c);
 		}
 	}
 	ll_plat_unlock(key);

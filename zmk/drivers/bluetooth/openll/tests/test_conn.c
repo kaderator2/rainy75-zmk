@@ -14,6 +14,7 @@
 #include <errno.h>
 #include <string.h>
 #include "test.h"
+#include "../ll_arb.h"
 #include "../ll_conn.h"
 #include "../ll_csa1.h"
 #include "../ll_defs.h"
@@ -193,6 +194,22 @@ static int hook_ctrl_tx(uint8_t link, const uint8_t *payload, uint8_t len)
 	return 0;
 }
 
+/* the arbiter (real ll_arb) dispatches to ll_conn as the glue does; no
+ * advertising in these tests */
+static void arb_start(uint8_t id, uint32_t cap_us)
+{
+	CHECK(id < LL_MAX_CONN);
+	ll_conn_arb_start(id, cap_us);
+}
+
+static void arb_bumped(uint8_t id)
+{
+	CHECK(id < LL_MAX_CONN);
+	ll_conn_arb_bumped(id);
+}
+
+static const struct ll_arb_ops arb_ops = {.start = arb_start, .bumped = arb_bumped};
+
 /* ---------------- helpers ---------------- */
 
 static const uint8_t all37[5] = {0xFF, 0xFF, 0xFF, 0xFF, 0x1F};
@@ -214,6 +231,7 @@ static void reset_all(bool hook)
 	memset(&sch, 0, sizeof(sch));
 	memset(&cbs, 0, sizeof(cbs));
 	auto_release = true;
+	ll_arb_init(&arb_ops);
 	ll_conn_init(&ops);
 	for (uint8_t i = 0; i < LL_MAX_CONN; i++) {
 		ll_rxq_reset(i);   /* the glue's job (controller thread), not ll_conn's */
@@ -1965,9 +1983,11 @@ static void test_links_interleaved(void)
 	CHECK(ll_conn_count() == 0 && sch.cb == NULL);
 }
 
-/* Until the arbiter (Task 5): an alarm that fires while another link's
- * event is on air does not issue a BRX; that event is skipped and counted
- * in the link's collisions (not missed). */
+/* With the arbiter (Task 5): a link whose window event overlaps another
+ * link's accepted one (same priority, it never yielded) is refused and
+ * yields that event: counter + 1, collisions + 1, neither missed nor
+ * issued; link 0's event runs undisturbed, then link 1's next window
+ * event. An event started with a cap below its floor yields as well. */
 static void test_collision_skips(void)
 {
 	struct ll_connect_ind ci0 = mk_ci_link(0), ci1 = mk_ci_link(1);
@@ -1980,24 +2000,50 @@ static void test_collision_skips(void)
 	}
 	reset_all(false);
 	ll_conn_get_stats(1, &s1a);
+	{
+		struct ll_conn_stats s0;
+
+		ll_conn_get_stats(0, &s0);
+		CHECK(s0.collisions == 0);
+	}
 	CHECK(ll_conn_start(&ci0, t0) == 0);
 	CHECK(ll_conn_start(&ci1, t0 + T(500)) == 1);
-	fire_alarm();   /* link 0 on air */
-	CHECK(rad.aa == ci0.aa);
-	ev = rad.events;
-	fire_alarm();   /* link 1's alarm while link 0's event is open */
-	CHECK(rad.events == ev);
 	CHECK(ll_conn_event_counter(1) == 1);
 	ll_conn_get_stats(1, &s1b);
 	CHECK(s1b.collisions - s1a.collisions == 1);
 	CHECK(s1b.missed == s1a.missed && s1b.events == s1a.events);
-	/* link 0's event completes undisturbed */
+	fire_alarm();   /* link 0 on air */
+	CHECK(rad.aa == ci0.aa);
+	ev = rad.events;
 	rx(t0 + T(1350), 0x01, 0);
 	done(1);
-	CHECK(ll_conn_event_counter(0) == 1);
+	/* link 0's (idle) event 1 overlaps link 1's window event 1 (MUST):
+	 * link 0 yields it */
+	CHECK(ll_conn_event_counter(0) == 2);
+	{
+		struct ll_conn_stats s0;
+
+		ll_conn_get_stats(0, &s0);
+		CHECK(s0.collisions == 1);
+	}
+	fire_alarm();   /* link 1, event 1: its window one interval later */
+	CHECK(rad.events == ev + 1 && rad.aa == ci1.aa);
+	done(0);
 	CHECK(ll_conn_active(0) && ll_conn_active(1));
 	ll_conn_end(0, 0x13);
 	ll_conn_end(1, 0x13);
+
+	/* started with a cap too small: yield, not a miss */
+	reset_all(false);
+	CHECK(ll_conn_start(&ci0, t0) == 0);
+	ll_conn_get_stats(0, &s1a);
+	ev = rad.events;
+	ll_conn_arb_start(0, 10);   /* as if the arbiter clipped it to 10 us */
+	ll_conn_get_stats(0, &s1b);
+	CHECK(rad.events == ev);
+	CHECK(s1b.collisions - s1a.collisions == 1 && s1b.missed == s1a.missed);
+	CHECK(ll_conn_event_counter(0) == 1 && sch.cb != NULL);
+	ll_conn_end(0, 0x13);
 }
 
 /* The single-link behaviour on the highest id alone (the others ended):
@@ -2013,8 +2059,9 @@ static void test_last_link_alone(void)
 
 	ci.latency = 4;
 	reset_all(true);
+	/* the others 5 ms apart before it (no overlap of the window events) */
 	for (uint8_t k = 0; k < LL_MAX_CONN; k++) {
-		CHECK(ll_conn_start(&ci, t0) == k);
+		CHECK(ll_conn_start(&ci, t0 - T(5000) * (uint32_t)(last - k)) == k);
 	}
 	for (uint8_t k = 0; k < last; k++) {
 		ll_conn_end(k, 0x13);

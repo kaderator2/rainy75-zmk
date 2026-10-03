@@ -2,6 +2,7 @@
 #include <string.h>
 #include "test.h"
 #include "../ll_adv.h"
+#include "../ll_arb.h"
 #include "../ll_conn.h"
 #include "../ll_defs.h"
 #include "../ll_sched.h"
@@ -57,12 +58,18 @@ static struct ll_adv_params params(uint8_t type, uint8_t map)
 	return p;
 }
 
+/* the real ll_arb with advertising as its only owner */
+static void arb_start(uint8_t id, uint32_t cap_us) { CHECK(id == LL_ARB_ADV); ll_adv_arb_start(cap_us); }
+static void arb_bumped(uint8_t id) { CHECK(id == LL_ARB_ADV); ll_adv_arb_bumped(); }
+static const struct ll_arb_ops arb_ops = {.start = arb_start, .bumped = arb_bumped};
+
 static void fire_sched(void) { ll_sched_cb_t cb = sched_cb; sched_cb = NULL; CHECK(cb != NULL); if (cb) cb(); }
 
 int main(void)
 {
 	struct ll_adv_params p;
 
+	ll_arb_init(&arb_ops);
 	ll_adv_init(adva, on_conn);
 
 	/* parameter validation */
@@ -148,7 +155,9 @@ int main(void)
 	int before = txrx_calls;
 	CHECK(ll_adv_enable(false) == LL_ST_SUCCESS);
 	CHECK(!ll_adv_is_enabled());
-	CHECK(sched_cancels >= 1 && radio_stops >= 1);
+	/* disabled inside an event: no alarm was pending (ll_arb arms none
+	 * while the adv event runs), the arbiter drops the request */
+	CHECK(sched_cb == NULL && radio_stops >= 1);
 	ll_adv_radio_evt(LL_RADIO_RX_TIMEOUT, NULL, 0, 0);
 	CHECK(txrx_calls == before);
 

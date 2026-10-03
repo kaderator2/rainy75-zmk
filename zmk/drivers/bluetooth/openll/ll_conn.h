@@ -5,7 +5,8 @@
  * Connection state (peripheral, LL_MAX_CONN links, slice 6a): transmit
  * window, window widening, anchor re-sync, CSA#1, event counter, instants,
  * supervision timeout, termination, per link. Drives the radio via
- * ll_radio.h, the alarm via ll_sched.h, and calls the ll_txq / ll_rxq
+ * ll_radio.h, requests its events from the arbiter (ll_arb.h), and calls
+ * the ll_txq / ll_rxq
  * per-event hooks of the link that owns the event.
  *
  * Link ids: uint8_t link, 0 <= link < LL_MAX_CONN (== the HCI connection
@@ -14,10 +15,11 @@
  * ll_llcp state first). Calls with an id out of range or of a link that is
  * not active do nothing (or return LL_ST_DISALLOWED / false / 0).
  *
- * Until the arbiter (slice 6a Task 5) the alarm is shared directly: the
- * main alarm (ll_sched_at) is armed for the earliest planned event of all
- * links; when it fires while another link's event is on air, the event is
- * skipped and counted in that link's stats.collisions.
+ * Events are arbitrated (slice 6a Task 5): every planned event is an
+ * ll_arb request with a priority (MUST > SUPERVISION > ACTIVE > IDLE, see
+ * ll_conn.c); a refused or displaced event is moved to another event of
+ * the latency window (dodge) or yielded (counter and CSA#1 advance as for
+ * a skip, stats.collisions counts it, not a miss for the latency rule).
  *
  * Timing uses stimer ticks only (LL_TICKS_PER_US). Window widening above
  * connInterval / 2 - T_IFS is clamped; the supervision timeout then ends
@@ -183,10 +185,11 @@ void ll_conn_release(uint8_t link);
  * this is the first skipped event (conservative: an instant for a skipped
  * event re-plans the listen to the first reachable event, or to the
  * instant if that comes first, and is passed if the instant event is no
- * longer reachable). After a re-plan (kick or instant) it is the planned
- * event, so an instant for an earlier event is treated as passed (0x28); a
- * conforming central never sends one (the instant is >= 6 events after the
- * PDU, which arrives in a listened event). */
+ * longer reachable). After a re-plan (kick, instant, or a yield to the
+ * arbiter) it is the planned event, so an instant for an earlier event is
+ * treated as passed (0x28); a conforming central never sends one (the
+ * instant is >= 6 events after the PDU, which arrives in a listened event;
+ * after yields it may be passed in rare multilink overlaps). */
 uint16_t ll_conn_event_counter(uint8_t link);
 /* New TX data was queued (call after a successful ll_txq_push; the
  * ll_plat_lock() it takes nests, so the caller may hold it): if the planned
@@ -222,13 +225,21 @@ struct ll_conn_stats {
 	uint32_t listened;
 	uint32_t skipped;
 	uint32_t kicks;
-	/* Slice 6a: events not issued because another link's event was on
-	 * air when the alarm fired (counted neither in listened nor missed;
-	 * planned - listened includes them). */
+	/* Slice 6a: events yielded to the arbiter (refused when planned,
+	 * displaced, or started with no room); counted neither in listened
+	 * nor missed nor skipped. planned - listened includes the yields at
+	 * start. */
 	uint32_t collisions;
 };
 /* Per link, cumulative since boot (not reset per connection). Out-of-range
  * link: all zero. */
 void ll_conn_get_stats(uint8_t link, struct ll_conn_stats *s);
+
+/* ll_arb owner callbacks for the links (the glue's ll_arb_ops dispatch ids
+ * < LL_MAX_CONN here). start: issue the BRX of the link's planned event
+ * with the arbiter's cap as max_event_us (stimer ISR). bumped: the planned
+ * event was displaced; re-plan (dodge, else yield) and request again. */
+void ll_conn_arb_start(uint8_t link, uint32_t cap_us);
+void ll_conn_arb_bumped(uint8_t link);
 
 #endif /* LL_CONN_H_ */

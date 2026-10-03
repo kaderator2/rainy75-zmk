@@ -53,6 +53,7 @@
 #include "aes.h"
 #include "trng.h"
 #include "ll_adv.h"
+#include "ll_arb.h"
 #include "ll_conn.h"
 #include "ll_crypt.h"
 #include "ll_hci.h"
@@ -393,6 +394,30 @@ static void txq_done(uint8_t link, enum ll_txq_kind kind, uint8_t ctrl_opcode)
 	}
 	k_sem_give(&wake);
 }
+
+/* The arbiter's owners: links 0..LL_MAX_CONN-1 and advertising. */
+static void arb_start(uint8_t id, uint32_t cap_us)
+{
+	if (id == LL_ARB_ADV) {
+		ll_adv_arb_start(cap_us);
+	} else {
+		ll_conn_arb_start(id, cap_us);
+	}
+}
+
+static void arb_bumped(uint8_t id)
+{
+	if (id == LL_ARB_ADV) {
+		ll_adv_arb_bumped();
+	} else {
+		ll_conn_arb_bumped(id);
+	}
+}
+
+static const struct ll_arb_ops arb_ops = {
+	.start = arb_start,
+	.bumped = arb_bumped,
+};
 
 /* One dispatcher for both users of the radio: ll_adv ignores everything
  * while advertising is disabled, ll_conn everything outside a connection
@@ -982,6 +1007,7 @@ int b91_bt_controller_init(void)
 	aes_selftest();
 	ll_radio_init(radio_evt);
 	ll_sched_init();
+	ll_arb_init(&arb_ops);
 	ll_conn_init(&conn_ops);
 	ll_llcp_init(&llcp_ops);   /* resets every link's LLCP state */
 	for (uint8_t i = 0; i < LL_MAX_CONN; i++) {
