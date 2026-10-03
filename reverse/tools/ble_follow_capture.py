@@ -55,7 +55,10 @@ def main(argv):
     except ImportError:
         sys.exit(f"SnifferAPI not found in {SNIFFER_API} (install AUR nrf-sniffer-ble)")
 
+    # An idle sniffer sends nothing, so a passive probe misses it: ping it then.
     rates = UART.find_sniffer_baudrates(a.port)
+    if rates is None:
+        rates = UART.find_sniffer_baudrates(a.port, write_data=True)
     if rates is None:
         sys.exit(f"{a.port} does not answer like an nRF Sniffer")
 
