@@ -456,9 +456,22 @@ static void llcp_enc_change(uint8_t link, uint8_t status, bool enabled)
 	ll_hci_evt_enc_change(link, status, enabled);
 }
 
+/* Controller thread (LL_LENGTH_REQ / _RSP) or HCI thread (LE Set Data
+ * Length). Not for a link the host does not know (yet) or any more. */
+static void llcp_data_len_change(uint8_t link, const struct ll_llcp_dle *eff)
+{
+	LOG_INF("data length (handle %u): tx %u B / %u us, rx %u B / %u us", link,
+		eff->max_tx_octets, eff->max_tx_time, eff->max_rx_octets, eff->max_rx_time);
+	if (ll_credit_up(link) && !pend_test(link, PEND_DISCONNECTED)) {
+		ll_hci_evt_data_len_change(link, eff->max_tx_octets, eff->max_tx_time,
+					   eff->max_rx_octets, eff->max_rx_time);
+	}
+}
+
 static const struct ll_llcp_ops llcp_ops = {
 	.ltk_req = llcp_ltk_req,
 	.enc_change = llcp_enc_change,
+	.data_len_change = llcp_data_len_change,
 };
 
 /* ---- HCI ops ---- */
@@ -572,6 +585,38 @@ static uint8_t ltk_reply(uint16_t handle, const uint8_t ltk[16])
 	return ll_llcp_ltk_reply((uint8_t)handle, ltk);
 }
 
+/* HCI thread: our LL_LENGTH_REQ may start the 40 s response timer, which
+ * the controller thread arms on its next pass: wake it. */
+static uint8_t hci_set_data_len(uint16_t handle, uint16_t tx_octets, uint16_t tx_time)
+{
+	uint8_t st = ll_llcp_set_data_len((uint8_t)handle, tx_octets, tx_time);
+
+	k_sem_give(&wake);
+	return st;
+}
+
+/* 1M only (slice 6b): both directions are always LE 1M */
+static uint8_t hci_read_phy(uint16_t handle, uint8_t *tx_phy, uint8_t *rx_phy)
+{
+	ARG_UNUSED(handle);
+	*tx_phy = LL_PHY_1M;
+	*rx_phy = LL_PHY_1M;
+	return LL_ST_SUCCESS;
+}
+
+/* ll_hci checked the PHYs (only 1M can pass): nothing to request on air;
+ * ll_hci reports LE PHY Update Complete (no change) after the status. */
+static uint8_t hci_set_phy(uint16_t handle, uint8_t all_phys, uint8_t tx_phys, uint8_t rx_phys,
+			   uint16_t opts)
+{
+	ARG_UNUSED(handle);
+	ARG_UNUSED(all_phys);
+	ARG_UNUSED(tx_phys);
+	ARG_UNUSED(rx_phys);
+	ARG_UNUSED(opts);
+	return LL_ST_SUCCESS;
+}
+
 static bool handle_valid(uint16_t handle)
 {
 	return handle < LL_MAX_CONN && ll_conn_active((uint8_t)handle);
@@ -595,6 +640,9 @@ static const struct ll_hci_ops hci_ops = {
 	.ltk_reply = ltk_reply,
 	.ltk_neg_reply = ltk_neg_reply,
 	.handle_valid = handle_valid,
+	.set_data_len = hci_set_data_len,
+	.read_phy = hci_read_phy,
+	.set_phy = hci_set_phy,
 };
 
 /* ---- controller thread ---- */
@@ -661,6 +709,14 @@ static void handle_connected(uint8_t link)
 		/* ll_conn uses CSA#2 exactly when the CONNECT_IND has ChSel 1
 		 * (our ADV_IND always has it) */
 		ll_hci_evt_chan_sel_algo(link, ci.chsel ? 0x01 : 0x00);
+		/* connInitialMaxTx* from the host's Suggested Default Data
+		 * Length (4.5.10 "For a new connection"); ll_llcp starts the
+		 * LENGTH procedure only when the central does not know our
+		 * values yet (never while LL_DLE_SUPP_OCTETS is 27) */
+		uint16_t def_oct, def_time;
+
+		ll_hci_default_data_len(&def_oct, &def_time);
+		(void)ll_llcp_set_data_len(link, def_oct, def_time);
 	}
 }
 
@@ -687,6 +743,23 @@ static void flush_nocp(uint8_t link)
 
 	if (n != 0) {
 		ll_hci_evt_num_completed(link, n);
+	}
+}
+
+/* The LENGTH and PHY requests from the central (rare: once per connection
+ * at most, typically): logged so the exchange is visible on the device. */
+static void log_llcp_rx(uint8_t link, const uint8_t *d, uint8_t len)
+{
+	if (len == 9 && (d[0] == 0x14 || d[0] == 0x15)) {
+		LOG_INF("LL_LENGTH_%s (handle %u): rx %u B / %u us, tx %u B / %u us",
+			d[0] == 0x14 ? "REQ" : "RSP", link, ll_get_le16(&d[1]), ll_get_le16(&d[3]),
+			ll_get_le16(&d[5]), ll_get_le16(&d[7]));
+	} else if (len == 3 && d[0] == 0x16) {
+		LOG_INF("LL_PHY_REQ (handle %u): tx 0x%02x rx 0x%02x, answering 1M", link, d[1],
+			d[2]);
+	} else if (len == 5 && d[0] == 0x18) {
+		LOG_INF("LL_PHY_UPDATE_IND (handle %u): c_to_p 0x%02x p_to_c 0x%02x", link, d[1],
+			d[2]);
 	}
 }
 
@@ -721,6 +794,7 @@ static void handle_rx(uint8_t link)
 		uint8_t llid = pdu.hdr0 & 0x03;
 
 		if (llid == LL_LLID_CTRL) {
+			log_llcp_rx(link, pdu.data, pdu.len);
 			ll_llcp_rx(link, pdu.data, pdu.len);
 			continue;
 		}

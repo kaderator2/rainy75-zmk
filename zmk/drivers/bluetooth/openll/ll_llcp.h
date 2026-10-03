@@ -34,6 +34,12 @@
 
 #include "ll_txq.h"
 
+/* Effective data length of a link (connEffectiveMaxTxOctets / TxTime /
+ * RxOctets / RxTime, Vol 6 Part B 4.5.10, 1M). Octets exclude the MIC. */
+struct ll_llcp_dle {
+	uint16_t max_tx_octets, max_tx_time, max_rx_octets, max_rx_time;
+};
+
 /* Events toward the host (HCI). Called in the context of the entry point
  * that caused them, without ll_plat_lock() or ll_plat_tx_lock() held. Disconnection Complete
  * and LE Connection Update Complete come from ll_conn, not from here. */
@@ -46,6 +52,9 @@ struct ll_llcp_ops {
 	 * queued. Not reported after a negative reply (the host chose it) or
 	 * when the link ends during the procedure (Disconnection Complete). */
 	void (*enc_change)(uint8_t link, uint8_t status, bool enabled);
+	/* HCI LE Data Length Change: the link's effective values
+	 * (connEffectiveMax*, Vol 6 Part B 4.5.10) changed. Only on a change. */
+	void (*data_len_change)(uint8_t link, const struct ll_llcp_dle *eff);
 };
 
 /* Once at startup. ops is copied (members may be NULL). Resets all links. */
@@ -69,10 +78,11 @@ uint8_t ll_llcp_ltk_neg_reply(uint8_t link);
  * via ll_conn_terminate(). Returns LL_ST_SUCCESS, or
  * LL_ST_UNKNOWN_CONN_ID without a connection on the link. */
 uint8_t ll_llcp_terminate(uint8_t link, uint8_t reason);
-/* Procedure response timeout (Vol 6 Part B 5.2), per link: 40 s from the
- * last LL control PDU the link queued in a procedure that waits on the
- * central (or on the host's LTK), then ll_conn_end(LL_ST_LMP_TIMEOUT) of
- * that link only. Checks all links. Call from the controller thread with
+/* Procedure response timeout (Vol 6 Part B 5.2), per link and procedure
+ * (encryption start, our LENGTH request, the PHY update after our
+ * LL_PHY_RSP): 40 s from the last LL control PDU the procedure queued while
+ * it waits on the central (or on the host's LTK), then
+ * ll_conn_end(LL_ST_LMP_TIMEOUT) of that link only. Checks all links. Call from the controller thread with
  * the stimer tick when ll_llcp_timeout_ticks() says it is due (calling it
  * earlier or more often is harmless). */
 void ll_llcp_tick(uint32_t now_tick);
@@ -83,11 +93,42 @@ void ll_llcp_tick(uint32_t now_tick);
 int32_t ll_llcp_timeout_ticks(uint32_t now_tick);
 /* ll_conn_ops.busy hook (peripheral latency): true while an LL control
  * procedure of the link waits on the host or the central (encryption
- * start: LL_ENC_RSP queued until our LL_START_ENC_RSP is queued). Reads
+ * start: LL_ENC_RSP queued until our LL_START_ENC_RSP is queued; our
+ * LL_LENGTH_REQ until LL_LENGTH_RSP; our LL_PHY_RSP until
+ * LL_PHY_UPDATE_IND). Reads
  * the procedure state without ll_plat_tx_lock(): ISR-safe, never blocks; a
  * stale answer costs at most one skip window. False for an out-of-range
  * link. */
 bool ll_llcp_busy(uint8_t link);
+
+/* Data Length Update procedure (Vol 6 Part B 5.1.9), per link.
+ * Responder: an LL_LENGTH_REQ is answered with LL_LENGTH_RSP carrying our
+ * connMax values (Rx: LL_DLE_SUPP_*, Tx: 27 / 328 or what the host set);
+ * the central's values (clamped to 27..251 / 328..17040) become the remote
+ * ones. Initiator (host LE Set Data Length): connMaxTx = the request
+ * clamped to 27..LL_DLE_SUPP_OCTETS / 328..LL_DLE_SUPP_TIME; when the
+ * central does not know these values yet, LL_LENGTH_REQ (deferred while
+ * the encryption start runs, sent right after it), 40 s response timer;
+ * LL_LENGTH_RSP completes it, LL_UNKNOWN_RSP / LL_REJECT_EXT_IND for
+ * opcode 0x14 ends it without a change. A crossing LL_LENGTH_REQ is
+ * answered normally and ours stays pending. ops.data_len_change reports
+ * every change of the effective values.
+ * Returns LL_ST_SUCCESS, LL_ST_UNKNOWN_CONN_ID (link out of range or not
+ * connected), LL_ST_DISALLOWED (our procedure still runs),
+ * LL_ST_UNSUPP_REMOTE (the central rejected LL_LENGTH_REQ before, or its
+ * features lack DLE) or LL_ST_MEM_CAPACITY (backlog full, nothing changed).
+ * Thread. */
+uint8_t ll_llcp_set_data_len(uint8_t link, uint16_t tx_octets, uint16_t tx_time);
+/* The link's effective values; 27 / 328 for a new connection and for an
+ * out-of-range link. Thread. */
+void ll_llcp_get_dle(uint8_t link, struct ll_llcp_dle *out);
+
+/* PHY Update procedure (5.1.10), responder, 1M only: LL_PHY_REQ ->
+ * LL_PHY_RSP(TX 1M, RX 1M) and the 40 s timer until the central's
+ * LL_PHY_UPDATE_IND. Every LL_PHY_UPDATE_IND keeps 1M: 0 (no change), 1M,
+ * and a PHY we lack / an RFU bit / several bits ("shall not change the PHY
+ * in that direction"); nothing goes to the host (no change, not host
+ * initiated). */
 
 /* Encrypt (when the link is encrypted) and queue one data PDU on the link:
  * ll_txq_push(link, ...) with ctrl_opcode = payload[0] for LL_TXQ_CTRL.

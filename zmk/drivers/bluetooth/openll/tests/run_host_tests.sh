@@ -36,5 +36,10 @@ for n in 1 3 5; do
     build_run_as test_rxq_n$n test_rxq -DLL_MAX_CONN=$n ../ll_rxq.c ../ll_crypt.c aes_ref.c
     build_run_as test_llcp_n$n test_llcp -DLL_MAX_CONN=$n \
         ../ll_llcp.c ../ll_crypt.c aes_ref.c
+    # slice 6b Task 3: the LENGTH rules with a supported maximum above 27
+    # (the device value stays LL_DATA_PDU_MAX = 27 until Task 4)
+    build_run_as test_llcp_dle_n$n test_llcp -DLL_MAX_CONN=$n -DLL_DLE_SUPP_OCTETS=251 \
+        ../ll_llcp.c ../ll_crypt.c aes_ref.c
+    build_run_as test_hci_dle_n$n test_hci -DLL_MAX_CONN=$n -DLL_DLE_SUPP_OCTETS=251 ../ll_hci.c
 done
 exit 0

@@ -32,6 +32,12 @@
  * procedure, timer or MIC failure of one link never touches another. The
  * single ll_plat_tx_lock() mutex serializes all links (cheap, and keeps
  * each link's TX counter order).
+ *
+ * Slice 6b: Data Length Update (5.1.9, values per 4.5.10) as responder and
+ * initiator, and the PHY Update procedure (5.1.10) as a 1M-only responder.
+ * Each procedure kind has its own 40 s response timer (TMR_ENC, TMR_DLE,
+ * TMR_PHY): they can overlap (LENGTH has no instant, so it is compatible
+ * with the others, 5.3), and one completing must not stop another's timer.
  */
 #include <errno.h>
 #include <string.h>
@@ -63,8 +69,11 @@
 #define OP_CONN_PARAM_RSP    0x10
 #define OP_REJECT_EXT_IND    0x11
 #define OP_PING_RSP          0x13
+#define OP_LENGTH_REQ        0x14
 #define OP_LENGTH_RSP        0x15
+#define OP_PHY_REQ           0x16
 #define OP_PHY_RSP           0x17
+#define OP_PHY_UPDATE_IND    0x18
 
 /* payload length incl. the opcode */
 #define LEN_CONN_UPDATE_IND  12
@@ -75,8 +84,21 @@
 #define LEN_VERSION_IND      6
 #define LEN_START_ENC_RSP    1
 #define LEN_PAUSE_ENC_REQ    1
+#define LEN_UNKNOWN_RSP      2
+#define LEN_REJECT_EXT_IND   3
+#define LEN_LENGTH           9    /* LL_LENGTH_REQ and LL_LENGTH_RSP */
+#define LEN_PHY_REQ          3
+#define LEN_PHY_UPDATE_IND   5
 
 #define RSP_TIMEOUT_TICKS    (40000000u * LL_TICKS_PER_US)
+
+/* per-link procedure response timers (Vol 6 Part B 5.2) */
+enum {
+	TMR_ENC,   /* encryption start: waits on the host's LTK / the central */
+	TMR_DLE,   /* our LL_LENGTH_REQ: waits on LL_LENGTH_RSP */
+	TMR_PHY,   /* our LL_PHY_RSP: waits on LL_PHY_UPDATE_IND */
+	TMR_N,
+};
 
 enum enc_state {
 	ENC_IDLE,
@@ -96,8 +118,16 @@ static struct llcp_link {
 	uint8_t peer_feat0;   /* byte 0 of the central's LL_FEATURE_REQ */
 	uint8_t skdm[8];
 	uint8_t skds[8];
-	bool tmr_on;
-	uint32_t tmr_start;
+	bool tmr_on[TMR_N];
+	uint32_t tmr_start[TMR_N];
+	/* Data length (4.5.10), each as {tx octets, tx time, rx octets, rx time}:
+	 * own = connMax*, remote = connRemoteMax* (the central's Tx / Rx),
+	 * told = our values as the central knows them (27 / 328 until our
+	 * LL_LENGTH_REQ or LL_LENGTH_RSP carried others), eff = effective. */
+	struct ll_llcp_dle own, remote, told, eff;
+	bool dle_pending;     /* our LL_LENGTH_REQ queued, LL_LENGTH_RSP awaited */
+	bool dle_want;        /* own != told: send LL_LENGTH_REQ after the encryption start */
+	bool dle_unsupp;      /* the central answered LL_UNKNOWN_RSP to LL_LENGTH_REQ */
 } links[LL_MAX_CONN];
 
 /* Caller holds ll_plat_tx_lock(); link < LL_MAX_CONN. */
@@ -190,10 +220,281 @@ static void reject(uint8_t link, uint8_t op, uint8_t err)
 }
 
 /* caller holds ll_plat_tx_lock() */
-static void timer_start(struct llcp_link *s)
+static void timer_start(struct llcp_link *s, unsigned int t)
 {
-	s->tmr_on = true;
-	s->tmr_start = ll_radio_now();
+	s->tmr_on[t] = true;
+	s->tmr_start[t] = ll_radio_now();
+}
+
+/* ---- data length (Vol 6 Part B 4.5.10, 5.1.9) ---- */
+
+static const struct ll_llcp_dle dle_default = {
+	.max_tx_octets = LL_DLE_MIN_OCTETS, .max_tx_time = LL_DLE_MIN_TIME,
+	.max_rx_octets = LL_DLE_MIN_OCTETS, .max_rx_time = LL_DLE_MIN_TIME,
+};
+
+static uint16_t min_u16(uint16_t a, uint16_t b)
+{
+	return a < b ? a : b;
+}
+
+static uint16_t clamp_u16(uint16_t v, uint16_t lo, uint16_t hi)
+{
+	return v < lo ? lo : (v > hi ? hi : v);
+}
+
+static bool dle_same(const struct ll_llcp_dle *a, const struct ll_llcp_dle *b)
+{
+	return a->max_tx_octets == b->max_tx_octets && a->max_tx_time == b->max_tx_time &&
+	       a->max_rx_octets == b->max_rx_octets && a->max_rx_time == b->max_rx_time;
+}
+
+/* New connection: connMaxTx = 27 / 328 until the host (or the glue, from
+ * the suggested default) sets more; connMaxRx = what we can receive; the
+ * remote values are 27 / 328 (4.5.10 "For a new connection"). */
+static void dle_init(struct llcp_link *s)
+{
+	s->own = dle_default;
+	s->own.max_rx_octets = LL_DLE_SUPP_OCTETS;
+	s->own.max_rx_time = LL_DLE_SUPP_TIME;
+	s->remote = dle_default;
+	s->told = dle_default;
+	s->eff = dle_default;
+}
+
+/* Recompute the effective values; true when one changed. Caller holds
+ * ll_plat_tx_lock(). */
+static bool dle_eff_update(struct llcp_link *s)
+{
+	struct ll_llcp_dle e = {
+		.max_tx_octets = min_u16(s->own.max_tx_octets, s->remote.max_rx_octets),
+		.max_tx_time = min_u16(s->own.max_tx_time, s->remote.max_rx_time),
+		.max_rx_octets = min_u16(s->own.max_rx_octets, s->remote.max_tx_octets),
+		.max_rx_time = min_u16(s->own.max_rx_time, s->remote.max_tx_time),
+	};
+	bool changed = !dle_same(&e, &s->eff);
+
+	s->eff = e;
+	return changed;
+}
+
+/* CtrData of LL_LENGTH_REQ / LL_LENGTH_RSP: MaxRxOctets, MaxRxTime,
+ * MaxTxOctets, MaxTxTime (2.4.2.21). */
+static void dle_build(uint8_t pdu[LEN_LENGTH], uint8_t op, const struct ll_llcp_dle *v)
+{
+	pdu[0] = op;
+	ll_put_le16(&pdu[1], v->max_rx_octets);
+	ll_put_le16(&pdu[3], v->max_rx_time);
+	ll_put_le16(&pdu[5], v->max_tx_octets);
+	ll_put_le16(&pdu[7], v->max_tx_time);
+}
+
+/* The central's values; below the minimum (it "shall" not send that) taken
+ * as the minimum, above the Table 4.6 range capped. */
+static void dle_parse_remote(struct llcp_link *s, const uint8_t *p)
+{
+	s->remote.max_rx_octets = clamp_u16(ll_get_le16(&p[1]), LL_DLE_MIN_OCTETS, LL_DLE_MAX_OCTETS);
+	s->remote.max_rx_time = clamp_u16(ll_get_le16(&p[3]), LL_DLE_MIN_TIME, LL_DLE_MAX_TIME_ANY);
+	s->remote.max_tx_octets = clamp_u16(ll_get_le16(&p[5]), LL_DLE_MIN_OCTETS, LL_DLE_MAX_OCTETS);
+	s->remote.max_tx_time = clamp_u16(ll_get_le16(&p[7]), LL_DLE_MIN_TIME, LL_DLE_MAX_TIME_ANY);
+}
+
+/* Our LL_LENGTH_REQ (initiator). Caller holds ll_plat_tx_lock(). */
+static int dle_send_req_locked(uint8_t link)
+{
+	struct llcp_link *s = &links[link];
+	uint8_t pdu[LEN_LENGTH];
+	int ret;
+
+	dle_build(pdu, OP_LENGTH_REQ, &s->own);
+	ret = tx_locked(link, LL_TXQ_CTRL, LL_LLID_CTRL, pdu, sizeof(pdu));
+	if (ret == 0) {
+		s->told = s->own;
+		s->dle_pending = true;
+		s->dle_want = false;
+		timer_start(s, TMR_DLE);
+	}
+	return ret;
+}
+
+/* A request deferred by the encryption start leaves once the link is out
+ * of it. A failed push (backlog full) is not retried: the central keeps
+ * our previous values, which stay valid. Caller holds ll_plat_tx_lock(). */
+static void dle_flush_locked(uint8_t link)
+{
+	struct llcp_link *s = &links[link];
+
+	if (!s->dle_want || s->enc != ENC_IDLE || s->dle_pending) {
+		return;
+	}
+	s->dle_want = false;
+	if (!dle_same(&s->own, &s->told)) {
+		(void)dle_send_req_locked(link);
+	}
+}
+
+static void dle_notify(uint8_t link, const struct ll_llcp_dle *eff)
+{
+	if (ops.data_len_change) {
+		ops.data_len_change(link, eff);
+	}
+}
+
+/* Responder: answer with our connMax values (also while our own request
+ * runs: a crossing is harmless, 5.1.9 Note). */
+static void rx_length_req(uint8_t link, const uint8_t *p)
+{
+	struct llcp_link *s = &links[link];
+	struct ll_llcp_dle eff;
+	uint8_t rsp[LEN_LENGTH];
+	bool changed;
+
+	ll_plat_tx_lock();
+	dle_parse_remote(s, p);
+	changed = dle_eff_update(s);
+	eff = s->eff;
+	dle_build(rsp, OP_LENGTH_RSP, &s->own);
+	if (tx_locked(link, LL_TXQ_CTRL, LL_LLID_CTRL, rsp, sizeof(rsp)) == 0) {
+		/* "use the response to communicate the changes" */
+		s->told = s->own;
+	}
+	ll_plat_tx_unlock();
+	if (changed) {
+		dle_notify(link, &eff);
+	}
+}
+
+/* Initiator: the response to our LL_LENGTH_REQ completes the procedure;
+ * any other LL_LENGTH_RSP is ignored (5.1.9: only "a response to an
+ * LL_LENGTH_REQ" updates the remote values). */
+static void rx_length_rsp(uint8_t link, const uint8_t *p)
+{
+	struct llcp_link *s = &links[link];
+	struct ll_llcp_dle eff;
+	bool changed = false;
+
+	ll_plat_tx_lock();
+	if (s->dle_pending) {
+		s->dle_pending = false;
+		s->tmr_on[TMR_DLE] = false;
+		dle_parse_remote(s, p);
+		changed = dle_eff_update(s);
+	}
+	eff = s->eff;
+	ll_plat_tx_unlock();
+	if (changed) {
+		dle_notify(link, &eff);
+	}
+}
+
+/* LL_UNKNOWN_RSP / LL_REJECT_EXT_IND naming one of our requests: the
+ * procedure ends without a change. */
+static void rx_proc_refused(uint8_t link, uint8_t op, bool unknown)
+{
+	struct llcp_link *s = &links[link];
+
+	if (op != OP_LENGTH_REQ) {
+		return;
+	}
+	ll_plat_tx_lock();
+	if (s->dle_pending) {
+		s->dle_pending = false;
+		s->tmr_on[TMR_DLE] = false;
+		if (unknown) {
+			s->dle_unsupp = true;
+		}
+	}
+	ll_plat_tx_unlock();
+}
+
+uint8_t ll_llcp_set_data_len(uint8_t link, uint16_t tx_octets, uint16_t tx_time)
+{
+	struct llcp_link *s;
+	struct ll_llcp_dle prev, eff;
+	bool changed = false;
+	uint8_t st;
+
+	if (link >= LL_MAX_CONN || !ll_conn_active(link)) {
+		return LL_ST_UNKNOWN_CONN_ID;
+	}
+	s = &links[link];
+	tx_octets = clamp_u16(tx_octets, LL_DLE_MIN_OCTETS, LL_DLE_SUPP_OCTETS);
+	tx_time = clamp_u16(tx_time, LL_DLE_MIN_TIME, LL_DLE_SUPP_TIME);
+
+	ll_plat_tx_lock();
+	prev = s->own;
+	s->own.max_tx_octets = tx_octets;
+	s->own.max_tx_time = tx_time;
+	if (s->dle_pending) {
+		s->own = prev;
+		st = LL_ST_DISALLOWED;
+	} else if (dle_same(&s->own, &s->told)) {
+		/* the central knows these values: no procedure needed */
+		s->dle_want = false;
+		changed = dle_eff_update(s);
+		st = LL_ST_SUCCESS;
+	} else if (s->dle_unsupp ||
+		   (s->peer_feat_valid && !(s->peer_feat0 & LL_FEAT_DLE))) {
+		s->own = prev;
+		st = LL_ST_UNSUPP_REMOTE;
+	} else if (s->enc != ENC_IDLE) {
+		/* no other procedure's PDU during the encryption start
+		 * (5.1.3.1): sent by dle_flush_locked() once it ended */
+		s->dle_want = true;
+		changed = dle_eff_update(s);
+		st = LL_ST_SUCCESS;
+	} else if (dle_send_req_locked(link) == 0) {
+		/* a lower connMaxTx applies at once, a higher one up to what
+		 * the central said it receives */
+		changed = dle_eff_update(s);
+		st = LL_ST_SUCCESS;
+	} else {
+		s->own = prev;
+		st = LL_ST_MEM_CAPACITY;
+	}
+	eff = s->eff;
+	ll_plat_tx_unlock();
+	if (changed) {
+		dle_notify(link, &eff);
+	}
+	return st;
+}
+
+void ll_llcp_get_dle(uint8_t link, struct ll_llcp_dle *out)
+{
+	if (link >= LL_MAX_CONN) {
+		*out = dle_default;
+		return;
+	}
+	ll_plat_tx_lock();
+	*out = links[link].eff;
+	ll_plat_tx_unlock();
+}
+
+/* ---- PHY (5.1.10), 1M only ---- */
+
+static void rx_phy_req(uint8_t link)
+{
+	static const uint8_t rsp[3] = {OP_PHY_RSP, LL_PHY_1M, LL_PHY_1M};
+	struct llcp_link *s = &links[link];
+
+	ll_plat_tx_lock();
+	if (tx_locked(link, LL_TXQ_CTRL, LL_LLID_CTRL, rsp, sizeof(rsp)) == 0) {
+		timer_start(s, TMR_PHY);   /* until LL_PHY_UPDATE_IND */
+	}
+	ll_plat_tx_unlock();
+}
+
+/* Every LL_PHY_UPDATE_IND keeps 1M in both directions: 0 = unchanged (no
+ * instant), 0x01 = the PHY in use, anything else (2M, Coded, an RFU bit,
+ * several bits) is a PHY we did not offer and "the Peripheral shall not
+ * change the PHY in that direction". No change and not host initiated:
+ * the host is not told. The procedure is complete. */
+static void rx_phy_update_ind(uint8_t link)
+{
+	ll_plat_tx_lock();
+	links[link].tmr_on[TMR_PHY] = false;
+	ll_plat_tx_unlock();
 }
 
 static void put_le32(uint8_t *p, uint32_t v)
@@ -225,7 +526,7 @@ static void rx_enc_req(uint8_t link, const uint8_t *p)
 		if (tx_locked(link, LL_TXQ_CTRL, LL_LLID_CTRL, rsp, sizeof(rsp)) == 0) {
 			s->enc = ENC_WAIT_LTK;
 			s->paused = true;
-			timer_start(s);
+			timer_start(s, TMR_ENC);
 			sent = true;
 		} else {
 			/* backlog full: the central waits for LL_ENC_RSP and
@@ -265,8 +566,10 @@ static void rx_start_enc_rsp(uint8_t link)
 		if (tx_locked(link, LL_TXQ_CTRL, LL_LLID_CTRL, rsp, sizeof(rsp)) == 0) {
 			s->enc = ENC_IDLE;
 			s->paused = false;
-			s->tmr_on = false;
+			s->tmr_on[TMR_ENC] = false;
 			done = true;
+			/* a LENGTH request the host made meanwhile */
+			dle_flush_locked(link);
 		} else {
 			/* backlog full: stay in the procedure, the
 			 * response timer ends the link */
@@ -359,6 +662,9 @@ static uint8_t expected_len(uint8_t op)
 	case OP_FEATURE_REQ:     return LEN_FEATURE_REQ;
 	case OP_VERSION_IND:     return LEN_VERSION_IND;
 	case OP_PAUSE_ENC_REQ:   return LEN_PAUSE_ENC_REQ;
+	case OP_LENGTH_REQ:      return LEN_LENGTH;
+	case OP_PHY_REQ:         return LEN_PHY_REQ;
+	case OP_PHY_UPDATE_IND:  return LEN_PHY_UPDATE_IND;
 	default:                 return 0;
 	}
 }
@@ -396,12 +702,25 @@ void ll_llcp_rx(uint8_t link, const uint8_t *payload, uint8_t len)
 		rx_start_enc_rsp(link);
 		return;
 	}
+	/* responses to our own requests (else dropped by ignored()) */
+	if (op == OP_LENGTH_RSP && len == LEN_LENGTH) {
+		rx_length_rsp(link, payload);
+		return;
+	}
+	if (op == OP_UNKNOWN_RSP && len == LEN_UNKNOWN_RSP) {
+		rx_proc_refused(link, payload[1], true);
+		return;
+	}
+	if (op == OP_REJECT_EXT_IND && len == LEN_REJECT_EXT_IND) {
+		rx_proc_refused(link, payload[1], false);
+		return;
+	}
 	if (ignored(op)) {
 		return;
 	}
 	want = expected_len(op);
 	if (want == 0 || len != want) {
-		/* Unsupported (LENGTH, PHY, PING, PERIPHERAL_FEATURE,
+		/* Unsupported (PING, PERIPHERAL_FEATURE, MIN_USED_CHANNELS,
 		 * CONN_PARAM, ...), or a known request whose length is not
 		 * exactly the specified one: LL_UNKNOWN_RSP, as Zephyr ll_sw
 		 * does for PDUs failing its exact-length validation. */
@@ -430,6 +749,15 @@ void ll_llcp_rx(uint8_t link, const uint8_t *payload, uint8_t len)
 	case OP_PAUSE_ENC_REQ:
 		/* encryption pause / key refresh not supported */
 		reject(link, OP_PAUSE_ENC_REQ, LL_ST_UNSUPP_REMOTE);
+		break;
+	case OP_LENGTH_REQ:
+		rx_length_req(link, payload);
+		break;
+	case OP_PHY_REQ:
+		rx_phy_req(link);
+		break;
+	case OP_PHY_UPDATE_IND:
+		rx_phy_update_ind(link);
 		break;
 	default:
 		break;
@@ -481,7 +809,7 @@ uint8_t ll_llcp_ltk_reply(uint8_t link, const uint8_t ltk[16])
 		ll_crypt_wipe(sk, sizeof(sk));
 		s->enc = ENC_WAIT_START_RSP;
 		(void)tx_locked(link, LL_TXQ_CTRL, LL_LLID_CTRL, req, sizeof(req));
-		timer_start(s);
+		timer_start(s, TMR_ENC);
 		st = LL_ST_SUCCESS;
 	}
 	ll_plat_tx_unlock();
@@ -502,13 +830,17 @@ uint8_t ll_llcp_ltk_neg_reply(uint8_t link)
 	if (ok) {
 		s->enc = ENC_IDLE;
 		s->paused = false;
-		s->tmr_on = false;
+		s->tmr_on[TMR_ENC] = false;
 	}
 	ll_plat_tx_unlock();
 	if (!ok) {
 		return LL_ST_DISALLOWED;
 	}
 	reject(link, OP_ENC_REQ, LL_ST_PIN_KEY_MISSING);
+	/* a LENGTH request the host made meanwhile, after the reject */
+	ll_plat_tx_lock();
+	dle_flush_locked(link);
+	ll_plat_tx_unlock();
 	return LL_ST_SUCCESS;
 }
 
@@ -529,12 +861,19 @@ void ll_llcp_tick(uint32_t now_tick)
 	for (uint8_t i = 0; i < LL_MAX_CONN; i++) {
 		struct llcp_link *s = &links[i];
 
-		expired[i] = s->tmr_on &&
-			     (int32_t)(now_tick - s->tmr_start) >= (int32_t)RSP_TIMEOUT_TICKS;
+		expired[i] = false;
+		for (unsigned int t = 0; t < TMR_N; t++) {
+			expired[i] |= s->tmr_on[t] &&
+				      (int32_t)(now_tick - s->tmr_start[t]) >=
+					      (int32_t)RSP_TIMEOUT_TICKS;
+		}
 		if (expired[i]) {
-			s->tmr_on = false;
+			/* the link is lost: every procedure on it ends */
+			memset(s->tmr_on, 0, sizeof(s->tmr_on));
 			s->enc = ENC_IDLE;
 			s->paused = false;
+			s->dle_pending = false;
+			s->dle_want = false;
 		}
 	}
 	ll_plat_tx_unlock();
@@ -552,17 +891,20 @@ int32_t ll_llcp_timeout_ticks(uint32_t now_tick)
 	ll_plat_tx_lock();
 	for (uint8_t i = 0; i < LL_MAX_CONN; i++) {
 		const struct llcp_link *s = &links[i];
-		int32_t left;
 
-		if (!s->tmr_on) {
-			continue;
-		}
-		left = (int32_t)RSP_TIMEOUT_TICKS - (int32_t)(now_tick - s->tmr_start);
-		if (left < 0) {
-			left = 0;
-		}
-		if (min < 0 || left < min) {
-			min = left;
+		for (unsigned int t = 0; t < TMR_N; t++) {
+			int32_t left;
+
+			if (!s->tmr_on[t]) {
+				continue;
+			}
+			left = (int32_t)RSP_TIMEOUT_TICKS - (int32_t)(now_tick - s->tmr_start[t]);
+			if (left < 0) {
+				left = 0;
+			}
+			if (min < 0 || left < min) {
+				min = left;
+			}
 		}
 	}
 	ll_plat_tx_unlock();
@@ -580,8 +922,15 @@ bool ll_llcp_busy(uint8_t link)
 		return false;
 	}
 	s = &links[link];
-	return *(volatile enum enc_state *)&s->enc != ENC_IDLE ||
-	       *(volatile bool *)&s->paused || *(volatile bool *)&s->tmr_on;
+	if (*(volatile enum enc_state *)&s->enc != ENC_IDLE || *(volatile bool *)&s->paused) {
+		return true;
+	}
+	for (unsigned int t = 0; t < TMR_N; t++) {
+		if (*(volatile bool *)&s->tmr_on[t]) {
+			return true;
+		}
+	}
+	return false;
 }
 
 void ll_llcp_init(const struct ll_llcp_ops *o)
@@ -602,5 +951,6 @@ void ll_llcp_reset(uint8_t link)
 	}
 	ll_plat_tx_lock();
 	memset(&links[link], 0, sizeof(links[link]));   /* also wipes the session key */
+	dle_init(&links[link]);
 	ll_plat_tx_unlock();
 }

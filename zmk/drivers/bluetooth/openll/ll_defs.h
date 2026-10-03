@@ -26,6 +26,7 @@ _Static_assert(LL_MAX_CONN >= 1 && LL_MAX_CONN <= 5, "LL_MAX_CONN must be 1..5")
 #define LL_ST_SUCCESS        0x00
 #define LL_ST_UNKNOWN_CMD    0x01
 #define LL_ST_UNKNOWN_CONN_ID 0x02
+#define LL_ST_MEM_CAPACITY   0x07   /* Memory Capacity Exceeded */
 #define LL_ST_DISALLOWED     0x0C
 #define LL_ST_UNSUPPORTED    0x11
 #define LL_ST_INVALID_PARAM  0x12
@@ -67,11 +68,38 @@ _Static_assert(LL_MAX_CONN >= 1 && LL_MAX_CONN <= 5, "LL_MAX_CONN must be 1..5")
  * Used by LL_FEATURE_RSP and HCI LE Read Local Supported Features. */
 #define LL_FEAT_LE_ENC        0x01   /* bit 0: LE Encryption */
 #define LL_FEAT_EXT_REJ_IND   0x04   /* bit 2: Extended Reject Indication */
-#define LL_FEATURES_LOW       (LL_FEAT_LE_ENC | LL_FEAT_EXT_REJ_IND)
+#define LL_FEAT_DLE           0x20   /* bit 5: LE Data Packet Length Extension */
+#define LL_FEATURES_LOW       (LL_FEAT_LE_ENC | LL_FEAT_EXT_REJ_IND | LL_FEAT_DLE)
 /* byte 1 of the feature set (LL_FEATURE_RSP sends our own byte 1, HCI LE
  * Read Local Supported Features reports it) */
 #define LL_FEAT1_CSA2         0x40   /* bit 14: Channel Selection Algorithm #2 */
 #define LL_FEATURES_BYTE1     (LL_FEAT1_CSA2)
+
+/* Data Length Extension (Vol 6 Part B 4.5.10, Table 4.6, 1M only).
+ * "Octets" is the Payload length WITHOUT the MIC (2.4: the header Length
+ * covers Payload and MIC, the Payload is at most 251), so the plaintext
+ * limit of an encrypted PDU is connEffectiveMaxTxOctets itself. "Time" is
+ * the whole packet incl. the MIC: preamble 1 + AA 4 + header 2 + payload +
+ * MIC 4 + CRC 3 octets at 8 us: LL_DLE_TIME_1M(27) = 328,
+ * LL_DLE_TIME_1M(251) = 2120. */
+#define LL_DLE_MIN_OCTETS     27
+#define LL_DLE_MIN_TIME       328
+#define LL_DLE_MAX_OCTETS     251
+#define LL_DLE_MAX_TIME_1M    2120
+#define LL_DLE_MAX_TIME_ANY   17040  /* Table 4.6 upper bound (Coded); remote values are capped to it */
+#define LL_DLE_TIME_1M(octets) (((octets) + 14) * 8)
+/* Our supportedMax{Tx,Rx}Octets: what the data path can carry. Follows
+ * LL_DATA_PDU_MAX (27 until slice 6b Task 4 raises it); host tests may
+ * override it. supportedMax{Tx,Rx}Time is the 1M time for it. */
+#ifndef LL_DLE_SUPP_OCTETS
+#define LL_DLE_SUPP_OCTETS    (LL_DATA_PDU_MAX < LL_DLE_MAX_OCTETS ? LL_DATA_PDU_MAX : LL_DLE_MAX_OCTETS)
+#endif
+#define LL_DLE_SUPP_TIME      LL_DLE_TIME_1M(LL_DLE_SUPP_OCTETS)
+_Static_assert(LL_DLE_SUPP_OCTETS >= LL_DLE_MIN_OCTETS && LL_DLE_SUPP_OCTETS <= LL_DLE_MAX_OCTETS,
+	       "LL_DLE_SUPP_OCTETS must be 27..251");
+
+/* PHY bits (Vol 6 Part B 2.4.2.22, HCI TX_PHYs/RX_PHYs) and HCI PHY values */
+#define LL_PHY_1M             0x01
 
 /* Controller identity reported via Read Local Version Information */
 #define LL_HCI_VERSION    0x09   /* Bluetooth Core 5.0 */

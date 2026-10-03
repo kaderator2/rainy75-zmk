@@ -27,6 +27,13 @@
 #define OP_LE_RAND               OP(0x08, 0x0018)
 #define OP_LE_LTK_REPLY          OP(0x08, 0x001A)
 #define OP_LE_LTK_NEG_REPLY      OP(0x08, 0x001B)
+#define OP_LE_SET_DATA_LEN       OP(0x08, 0x0022)
+#define OP_LE_READ_DEF_DATA_LEN  OP(0x08, 0x0023)
+#define OP_LE_WRITE_DEF_DATA_LEN OP(0x08, 0x0024)
+#define OP_LE_READ_MAX_DATA_LEN  OP(0x08, 0x002F)
+#define OP_LE_READ_PHY           OP(0x08, 0x0030)
+#define OP_LE_SET_DEFAULT_PHY    OP(0x08, 0x0031)
+#define OP_LE_SET_PHY            OP(0x08, 0x0032)
 
 /* Events (Vol 4 Part E 7.7) */
 #define EVT_DISCONN_COMPLETE     0x05
@@ -38,6 +45,8 @@
 #define SUBEVT_CONN_COMPLETE     0x01
 #define SUBEVT_CONN_UPDATE       0x03
 #define SUBEVT_LTK_REQ           0x05
+#define SUBEVT_DATA_LEN_CHANGE   0x07
+#define SUBEVT_PHY_UPDATE        0x0C
 #define SUBEVT_CHAN_SEL_ALGO     0x14
 
 /* Event mask bits (7.3.1) and defaults (7.3.1, 7.8.1) */
@@ -70,17 +79,45 @@ static const uint8_t supported_cmds[][2] = {
 	{27, 7}, /* LE Rand */
 	{28, 1}, /* LE Long Term Key Request Reply */
 	{28, 2}, /* LE Long Term Key Request Negative Reply */
+	{33, 6}, /* LE Set Data Length */
+	{33, 7}, /* LE Read Suggested Default Data Length */
+	{34, 0}, /* LE Write Suggested Default Data Length */
+	{35, 3}, /* LE Read Maximum Data Length */
+	{35, 4}, /* LE Read PHY */
+	{35, 5}, /* LE Set Default PHY */
+	{35, 6}, /* LE Set PHY */
 };
+
+/* HCI parameter ranges of TX_Octets / TX_Time (Vol 4 Part E 7.8.33-35) */
+#define HCI_DLE_OCTETS_MIN       0x001B
+#define HCI_DLE_OCTETS_MAX       0x00FB
+#define HCI_DLE_TIME_MIN         0x0148
+#define HCI_DLE_TIME_MAX         0x4290
 
 static const struct ll_hci_ops *hci_ops;
 static ll_hci_sink_t hci_sink;
 static uint64_t event_mask = EVENT_MASK_DEFAULT;
 static uint64_t le_event_mask = LE_EVENT_MASK_DEFAULT;
+/* Host suggestions for new connections (7.8.35) and default PHYs (7.8.48);
+ * the PHY preference is stored only (1M is the one PHY we have). */
+static uint16_t def_tx_octets = LL_DLE_MIN_OCTETS, def_tx_time = LL_DLE_MIN_TIME;
+static uint8_t def_phy[3] = {0x00, LL_PHY_1M, LL_PHY_1M};   /* All_PHYs, TX, RX */
 
 static void masks_default(void)
 {
 	event_mask = EVENT_MASK_DEFAULT;
 	le_event_mask = LE_EVENT_MASK_DEFAULT;
+	def_tx_octets = LL_DLE_MIN_OCTETS;
+	def_tx_time = LL_DLE_MIN_TIME;
+	def_phy[0] = 0x00;
+	def_phy[1] = LL_PHY_1M;
+	def_phy[2] = LL_PHY_1M;
+}
+
+void ll_hci_default_data_len(uint16_t *tx_octets, uint16_t *tx_time)
+{
+	*tx_octets = def_tx_octets;
+	*tx_time = def_tx_time;
 }
 
 void ll_hci_init(const struct ll_hci_ops *ops, ll_hci_sink_t sink)
@@ -88,6 +125,7 @@ void ll_hci_init(const struct ll_hci_ops *ops, ll_hci_sink_t sink)
 	/* required by the connection commands and host ACL: fail loudly at
 	 * init instead of a NULL call on the first Disconnect / ACL packet */
 	assert(ops != NULL && ops->handle_valid != NULL);
+	assert(ops->set_data_len != NULL && ops->read_phy != NULL && ops->set_phy != NULL);
 	hci_ops = ops;
 	hci_sink = sink;
 	masks_default();
@@ -171,6 +209,108 @@ static void ltk_reply(uint16_t op, const uint8_t *p, uint8_t plen)
 		ret[0] = hci_ops->ltk_neg_reply(ll_get_le16(p));
 	}
 	cmd_complete(op, ret, 3);
+}
+
+static bool dle_range_ok(uint16_t octets, uint16_t time)
+{
+	return octets >= HCI_DLE_OCTETS_MIN && octets <= HCI_DLE_OCTETS_MAX &&
+	       time >= HCI_DLE_TIME_MIN && time <= HCI_DLE_TIME_MAX;
+}
+
+/* LE Set Data Length: Command Complete (status, handle) */
+static void set_data_len(uint16_t op, const uint8_t *p, uint8_t plen)
+{
+	uint8_t ret[3];
+	uint16_t h;
+
+	if (plen != 6) {
+		status_only(op, LL_ST_INVALID_PARAM);
+		return;
+	}
+	h = ll_get_le16(p);
+	memcpy(&ret[1], p, 2);
+	if (!dle_range_ok(ll_get_le16(&p[2]), ll_get_le16(&p[4]))) {
+		ret[0] = LL_ST_INVALID_PARAM;
+	} else if (!hci_ops->handle_valid(h)) {
+		ret[0] = LL_ST_UNKNOWN_CONN_ID;
+	} else {
+		ret[0] = hci_ops->set_data_len(h, ll_get_le16(&p[2]), ll_get_le16(&p[4]));
+	}
+	cmd_complete(op, ret, 3);
+}
+
+/* LE Read PHY: Command Complete (status, handle, TX_PHY, RX_PHY) */
+static void read_phy(uint16_t op, const uint8_t *p, uint8_t plen)
+{
+	uint8_t ret[5] = {0};
+	uint16_t h;
+
+	if (plen != 2) {
+		status_only(op, LL_ST_INVALID_PARAM);
+		return;
+	}
+	h = ll_get_le16(p);
+	memcpy(&ret[1], p, 2);
+	if (!hci_ops->handle_valid(h)) {
+		ret[0] = LL_ST_UNKNOWN_CONN_ID;
+	} else {
+		ret[0] = hci_ops->read_phy(h, &ret[3], &ret[4]);
+	}
+	cmd_complete(op, ret, 5);
+}
+
+/* All_PHYs / TX_PHYs / RX_PHYs of LE Set Default PHY and LE Set PHY
+ * (7.8.48, 7.8.49): a direction with a preference needs at least one bit
+ * (else Invalid HCI Command Parameters); a bit for a PHY we lack, RFU
+ * included, is Unsupported Feature or Parameter Value. Only 1M here, so no
+ * asymmetric combination can pass. */
+static uint8_t phys_check(uint8_t all, uint8_t tx, uint8_t rx)
+{
+	if (!(all & 0x01)) {
+		if (tx == 0) {
+			return LL_ST_INVALID_PARAM;
+		}
+		if (tx & ~LL_PHY_1M) {
+			return LL_ST_UNSUPPORTED;
+		}
+	}
+	if (!(all & 0x02)) {
+		if (rx == 0) {
+			return LL_ST_INVALID_PARAM;
+		}
+		if (rx & ~LL_PHY_1M) {
+			return LL_ST_UNSUPPORTED;
+		}
+	}
+	return LL_ST_SUCCESS;
+}
+
+/* LE Set PHY: Command Status; on success LE PHY Update Complete follows
+ * right away from here (1M only: "neither PHY will change immediately",
+ * 7.8.49), through the same sink, so it cannot overtake the status. */
+static void set_phy(uint16_t op, const uint8_t *p, uint8_t plen)
+{
+	uint8_t st, tx = LL_PHY_1M, rx = LL_PHY_1M;
+	uint16_t h;
+
+	if (plen != 7) {
+		cmd_status(op, LL_ST_INVALID_PARAM);
+		return;
+	}
+	h = ll_get_le16(p);
+	if (!hci_ops->handle_valid(h)) {
+		cmd_status(op, LL_ST_UNKNOWN_CONN_ID);
+		return;
+	}
+	st = phys_check(p[2], p[3], p[4]);
+	if (st == LL_ST_SUCCESS) {
+		st = hci_ops->set_phy(h, p[2], p[3], p[4], ll_get_le16(&p[5]));
+	}
+	cmd_status(op, st);
+	if (st == LL_ST_SUCCESS) {
+		(void)hci_ops->read_phy(h, &tx, &rx);
+		ll_hci_evt_phy_update(h, LL_ST_SUCCESS, tx, rx);
+	}
 }
 
 static void set_adv_params(uint16_t op, const uint8_t *p, uint8_t plen)
@@ -294,6 +434,57 @@ void ll_hci_cmd(const uint8_t *cmd, uint16_t len)
 		break;
 	case OP_LE_SET_SCAN_RSP_DATA:
 		set_data(op, p, plen, hci_ops->adv_set_scan_rsp);
+		break;
+	case OP_LE_SET_DATA_LEN:
+		set_data_len(op, p, plen);
+		break;
+	case OP_LE_READ_DEF_DATA_LEN:
+		if (plen != 0) {
+			status_only(op, LL_ST_INVALID_PARAM);
+			break;
+		}
+		ll_put_le16(&ret[1], def_tx_octets);
+		ll_put_le16(&ret[3], def_tx_time);
+		cmd_complete(op, ret, 5);
+		break;
+	case OP_LE_WRITE_DEF_DATA_LEN:
+		if (plen != 4 || !dle_range_ok(ll_get_le16(p), ll_get_le16(&p[2]))) {
+			status_only(op, LL_ST_INVALID_PARAM);
+			break;
+		}
+		/* stored as written (7.8.34 reads them back); clamped to what
+		 * we support per connection (ll_llcp_set_data_len) */
+		def_tx_octets = ll_get_le16(p);
+		def_tx_time = ll_get_le16(&p[2]);
+		status_only(op, LL_ST_SUCCESS);
+		break;
+	case OP_LE_READ_MAX_DATA_LEN:
+		if (plen != 0) {
+			status_only(op, LL_ST_INVALID_PARAM);
+			break;
+		}
+		ll_put_le16(&ret[1], LL_DLE_SUPP_OCTETS);
+		ll_put_le16(&ret[3], LL_DLE_SUPP_TIME);
+		ll_put_le16(&ret[5], LL_DLE_SUPP_OCTETS);
+		ll_put_le16(&ret[7], LL_DLE_SUPP_TIME);
+		cmd_complete(op, ret, 9);
+		break;
+	case OP_LE_READ_PHY:
+		read_phy(op, p, plen);
+		break;
+	case OP_LE_SET_DEFAULT_PHY:
+		if (plen != 3) {
+			status_only(op, LL_ST_INVALID_PARAM);
+			break;
+		}
+		ret[0] = phys_check(p[0], p[1], p[2]);
+		if (ret[0] == LL_ST_SUCCESS) {
+			memcpy(def_phy, p, 3);
+		}
+		status_only(op, ret[0]);
+		break;
+	case OP_LE_SET_PHY:
+		set_phy(op, p, plen);
 		break;
 	case OP_LE_SET_ADV_ENABLE:
 		if (plen != 1 || p[0] > 1) {
@@ -421,6 +612,32 @@ void ll_hci_evt_chan_sel_algo(uint16_t handle, uint8_t algo)
 	ll_put_le16(&p[1], handle);
 	p[3] = algo;
 	send_le_evt(p, sizeof(p));   /* LE event mask bit 19 */
+}
+
+void ll_hci_evt_data_len_change(uint16_t handle, uint16_t max_tx_octets, uint16_t max_tx_time,
+				uint16_t max_rx_octets, uint16_t max_rx_time)
+{
+	uint8_t p[11];
+
+	p[0] = SUBEVT_DATA_LEN_CHANGE;
+	ll_put_le16(&p[1], handle);
+	ll_put_le16(&p[3], max_tx_octets);
+	ll_put_le16(&p[5], max_tx_time);
+	ll_put_le16(&p[7], max_rx_octets);
+	ll_put_le16(&p[9], max_rx_time);
+	send_le_evt(p, sizeof(p));   /* LE event mask bit 6 */
+}
+
+void ll_hci_evt_phy_update(uint16_t handle, uint8_t status, uint8_t tx_phy, uint8_t rx_phy)
+{
+	uint8_t p[6];
+
+	p[0] = SUBEVT_PHY_UPDATE;
+	p[1] = status;
+	ll_put_le16(&p[2], handle);
+	p[4] = tx_phy;
+	p[5] = rx_phy;
+	send_le_evt(p, sizeof(p));   /* LE event mask bit 11 */
 }
 
 /* ---- ACL framing ---- */

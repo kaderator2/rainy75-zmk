@@ -17,7 +17,18 @@ static uint8_t got_data[40], got_data_len;
 static int data_calls, enable_arg = -1;
 static uint8_t next_status;
 
-static void sink(const uint8_t *h4, uint16_t len) { memcpy(evt, h4, len); evt_len = len; }
+/* the last two events (evt, evt_prev) and a running count */
+static uint8_t evt_prev[128];
+static uint16_t evt_prev_len;
+static int evt_count;
+static void sink(const uint8_t *h4, uint16_t len)
+{
+	memcpy(evt_prev, evt, sizeof(evt));
+	evt_prev_len = evt_len;
+	memcpy(evt, h4, len);
+	evt_len = len;
+	evt_count++;
+}
 static void get_addr(uint8_t a[6]) { static const uint8_t m[6] = {1, 2, 3, 4, 5, 6}; memcpy(a, m, 6); }
 static void rnd(uint8_t *o, uint8_t n) { for (uint8_t i = 0; i < n; i++) o[i] = 0xA0 + i; }
 static void reset(void) { reset_calls++; }
@@ -41,6 +52,24 @@ static uint8_t ltk_reply(uint16_t h, const uint8_t ltk[16])
 }
 static uint8_t ltk_neg(uint16_t h) { neg_calls++; got_handle = h; return next_status; }
 static bool handle_valid(uint16_t h) { return h < 32 && ((valid_mask >> h) & 1u); }
+/* slice 6b Task 3 */
+static int sdl_calls, rphy_calls, sphy_calls;
+static uint16_t sdl_oct, sdl_time;
+static uint8_t sphy_args[3];
+static uint16_t sphy_opts;
+static uint8_t set_data_len(uint16_t h, uint16_t o, uint16_t t)
+{
+	sdl_calls++; got_handle = h; sdl_oct = o; sdl_time = t; return next_status;
+}
+static uint8_t read_phy(uint16_t h, uint8_t *tx, uint8_t *rx)
+{
+	rphy_calls++; got_handle = h; *tx = 0x01; *rx = 0x01; return next_status;
+}
+static uint8_t set_phy(uint16_t h, uint8_t all, uint8_t tx, uint8_t rx, uint16_t opts)
+{
+	sphy_calls++; got_handle = h; sphy_args[0] = all; sphy_args[1] = tx; sphy_args[2] = rx;
+	sphy_opts = opts; return next_status;
+}
 
 static const struct ll_hci_ops ops = {
 	.get_bd_addr = get_addr, .rand = rnd, .reset = reset,
@@ -48,6 +77,7 @@ static const struct ll_hci_ops ops = {
 	.adv_set_scan_rsp = set_data, .adv_enable = enable, .unknown = unknown,
 	.disconnect = disconnect, .ltk_reply = ltk_reply, .ltk_neg_reply = ltk_neg,
 	.handle_valid = handle_valid,
+	.set_data_len = set_data_len, .read_phy = read_phy, .set_phy = set_phy,
 };
 
 static void cmd(uint16_t op, const uint8_t *p, uint8_t plen)
@@ -486,6 +516,228 @@ static void test_handles(void)
 	CHECK(ll_get_le16(&out[1]) == (uint16_t)(last | 0x1000));
 }
 
+/* Slice 6b Task 3: Data Length and PHY commands and events (Vol 4 Part E
+ * 7.8.33-35, 7.8.46-49, 7.7.65.7, 7.7.65.12) */
+static void test_dle_phy_cmds(void)
+{
+	uint8_t p[8];
+	uint16_t o, t;
+	const uint16_t sup = LL_DLE_SUPP_OCTETS, supt = LL_DLE_TIME_1M(LL_DLE_SUPP_OCTETS);
+
+	all_events_on();
+	valid_mask = 0x1;
+	next_status = LL_ST_SUCCESS;
+
+	/* LE Read Maximum Data Length: supportedMax Tx/Rx Octets/Time */
+	cmd(0x202F, NULL, 0);
+	CHECK(is_cc(0x202F, LL_ST_SUCCESS) && evt_len == 7 + 8);
+	CHECK(ll_get_le16(&evt[7]) == sup && ll_get_le16(&evt[9]) == supt);
+	CHECK(ll_get_le16(&evt[11]) == sup && ll_get_le16(&evt[13]) == supt);
+	cmd(0x202F, p, 1);
+	CHECK(is_cc(0x202F, LL_ST_INVALID_PARAM));
+
+	/* Suggested Default Data Length: 27 / 328 after Reset, stored as written */
+	cmd(0x0C03, NULL, 0);
+	all_events_on();
+	cmd(0x2023, NULL, 0);
+	CHECK(is_cc(0x2023, LL_ST_SUCCESS) && evt_len == 7 + 4);
+	CHECK(ll_get_le16(&evt[7]) == 0x001B && ll_get_le16(&evt[9]) == 0x0148);
+	ll_hci_default_data_len(&o, &t);
+	CHECK(o == 27 && t == 328);
+	ll_put_le16(&p[0], 251);
+	ll_put_le16(&p[2], 2120);
+	cmd(0x2024, p, 4);
+	CHECK(is_cc(0x2024, LL_ST_SUCCESS) && evt_len == 7);
+	cmd(0x2023, NULL, 0);
+	CHECK(ll_get_le16(&evt[7]) == 251 && ll_get_le16(&evt[9]) == 2120);
+	ll_hci_default_data_len(&o, &t);
+	CHECK(o == 251 && t == 2120);
+	/* the full HCI range 0x001B..0x00FB / 0x0148..0x4290 */
+	ll_put_le16(&p[0], 0x00FB);
+	ll_put_le16(&p[2], 0x4290);
+	cmd(0x2024, p, 4);
+	CHECK(is_cc(0x2024, LL_ST_SUCCESS));
+	{
+		static const uint16_t bad[][2] = {{26, 328}, {252, 328}, {27, 327}, {27, 0x4291},
+						  {0, 0}};
+
+		for (unsigned int i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+			ll_put_le16(&p[0], bad[i][0]);
+			ll_put_le16(&p[2], bad[i][1]);
+			cmd(0x2024, p, 4);
+			CHECK(is_cc(0x2024, LL_ST_INVALID_PARAM));
+		}
+	}
+	cmd(0x2024, p, 3);
+	CHECK(is_cc(0x2024, LL_ST_INVALID_PARAM));
+	ll_hci_default_data_len(&o, &t);
+	CHECK(o == 0x00FB && t == 0x4290);
+	cmd(0x0C03, NULL, 0);
+	all_events_on();
+	ll_hci_default_data_len(&o, &t);
+	CHECK(o == 27 && t == 328);
+
+	/* LE Set Data Length: Command Complete (status, handle) */
+	sdl_calls = 0;
+	p[0] = 0x00; p[1] = 0x00;
+	ll_put_le16(&p[2], 251);
+	ll_put_le16(&p[4], 2120);
+	cmd(0x2022, p, 6);
+	CHECK(is_cc(0x2022, LL_ST_SUCCESS) && evt_len == 9 && ll_get_le16(&evt[7]) == 0);
+	CHECK(sdl_calls == 1 && got_handle == 0 && sdl_oct == 251 && sdl_time == 2120);
+	next_status = LL_ST_UNSUPP_REMOTE;
+	cmd(0x2022, p, 6);
+	CHECK(is_cc(0x2022, LL_ST_UNSUPP_REMOTE) && evt_len == 9 && sdl_calls == 2);
+	next_status = LL_ST_SUCCESS;
+	{
+		static const uint16_t bad[][2] = {{26, 328}, {252, 2120}, {27, 327}, {251, 0x4291}};
+
+		for (unsigned int i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+			ll_put_le16(&p[2], bad[i][0]);
+			ll_put_le16(&p[4], bad[i][1]);
+			cmd(0x2022, p, 6);
+			CHECK(is_cc(0x2022, LL_ST_INVALID_PARAM) && evt_len == 9);
+		}
+	}
+	CHECK(sdl_calls == 2);
+	ll_put_le16(&p[2], 27);
+	ll_put_le16(&p[4], 328);
+	p[0] = 0x01;                       /* not a link */
+	cmd(0x2022, p, 6);
+	CHECK(is_cc(0x2022, LL_ST_UNKNOWN_CONN_ID) && ll_get_le16(&evt[7]) == 1);
+	p[0] = 0x00;
+	cmd(0x2022, p, 5);
+	CHECK(is_cc(0x2022, LL_ST_INVALID_PARAM));
+	CHECK(sdl_calls == 2);
+
+	/* LE Read PHY: status, handle, TX_PHY, RX_PHY (1M = 0x01) */
+	rphy_calls = 0;
+	cmd(0x2030, p, 2);
+	CHECK(is_cc(0x2030, LL_ST_SUCCESS) && evt_len == 7 + 4);
+	CHECK(ll_get_le16(&evt[7]) == 0 && evt[9] == 0x01 && evt[10] == 0x01 && rphy_calls == 1);
+	p[0] = 0x01;
+	cmd(0x2030, p, 2);
+	CHECK(is_cc(0x2030, LL_ST_UNKNOWN_CONN_ID) && evt_len == 7 + 4 &&
+	      ll_get_le16(&evt[7]) == 1 && rphy_calls == 1);
+	p[0] = 0x00;
+	cmd(0x2030, p, 1);
+	CHECK(is_cc(0x2030, LL_ST_INVALID_PARAM) && rphy_calls == 1);
+
+	/* LE Set Default PHY: 1M only; a missing preference is invalid, a PHY
+	 * we lack (2M, Coded, RFU) is Unsupported Feature or Parameter Value */
+	{
+		static const struct { uint8_t all, tx, rx, st; } v[] = {
+			{0x00, 0x01, 0x01, LL_ST_SUCCESS},
+			{0x03, 0x00, 0x00, LL_ST_SUCCESS},       /* no preference: ignored */
+			{0x01, 0x06, 0x01, LL_ST_SUCCESS},       /* TX ignored */
+			{0x02, 0x01, 0xFF, LL_ST_SUCCESS},       /* RX ignored */
+			{0x00, 0x00, 0x01, LL_ST_INVALID_PARAM},
+			{0x00, 0x01, 0x00, LL_ST_INVALID_PARAM},
+			{0x00, 0x03, 0x01, LL_ST_UNSUPPORTED},
+			{0x00, 0x01, 0x04, LL_ST_UNSUPPORTED},
+			{0x00, 0x09, 0x01, LL_ST_UNSUPPORTED},
+		};
+
+		for (unsigned int i = 0; i < sizeof(v) / sizeof(v[0]); i++) {
+			p[0] = v[i].all;
+			p[1] = v[i].tx;
+			p[2] = v[i].rx;
+			cmd(0x2031, p, 3);
+			CHECK(is_cc(0x2031, v[i].st) && evt_len == 7);
+		}
+		cmd(0x2031, p, 2);
+		CHECK(is_cc(0x2031, LL_ST_INVALID_PARAM));
+
+		/* LE Set PHY: Command Status, then LE PHY Update Complete
+		 * (status 0, handle, 1M, 1M) */
+		for (unsigned int i = 0; i < sizeof(v) / sizeof(v[0]); i++) {
+			uint8_t sp[7] = {0x00, 0x00, v[i].all, v[i].tx, v[i].rx, 0x02, 0x00};
+			int n0 = evt_count;
+
+			sphy_calls = 0;
+			cmd(0x2032, sp, 7);
+			if (v[i].st == LL_ST_SUCCESS) {
+				static const uint8_t pu[] = {0x04, 0x3E, 6, 0x0C, 0x00, 0x00, 0x00,
+							     0x01, 0x01};
+
+				CHECK(evt_count == n0 + 2);
+				CHECK(evt_prev_len == 7 && evt_prev[1] == 0x0F && evt_prev[3] == 0 &&
+				      ll_get_le16(&evt_prev[5]) == 0x2032);
+				CHECK(evt_len == sizeof(pu) && memcmp(evt, pu, sizeof(pu)) == 0);
+				CHECK(sphy_calls == 1 && sphy_args[0] == v[i].all &&
+				      sphy_args[1] == v[i].tx && sphy_args[2] == v[i].rx &&
+				      sphy_opts == 2);
+			} else {
+				CHECK(evt_count == n0 + 1 && is_cs(0x2032, v[i].st));
+				CHECK(sphy_calls == 0);
+			}
+		}
+	}
+	{
+		uint8_t sp[7] = {0x01, 0x00, 0x00, 0x01, 0x01, 0x00, 0x00};
+		int n0 = evt_count;
+
+		sphy_calls = 0;
+		cmd(0x2032, sp, 7);                 /* not a link */
+		CHECK(evt_count == n0 + 1 && is_cs(0x2032, LL_ST_UNKNOWN_CONN_ID) && sphy_calls == 0);
+		sp[0] = 0x00;
+		cmd(0x2032, sp, 6);
+		CHECK(is_cs(0x2032, LL_ST_INVALID_PARAM) && sphy_calls == 0);
+		/* the controller refuses: Command Status only */
+		next_status = LL_ST_DISALLOWED;
+		n0 = evt_count;
+		cmd(0x2032, sp, 7);
+		CHECK(evt_count == n0 + 1 && is_cs(0x2032, LL_ST_DISALLOWED) && sphy_calls == 1);
+		next_status = LL_ST_SUCCESS;
+		/* LE event mask bit 11 off: the Command Status alone */
+		memset(p, 0, 8);
+		p[0] = 0x1F;
+		cmd(0x2001, p, 8);
+		n0 = evt_count;
+		cmd(0x2032, sp, 7);
+		CHECK(evt_count == n0 + 1 && is_cs(0x2032, LL_ST_SUCCESS));
+		all_events_on();
+	}
+
+	/* LE Data Length Change (0x3E/0x07): handle, Tx Octets/Time, Rx Octets/Time */
+	evt_len = 0;
+	ll_hci_evt_data_len_change(LL_MAX_CONN - 1, 251, 2120, 27, 328);
+	{
+		const uint8_t dl[] = {0x04, 0x3E, 11, 0x07, (uint8_t)(LL_MAX_CONN - 1), 0x00,
+				      0xFB, 0x00, 0x48, 0x08, 0x1B, 0x00, 0x48, 0x01};
+
+		CHECK(evt_len == sizeof(dl) && memcmp(evt, dl, sizeof(dl)) == 0);
+	}
+	/* LE PHY Update Complete builder */
+	evt_len = 0;
+	ll_hci_evt_phy_update(LL_MAX_CONN - 1, 0x1A, 0x01, 0x01);
+	{
+		const uint8_t pu[] = {0x04, 0x3E, 6, 0x0C, 0x1A, (uint8_t)(LL_MAX_CONN - 1), 0x00,
+				      0x01, 0x01};
+
+		CHECK(evt_len == sizeof(pu) && memcmp(evt, pu, sizeof(pu)) == 0);
+	}
+	/* masks: LE bit 6 (Data Length Change), bit 11 (PHY Update Complete) */
+	memset(p, 0, 8);
+	p[0] = 0x1F;                       /* spec default */
+	cmd(0x2001, p, 8);
+	evt_len = 0;
+	ll_hci_evt_data_len_change(0, 251, 2120, 251, 2120);
+	CHECK(evt_len == 0);
+	ll_hci_evt_phy_update(0, 0, 1, 1);
+	CHECK(evt_len == 0);
+	p[0] = 0x40;
+	p[1] = 0x08;
+	cmd(0x2001, p, 8);
+	evt_len = 0;
+	ll_hci_evt_data_len_change(0, 251, 2120, 251, 2120);
+	CHECK(evt_len == 14);
+	evt_len = 0;
+	ll_hci_evt_phy_update(0, 0, 1, 1);
+	CHECK(evt_len == 9);
+	all_events_on();
+}
+
 /* ll_hci_init without handle_valid fails loudly (assert -> abort) */
 static void test_init_requires_handle_valid(void)
 {
@@ -559,6 +811,16 @@ int main(void)
 	CHECK(!(evt[7 + 27] & 0x20));      /* no LE Read Remote Features */
 	CHECK(!(evt[7 + 2] & 0x80));       /* no Read Remote Version Information */
 	CHECK(!(evt[7 + 27] & 0x40));      /* no LE Encrypt */
+	/* slice 6b Task 3: DLE and PHY commands (Vol 4 Part E 6.27) */
+	CHECK(evt[7 + 33] & 0x40);         /* LE Set Data Length */
+	CHECK(evt[7 + 33] & 0x80);         /* LE Read Suggested Default Data Length */
+	CHECK(evt[7 + 34] & 0x01);         /* LE Write Suggested Default Data Length */
+	CHECK(evt[7 + 35] & 0x08);         /* LE Read Maximum Data Length */
+	CHECK(evt[7 + 35] & 0x10);         /* LE Read PHY */
+	CHECK(evt[7 + 35] & 0x20);         /* LE Set Default PHY */
+	CHECK(evt[7 + 35] & 0x40);         /* LE Set PHY */
+	CHECK(!(evt[7 + 33] & 0x30));      /* no Connection Parameter Request replies */
+	CHECK(!(evt[7 + 35] & 0x87));      /* no resolving-list / RPA commands */
 
 	/* Read BD_ADDR */
 	cmd(0x1009, NULL, 0);
@@ -575,7 +837,9 @@ int main(void)
 	cmd(0x2003, NULL, 0);
 	CHECK(is_cc(0x2003, LL_ST_SUCCESS));
 	CHECK(evt_len == 7 + 8);
-	CHECK(evt[7] == LL_FEATURES_LOW && evt[7] == 0x05);
+	/* + bit 5 LE Data Packet Length Extension (slice 6b Task 3); no 2M (bit 8) */
+	CHECK(evt[7] == LL_FEATURES_LOW && evt[7] == 0x25);
+	CHECK(!(evt[8] & 0x01));
 	/* byte 1: bit 14 Channel Selection Algorithm #2 (Vol 6 Part B 4.6) */
 	CHECK(evt[8] == LL_FEATURES_BYTE1 && evt[8] == 0x40);
 	for (int i = 2; i < 8; i++) CHECK(evt[7 + i] == 0);
@@ -654,6 +918,7 @@ int main(void)
 	test_event_masks();
 	test_acl();
 	test_handles();
+	test_dle_phy_cmds();
 
 	DONE();
 }

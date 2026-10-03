@@ -239,7 +239,24 @@ static void on_enc_change(uint8_t link, uint8_t status, bool enabled)
 	hcil[link].enabled = enabled;
 }
 
-static const struct ll_llcp_ops ops = {.ltk_req = on_ltk_req, .enc_change = on_enc_change};
+/* LE Data Length Change (slice 6b Task 3): per link, the last effective values */
+static struct {
+	int calls;
+	struct ll_llcp_dle eff;
+} dlcl[LL_MAX_CONN];
+#define dlc (dlcl[L])
+
+static void on_data_len_change(uint8_t link, const struct ll_llcp_dle *eff)
+{
+	CHECK(locks == 0);
+	CHECK(tx_locks == 0);
+	CHECK(link < LL_MAX_CONN);
+	dlcl[link].calls++;
+	dlcl[link].eff = *eff;
+}
+
+static const struct ll_llcp_ops ops = {.ltk_req = on_ltk_req, .enc_change = on_enc_change,
+				       .data_len_change = on_data_len_change};
 
 /* ---------------- helpers ---------------- */
 
@@ -248,6 +265,7 @@ static void fresh(void)
 	memset(&tx, 0, sizeof(tx));
 	memset(cnl, 0, sizeof(cnl));
 	memset(hcil, 0, sizeof(hcil));
+	memset(dlcl, 0, sizeof(dlcl));
 	memset(&kk, 0, sizeof(kk));
 	memset(rxq_crypt_l, 0, sizeof(rxq_crypt_l));
 	rxq_set_calls = 0;
@@ -337,11 +355,12 @@ static void single_link_suite(void)
 	fresh();
 	features(0xFF);
 	{
-		/* ours: LE Encryption (bit 0) + Extended Reject Indication (bit 2);
-		 * byte 1 is ours: CSA#2 (bit 14) */
-		static const uint8_t exp[9] = {0x09, 0x05, 0x40, 0, 0, 0, 0, 0, 0};
+		/* ours: LE Encryption (bit 0) + Extended Reject Indication (bit 2)
+		 * + LE Data Packet Length Extension (bit 5); byte 1 is ours:
+		 * CSA#2 (bit 14) */
+		static const uint8_t exp[9] = {0x09, 0x25, 0x40, 0, 0, 0, 0, 0, 0};
 
-		CHECK(LL_FEATURES_LOW == 0x05);
+		CHECK(LL_FEATURES_LOW == 0x25);
 		CHECK(tx.n == 1);
 		CHECK(last_is(exp, 9));
 	}
@@ -378,9 +397,11 @@ static void single_link_suite(void)
 
 	/* ---- unknown / unsupported -> LL_UNKNOWN_RSP(opcode) ---- */
 	{
-		static const uint8_t ops_unk[] = {0x14, 0x16, 0x12, 0x0E, 0x0F, 0x04, 0x05,
-						  0x18, 0x20, 0xFF};
-		static const uint8_t lens[] = {9, 3, 1, 9, 24, 13, 1, 5, 1, 1};
+		/* LL_LENGTH_REQ (0x14), LL_PHY_REQ (0x16) and LL_PHY_UPDATE_IND
+		 * (0x18) are answered since slice 6b Task 3 (dle_phy_suite) */
+		static const uint8_t ops_unk[] = {0x19, 0x1A, 0x12, 0x0E, 0x0F, 0x04, 0x05,
+						  0x1F, 0x20, 0xFF};
+		static const uint8_t lens[] = {3, 1, 1, 9, 24, 13, 1, 5, 1, 1};
 
 		for (unsigned int i = 0; i < sizeof(ops_unk); i++) {
 			uint8_t pdu[27] = {0};
@@ -934,6 +955,476 @@ static void single_link_suite(void)
 	CHECK(locks == 0);
 }
 
+/* ---------------- LENGTH and PHY procedures (slice 6b Task 3) ----------------
+ *
+ * Data Length Update (Vol 6 Part B 2.4.2.21, 4.5.10, 5.1.9): Octets are the
+ * Payload length without the MIC; times are 1M packet times incl. the MIC
+ * (LL_DLE_TIME_1M). Our connMaxRx* is the supported maximum (SUP / SUPT),
+ * connMaxTx* starts at 27 / 328 and follows ll_llcp_set_data_len(). The
+ * suite runs for the device value (SUP 27 in this task, nothing can grow)
+ * and with -DLL_DLE_SUPP_OCTETS=251 (test_llcp_dle_n<N>), where every rule
+ * is visible.
+ * PHY (5.1.10): 1M only; LL_PHY_REQ -> LL_PHY_RSP(1M, 1M), any
+ * LL_PHY_UPDATE_IND keeps 1M (an unsupported / reserved / multi-bit PHY:
+ * "shall not change the PHY in that direction"). */
+
+#define SUP   ((uint16_t)LL_DLE_SUPP_OCTETS)
+#define SUPT  ((uint16_t)LL_DLE_TIME_1M(LL_DLE_SUPP_OCTETS))
+
+static void length_pdu(uint8_t p[9], uint8_t op, uint16_t rxo, uint16_t rxt, uint16_t txo,
+		       uint16_t txt)
+{
+	p[0] = op;
+	ll_put_le16(&p[1], rxo);
+	ll_put_le16(&p[3], rxt);
+	ll_put_le16(&p[5], txo);
+	ll_put_le16(&p[7], txt);
+}
+
+static int dle_is(const struct ll_llcp_dle *d, uint16_t txo, uint16_t txt, uint16_t rxo,
+		  uint16_t rxt)
+{
+	return d->max_tx_octets == txo && d->max_tx_time == txt && d->max_rx_octets == rxo &&
+	       d->max_rx_time == rxt;
+}
+
+static int eff_is(uint8_t link, uint16_t txo, uint16_t txt, uint16_t rxo, uint16_t rxt)
+{
+	struct ll_llcp_dle d;
+
+	memset(&d, 0xEE, sizeof(d));
+	ll_llcp_get_dle(link, &d);
+	return dle_is(&d, txo, txt, rxo, rxt);
+}
+
+/* last push is our LL_LENGTH_RSP / LL_LENGTH_REQ with these values */
+static int last_length(uint8_t op, uint16_t rxo, uint16_t rxt, uint16_t txo, uint16_t txt)
+{
+	uint8_t exp[9];
+
+	length_pdu(exp, op, rxo, rxt, txo, txt);
+	return last_is(exp, 9);
+}
+
+static uint16_t min16(uint16_t a, uint16_t b) { return a < b ? a : b; }
+
+static void dle_responder(void)
+{
+	uint8_t req[9];
+	int n0;
+
+	CHECK(LL_DLE_TIME_1M(27) == 328 && LL_DLE_TIME_1M(251) == 2120);
+	CHECK(LL_DLE_MAX_OCTETS == 251 && LL_DLE_MAX_TIME_1M == 2120);
+	CHECK(SUP >= 27 && SUP <= 251);
+
+	/* new connection: 27 / 328 everywhere */
+	fresh();
+	CHECK(eff_is(L, 27, 328, 27, 328));
+
+	/* central offers 251 / 2120 both ways: we answer our connMax values
+	 * (Tx 27 / 328 until the host asks, Rx our supported maximum) */
+	length_pdu(req, 0x14, 251, 2120, 251, 2120);
+	rx(req, 9);
+	CHECK(tx.n == 1 && last_length(0x15, SUP, SUPT, 27, 328));
+	CHECK(tx.p[0].kind == LL_TXQ_CTRL);
+	/* effective Rx = min(our Rx, central Tx), Tx unchanged */
+	CHECK(eff_is(L, 27, 328, SUP, SUPT));
+	CHECK(dlc.calls == (SUP > 27 ? 1 : 0));
+	if (SUP > 27) {
+		CHECK(dle_is(&dlc.eff, 27, 328, SUP, SUPT));
+	}
+	/* the responder procedure ends with our response: nothing pending */
+	CHECK(!ll_llcp_busy(L));
+	CHECK(ll_llcp_timeout_ticks(now) == -1);
+	CHECK(kk.bad == 0 && kk.calls == 1);
+
+	/* the same request again: answered, no change, no event */
+	n0 = dlc.calls;
+	rx(req, 9);
+	CHECK(tx.n == 2 && last_length(0x15, SUP, SUPT, 27, 328));
+	CHECK(dlc.calls == n0);
+
+	/* the central lowers its Tx to 100 / 912: eff Rx follows */
+	length_pdu(req, 0x14, 251, 2120, 100, 912);
+	rx(req, 9);
+	CHECK(eff_is(L, 27, 328, min16(SUP, 100), min16(SUPT, 912)));
+	CHECK(dlc.calls == n0 + (SUP > 27 ? 1 : 0));
+
+	/* values below the minimum are taken as the minimum (27 / 328) */
+	n0 = dlc.calls;
+	length_pdu(req, 0x14, 10, 100, 5, 50);
+	rx(req, 9);
+	CHECK(last_length(0x15, SUP, SUPT, 27, 328));
+	CHECK(eff_is(L, 27, 328, 27, 328));
+	CHECK(dlc.calls == n0 + (SUP > 27 ? 1 : 0));
+	if (SUP > 27) {
+		CHECK(dle_is(&dlc.eff, 27, 328, 27, 328));
+	}
+	/* values above the range are capped (Octets 251, Time 17040): the
+	 * effective values are ours */
+	length_pdu(req, 0x14, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF);
+	rx(req, 9);
+	CHECK(eff_is(L, 27, 328, SUP, SUPT));
+
+	/* a LENGTH_RSP we did not ask for is ignored */
+	n0 = tx.n;
+	length_pdu(req, 0x15, 27, 328, 27, 328);
+	rx(req, 9);
+	CHECK(tx.n == n0 && eff_is(L, 27, 328, SUP, SUPT));
+	/* wrong length -> LL_UNKNOWN_RSP(0x14) */
+	{
+		static const uint8_t exp[2] = {0x07, 0x14};
+
+		length_pdu(req, 0x14, 251, 2120, 251, 2120);
+		rx(req, 8);
+		CHECK(last_is(exp, 2));
+	}
+	CHECK(cn.end_calls == 0);
+
+	/* a new connection on the link starts over */
+	ll_llcp_reset(L);
+	CHECK(eff_is(L, 27, 328, 27, 328));
+}
+
+static void dle_initiator(void)
+{
+	uint8_t pdu[9];
+	uint32_t t0;
+
+	/* host asks for 251 / 2120: connMaxTx = min(asked, supported). With
+	 * SUP 27 nothing changes: no PDU, success. */
+	fresh();
+	CHECK(ll_llcp_set_data_len(L, 251, 2120) == LL_ST_SUCCESS);
+	CHECK(locks == 0 && tx_locks == 0);
+	if (SUP == 27) {
+		CHECK(tx.n == 0 && dlc.calls == 0 && !ll_llcp_busy(L));
+		CHECK(eff_is(L, 27, 328, 27, 328));
+		/* below the minimum is clamped up, too */
+		CHECK(ll_llcp_set_data_len(L, 0, 0) == LL_ST_SUCCESS);
+		CHECK(tx.n == 0);
+		return;
+	}
+	/* LL_LENGTH_REQ with our new connMax values */
+	CHECK(tx.n == 1 && last_length(0x14, SUP, SUPT, SUP, SUPT));
+	CHECK(kk.calls == 1 && kk.bad == 0);
+	/* the central still only receives 27: no change yet */
+	CHECK(eff_is(L, 27, 328, 27, 328) && dlc.calls == 0);
+	CHECK(ll_llcp_busy(L));
+	CHECK(ll_llcp_timeout_ticks(now) == (int32_t)T(TIMEOUT_US));
+	/* a second request while ours runs: Command Disallowed */
+	CHECK(ll_llcp_set_data_len(L, 100, 912) == LL_ST_DISALLOWED);
+	CHECK(tx.n == 1);
+	/* the central answers 251 / 2120: all effective values grow, one event */
+	length_pdu(pdu, 0x15, 251, 2120, 251, 2120);
+	rx(pdu, 9);
+	CHECK(tx.n == 1);
+	CHECK(eff_is(L, SUP, SUPT, SUP, SUPT));
+	CHECK(dlc.calls == 1 && dle_is(&dlc.eff, SUP, SUPT, SUP, SUPT));
+	CHECK(!ll_llcp_busy(L) && ll_llcp_timeout_ticks(now) == -1);
+	/* a second RSP: not a response to anything, ignored */
+	length_pdu(pdu, 0x15, 27, 328, 27, 328);
+	rx(pdu, 9);
+	CHECK(eff_is(L, SUP, SUPT, SUP, SUPT) && dlc.calls == 1);
+
+	/* the host lowers Tx to 100 / 912: eff Tx drops at once (we may send
+	 * shorter PDUs any time), then the procedure tells the central */
+	CHECK(ll_llcp_set_data_len(L, 100, 912) == LL_ST_SUCCESS);
+	CHECK(last_length(0x14, SUP, SUPT, 100, 912));
+	CHECK(eff_is(L, 100, 912, SUP, SUPT) && dlc.calls == 2);
+	length_pdu(pdu, 0x15, 251, 2120, 251, 2120);
+	rx(pdu, 9);
+	CHECK(dlc.calls == 2);   /* nothing changed by the response */
+	/* the same values again: the central knows them, no procedure */
+	CHECK(ll_llcp_set_data_len(L, 100, 912) == LL_ST_SUCCESS);
+	CHECK(tx.n == 2 && !ll_llcp_busy(L));
+	/* TxTime only: Octets and Time need not match (4.5.10) */
+	CHECK(ll_llcp_set_data_len(L, 100, 2120) == LL_ST_SUCCESS);
+	CHECK(last_length(0x14, SUP, SUPT, 100, SUPT));
+	CHECK(eff_is(L, 100, SUPT, SUP, SUPT) && dlc.calls == 3);
+
+	/* crossing: ours queued, the central's LL_LENGTH_REQ arrives first.
+	 * We answer it as usual, ours stays pending until its LL_LENGTH_RSP. */
+	fresh();
+	CHECK(ll_llcp_set_data_len(L, 251, 2120) == LL_ST_SUCCESS);
+	CHECK(tx.n == 1 && last_length(0x14, SUP, SUPT, SUP, SUPT));
+	length_pdu(pdu, 0x14, 200, 1712, 200, 1712);
+	rx(pdu, 9);
+	CHECK(tx.n == 2 && last_length(0x15, SUP, SUPT, SUP, SUPT));
+	CHECK(eff_is(L, min16(SUP, 200), min16(SUPT, 1712), min16(SUP, 200), min16(SUPT, 1712)));
+	CHECK(dlc.calls == 1);
+	CHECK(ll_llcp_busy(L));
+	length_pdu(pdu, 0x15, 200, 1712, 200, 1712);
+	rx(pdu, 9);
+	CHECK(!ll_llcp_busy(L) && dlc.calls == 1 && tx.n == 2);
+
+	/* the central does not know LL_LENGTH_REQ: LL_UNKNOWN_RSP ends the
+	 * procedure without a change; later requests are refused with
+	 * Unsupported Remote Feature */
+	fresh();
+	CHECK(ll_llcp_set_data_len(L, 251, 2120) == LL_ST_SUCCESS);
+	{
+		static const uint8_t unk[2] = {0x07, 0x14};
+
+		rx(unk, 2);
+	}
+	CHECK(!ll_llcp_busy(L) && dlc.calls == 0 && eff_is(L, 27, 328, 27, 328));
+	CHECK(ll_llcp_set_data_len(L, 100, 912) == LL_ST_UNSUPP_REMOTE);
+	CHECK(tx.n == 1);
+	/* an LL_UNKNOWN_RSP for another opcode leaves ours running */
+	fresh();
+	CHECK(ll_llcp_set_data_len(L, 251, 2120) == LL_ST_SUCCESS);
+	{
+		static const uint8_t unk[2] = {0x07, 0x16};
+
+		rx(unk, 2);
+	}
+	CHECK(ll_llcp_busy(L));
+	/* LL_REJECT_EXT_IND(LL_LENGTH_REQ) ends it, too */
+	{
+		static const uint8_t rej[3] = {0x11, 0x14, 0x1A};
+
+		rx(rej, 3);
+	}
+	CHECK(!ll_llcp_busy(L) && dlc.calls == 0 && tx.n == 1);
+
+	/* the feature exchange said: no DLE on the central */
+	fresh();
+	features(0x01);
+	CHECK(ll_llcp_set_data_len(L, 251, 2120) == LL_ST_UNSUPP_REMOTE);
+	CHECK(tx.n == 1);   /* only the LL_FEATURE_RSP */
+	fresh();
+	features(0x21);
+	CHECK(ll_llcp_set_data_len(L, 251, 2120) == LL_ST_SUCCESS);
+	CHECK(tx.n == 2 && last_length(0x14, SUP, SUPT, SUP, SUPT));
+
+	/* 40 s procedure response timeout: the link ends with 0x22 */
+	fresh();
+	t0 = now;
+	CHECK(ll_llcp_set_data_len(L, 251, 2120) == LL_ST_SUCCESS);
+	CHECK(ll_llcp_timeout_ticks(t0 + 5) == (int32_t)T(TIMEOUT_US) - 5);
+	ll_llcp_tick(t0 + T(TIMEOUT_US) - 1);
+	CHECK(cn.end_calls == 0);
+	ll_llcp_tick(t0 + T(TIMEOUT_US));
+	CHECK(cn.end_calls == 1 && cn.end_reason == LL_ST_LMP_TIMEOUT);
+	CHECK(!ll_llcp_busy(L) && ll_llcp_timeout_ticks(now) == -1);
+
+	/* backlog full: Memory Capacity Exceeded, nothing changed */
+	fresh();
+	tx.fail = 1;
+	CHECK(ll_llcp_set_data_len(L, 251, 2120) == 0x07);
+	CHECK(tx.n == 0 && !ll_llcp_busy(L) && kk.calls == 0);
+	CHECK(eff_is(L, 27, 328, 27, 328));
+	/* our connMaxTx is still 27 / 328: the next LL_LENGTH_RSP says so */
+	length_pdu(pdu, 0x14, 251, 2120, 251, 2120);
+	rx(pdu, 9);
+	CHECK(tx.n == 1 && last_length(0x15, SUP, SUPT, 27, 328));
+	CHECK(eff_is(L, 27, 328, SUP, SUPT));
+	CHECK(ll_llcp_set_data_len(L, 251, 2120) == LL_ST_SUCCESS);
+	CHECK(tx.n == 2 && last_length(0x14, SUP, SUPT, SUP, SUPT));
+
+	/* connMaxRx above 27 alone is news for the central (4.5.10: "should
+	 * initiate" when a value is not 27 / 328): the host's 27 / 328 still
+	 * sends LL_LENGTH_REQ ... */
+	fresh();
+	CHECK(ll_llcp_set_data_len(L, 27, 328) == LL_ST_SUCCESS);
+	CHECK(tx.n == 1 && last_length(0x14, SUP, SUPT, 27, 328));
+	/* ... unless our LL_LENGTH_RSP already carried it */
+	fresh();
+	length_pdu(pdu, 0x14, 27, 328, 27, 328);
+	rx(pdu, 9);
+	CHECK(tx.n == 1);
+	CHECK(ll_llcp_set_data_len(L, 27, 328) == LL_ST_SUCCESS);
+	CHECK(tx.n == 1 && !ll_llcp_busy(L));
+
+	/* during the encryption start (data paused, Vol 6 Part B 5.1.3.1)
+	 * the request waits and leaves, encrypted, right after our
+	 * LL_START_ENC_RSP */
+	fresh();
+	{
+		uint8_t req[23], buf[8];
+
+		sample_rand();
+		build_enc_req(req);
+		rx(req, sizeof(req));
+		CHECK(ll_llcp_set_data_len(L, 251, 2120) == LL_ST_SUCCESS);
+		CHECK(tx.n == 1 && tx.p[0].op == 0x04);   /* only LL_ENC_RSP */
+		CHECK(ll_llcp_ltk_reply(L, ltk) == LL_ST_SUCCESS);
+		CHECK(tx.n == 2 && tx.p[1].op == 0x05);
+		memcpy(buf, rsp1_air, 5);
+		CHECK(ll_crypt_decrypt(rxq_crypt, 0x0F, buf, 5) == 1);
+		rx(buf, 1);
+		CHECK(tx.n == 4);
+		CHECK(tx.p[2].op == 0x06 && memcmp(tx.p[2].d, rsp2_air, 5) == 0);
+		CHECK(tx.p[3].op == 0x14 && tx.p[3].len == 9 + LL_MIC_LEN);
+		CHECK(ll_llcp_busy(L));
+		CHECK(hci.enc_change == 1);
+		/* and after a negative reply */
+		fresh();
+		sample_rand();
+		rx(req, sizeof(req));
+		CHECK(ll_llcp_set_data_len(L, 251, 2120) == LL_ST_SUCCESS);
+		CHECK(tx.n == 1);
+		CHECK(ll_llcp_ltk_neg_reply(L) == LL_ST_SUCCESS);
+		CHECK(tx.n == 3 && tx.p[1].op == 0x0D);
+		CHECK(last_length(0x14, SUP, SUPT, SUP, SUPT));
+	}
+	CHECK(kk.bad == 0);
+}
+
+static void phy_procedure(void)
+{
+	static const uint8_t phy_rsp[3] = {0x17, 0x01, 0x01};
+	uint8_t ind[5] = {0x18, 0, 0, 0x34, 0x12};
+	uint32_t t0;
+
+	/* central prefers 1M|2M both ways: we answer 1M only */
+	fresh();
+	{
+		static const uint8_t req[3] = {0x16, 0x03, 0x03};
+
+		rx(req, 3);
+	}
+	CHECK(tx.n == 1 && last_is(phy_rsp, 3));
+	CHECK(kk.bad == 0);
+	/* the procedure waits on the central's LL_PHY_UPDATE_IND */
+	CHECK(ll_llcp_busy(L));
+	CHECK(ll_llcp_timeout_ticks(now) == (int32_t)T(TIMEOUT_US));
+	/* no change (both 0, no instant): done, nothing else happens */
+	rx(ind, 5);
+	CHECK(!ll_llcp_busy(L) && ll_llcp_timeout_ticks(now) == -1);
+	CHECK(tx.n == 1 && cn.end_calls == 0 && cn.upd_calls == 0);
+
+	/* LL_PHY_UPDATE_IND with 1M (no real change), an unsupported PHY,
+	 * a reserved bit or several bits: we keep 1M ("shall not change the
+	 * PHY in that direction"), the link stays */
+	{
+		static const uint8_t fields[][2] = {{0x01, 0x01}, {0x01, 0x00}, {0x02, 0x02},
+						    {0x04, 0x00}, {0x03, 0x05}, {0x80, 0x00},
+						    {0x00, 0x08}};
+
+		for (unsigned int i = 0; i < sizeof(fields) / sizeof(fields[0]); i++) {
+			static const uint8_t req[3] = {0x16, 0x01, 0x01};
+
+			fresh();
+			rx(req, 3);
+			CHECK(ll_llcp_busy(L));
+			ind[1] = fields[i][0];
+			ind[2] = fields[i][1];
+			rx(ind, 5);
+			CHECK(!ll_llcp_busy(L));
+			CHECK(tx.n == 1 && cn.end_calls == 0);
+		}
+	}
+	/* an unsolicited LL_PHY_UPDATE_IND: no answer, no end */
+	fresh();
+	ind[1] = 0x02;
+	rx(ind, 5);
+	CHECK(tx.n == 0 && cn.end_calls == 0 && !ll_llcp_busy(L));
+
+	/* PHY_REQ with an empty field still gets our 1M answer */
+	{
+		static const uint8_t req[3] = {0x16, 0x00, 0x00};
+
+		rx(req, 3);
+		CHECK(tx.n == 1 && last_is(phy_rsp, 3));
+	}
+
+	/* wrong lengths -> LL_UNKNOWN_RSP */
+	fresh();
+	{
+		static const uint8_t req[4] = {0x16, 0x01, 0x01, 0x00};
+		static const uint8_t exp_r[2] = {0x07, 0x16};
+		static const uint8_t exp_i[2] = {0x07, 0x18};
+
+		rx(req, 4);
+		CHECK(last_is(exp_r, 2));
+		rx(ind, 4);
+		CHECK(last_is(exp_i, 2));
+		CHECK(!ll_llcp_busy(L));
+	}
+
+	/* no LL_PHY_UPDATE_IND within 40 s: link lost (0x22) */
+	fresh();
+	t0 = now;
+	{
+		static const uint8_t req[3] = {0x16, 0x01, 0x01};
+
+		rx(req, 3);
+	}
+	ll_llcp_tick(t0 + T(TIMEOUT_US) - 1);
+	CHECK(cn.end_calls == 0);
+	ll_llcp_tick(t0 + T(TIMEOUT_US));
+	CHECK(cn.end_calls == 1 && cn.end_reason == LL_ST_LMP_TIMEOUT);
+	CHECK(!ll_llcp_busy(L));
+
+	/* the PHY and LENGTH timers are independent: the PHY procedure
+	 * completing leaves our LENGTH procedure's timer running */
+	fresh();
+	t0 = now;
+	if (SUP > 27) {
+		static const uint8_t req[3] = {0x16, 0x01, 0x01};
+
+		CHECK(ll_llcp_set_data_len(L, 251, 2120) == LL_ST_SUCCESS);
+		now += T(1000000);
+		rx(req, 3);
+		ind[1] = 0;
+		ind[2] = 0;
+		rx(ind, 5);
+		CHECK(ll_llcp_busy(L));
+		CHECK(ll_llcp_timeout_ticks(t0) == (int32_t)T(TIMEOUT_US));
+	}
+}
+
+/* Out-of-range and inactive links */
+static void dle_bounds(void)
+{
+	struct ll_llcp_dle d;
+
+	fresh();
+	CHECK(ll_llcp_set_data_len(LL_MAX_CONN, 251, 2120) == LL_ST_UNKNOWN_CONN_ID);
+	memset(&d, 0xEE, sizeof(d));
+	ll_llcp_get_dle(LL_MAX_CONN, &d);
+	CHECK(dle_is(&d, 27, 328, 27, 328));
+	cnl[0].active = false;
+	CHECK(ll_llcp_set_data_len(0, 251, 2120) == LL_ST_UNKNOWN_CONN_ID);
+	CHECK(tx.n == 0);
+}
+
+/* LENGTH state is per link: a procedure on one link never changes
+ * another's values, timer or events */
+static void test_dle_per_link(void)
+{
+	const uint8_t a = 0, b = (uint8_t)(LL_MAX_CONN - 1);
+	uint8_t pdu[9];
+
+	if (LL_MAX_CONN < 2) {
+		return;
+	}
+	fresh();
+	length_pdu(pdu, 0x14, 251, 2120, 251, 2120);
+	rx_l(b, pdu, 9);
+	CHECK(tx.n == 1 && tx.p[0].link == b);
+	CHECK(eff_is(a, 27, 328, 27, 328));
+	CHECK(dlcl[a].calls == 0 && dlcl[b].calls == (SUP > 27 ? 1 : 0));
+	if (SUP > 27) {
+		CHECK(ll_llcp_set_data_len(a, 251, 2120) == LL_ST_SUCCESS);
+		CHECK(tx.p[1].link == a && ll_llcp_busy(a) && !ll_llcp_busy(b));
+		/* the RSP on link b is no answer to anything there */
+		length_pdu(pdu, 0x15, 251, 2120, 251, 2120);
+		rx_l(b, pdu, 9);
+		CHECK(ll_llcp_busy(a) && eff_is(a, 27, 328, 27, 328));
+		rx_l(a, pdu, 9);
+		CHECK(!ll_llcp_busy(a) && eff_is(a, SUP, SUPT, SUP, SUPT));
+		CHECK(eff_is(b, 27, 328, SUP, SUPT));
+		CHECK(dlcl[a].calls == 1 && dlcl[b].calls == 1);
+	}
+	ll_llcp_reset(b);
+	CHECK(eff_is(b, 27, 328, 27, 328));
+	if (SUP > 27) {
+		CHECK(eff_is(a, SUP, SUPT, SUP, SUPT));
+	}
+}
+
 /* ---------------- multi-link (slice 6a) ---------------- */
 
 static uint8_t pushes_on(uint8_t link)
@@ -1220,11 +1711,16 @@ static void test_routing_per_link(void)
 
 int main(void)
 {
+	for (int k = 0; k < 2; k++) {
+		L = k == 0 ? 0 : (uint8_t)(LL_MAX_CONN - 1);
+		single_link_suite();
+		dle_responder();
+		dle_initiator();
+		phy_procedure();
+	}
 	L = 0;
-	single_link_suite();
-	L = (uint8_t)(LL_MAX_CONN - 1);
-	single_link_suite();
-	L = 0;
+	dle_bounds();
+	test_dle_per_link();
 	test_link_bounds();
 	test_enc_one_link_while_other_sends();
 	test_link_end_isolated();

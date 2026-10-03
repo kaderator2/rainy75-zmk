@@ -46,6 +46,15 @@ struct ll_hci_ops {
 	/* true while handle is an active link (ll_conn_active(handle)); used
 	 * by the commands above and by ll_hci_acl_from_host(). Required. */
 	bool (*handle_valid)(uint16_t handle);
+	/* Slice 6b Task 3, handle validated before the call, parameters
+	 * range-checked (Vol 4 Part E 7.8.33 / 7.8.49). */
+	uint8_t (*set_data_len)(uint16_t handle, uint16_t tx_octets, uint16_t tx_time); /* ll_llcp_set_data_len */
+	uint8_t (*read_phy)(uint16_t handle, uint8_t *tx_phy, uint8_t *rx_phy);       /* 1M / 1M */
+	/* LE Set PHY: on LL_ST_SUCCESS ll_hci sends the Command Status and right
+	 * after it LE PHY Update Complete (status 0, read_phy values), so the
+	 * order is fixed whatever thread delivers events. */
+	uint8_t (*set_phy)(uint16_t handle, uint8_t all_phys, uint8_t tx_phys, uint8_t rx_phys,
+			   uint16_t opts);
 };
 
 typedef void (*ll_hci_sink_t)(const uint8_t *h4, uint16_t len);
@@ -81,6 +90,17 @@ void ll_hci_evt_conn_update(uint16_t handle, const struct ll_conn_params *p);
  * event mask bit 19 is set: handle, algo 0x00 = CSA#1, 0x01 = CSA#2. Sent by
  * the glue right after LE Connection Complete. */
 void ll_hci_evt_chan_sel_algo(uint16_t handle, uint8_t algo);
+
+/* LE Data Length Change (0x3E/0x07, Vol 4 Part E 7.7.65.7), LE event mask
+ * bit 6: the link's effective values. */
+void ll_hci_evt_data_len_change(uint16_t handle, uint16_t max_tx_octets, uint16_t max_tx_time,
+				uint16_t max_rx_octets, uint16_t max_rx_time);
+/* LE PHY Update Complete (0x3E/0x0C, 7.7.65.12), LE event mask bit 11. */
+void ll_hci_evt_phy_update(uint16_t handle, uint8_t status, uint8_t tx_phy, uint8_t rx_phy);
+/* Host's Suggested Default Data Length (LE Write Suggested Default Data
+ * Length, 27 / 328 after init and Reset): connInitialMaxTx{Octets,Time} for
+ * new connections; the glue hands them to ll_llcp_set_data_len() on connect. */
+void ll_hci_default_data_len(uint16_t *tx_octets, uint16_t *tx_time);
 
 /* ---- ACL data framing (no H4 type byte on input, H4 type 0x02 on
  * output). LE ACL is never fragmented here: LE Read Buffer Size reports
