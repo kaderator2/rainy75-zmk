@@ -28,7 +28,8 @@
  * Host ACL held back (-ENOMEM: TX backlog full; -EAGAIN: encryption start
  * pauses data) is retried on the wakeup that frees it: an ll_txq ack
  * (txq_done), the end of the procedure (LL_START_ENC_RSP received here,
- * the host's LTK negative reply, which wakes it) or the disconnect.
+ * the host's LTK negative reply, which wakes it, or the 40 s response
+ * timeout, which ends the link) or the disconnect.
  *
  * Toward the host, the controller thread delivers directly (after draining
  * the event queue first, so the order of everything it produced is kept);
@@ -366,8 +367,12 @@ static void radio_evt(enum ll_radio_evt evt, const uint8_t *pdu, uint8_t len, ui
 		atomic_inc(&cnt_guard_escalations);
 		ll_conn_end(LL_ST_CONN_TIMEOUT);
 	}
-	if (len != 0) {
-		k_sem_give(&wake);   /* ll_rxq has data */
+	/* Wake the controller thread only when this event queued a data PDU
+	 * (len counts empty PDUs too, which would wake it at every listened
+	 * event). Acks of our PDUs wake it via txq_done, a link end via
+	 * conn_evt (DISCONNECTED, also after an ll_rxq overflow). */
+	if (ll_rxq_isr_take_queued()) {
+		k_sem_give(&wake);
 	}
 }
 
@@ -720,8 +725,9 @@ static uint32_t ticks_to_us(uint32_t t)
 }
 
 /* Periodic health log (CONFIG_BT_HCI_B91_OPENLL_STATS_LOG): one line every
- * 2 s while there is anything to report, plus a stall warning if advertising is enabled but tx2rx is not
- * advancing. Connection counters are logged while connected or changed. */
+ * 2 s while there is anything to report, plus a stall warning if
+ * advertising is enabled but tx2rx is not advancing. Connection counters
+ * are logged while connected or changed. */
 static void report_stats(struct ll_radio_stats *last, struct ll_conn_stats *last_c)
 {
 	struct ll_radio_stats st;

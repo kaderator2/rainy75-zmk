@@ -251,5 +251,32 @@ int main(void)
 		CHECK(memcmp(out.data, payload, 2) == 0);
 	}
 
+	/* ---- ll_rxq_isr_take_queued: wake the consumer only for data PDUs ---- */
+	ll_rxq_reset();
+	CHECK(!ll_rxq_isr_take_queued());
+	put(0x01, NULL, 0);                       /* empty PDU: nothing queued */
+	put(0x09, NULL, 0);
+	CHECK(!ll_rxq_isr_take_queued());
+	{
+		static const uint8_t d[3] = {0x01, 0x02, 0x03};
+		struct ll_rx_pdu out;
+		uint8_t bad[1] = {0};
+
+		put(0x02, d, 3);
+		put(0x01, NULL, 0);
+		CHECK(ll_rxq_isr_take_queued());
+		CHECK(!ll_rxq_isr_take_queued());     /* cleared by the take */
+		CHECK(!ll_rxq_isr_put(bad, 1));       /* malformed: dropped, not queued */
+		CHECK(!ll_rxq_isr_take_queued());
+		/* consuming does not clear a pending flag of a later put */
+		put(0x02, d, 3);
+		CHECK(ll_rxq_get(&out) == LL_RXQ_OK);
+		CHECK(ll_rxq_get(&out) == LL_RXQ_OK);
+		CHECK(ll_rxq_isr_take_queued());
+		/* reset clears it */
+		put(0x02, d, 3);
+		ll_rxq_reset();
+		CHECK(!ll_rxq_isr_take_queued());
+	}
 	DONE();
 }

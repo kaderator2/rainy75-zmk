@@ -43,6 +43,11 @@ void ll_rxq_set_crypt(struct ll_crypt *c);
  * length (dropped and counted). A dropped data PDU is lost for good (the
  * hardware has acked it), so the caller ends the link (ll_conn: 0x08). */
 bool ll_rxq_isr_put(const uint8_t *pdu, uint8_t len);
+/* ISR (the producer side, e.g. at LL_RADIO_CONN_DONE): true if a data PDU
+ * was queued since the last call or ll_rxq_reset(), and clears that flag.
+ * Empty and dropped PDUs do not count, so the consumer is woken only when
+ * there is something to deliver. */
+bool ll_rxq_isr_take_queued(void);
 /* Thread: next queued PDU, decrypted when encryption is on; call again
  * after LL_RXQ_OK to continue draining. Single consumer. */
 enum ll_rxq_result ll_rxq_get(struct ll_rx_pdu *out);

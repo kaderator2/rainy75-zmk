@@ -69,11 +69,20 @@ static struct {
 	uint32_t overflow;
 	struct ll_crypt *crypt;
 	bool mic_failed;         /* sticky until ll_rxq_reset() (consumer only) */
+	bool queued;             /* data PDU queued since the last take (producer only) */
 } q;
 
 void ll_rxq_reset(void)
 {
 	memset(&q, 0, sizeof(q));
+}
+
+bool ll_rxq_isr_take_queued(void)
+{
+	bool r = q.queued;
+
+	q.queued = false;
+	return r;
 }
 
 void ll_rxq_set_crypt(struct ll_crypt *c)
@@ -109,6 +118,7 @@ bool ll_rxq_isr_put(const uint8_t *pdu, uint8_t len)
 	memcpy(e->data, &pdu[2], paylen);
 	RING_BARRIER();   /* publish: slot complete before head moves */
 	q.head = (uint8_t)(head + 1);
+	q.queued = true;
 	return true;
 }
 
