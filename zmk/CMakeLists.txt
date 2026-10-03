@@ -24,6 +24,7 @@ endif()
 
 if(CONFIG_POWEROFF)
   zephyr_library_named(poweroff_b91)
+  zephyr_library_include_directories(${CMAKE_CURRENT_SOURCE_DIR}/drivers/bluetooth)
   zephyr_library_sources(src/poweroff.c)
 endif()
 

@@ -846,6 +846,15 @@ uint32_t b91_bt_controller_wakeups(void)
 	return (uint32_t)atomic_get(&cnt_wakeups);
 }
 
+/* Called from z_sys_poweroff() (irq locked, scheduler context irrelevant): no
+ * radio or stimer IRQ may reach the link layer while the SoC powers down. The
+ * SoC cold-boots on wakeup, so nothing is re-enabled. */
+void b91_bt_controller_poweroff(void)
+{
+	ll_sched_quiesce();
+	ll_radio_quiesce();
+}
+
 int b91_bt_controller_init(void)
 {
 	uint8_t mac_random_static[6];

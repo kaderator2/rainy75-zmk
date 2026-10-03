@@ -26,5 +26,8 @@ void ll_sched_cancel(void);
  * host tests). */
 void ll_sched_guard_at(uint32_t tick, ll_sched_cb_t cb);
 void ll_sched_guard_cancel(void);
+/* Before SoC poweroff (device only): drop both slots, mask the stimer compare
+ * IRQ and its PLIC line. Irq-lock safe, no re-enable path. */
+void ll_sched_quiesce(void);
 
 #endif /* LL_SCHED_H_ */

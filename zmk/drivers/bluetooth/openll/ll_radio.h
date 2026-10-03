@@ -64,6 +64,10 @@ void ll_radio_prepare_rsp(const uint8_t *pdu, uint8_t len);
  * the TX trigger tick is already too close or in the past. */
 bool ll_radio_tx_rsp_at(uint32_t tick);
 void ll_radio_stop(void);
+/* Before SoC poweroff (device only): stop the FSM, clear all RF IRQ masks and
+ * status, mask the RF PLIC IRQ. Irq-lock safe, no re-enable path (the SoC
+ * cold-boots on wakeup). */
+void ll_radio_quiesce(void);
 
 /* ---- Connection mode (slice 2; implemented in ll_radio.c, faked in host
  * tests). One connection, peripheral role, 1M PHY. ---- */

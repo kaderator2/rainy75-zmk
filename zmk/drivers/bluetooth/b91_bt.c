@@ -638,6 +638,11 @@ void b91_bt_host_send_packet(uint8_t type, uint8_t *data, uint16_t len)
  * The old pm_state_set/pm_state_exit_post_ops stubs were removed —
  * ZMK uses sys_poweroff() (not Zephyr idle PM) for deep sleep. */
 
+void b91_bt_controller_poweroff(void)
+{
+	/* Blob: nothing to do (kept identical to the behaviour before the hook). */
+}
+
 void b91_bt_host_callback_register(const b91_bt_host_callback_t *pcb)
 {
 	b91_ctrl.callbacks.host_read_packet = pcb->host_read_packet;

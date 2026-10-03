@@ -483,6 +483,14 @@ void ll_radio_stop(void)
 	rf_set_tx_rx_off_auto_mode();
 }
 
+void ll_radio_quiesce(void)
+{
+	ll_radio_stop();
+	rf_clr_irq_mask(FLD_RF_IRQ_ALL);
+	rf_clr_irq_status(FLD_RF_IRQ_ALL);
+	irq_disable(RF_IRQ);
+}
+
 /* ---- connection mode ---- */
 
 static uint8_t *ring_entry(uint8_t idx)

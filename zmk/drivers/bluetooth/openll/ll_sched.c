@@ -103,6 +103,19 @@ static void slot_cancel(int i)
 	irq_unlock(key);
 }
 
+void ll_sched_quiesce(void)
+{
+	unsigned int key = irq_lock();
+
+	for (int i = 0; i < SLOT_N; i++) {
+		slots[i].cb = NULL;
+	}
+	stimer_clr_irq_mask(FLD_SYSTEM_IRQ);
+	stimer_clr_irq_status(FLD_SYSTEM_IRQ);
+	irq_disable(STIMER_IRQ);
+	irq_unlock(key);
+}
+
 void ll_sched_at(uint32_t tick, ll_sched_cb_t cb)
 {
 	slot_at(SLOT_MAIN, tick, cb);
