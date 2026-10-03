@@ -156,7 +156,8 @@ bool ll_conn_active(void);
 /* Counter of the next connection event not yet completed (the one on air,
  * if any). Instants are relative to this. While a latency skip is planned
  * this is the first skipped event (conservative: an instant for a skipped
- * event re-plans the listen to it, or is passed if that event is no
+ * event re-plans the listen to the first reachable event, or to the
+ * instant if that comes first, and is passed if the instant event is no
  * longer reachable). After a re-plan (kick or instant) it is the planned
  * event, so an instant for an earlier event is treated as passed (0x28); a
  * conforming central never sends one (the instant is >= 6 events after the
@@ -167,10 +168,10 @@ uint16_t ll_conn_event_counter(void);
  * event lies beyond the next regular event that can still be prepared
  * (alarm LL_CONN_ARM_LEAD_US before its RX opens), re-plan to that event.
  * No-op without a connection, during an event (the next plan sees the
- * backlog) or when that event is already the planned one. Once an instant
- * is applied at the planned event (it was re-planned to an instant), a kick
- * cannot pull the listen earlier: TX may then wait up to latency x interval
- * until the instant event (accepted trade-off, instants are rare).
+ * backlog) or when that event is already the planned one. An instant in
+ * the skip window re-plans to the first reachable event (see
+ * ll_conn_event_counter), and no skip is planned while an instant is
+ * pending within the latency window, so a kick never waits for an instant.
  * ISR-safe; takes ll_plat_lock(). */
 void ll_conn_kick(void);
 

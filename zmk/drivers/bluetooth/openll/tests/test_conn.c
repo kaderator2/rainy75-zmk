@@ -1407,8 +1407,10 @@ static void test_latency_instant_in_window(void)
 
 	ll_conn_get_stats(&s0);
 	a0 = start_lat(4, 400, &ref, false);
-	/* skip to event 5 planned; the thread now handles a map update for
-	 * instant 3 */
+	/* skip to event 5 planned; 31 ms later (events 1 and 2 gone) the
+	 * thread handles a map update for instant 3, now the first reachable
+	 * event (an earlier reachable one: test_latency_instant_replan_reachable) */
+	now = a0 + T(31000);
 	CHECK(ll_conn_chmap_at(3, no0to9) == 0);
 	fire_alarm();
 	CHECK(ll_conn_event_counter() == 3);
@@ -1633,8 +1635,10 @@ static void test_latency_instant_replan_then_kick(void)
 	uint32_t a0;
 	int cancels;
 
-	/* channel map instant 3 re-planned, then a kick: still event 3, new map */
+	/* channel map instant 3 re-planned (events 1 and 2 gone, so event 3
+	 * is the first reachable one), then a kick: still event 3, new map */
 	a0 = start_lat(4, 400, &ref, false);
+	now = a0 + T(31000);
 	CHECK(ll_conn_chmap_at(3, no0to9) == 0);
 	cancels = sch.cancels;
 	ll_conn_kick();
@@ -1652,6 +1656,7 @@ static void test_latency_instant_replan_then_kick(void)
 	 * transmit window of event 3 (old anchor + 0, 1.25 ms, widening over
 	 * 46.25 ms: 13.875 -> 14 + 16 = 30 us) */
 	a0 = start_lat(4, 400, &ref, false);
+	now = a0 + T(31000);
 	CHECK(ll_conn_update_at(3, 1, 0, &p24) == 0);
 	ll_conn_kick();
 	fire_alarm();
@@ -1664,6 +1669,7 @@ static void test_latency_instant_replan_then_kick(void)
 	/* a second instant for the event whose map instant is applied: the
 	 * applied map stays (re-plan restores the state after it) */
 	a0 = start_lat(4, 400, &ref, false);
+	now = a0 + T(31000);
 	CHECK(ll_conn_chmap_at(3, no28) == 0);
 	CHECK(ll_conn_update_at(3, 1, 0, &p12) == 0);
 	ll_conn_kick();
@@ -1674,6 +1680,86 @@ static void test_latency_instant_replan_then_kick(void)
 	ll_csa1_set_map(&ref, no28);
 	CHECK(rad.ch == ll_csa1_next(&ref));
 	CHECK(rad.ch != 28);   /* event 3's unmapped channel (4 * 7 mod 37) */
+	done(0);
+	ll_conn_end(LL_ST_REMOTE_TERM);
+}
+
+/* Final review fix: an instant inside the planned skip window re-plans to
+ * the first reachable event (not to the instant), so a kick right after it
+ * still reaches the next event; every event up to and including the
+ * instant is then listened to, the instant is applied at its own event and
+ * the channel sequence follows CSA#1. */
+static void test_latency_instant_replan_reachable(void)
+{
+	struct ll_conn_params p24 = {.interval = 24, .latency = 0, .timeout = 400};
+	struct ll_csa1 ref;
+	struct ll_conn_stats s0, s1;
+	uint32_t a0, a;
+	int cancels;
+
+	/* channel map instant 4 while the skip to event 5 is planned:
+	 * listen at event 1 (old map), 2, 3, then 4 with the new map */
+	ll_conn_get_stats(&s0);
+	a0 = start_lat(4, 400, &ref, false);
+	CHECK(ll_conn_chmap_at(4, no0to9) == 0);
+	cancels = sch.cancels;
+	ll_conn_kick();   /* already the next event: no-op */
+	CHECK(sch.cancels == cancels);
+	a = a0;
+	for (uint16_t e = 1; e <= 4; e++) {
+		fire_alarm();
+		CHECK(ll_conn_event_counter() == e);
+		CHECK(rad.open == open_at(a, 1));
+		if (e == 4) {
+			ll_csa1_set_map(&ref, no0to9);
+		}
+		CHECK(rad.ch == ll_csa1_next(&ref));
+		a += T(15000);
+		rx(a, 0x01, 0);
+		done(1);
+	}
+	CHECK(rad.ch >= 10);
+	/* instant passed: skipping resumes (events 5..8, listen at 9) */
+	fire_alarm();
+	CHECK(ll_conn_event_counter() == 9);
+	CHECK(rad.open == open_at(a, 5));
+	CHECK(rad.ch == ref_skip(&ref, 5));
+	done(0);
+	ll_conn_get_stats(&s1);
+	CHECK(s1.skipped - s0.skipped == 4);   /* events 5..8 only */
+	ll_conn_end(LL_ST_REMOTE_TERM);
+
+	/* event 1 already gone: the re-plan lands on event 2, and queued data
+	 * (kick) does not wait for the instant either */
+	a0 = start_lat(4, 400, &ref, false);
+	now = a0 + T(16000);
+	CHECK(ll_conn_chmap_at(4, no0to9) == 0);
+	ll_conn_kick();
+	fire_alarm();
+	CHECK(ll_conn_event_counter() == 2);
+	CHECK(rad.open == open_at(a0, 2));
+	CHECK(rad.ch == ref_skip(&ref, 2));
+	done(0);
+	ll_conn_end(LL_ST_REMOTE_TERM);
+
+	/* connection update instant 3: events 1, 2 with the old timing, the
+	 * transmit window at event 3 (old anchor + 0, 1.25 ms) */
+	a0 = start_lat(4, 400, &ref, false);
+	CHECK(ll_conn_update_at(3, 1, 0, &p24) == 0);
+	a = a0;
+	for (uint16_t e = 1; e <= 2; e++) {
+		fire_alarm();
+		CHECK(ll_conn_event_counter() == e && cbs.updated == 0);
+		CHECK(rad.open == open_at(a, 1));
+		CHECK(rad.ch == ll_csa1_next(&ref));
+		a += T(15000);
+		rx(a, 0x01, 0);
+		done(1);
+	}
+	fire_alarm();
+	CHECK(ll_conn_event_counter() == 3 && cbs.updated == 1);
+	CHECK(rad.open == a + T(15000) - T(widen(300, 15000) + LL_CONN_WIN_MARGIN_US));
+	CHECK(rad.ch == ll_csa1_next(&ref));
 	done(0);
 	ll_conn_end(LL_ST_REMOTE_TERM);
 }
@@ -1715,5 +1801,6 @@ int main(void)
 	test_kick();
 	test_latency_from_update();
 	test_latency_instant_replan_then_kick();
+	test_latency_instant_replan_reachable();
 	DONE();
 }

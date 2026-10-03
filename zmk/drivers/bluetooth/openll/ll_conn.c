@@ -616,11 +616,22 @@ static int check_instant(uint16_t instant)
 }
 
 /* A new instant for the planned event or one of the skipped events before
- * it: listen at the instant (re-plan). check_instant() passed. */
+ * it: re-plan to the first reachable event of the window, or to the
+ * instant if that comes first (check_instant() passed, so the instant is
+ * not before the first reachable event). A target before the instant
+ * applies no instant there, and plan() refuses to skip while the instant
+ * lies within the latency window, so every event up to and including the
+ * instant is listened to. Re-planning to the instant itself would leave
+ * skip_n = 0 at the instant event, so a kick in between could not pull the
+ * listen earlier and TX would wait for the instant. */
 static void instant_replan(uint16_t instant)
 {
-	if (c.planned && (uint16_t)(instant - c.skip_base) <= c.skip_n) {
-		replan_to(instant);
+	uint16_t d = (uint16_t)(instant - c.skip_base);
+
+	if (c.planned && d <= c.skip_n) {
+		uint16_t i = c.skip_n > 0 ? first_reachable() : 0;
+
+		replan_to((uint16_t)(c.skip_base + (i < d ? i : d)));
 	}
 }
 
