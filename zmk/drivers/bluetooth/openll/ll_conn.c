@@ -388,7 +388,10 @@ int ll_conn_start(const struct ll_connect_ind *ci, uint32_t connect_ind_end_tick
 
 	ll_radio_conn_setup(ci->aa, ci->crc_init);
 	ll_txq_reset(txq_done);
-	ll_rxq_reset();
+	/* No ll_rxq_reset() here: this runs in ISR context while the controller
+	 * thread may be inside ll_rxq_get(). The glue resets ll_rxq in its
+	 * thread when it handles LL_CONN_EVT_DISCONNECTED, before advertising
+	 * (and so a new connection) can be enabled again. */
 	plan();
 	report(LL_CONN_EVT_CONNECTED, &c.ci);
 	return 0;

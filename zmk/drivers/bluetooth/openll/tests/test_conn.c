@@ -167,6 +167,7 @@ static void reset_all(bool hook)
 	memset(&sch, 0, sizeof(sch));
 	memset(&cbs, 0, sizeof(cbs));
 	ll_conn_init(&ops);
+	ll_rxq_reset();   /* the glue's job (controller thread), not ll_conn's */
 }
 
 static struct ll_connect_ind mk_ci(uint16_t interval, uint16_t timeout, uint8_t sca,
@@ -329,6 +330,24 @@ static void test_rx_path(void)
 	CHECK(out.len == 5 && out.data[0] == 0xA0 && (out.hdr0 & 3) == LL_LLID_START);
 	CHECK(ll_rxq_get(&out) == LL_RXQ_OK);
 	CHECK(out.len == 3 && (out.hdr0 & 3) == LL_LLID_CTRL);
+	CHECK(ll_rxq_get(&out) == LL_RXQ_EMPTY);
+	ll_conn_end(LL_ST_REMOTE_TERM);
+}
+
+/* ll_conn_start runs in ISR context and must not reset ll_rxq (the
+ * controller thread may be inside ll_rxq_get); the glue resets it in its
+ * thread on DISCONNECTED. A PDU already in the ring survives the start. */
+static void test_start_keeps_rxq(void)
+{
+	struct ll_connect_ind ci = mk_ci(12, 400, 1, 1, 0);
+	const uint8_t pdu[3] = {LL_LLID_START, 1, 0x5A};
+	struct ll_rx_pdu out;
+
+	reset_all(false);
+	CHECK(ll_rxq_isr_put(pdu, sizeof(pdu)));
+	CHECK(ll_conn_start(&ci, 500000) == 0);
+	CHECK(ll_rxq_get(&out) == LL_RXQ_OK);
+	CHECK(out.len == 1 && out.data[0] == 0x5A);
 	CHECK(ll_rxq_get(&out) == LL_RXQ_EMPTY);
 	ll_conn_end(LL_ST_REMOTE_TERM);
 }
@@ -876,6 +895,7 @@ int main(void)
 {
 	test_first_events();
 	test_rx_path();
+	test_start_keeps_rxq();
 	test_six_interval_rule();
 	test_supervision();
 	test_widening_clamp();

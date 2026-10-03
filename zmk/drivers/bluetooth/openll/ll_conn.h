@@ -73,8 +73,11 @@ struct ll_conn_ops {
 /* ops is copied. */
 void ll_conn_init(const struct ll_conn_ops *ops);
 /* Start following a connection: ll_radio_conn_setup(), ll_txq_reset(),
- * ll_rxq_reset(), plan the first event in the transmit window, report
- * LL_CONN_EVT_CONNECTED. connect_ind_end_tick = end of the CONNECT_IND
+ * plan the first event in the transmit window, report
+ * LL_CONN_EVT_CONNECTED. ll_rxq is NOT reset here (ISR context, the
+ * consumer thread may be inside ll_rxq_get()): the owner of the consumer
+ * thread resets it when it handles LL_CONN_EVT_DISCONNECTED, before
+ * advertising can be enabled again (boot state is reset already). connect_ind_end_tick = end of the CONNECT_IND
  * packet (LL_RADIO_RX_OK end_tick); the caller has stopped advertising.
  * Returns 0, or -EINVAL for unusable parameters (nothing started, the
  * caller keeps advertising) or -EBUSY (a connection is active). ISR. */
