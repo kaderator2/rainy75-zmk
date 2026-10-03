@@ -4,12 +4,14 @@ Our own BLE link layer for the Telink B91. It replaces the proprietary
 controller blob `liblt_9518_zephyr.a`. Tracking issue:
 [#13](https://github.com/scholzri/rainy75-zmk/issues/13).
 
-**Status:** slices 1 to 4 are done. A keyboard running the open controller
+**Status:** slices 1 to 5 are done. A keyboard running the open controller
 advertises, accepts a connection from a bonded host, starts link encryption with
 the existing bond and works as a BLE HID keyboard. No blob is linked. A 33-minute
-encrypted soak under traffic ended with 0 disconnects. The blob stays the
-default build until power management (slice 5) is done. Only one central has
-been tested so far (Intel controller with Linux/BlueZ).
+encrypted soak under traffic ended with 0 disconnects. Slice 5 added peripheral
+latency, an event-driven controller thread and coordination with deep sleep
+(see [Power management](#power-management)). The blob stays the default build
+until the battery comparison of slice 5b is done. Only one central has been
+tested so far (Intel controller with Linux/BlueZ).
 
 ## Why
 
@@ -36,22 +38,9 @@ grep -c liblt build/zephyr/zmk.map    # 0 for the open controller, 48 for the bl
 `--openll` appends `conf/openll.conf` (`CONFIG_BT_HCI_B91_CTLR_OPEN=y`) to the
 app config. `fetch_ble_blob.sh` is not run for an `--openll` build.
 
-Deep sleep with the open controller is not tested yet (slice 5). The tested
-configuration for daily use turns deep sleep off with a small local config file
-and a manual build:
-
-```bash
-printf 'CONFIG_ZMK_SLEEP=n\n' > conf/nosleep.conf      # local file, not in the repo
-export ZEPHYR_TOOLCHAIN_VARIANT=zephyr
-export ZEPHYR_SDK_INSTALL_DIR=$(pwd)/toolchain/zephyr-sdk-0.17.0
-west build -d build-openll -b rainy75 zmk-src/app -- \
-    -DZMK_CONFIG=$(pwd)/zmk/boards/rainy75 -DZMK_EXTRA_MODULES=$(pwd)/zmk \
-    "-DEXTRA_CONF_FILE=$(pwd)/conf/app.conf;$(pwd)/conf/openll.conf;$(pwd)/conf/nosleep.conf" \
-    "-DEXTRA_DTC_OVERLAY_FILE=$(pwd)/zmk/boards/rainy75/rainy75.keymap;$(pwd)/conf/mcumgr.overlay"
-```
-
-If `ZEPHYR_TOOLCHAIN_VARIANT` is set but empty in your environment, the build
-cannot find the toolchain, hence the `export`.
+Deep sleep works with the open controller and needs no extra configuration:
+`./build.sh --openll` keeps `CONFIG_ZMK_SLEEP=y` (15 minute idle timeout). The
+old advice to build with a local `conf/nosleep.conf` no longer applies.
 
 Image sizes from the "Memory region" summary (ISO, `conf/app.conf`, deep sleep
 on, nothing else changed):
@@ -385,6 +374,86 @@ covers that with a retransmission.
 `conf/app.conf` raises the log thread stack to 1024 bytes for both controllers
 (the default 768 was 99 % used).
 
+## Power management
+
+Slice 5 does not suspend the SoC between connection events (that is slice 5b,
+below). It removes everything that made the CPU or the radio work for nothing:
+
+- **Peripheral latency.** The latency from CONNECT_IND or from the last
+  connection update is honoured. After an event that re-anchored, the planner
+  skips up to `latency` events and arms the next listen directly (counter and
+  CSA #1 channel advance over the skipped events). Skipping is refused while
+  there is queued or unacknowledged TX data, while an LLCP or encryption
+  procedure runs (`ll_llcp_busy()`), while a local terminate runs, after a
+  missed or late event, and while a channel map or connection update instant
+  lies within the skip window. Window widening keeps using real time since the
+  last sync.
+- **Kick.** Every successful TX push (ACL data, LLCP response, encryption PDU)
+  calls `ll_conn_kick()`. If the planned listen is a skipped-ahead one, it is
+  re-planned to the first event whose alarm is still in the future, so queued
+  data leaves within one connection interval instead of waiting out the skip
+  window. Kicks during an event are no-ops: the next plan sees the backlog.
+- **Quiet controller thread.** The thread blocks with `K_FOREVER` and is woken
+  only by queued data PDUs, a CONNECT_IND log entry, TX acknowledgements and
+  timers. The 40 s LLCP response timeout is a delayable work item that exists
+  only while a procedure is pending. There is no polling.
+- **Deep sleep.** `z_sys_poweroff()` calls `b91_bt_controller_poweroff()`
+  first. The open controller clears both scheduler slots, masks the system
+  timer compare, stops the radio, clears the RF interrupt state and disables
+  both PLIC sources, all interrupt-lock safe. Wake is a cold boot through
+  MCUboot as before. The blob variant of this hook is a no-op.
+
+### Power counters
+
+The controller counts planned listens, skipped events, kicks, misses and
+controller thread wakeups. They are exposed through the custom mcumgr group 66
+(command 0, read only) and read with `reverse/tools/openll_stats.py`:
+
+```bash
+reverse/tools/openll_stats.py                 # one read over USB serial
+reverse/tools/openll_stats.py -n 6 -i 10      # six reads, 10 s apart, with deltas
+reverse/tools/openll_stats.py --ble           # over BLE (needs bleak)
+```
+
+Reply fields: `up` (ms), `idle` (CPU idle ms, from
+`CONFIG_THREAD_RUNTIME_STATS`), `plan` (listen alarms armed), `listen`
+(events listened to), `skip` (events skipped by latency), `kick`, `ev`, `miss`
+(events without a valid first packet), `wake` (controller thread wakeups) and
+`mv` (battery millivolts, 0 if unavailable). The tool prints deltas, idle
+percentage and the share of skipped events. `ev`, `miss` and `skip` are counted
+when planned or closed, so `skip` may overstate by up to the latency when a
+link ends. Over BLE the read itself is traffic: the host raises the link to
+7.5 ms with latency 0 for a few seconds, so use USB for idle measurements.
+
+The periodic stats log line (every 2 s) is opt-in with
+`CONFIG_BT_HCI_B91_OPENLL_STATS_LOG=y`; it adds the planned, listened, skipped
+and kick counts.
+
+### Measured results (power)
+
+All on the keyboard with the bonded Linux/BlueZ PC, link at interval 12
+(15 ms), latency 30, timeout 400.
+
+| Check | Result |
+|---|---|
+| Idle cadence on air (sniffer, 24 s window) | we answer every 31st event (steps of 31, 62, 93) |
+| Idle skipped events (USB counters, 10 to 20 s windows) | 96 to 97 % skipped, controller wakeups 0.0 to 0.2 per s |
+| CPU idle share | 91.8 % shortly after boot, 94.1 % after 30 min |
+| Kick to RX open of the listen | 1.2 to 13.7 ms, always below one interval; the data PDU is on air in that event |
+| 30 min connected soak, SMP echo every 30 s | 60/60 echoes, 0 disconnects, 120 connection updates |
+| Deep sleep | USB detached and advertising stopped after the idle timeout (0 ADV packets from the keyboard in a 45 s scan) |
+| Wake by keypress | cold boot, bonded host reconnected by itself about 13 s after the key press, encrypted echo 10/10 |
+
+### Slice 5b (not done)
+
+- An overnight battery comparison, blob versus open controller, with RGB off,
+  logging `mv` and the counters over BLE. If the open build is clearly worse,
+  the counters show where.
+- SoC suspend between connection events (Zephyr PM states for the B91,
+  `pm_policy_event` hook from the link layer). This is where the remaining
+  battery gap to the blob would be closed. Risks are suspend reliability on
+  the chip revision, system timer recovery, GPIO wake, RGB DMA and USB.
+
 ## Hardware findings
 
 These are measured on this board and do not appear in the Telink
@@ -425,11 +494,15 @@ documentation. They may help anyone writing a B91 link layer.
 
 ## Known limitations
 
-- **No power management yet (slice 5).** The CPU does not sleep between
-  connection events and every event is listened to (peripheral latency is
-  accepted but not used). Deep sleep is not coordinated with the controller and
-  is untested with it; run with `CONFIG_ZMK_SLEEP=n` for now. Battery life is
-  therefore shorter than with the blob.
+- **No SoC suspend between events (slice 5b).** The CPU idles but the SoC is
+  not suspended, so battery life is likely still shorter than with the blob.
+  The overnight comparison is not done yet.
+- **About 8 % of the listens are misses** (the central did not transmit in
+  that event, for example the two events after each echo response). Each miss
+  costs one extra listen because there is no skip after a miss.
+- **Latency applies from event 1 after connect.** Early LLCP or GATT requests
+  from the central, before we have anything to send, can wait up to one skip
+  window (up to 31 x 15 ms = 465 ms). A kick only helps when we have TX data.
 - **Interrupt latency from outside the link layer.** USB interrupts and flash
   writes with interrupts off can still skip single connection events.
 - **Not supported:** CSA #2 (we advertise ChSel 0, so the central uses CSA #1),
@@ -617,9 +690,10 @@ matter here because the name is in ADV_IND.
 
 ## Roadmap
 
-- **Slice 5: power management.** CPU sleep between connection events,
-  peripheral latency, coordination with deep sleep (`poweroff.c`), 32 kHz RC
-  calibration.
+- **Slice 5: power management (done).** Peripheral latency, kick, quiet
+  controller thread, power counters, deep sleep coordination.
+- **Slice 5b: battery measurement and SoC suspend.** Overnight comparison with
+  the blob, then suspend between connection events and 32 kHz RC calibration.
 - **Slice 6: privacy and extras.** LE Set Random Address and RPA (the blob hangs
   on this today), optional 2M PHY, Data Length Extension, CSA #2.
 - **More centrals:** test with Windows, macOS, Android and iOS hosts.

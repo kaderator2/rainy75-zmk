@@ -42,6 +42,11 @@ LOG_MODULE_REGISTER(openll_mgmt, LOG_LEVEL_INF);
 #define BATT_NODE DT_CHOSEN(zmk_battery)
 #endif
 
+/*
+ * The battery sensor is shared with ZMK's own battery reporting. There is no
+ * lock around the sample: a rare overlap with a ZMK read would at worst yield
+ * one odd millivolt value in a diagnostic reply, never a stuck ADC.
+ */
 static uint32_t battery_mv(void)
 {
 #ifdef BATT_NODE

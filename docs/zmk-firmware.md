@@ -881,6 +881,8 @@ Implemented in `zmk/src/poweroff.c` as `z_sys_poweroff()`, triggered by ZMK afte
 
 **GPIO wakeup config:** 6 row pins (PD2-PD6, PE0) via `pm_set_gpio_wakeup()`. SDK register layout: 0x41-0x45 = polarity (SET = LOW-level), 0x46-0x4A = enable. Wakeup status register 0x64 guards entry — all rows must be HIGH (no key pressed) to enter sleep.
 
+With the open BLE controller (`./build.sh --openll`), `z_sys_poweroff()` first calls `b91_bt_controller_poweroff()`, which quiesces the link layer scheduler and the radio (both interrupt sources off). Deep sleep and the 15 minute timeout work unchanged, including wake and automatic reconnect to the bonded host. See [open-ble-controller.md](open-ble-controller.md#power-management).
+
 ## MCUboot DFU
 
 USB-based firmware updates via mcumgr, with watchdog-based crash revert.
@@ -1097,9 +1099,9 @@ The Telink BLE SDK headers (`tl_common.h`, `ble.h`, etc.) redefine `uint8_t`, `b
 
 ## Remaining Work
 
-### Stage 4: Battery ADC (only incomplete stage)
+### Stage 4: Battery ADC (done)
 
-Driver exists (`battery_b91_adc.c`), config enabled, BLE battery service registered. PD1 channel 0x0A via 1/2 resistor divider, calibration data at 0xFE0C0. **Voltage scaling needs hardware validation** — measure actual battery voltage vs. ADC reading to confirm the divider ratio and Vref. Linear SoC model (3300–4200 mV) is adequate for a keyboard.
+Complete, see the Stage 4 checklist above. Linear SoC model (3300 to 4200 mV) is adequate for a keyboard. The open controller's power counters (mcumgr group 66) also report the battery millivolts.
 
 ### Upstream patches
 
