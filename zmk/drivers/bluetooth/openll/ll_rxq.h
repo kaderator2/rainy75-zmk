@@ -3,7 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * RX queue: ISR-filled software ring of received data PDUs, consumed by the
- * controller thread (duplicate detection by SN, decrypt, empty PDUs dropped).
+ * controller thread (decrypt). Empty PDUs are dropped at the put; there is
+ * no SN duplicate check, the baseband delivers only new packets (ll_rxq.c).
  */
 #ifndef LL_RXQ_H_
 #define LL_RXQ_H_
@@ -23,7 +24,7 @@ struct ll_rx_pdu {
 enum ll_rxq_result {
 	LL_RXQ_EMPTY,     /* ring drained, nothing to deliver */
 	LL_RXQ_OK,        /* out filled with a new, non-empty, decrypted PDU */
-	LL_RXQ_MIC_FAIL,  /* decrypt of a new (non-duplicate) PDU failed its MIC;
+	LL_RXQ_MIC_FAIL,  /* decrypt of the next PDU failed its MIC;
 			   * caller terminates the connection (LL_ST_MIC_FAILURE).
 			   * The failing PDU is not retried; ll_rxq_get may be
 			   * called again to continue draining the ring, but
@@ -37,14 +38,12 @@ void ll_rxq_reset(void);
 void ll_rxq_set_crypt(struct ll_crypt *c);
 /* ISR: copy one CRC-valid PDU (2-byte header + payload, as delivered by
  * LL_RADIO_CONN_RX: pdu[0] = header byte 0, pdu[1] = on-air length,
- * pdu[2..] = payload; len = 2 + payload length). Single producer. Returns
- * false on overflow or a malformed length (dropped and counted). */
+ * pdu[2..] = payload; len = 2 + payload length). Single producer. An empty
+ * PDU is accepted and not queued. Returns false on overflow or a malformed
+ * length (dropped and counted). */
 bool ll_rxq_isr_put(const uint8_t *pdu, uint8_t len);
-/* Thread: next new (non-duplicate) PDU, decrypted when encryption is on.
- * Empty PDUs (length 0) and exact-SN retransmissions are consumed and
- * skipped internally (a retransmission does not reach ll_crypt or update
- * any counter); call again after LL_RXQ_OK to continue draining. Single
- * consumer. */
+/* Thread: next queued PDU, decrypted when encryption is on; call again
+ * after LL_RXQ_OK to continue draining. Single consumer. */
 enum ll_rxq_result ll_rxq_get(struct ll_rx_pdu *out);
 /* Count of ll_rxq_isr_put() calls dropped for lack of ring room (or a
  * malformed length), since the last ll_rxq_reset(). */

@@ -100,25 +100,46 @@ int main(void)
 		CHECK(out.data[0] == 0xAA);
 	}
 
-	/* Duplicate by SN: a retransmission (same SN as last accepted) is
-	 * ignored entirely; a genuinely new packet (SN flipped) is delivered.
-	 * An empty PDU still occupies the SN sequence for dup detection. */
+	/* No SN filter in software (Task 10): the hardware writes only new
+	 * packets into the RX FIFO (a retransmission is acked via NESN and
+	 * not written), so every PDU put here is new, whatever its SN. With
+	 * empty PDUs no longer queued, two data PDUs in a row can carry the
+	 * same SN bit (the empty one in between had the other); both must be
+	 * delivered. */
 	{
 		static const uint8_t p1[1] = {0x01};
-		static const uint8_t p2[1] = {0x02};
 		static const uint8_t p3[1] = {0x03};
 
 		ll_rxq_reset();
-		put(0x02, p1, 1);               /* SN 0, first: accepted */
-		put(0x02, p1, 1);               /* SN 0 again: our ack was lost, ignore */
-		put(0x01 | HDR_SN, NULL, 0);     /* SN 1, empty: consumes SN 1 */
-		put(0x02 | HDR_SN, p2, 1);       /* SN 1 again: duplicate of the empty, ignore */
-		put(0x02, p3, 1);                /* SN 0 again: new (flipped back) */
+		put(0x02, p1, 1);                /* SN 0 */
+		put(0x02, p3, 1);                /* SN 0: new (an SN 1 packet in between was
+						  * empty, or lost by an RX ring overflow) */
 
 		CHECK(ll_rxq_get(&out) == LL_RXQ_OK);
 		CHECK(out.data[0] == 0x01);
 		CHECK(ll_rxq_get(&out) == LL_RXQ_OK);
 		CHECK(out.data[0] == 0x03);
+		CHECK(ll_rxq_get(&out) == LL_RXQ_EMPTY);
+	}
+
+	/* Empty PDUs never take ring room (Task 10: the host's LE Connection
+	 * Complete processing blocks the controller thread for about 300 ms,
+	 * 20 events whose empty PDUs overflowed the 16-entry ring). */
+	{
+		ll_rxq_reset();
+		for (int i = 0; i < 40; i++) {
+			put((uint8_t)(0x01 | ((i & 1) ? HDR_SN : 0)), NULL, 0);
+		}
+		for (int i = 0; i < 16; i++) {
+			uint8_t payload[1] = {(uint8_t)i};
+
+			put(0x02, payload, 1);
+		}
+		CHECK(ll_rxq_overflow_count() == 0);
+		for (int i = 0; i < 16; i++) {
+			CHECK(ll_rxq_get(&out) == LL_RXQ_OK);
+			CHECK(out.data[0] == (uint8_t)i);
+		}
 		CHECK(ll_rxq_get(&out) == LL_RXQ_EMPTY);
 	}
 
@@ -172,12 +193,7 @@ int main(void)
 		CHECK(out.len == 27);
 		CHECK(memcmp(out.data, data1_clear, 27) == 0);
 		CHECK(c.rx_ctr == 2);
-
-		/* A retransmission of the last accepted PDU (same SN) never
-		 * reaches ll_crypt: no counter change, not delivered. */
-		put(0x06, data1_air, sizeof(data1_air));       /* SN 0 again */
 		CHECK(ll_rxq_get(&out) == LL_RXQ_EMPTY);
-		CHECK(c.rx_ctr == 2);
 	}
 
 	/* MIC failure: reported distinctly (LL_RXQ_MIC_FAIL), counter
@@ -199,7 +215,7 @@ int main(void)
 		CHECK(ll_rxq_get(&out) == LL_RXQ_MIC_FAIL);
 		CHECK(c.rx_ctr == 0);
 
-		/* Next connection: fresh dup-detection and crypt state. */
+		/* Next connection: fresh crypt state. */
 		ll_rxq_reset();
 		ll_rxq_set_crypt(&c);
 		put(0x0F, rsp1_air, sizeof(rsp1_air));
