@@ -93,7 +93,7 @@ rainy75/                            # workspace root
 │       │   ├── b91_bt.h            # shim API header
 │       │   ├── b91_bt.c            # shim: blob bridge + init + thread + PM hooks
 │       │   ├── b91_mac.c / .h      # MAC from flash, shared by blob and open controller
-│       │   ├── openll/             # open link layer (experimental, --openll)
+│       │   ├── openll/             # open link layer, blob-free (--openll)
 │       │   ├── hci_b91.c           # Zephyr HCI device-model driver
 │       │   ├── Kconfig
 │       │   └── CMakeLists.txt
@@ -616,7 +616,7 @@ We revive this functionality with a clean implementation:
 
 ### Open controller (experimental)
 
-An open-source link layer (`zmk/drivers/bluetooth/openll/`) can replace the blob behind the same `b91_bt.h` seam. It is selected with `CONFIG_BT_HCI_B91_CTLR_OPEN=y` (`./build.sh -p --iso --openll`); the blob stays the default. Slice 1 brings up `bt_enable()` and legacy connectable advertising without linking `liblt_9518_zephyr.a`, but does not follow connections yet, so BLE typing needs the blob build for now. Architecture, measurements, sniffer workflow and roadmap: [open-ble-controller.md](open-ble-controller.md).
+An open-source link layer (`zmk/drivers/bluetooth/openll/`) can replace the blob behind the same `b91_bt.h` seam. It is selected with `CONFIG_BT_HCI_B91_CTLR_OPEN=y` (`./build.sh -p --iso --openll`) and does not link `liblt_9518_zephyr.a`. It works end to end: advertising, connections (hardware BRX turnaround, CSA #1, connection and channel map updates), LLCP, ACL with HCI flow control and link encryption with the existing bond, so BLE typing works. A 33-minute encrypted soak under traffic ended with 0 disconnects. The blob stays the default until power management (sleep between connection events, deep-sleep coordination) is done; only a Linux/BlueZ central is tested so far. Architecture, measurements, build and flash steps, hardware findings and roadmap: [open-ble-controller.md](open-ble-controller.md).
 
 ### Driver architecture
 

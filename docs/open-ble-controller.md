@@ -1,12 +1,15 @@
 # Open BLE Controller (openll)
 
-Our own BLE link layer for the Telink B91, replacing the proprietary controller
-blob `liblt_9518_zephyr.a`. Tracking issue: [#13](https://github.com/scholzri/rainy75-zmk/issues/13).
+Our own BLE link layer for the Telink B91. It replaces the proprietary
+controller blob `liblt_9518_zephyr.a`. Tracking issue:
+[#13](https://github.com/scholzri/rainy75-zmk/issues/13).
 
-This is slice 1 of a multi-slice project. Slice 1 brings up Zephyr's Bluetooth
-host (`bt_enable()` succeeds) and does legacy connectable advertising on the
-open controller. It does not follow connections yet, so a keyboard running the
-open controller cannot be used over BLE. The blob stays the default build.
+**Status:** slices 1 to 4 are done. A keyboard running the open controller
+advertises, accepts a connection from a bonded host, starts link encryption with
+the existing bond and works as a BLE HID keyboard. No blob is linked. A 33-minute
+encrypted soak under traffic ended with 0 disconnects. The blob stays the
+default build until power management (slice 5) is done. Only one central has
+been tested so far (Intel controller with Linux/BlueZ).
 
 ## Why
 
@@ -16,11 +19,72 @@ this repository and no prebuilt firmware image can be published. Every user has
 to build locally, and `fetch_ble_blob.sh` downloads the blob at build time.
 
 The link map shows the blob as the only prebuilt binary in the image. Zephyr,
-the BT host, mbedTLS, picolibc, hal_telink (including `rf.c`, `trng.c`,
-`stimer.c`) and our drivers all build from source. The per-chip RF calibration
-at flash `0xFE000` is factory data, not code. Once the open controller can do
-everything the keyboard needs, the firmware can be built and shipped without
-any binary blob.
+the BT host, mbedTLS, picolibc, hal_telink (including `rf.c`, `aes.c`, `trng.c`
+and `stimer.c`) and our drivers all build from source. The per-chip RF
+calibration at flash `0xFE000` is factory data, not code. With the open
+controller the firmware can be built and shipped without any binary blob.
+
+## Using it
+
+### Build
+
+```bash
+./build.sh -p --iso --openll          # or --ansi
+grep -c liblt build/zephyr/zmk.map    # 0 for the open controller, 48 for the blob
+```
+
+`--openll` appends `conf/openll.conf` (`CONFIG_BT_HCI_B91_CTLR_OPEN=y`) to the
+app config. `fetch_ble_blob.sh` is not run for an `--openll` build.
+
+Deep sleep with the open controller is not tested yet (slice 5). The tested
+configuration for daily use turns deep sleep off with a small local config file
+and a manual build:
+
+```bash
+printf 'CONFIG_ZMK_SLEEP=n\n' > conf/nosleep.conf      # local file, not in the repo
+export ZEPHYR_TOOLCHAIN_VARIANT=zephyr
+export ZEPHYR_SDK_INSTALL_DIR=$(pwd)/toolchain/zephyr-sdk-0.17.0
+west build -d build-openll -b rainy75 zmk-src/app -- \
+    -DZMK_CONFIG=$(pwd)/zmk/boards/rainy75 -DZMK_EXTRA_MODULES=$(pwd)/zmk \
+    "-DEXTRA_CONF_FILE=$(pwd)/conf/app.conf;$(pwd)/conf/openll.conf;$(pwd)/conf/nosleep.conf" \
+    "-DEXTRA_DTC_OVERLAY_FILE=$(pwd)/zmk/boards/rainy75/rainy75.keymap;$(pwd)/conf/mcumgr.overlay"
+```
+
+If `ZEPHYR_TOOLCHAIN_VARIANT` is set but empty in your environment, the build
+cannot find the toolchain, hence the `export`.
+
+Image sizes from the "Memory region" summary (ISO, `conf/app.conf`, deep sleep
+on, nothing else changed):
+
+| Variant | ROM | RAM | RAM_ILM |
+|---|---|---|---|
+| Blob (`./build.sh -p --iso`) | 328120 B | 85416 B | 40288 B |
+| Open (`./build.sh -p --iso --openll`) | 277700 B | 85988 B | 6236 B |
+
+### Flash over USB (mcumgr)
+
+The same as any other app update (see [zmk-firmware.md](zmk-firmware.md)):
+
+```bash
+M="$HOME/go/bin/mcumgr --conntype serial --connstring dev=/dev/ttyACM0,baud=115200"
+$M image upload build-openll/zephyr/zmk.signed.bin
+$M image list                 # note the hash of the new image in slot 1
+$M image test <slot-1 hash>
+$M reset
+# after the reboot, once BLE typing works:
+$M image confirm
+```
+
+A bonded host reconnects by itself and keeps its bond: the identity address
+(MAC from flash) and the host's bond storage are the same for both controllers.
+The boot log shows `open link layer up`, `AES self-test (FIPS-197 C.1): pass`
+and, once the host connects, `connected: interval ...`.
+
+### Switching back to the blob
+
+MCUboot keeps the previous image in slot 1. Either `image test <slot-1 hash>`
+plus `reset`, or build the blob (`./build.sh -p --iso`) and upload it as above.
+The bond survives both ways.
 
 ## Architecture
 
@@ -38,203 +102,346 @@ the implementation:
 
 | Option | Meaning |
 |---|---|
-| `BT_HCI_B91_CTLR_BLOB` (default) | Telink blob, full peripheral feature set. Unchanged behaviour. |
+| `BT_HCI_B91_CTLR_BLOB` (default) | Telink blob. |
 | `BT_HCI_B91_CTLR_OPEN` | Open link layer from `openll/`. The blob is not linked. |
 
 Wiring:
 
 - `zmk/CMakeLists.txt` links `liblt_9518_zephyr.a` only under `BT_HCI_B91_CTLR_BLOB`.
 - `zmk/drivers/bluetooth/CMakeLists.txt` builds `hci_b91.c` and `b91_mac.c` for
-  both, `b91_bt.c` for the blob, and `openll/*.c` plus hal_telink's `rf.c` (and
-  `trng.c` unless the Zephyr TRNG driver already provides it) for the open
-  controller.
+  both, `b91_bt.c` for the blob, and `openll/*.c` plus hal_telink's `rf.c`,
+  `aes.c` (and `trng.c` unless the Zephyr TRNG driver already provides it) for
+  the open controller.
 - `b91_mac.c` holds the MAC-from-flash logic (read at `0xFF000`, random static
   fallback), shared by both controllers. Both derive the same public address.
 - `patches/hal_telink/0002-...` builds hal_telink's `sys.c` unless the blob is
   selected. The blob ships its own `sys_init`, the open controller needs the
   HAL one.
-- `conf/openll.conf` contains only `CONFIG_BT_HCI_B91_CTLR_OPEN=y`.
 
 ### Files (`zmk/drivers/bluetooth/openll/`)
 
-| File | Responsibility | Touches hardware |
-|---|---|---|
-| `ll_glue.c` | Implements `b91_bt.h`. Init (TRNG, MAC, radio, scheduler), controller thread, event queue to the host, CONNECT_IND logging, periodic radio stats | no (Zephyr glue) |
-| `ll_hci.c` / `.h` | HCI command parser and dispatcher, Command Complete builders, parameter validation. Pure logic: actions go through `struct ll_hci_ops`, events leave through a sink as H4 packets | no, host-tested |
-| `ll_pdu.c` / `.h` | Build ADV_IND / ADV_SCAN_IND / ADV_NONCONN_IND and SCAN_RSP, match SCAN_REQ, parse CONNECT_IND into `struct ll_connect_ind` | no, host-tested |
-| `ll_adv.c` / `.h` | Advertising state machine: interval plus 0..10 ms advDelay, channels 37 -> 38 -> 39, TX then a 300 us RX window per channel, SCAN_REQ and CONNECT_IND handling | no, host-tested against a fake radio |
-| `ll_sched.c` / `.h` | One one-shot alarm at an absolute system timer tick (16 MHz), callback in ISR context | stimer |
-| `ll_radio.c` / `.h` | The only RF-touching file. Wraps hal_telink `rf.c`: BLE 1M mode, advertising access address and CRC init, channel and whitening, TX/RX DMA buffers, RF IRQ, RX timestamps, counters | RF |
-| `ll_defs.h` | Shared constants (HCI status codes, PDU types, version and company ID, ACL buffer sizes, ticks per us, T_IFS) | no |
-| `ll_plat.h` | Platform hooks used by the pure code: random number, IRQ lock/unlock | no |
-| `tests/` | Host gcc tests `test_hci.c`, `test_pdu.c`, `test_adv.c` and `run_host_tests.sh` | no |
+Everything except `ll_glue.c`, `ll_radio.c` and `ll_sched.c` is pure C without
+Zephyr or hardware dependencies and is tested on the host with gcc.
 
-### Interfaces
+| File | Responsibility |
+|---|---|
+| `ll_glue.c` | Implements `b91_bt.h`. Init (TRNG, MAC, radio, scheduler, AES self-test), controller thread, ACL in and out, HCI flow control (Number Of Completed Packets), connection and disconnection handling, platform hooks (`ll_plat.h`), periodic statistics |
+| `ll_hci.c` / `.h` | HCI command parser and dispatcher, Command Complete/Status builders, all events toward the host (LE Connection Complete, Disconnection Complete, Number Of Completed Packets, LE LTK Request, Encryption Change, LE Connection Update Complete), ACL framing |
+| `ll_pdu.c` / `.h` | Advertising PDUs and SCAN_RSP, SCAN_REQ match, CONNECT_IND parsing |
+| `ll_adv.c` / `.h` | Advertising state machine; hands a CONNECT_IND for us to `ll_conn_start()` |
+| `ll_conn.c` / `.h` | Connection state machine: transmit window, window widening, anchor re-sync, event counter, CSA #1 channel, instants (connection update, channel map), supervision timeout, termination |
+| `ll_csa1.c` / `.h` | Channel Selection Algorithm #1 |
+| `ll_txq.c` / `.h` | Software model of the hardware TX FIFO: backlog, ring refill, placeholder rule, SN/NESN init per event, ack detection by read pointer, completion callbacks |
+| `ll_rxq.c` / `.h` | RX queue: ISR-filled ring of received data PDUs, decryption in the consumer |
+| `ll_llcp.c` / `.h` | Responder LL control procedures, encryption start, the single encrypt-and-push point for all outgoing data PDUs |
+| `ll_crypt.c` / `.h` | BLE AES-CCM (encrypt and decrypt one PDU, nonce from packet counter, direction and IV), session key derivation |
+| `ll_radio.c` / `.h` | The only RF-touching file. Wraps hal_telink `rf.c`: advertising (STX2RX, STX), connection events (BRX), TX FIFO pointers, RX DMA ring, timestamps, T_IFS monitor, return to advertising, counters |
+| `ll_sched.c` / `.h` | One-shot alarm and a guard alarm at absolute system timer (stimer, 16 MHz) ticks, callbacks in ISR context |
+| `ll_defs.h` | Shared constants (HCI status codes, PDU types, LLIDs, features, version, ACL buffer sizes, ticks per us) |
+| `ll_plat.h` | Platform hooks used by the pure code: random number, IRQ lock, TX mutex, AES-128 block |
+| `tests/` | Host tests (see [Host tests](#host-tests)) |
 
-- **Radio** (`ll_radio.h`): `ll_radio_set_adv_channel(ch)`,
-  `ll_radio_tx_then_rx(pdu, len, start_tick, rx_window_us)` (hardware TX then
-  RX, `rf_start_stx2rx`), `ll_radio_prepare_rsp()` plus `ll_radio_tx_rsp_at(tick)`
-  for SCAN_RSP (returns false and sends nothing when the TX trigger would be
-  less than 10 us in the future; the advertiser then moves to the next channel
-  at once), `ll_radio_stop()`, `ll_radio_now()`. Completions come back
-  through one callback in ISR context with `TX_DONE`, `RX_OK` (PDU, length and
-  the tick at the end of the packet), `RX_TIMEOUT` or `RX_CRC_ERR`.
-- **Scheduler** (`ll_sched.h`): `ll_sched_at(tick, cb)` and `ll_sched_cancel()`.
-- **HCI** (`ll_hci.h`): `ll_hci_init(ops, sink)` and `ll_hci_cmd(cmd, len)`.
-- **Advertising** (`ll_adv.h`): parameter, data and enable setters called by
-  the HCI layer, `ll_adv_radio_evt()` registered as the radio callback, and a
-  connect callback that receives every parsed CONNECT_IND.
+### Execution contexts
 
-### Data flow and threading
+- **ISR (RF and stimer interrupts):** `ll_adv`, `ll_conn`, `ll_txq` (refill at
+  event start, ack processing at event end) and the producer side of `ll_rxq`.
+  The RX ISR copies every received data PDU out of the RX DMA ring before the
+  DMA can reuse the entry. Callbacks toward the glue only record what happened
+  (pending bits, counters) and wake the controller thread.
+- **Controller thread** (`CONFIG_BT_HCI_B91_RX_PRIO`, preemptible): consumes
+  `ll_rxq` (decrypt, LLCP to `ll_llcp`, ACL to the host), sends host ACL through
+  `ll_llcp_tx()`, emits LE Connection Complete, Connection Update Complete,
+  Number Of Completed Packets and Disconnection Complete, and resets `ll_rxq` and
+  `ll_llcp` after a disconnect, before advertising may be enabled again.
+- **HCI thread** (the host's TX path): HCI commands. Host ACL is only parsed and
+  queued here. The LTK reply and HCI Disconnect queue control PDUs from this
+  thread.
+- **Locks:** `ll_plat_lock()` (interrupts off) protects state shared with the
+  ISRs and is held only briefly: around `ll_txq_push()` and around the switch of
+  the RX decryption context. `ll_plat_tx_lock()` is a recursive `k_mutex` with
+  priority inheritance that serializes the two TX producers (controller thread
+  and HCI thread). Encryption and push of one PDU run under it, so the CCM
+  packet counter order equals the FIFO order. AES never runs with interrupts
+  off. The mutex may block, so it is never taken from an ISR or with the IRQ
+  lock held.
 
-- Host to controller: `hci_b91_send()` -> `b91_bt_host_send_packet()` ->
-  `ll_hci_cmd()` -> state changes in `ll_adv`. ACL packets are dropped with a
-  warning (no connections in slice 1).
-- Controller to host: events go into a `k_msgq`. The controller thread
-  delivers them through the registered `host_read_packet` callback, the same
-  thread context the blob shim uses.
-- Radio and scheduler callbacks run in ISR context. A parsed CONNECT_IND is
-  pushed into a second queue and logged from the controller thread.
-- The controller thread polls the event queue with a 100 ms timeout and logs
-  the radio counters every 2 s.
+### Connection event flow
+
+1. **Alarm** (`ll_sched`), `LL_CONN_ARM_LEAD_US` = 500 us before the RX window
+   opens. If the alarm runs less than 120 us before the window, the event is
+   skipped (counted as `late`).
+2. **Prepare** (`ll_conn`): channel from CSA #1, RX window = anchor - widening -
+   margin, first-RX timeout = 2 x (widening + margin) + 40 us (the transmit
+   window size is added for window events). `ll_txq_event_start()` programs SN
+   and NESN init and refills the ring.
+3. **BRX** (`ll_radio`): one BRX command (`0x82`) with TX settle 86 us,
+   triggered 80 us (RX settle) before the window opens. The hardware receives
+   the central's packet, answers after its own turnaround and keeps chaining
+   RX/TX exchanges while either side has MD set.
+4. **RX IRQ, per packet:** the PDU goes to `ll_txq_rx()` (SN tracking) and
+   `ll_rxq_isr_put()`. Only the event's first packet re-anchors and refreshes
+   the supervision timer (see "Anchor rule" below).
+5. **Event end:** CMD_DONE or a first-RX timeout. `ll_txq_event_end()` reads the
+   read pointer and completes acked entries, the event counter advances,
+   supervision and termination are checked, instants are applied and the next
+   event is planned. A guard alarm ends any event that has no end IRQ after
+   first-RX timeout + 6 ms; three guard-ended events in a row end the link with
+   0x08.
+
+**Anchor rule:** the anchor is the start of the event's first packet. If that
+packet had a bad CRC, or was a retransmission the hardware acked without an RX
+entry (`LL_RADIO_CONN_RX_NODATA`), or the first reported packet starts after the
+RX window, a later packet of the same event is a chained one and must not move
+the anchor. It only refreshes the supervision timer.
+
+**Timing:** all link layer timing uses the stimer (16 MHz from the 24 MHz
+crystal). Kernel time runs on the 32 kHz RC and is not used. Window widening is
+`(central SCA ppm + 50 ppm) x time since the last received anchor + 16 us`,
+rounded up, clamped at `interval / 2 - 150 us` (the supervision timeout then
+ends the link). RX margin is 60 us for synced events, 200 us for transmit
+window events.
+
+### TX path
+
+The B91 baseband has a 4-entry TX FIFO for pipe 0 with a read pointer
+(`0x80100501`) that the hardware advances when the central acks the head, and a
+write pointer (`0x80100500`) written by software:
+
+- Empty FIFO (`rptr == wptr`): the hardware sends the DMA base buffer, which
+  holds an empty PDU.
+- Otherwise it sends entry `rptr & 3` at base + 64 x (1 + entry). MD on air is
+  set by the hardware when more entries wait behind the one being sent. The MD,
+  SN and NESN bits in the buffer are ignored.
+- An entry that is not acked is resent with the same SN.
+
+`ll_txq` keeps a backlog of 8 PDUs and copies them into the ring only at event
+start, never while an event is on air. An entry is complete when the read
+pointer has passed it: ACL entries count toward Number Of Completed Packets,
+control PDUs notify `ll_llcp` and `ll_conn` (LL_TERMINATE_IND ack).
+
+**Placeholder rule.** At the first RX of a BRX command the hardware judges the
+central's ack against the programmed SN init, but it cannot know whether our
+last packet was the base buffer or a ring entry. If our last packet was the base
+empty PDU, `ll_txq` therefore writes an empty placeholder entry in front of new
+data. If the central acked the base, the first pop removes the placeholder
+unsent, which is correct. If not, the placeholder is resent with the base's SN
+and the same empty content, a correct retransmission. Verified on the device
+under forced NACKs (TX settle raised to 102 us, about 18 % of our responses not
+received by the central): 2686 of 2686 encrypted SMP echoes matched, about 12000
+encrypted data PDUs, 0 MIC failures. On an encrypted link a duplicate or a lost
+PDU would have shifted the CCM packet counter and ended the link with 0x3D. A
+fallback (`LL_TXQ_SAFE_MODE`, one data PDU per event) exists in the code and is
+host-tested, but is not needed.
+
+### RX path
+
+The RX DMA is a 4 x 64 byte ring, configured once at boot. The hardware writes
+only new packets into it: a retransmission of the central (SN not the expected
+one) is acked through NESN but not written, and its RX IRQ finds no new entry.
+Retransmissions are therefore filtered in hardware; there is no software
+duplicate check. This was verified under forced NACKs: 10 595 central
+retransmissions in one run, none reached software.
+
+The RX ISR copies each CRC-valid data PDU into `ll_rxq`, a 16-entry ring that
+holds data PDUs only (empty PDUs are not queued). The controller thread drains
+it and decrypts in RX order. A MIC failure ends the link with 0x3D.
+
+An overflow of `ll_rxq` cannot be recovered: the hardware has already acked the
+PDU, so the central will never resend it. `ll_conn` then ends the link with
+0x08 at the end of the event instead of continuing with a hole in the L2CAP
+stream. With data-only queuing no overflow has been seen since; before, empty
+PDUs filled the ring while the host processed LE Connection Complete (about
+300 ms, see "Measured results").
+
+### LLCP (responder) and encryption
+
+| Received | Action |
+|---|---|
+| LL_FEATURE_REQ | LL_FEATURE_RSP. Features: LE Encryption, Extended Reject Indication (`0x05`) |
+| LL_VERSION_IND | LL_VERSION_IND (version 0x09, company 0xFFFF, subversion 1), once per connection |
+| LL_CONNECTION_UPDATE_IND | Applied at the instant with the new transmit window; LE Connection Update Complete if interval, latency or timeout changed |
+| LL_CHANNEL_MAP_IND | Applied at the instant. Fewer than 2 used channels end the link with 0x1E |
+| LL_TERMINATE_IND | Disconnection Complete with the reason from the PDU |
+| LL_ENC_REQ | LL_ENC_RSP (SKDs, IVs) right away, then LE LTK Request to the host |
+| LL_START_ENC_RSP | TX encryption on, encrypted LL_START_ENC_RSP, Encryption Change to the host |
+| LL_PAUSE_ENC_REQ | Rejected (0x1A), key refresh not supported |
+| Anything else (LENGTH, PHY, PING, PERIPHERAL_FEATURE, CONN_PARAM, ...) | LL_UNKNOWN_RSP |
+| own: HCI Disconnect | LL_TERMINATE_IND, Disconnection Complete (0x16) after the ack or the supervision timeout |
+
+Encryption start (Core Spec Vol 6 Part B 5.1.3.1), peripheral side: on the
+host's LTK reply the session key `SK = e(LTK, SKDs || SKDm)` is derived, RX
+decryption is switched on and LL_START_ENC_REQ is queued in plaintext. The
+central's LL_START_ENC_RSP arrives encrypted and turns TX encryption on. A
+negative reply sends LL_REJECT_EXT_IND (or LL_REJECT_IND if the central lacks
+Extended Reject) with 0x06. The LLCP response timeout is 40 s (0x22).
+
+`ll_crypt` implements AES-CCM in software on top of the hardware AES-128 block
+of the B91 (hal `aes_encrypt()`). It reproduces the Core Spec sample data
+(Vol 6 Part C) in the host tests, and the glue runs a FIPS-197 C.1 self-test at
+every boot. One AES block takes 31 to 43 us on the device; a 27-byte PDU needs
+a few blocks.
 
 ### HCI subset
 
-Exactly the commands `bt_enable()` plus legacy advertising need: Reset, Set
-Event Mask, LE Set Event Mask, Read Local Version Information, Read Local
-Supported Commands, Read Local Supported Features, LE Read Local Supported
-Features, LE Read Buffer Size, Read BD_ADDR, LE Rand (hardware TRNG), LE Set
-Advertising Parameters, LE Set Advertising Data, LE Set Scan Response Data, LE
-Set Advertising Enable.
+Reset, Set Event Mask, LE Set Event Mask, Read Local Version Information, Read
+Local Supported Commands, Read Local Supported Features, LE Read Local Supported
+Features, LE Read Buffer Size (27 bytes, 3 packets), Read BD_ADDR, LE Rand
+(hardware TRNG), LE Set Advertising Parameters, LE Set Advertising Data, LE Set
+Scan Response Data, LE Set Advertising Enable, Disconnect, LE Long Term Key
+Request Reply and Negative Reply.
 
-Invalid parameters return status `0x12`. Unknown opcodes return `0x01` and are
-logged once per opcode. The supported-commands bitmap was cross-checked against
-Zephyr's `ll_sw` `hci.c`. The feature bits advertise no 2M PHY, no Data Length
-Extension, no LL privacy and no extended advertising, so the host does not try
-them. The controller reports HCI version 5.0, manufacturer `0xffff`.
+Invalid parameters return 0x12, unknown opcodes 0x01 (logged once per opcode).
+The supported-commands bitmap was cross-checked against Zephyr's `ll_sw`
+`hci.c`. The feature bits advertise no 2M PHY, no Data Length Extension, no LL
+privacy and no extended advertising, so the host does not try them. ACL toward
+the host uses connection handle 0x0000.
 
-### Robustness measures
+### Return to advertising
 
-Added before the first hardware run, since a radio bug shows up as silence:
+After a disconnect, `ll_radio_adv_restore()` resets the baseband and
+re-initializes advertising. The TX read pointer survives the reset (it cannot be
+written either), but advertising works anyway once the DMA is no longer
+reconfigured at runtime: up to 11 disconnects and restores in one boot, no
+reboot, and the host reconnects within seconds.
 
-- `rx_buf` is 288 bytes, large enough for a full 255-byte noise packet plus DMA
-  header and trailer, and that size is passed to `rf_set_rx_dma()` (hardware
-  enforcement of the max length is unverified).
-- `ll_adv` ignores radio events that arrive after an advertising event ended
-  (no double scheduling), re-bases the next event on "now" after a stall instead
-  of firing a burst of late events, and rejects NULL data with a nonzero length.
-- `ll_radio` counts `tx2rx`, `rx_ok`, `crc`, `timeout`, `rsp` (SCAN_RSP TX
-  triggered, not confirmed on air) and `rsp_late` (SCAN_RSP refused because the
-  TX trigger tick was less than 10 us ahead or already past; a trigger in the
-  past would leave the radio waiting and stall advertising). `ll_glue` logs them
-  every 2 s as `radio: tx2rx N rx_ok N crc N timeout N rsp N rsp_late N` and
-  warns `radio stalled` when advertising is enabled but `tx2rx` does not
-  advance.
-- Oversized events are dropped with an error, dropped CONNECT_INDs are counted.
-- CONNECT_IND logging is rate limited: the first one and then at most one full
-  dump every 10 s, with `N since last dump`. Without this the log flood
-  overflowed the log buffer and made mcumgr time out on the shared CDC ACM port.
+## Measured results
 
-## Building
+All on the keyboard with a bonded Linux/BlueZ PC (Intel controller). Numbers
+come from the device statistics (logged every 2 s) and the nRF sniffer.
 
-```bash
-./build.sh -p --iso --openll      # or --ansi
-grep -c liblt build/zephyr/zmk.map   # 0 for the open controller, 48 for the blob
-```
+### T_IFS
 
-`--openll` appends `conf/openll.conf` to the app config. Flash with mcumgr as
-usual (`image upload`, `image test`, `reset`). MCUboot keeps the previous image
-in slot 1, so going back to the blob is `image test <slot-1 hash>` plus
-`reset`, or a fresh `./build.sh -p --iso` and upload.
+On air, sniffer, one connection, n = 542, 0 CRC errors:
 
-Image sizes from the "Memory region" summary of the final builds (ISO,
-`conf/app.conf`, deep sleep on, nothing else changed):
+| T_IFS | 148 us | 149 us | 150 us | 151 us | 152 us | 153 us | 154 us |
+|---|---|---|---|---|---|---|---|
+| share | 15.3 % | 46.5 % | 24.9 % | 5.4 % | 5.0 % | 2.8 % | 0.2 % |
 
-| Variant | ROM | RAM | RAM_ILM |
-|---|---|---|---|
-| Blob (`./build.sh -p --iso`) | 328088 B | 85160 B | 40288 B |
-| Open (`./build.sh -p --iso --openll`) | 263396 B | 83416 B | 6204 B |
+86.7 % at or below 150 us, 3.0 % above 152 us. The blob shows the same mode
+(148/149 us). The device's own estimate from the TX timestamp reads about 1 us
+higher than the sniffer; over the 33-minute soak it gave 71.7 % at or below
+150 us, 27.5 % at 151 to 152 us and 1.3 % above. The central accepted every
+response.
 
-Practical notes:
+### Soak
 
-- With the open controller the keyboard advertises but cannot hold a
-  connection, so a bonded host keeps retrying (several CONNECT_INDs per second)
-  and BLE typing does not work. Use USB.
-- The default config enables deep sleep after 15 minutes, which stops
-  advertising until a keypress. For long sniffer sessions build with
-  `CONFIG_ZMK_SLEEP=n` in an extra config file (for example by adding it to
-  `EXTRA_CONF_FILE` in a manual `west build`).
-- If `ZEPHYR_TOOLCHAIN_VARIANT` is set but empty in your environment, the
-  build fails to find the toolchain. `export ZEPHYR_TOOLCHAIN_VARIANT=zephyr`
-  first.
+33 minutes connected, encrypted, with an SMP echo every 5 s (ACL in both
+directions, multi-PDU L2CAP, MD chains) and the host switching between 15 ms
+and 7.5 ms intervals:
 
-## Status (slice 1)
-
-Measured on the keyboard on 2026-10-02.
-
-| Check | Result |
+| Counter | Value |
 |---|---|
-| Blob not linked | Pass. `grep -c liblt zmk.map` = 0 (blob build: 48). |
-| `bt_enable()` | Pass on first flash. Identity address matches the MAC from flash. Only unsupported opcode seen: `0xfc01` (Zephyr vendor Read Version Info, warning only). |
-| ADV_IND on air | Pass. Channels 37/38/39, CRC valid (CRC24 recomputed independently). 0 CRC errors in one 30 s capture, 6 isolated ones (0.6 %) in another, with the other channels of the same events good. AdvData, AdvA and length byte-identical to the blob. |
-| Advertising interval | 100 ms + 0..10 ms advDelay: mean 105.07 ms, min 99.80, max 110.00 over 228 single intervals. ZMK requests 100..150 ms; the blob picks 150 ms (mean 152.75 ms). Both are valid. |
-| Channel step inside an event | 0.906 ms (blob 0.725 ms). Each ADV_IND is about 376 us on air. |
-| Scanners see the device | Pass. `bluetoothctl` lists "Rainy 75 Pro". The name is in ADV_IND (ZMK's scan response is empty), so this does not depend on SCAN_RSP. |
-| SCAN_RSP | Partial. On air with valid CRC, but T_IFS is about 209 us instead of 150 +/- 2 us. See below. |
-| CONNECT_IND parsing | Pass on all fields observable so far. The bonded PC sends about 2.6 CONNECT_INDs per second and every one is decoded. Static fields match the sniffer capture (after CRC reconstruction, see below). A capture of the same CONNECT_IND by both sniffer and device log (matched Access Address) is still missing because follow mode is unreliable. |
-| Blob build regression | Pass. Default blob build flashed after the work, reconnects to the bonded host by itself, and BLE typing works (confirmed by the user). |
+| disconnects | 0 |
+| connection events | 233 628 |
+| events with RX | 217 813 |
+| missed (central did not send) | 15 815 |
+| late / guard / CRC errors / RX queue overflow | 0 / 0 / 0 / 0 |
+| window widening max | 43 us |
+| connection updates applied | 756 |
+| SMP echoes matched | 378 / 378 |
 
-Fields decoded by the device and seen on air, from a Linux/BlueZ central:
-Interval 12 (15 ms), Latency 30, Timeout 400 (4 s), WinSize 1, WinOffset
-0..11, ChM `ff ff ff ff 1f`, Hop 5..15, SCA 1, ChSel 1, with a fresh Access
-Address and CRCInit on every attempt.
+### Interrupt lock times
 
-Radio counters after about 7 minutes with the bonded PC retrying (before
-`rsp_late` existed):
-`tx2rx 10076 rx_ok 1114 crc 87 timeout 8875 rsp 5`. Most RX windows time out,
-which is normal for advertising. RX CRC errors are mostly other devices'
-packets or collisions in our window.
+| | Before (encrypt under the IRQ lock) | After (TX mutex) |
+|---|---|---|
+| ACL encrypt + push, IRQ lock | 360 to 398 us | 42 to 55 us |
+| Longest IRQ lock while connected | 360 to 398 us | 68 to 86 us |
 
-### SCAN_RSP turnaround spike
+The longest lock overall, 206 to 223 us, is the baseband reset at the return to
+advertising, while no connection exists.
 
-T_IFS (150 us between the end of SCAN_REQ and the start of SCAN_RSP) was the
-main technical risk of slice 1. The current code is software timed: the RX IRQ
-parses the SCAN_REQ and starts a single TX with `rf_start_stx()` at
-`packet end + 150 us - 78 us` TX settle.
+### Connection updates
 
-Result: SCAN_RSP is on air with a valid CRC, but starts about **209 us** after
-the SCAN_REQ (about 59 us late). Measured indirectly with the sniffer: SCAN_REQ
-end to the next ADV on channel 38 is 577 us, SCAN_RSP start to the next ADV
-start is 368 us in both captured responses, so 577 - 368 = 209 us.
+The PC sends LL_CONNECTION_UPDATE_IND about 5 s after every connect (parameters
+unchanged, interval 12, latency 30, timeout 400; only the anchor shifts by the
+window offset). During GATT/SMP activity the host asks for 7.5 ms, latency 0,
+and later returns to 15 ms. Both are applied at their instant; at 7.5 ms the
+link runs at 133 events per second with an RX in almost every event.
 
-Why it cannot be fixed in software:
+### Late events
 
-- The RX IRQ reaches the ISR 19..57 us after the packet end, and the TX trigger
-  is programmed about 46..75 us after the packet end.
-- Air start = trigger tick + 78 us TX settle + about 59 us fixed TX path delay.
-  To get 150 us the trigger would have to be at packet end + 13 us. Pulling the
-  trigger earlier (iteration 1, -59 us) put the start tick in the past.
-- Iteration 2 tried the hardware RX->TX turnaround (FSM `0x88` rx2tx with the
-  SCAN_RSP preloaded). Advertising kept running and SCAN_REQs were matched, but
-  no SCAN_RSP appeared on air in 180 s. Not converged within the timebox, not
-  committed.
+Under traffic the stimer alarm often starts 150 to 270 us late, mostly because
+the USB ISR (higher interrupt priority) is still running. With a 300 us lead
+about 0.4 % of the events at 7.5 ms were skipped; with 500 us, 0 in a 10-minute
+run. Flash writes (bond, CCC and settings storage after a connect) disable
+interrupts for up to 3.8 ms and can still skip a single event; the central
+covers that with a retransmission.
 
-Implication for slice 2: connection events need a response within T_IFS every
-interval, so the connection path must use the hardware brx/btx automatic
-turnaround of the B91 FSM, not a software-triggered TX. Unexplored options for
-SCAN_RSP: a shorter TX settle on the STX path, `txwait`/`tx_stl` tuning for the
-rx2tx path, and a RAM-resident ISR.
+### Stack usage (soak, used / size)
 
-A response whose TX trigger tick would be less than 10 us ahead is now not
-started at all and is counted in `rsp_late` instead. The trigger slack at
-baseline was estimated at about +26..-3 us (from the slack measured with a
--59 us correction), so part of the SCAN_REQs now get no response. This trades
-some responses for an advertising state machine that cannot stall on a
-trigger in the past.
+| Thread | Bytes |
+|---|---|
+| openll controller | 888 / 2048 |
+| BT RX WQ | 1056 / 2208 |
+| BT LW WQ | 1080 / 1408 |
+| logging | 824 / 1024 |
+| ISR | 608 / 2048 |
 
-Scanners treat our late responses as missing and back off (Core Vol 6 Part B
-4.4.3.2), so a PC sends few SCAN_REQs to the keyboard (about one per minute
-visible on air). This does not affect discovery, since the name is in ADV_IND.
+`conf/app.conf` raises the log thread stack to 1024 bytes for both controllers
+(the default 768 was 99 % used).
+
+## Hardware findings
+
+These are measured on this board and do not appear in the Telink
+documentation. They may help anyone writing a B91 link layer.
+
+- **BRX turnaround.** The BRX command (`0x80140a00 = 0x82`, register sequence of
+  hal `rf_start_brx()`) receives and answers in hardware. TX settle 86 us gives
+  an on-air T_IFS of 148/149 us, like the blob. A software-triggered TX cannot
+  meet T_IFS: the RX IRQ arrives 19 to 57 us after the packet end and the TX
+  path adds about 59 us plus settle (the SCAN_RSP of slice 1 lands at about
+  209 us).
+- **Chaining and MD.** One BRX command chains RX/TX exchanges while either side
+  has MD. Our MD bit comes from the TX FIFO occupancy, not from the buffer.
+- **SN/NESN in hardware.** The baseband sets SN and NESN on air. Before every
+  BRX it reads SN init and NESN init from `ll_ctrl_1` (`0x80140a03` bits 4 and
+  5) for the first exchange of the command. Both must be programmed per
+  command: SN init = SN of our last packet, NESN init = SN of the central's last
+  new packet XOR 1. With NESN init left at 0, every central packet with SN 1 was
+  acked but dropped. `reset_sn_nesn()` (`0x80140a01 = 1`) once per connection.
+- **5-bit pointers.** The TX FIFO read/write pointers and the RX DMA write
+  pointer are 5-bit counters (wrap at 32). 8-bit arithmetic stalled the TX queue
+  after the first wrap.
+- **Read pointer not resettable.** Writing `0x80` or `0x00` to the TX read
+  pointer has no effect. A baseband reset does not reset it either, yet
+  advertising works after a connection as long as the DMA geometry is not
+  changed at runtime.
+- **`rf_set_rx_dma()` on a live radio freezes the SoC** within microseconds,
+  before any fault handler runs (watchdog reset). Configure the RX and TX DMA
+  once at boot. The mechanism is not understood, only avoided.
+- **Timestamps.** The RX DMA trailer timestamp marks the end of the access
+  address. With `0x80140830 |= 0x08` the register `0x80140850` holds the TX
+  start time, which gives an on-device T_IFS monitor.
+- **Kernel clock.** The board ran kernel time 6.67 % fast:
+  `SYS_CLOCK_TICKS_PER_SEC` 10000 against a 32 kHz mtime gave 3 instead of 3.2
+  cycles per tick. Fixed by a tick rate of 32000 (affects every ZMK build:
+  debounce, tap-hold and sleep timeouts were 6.25 % short). The link layer uses
+  only the stimer anyway.
+
+## Known limitations
+
+- **No power management yet (slice 5).** The CPU does not sleep between
+  connection events and every event is listened to (peripheral latency is
+  accepted but not used). Deep sleep is not coordinated with the controller and
+  is untested with it; run with `CONFIG_ZMK_SLEEP=n` for now. Battery life is
+  therefore shorter than with the blob.
+- **Interrupt latency from outside the link layer.** USB interrupts and flash
+  writes with interrupts off can still skip single connection events.
+- **Not supported:** CSA #2 (we advertise ChSel 0, so the central uses CSA #1),
+  2M and Coded PHY, Data Length Extension, LL privacy (LE Set Random Address,
+  RPA), LE Ping (answered with LL_UNKNOWN_RSP, which the tested central
+  accepts), encryption pause and key refresh, multiple connections.
+- **SCAN_RSP is about 59 us late** (T_IFS about 209 us, software timed), and a
+  response whose trigger would be too late is skipped. Discovery is not
+  affected: the name is in ADV_IND.
+- **About 3 % of the responses have a T_IFS above 152 us** (first exchange of
+  an event, cause unknown). The tested central accepts them; stricter centrals
+  might not.
+- **One central tested.** Only an Intel controller with Linux/BlueZ. Other
+  operating systems and controllers are untested.
+- After LE Connection Complete the Zephyr host's cooperative RX work queue holds
+  the CPU for about 300 ms, so our first LLCP answers leave that late. Harmless
+  (the central allows 40 s).
 
 ## Measuring with the sniffer
 
@@ -261,7 +468,7 @@ visible on air). This does not affect discovery, since the name is in ADV_IND.
 - `tshark` / `wireshark` (4.7.3 used) for decoding. `nrfutil ble-sniffer bootstrap`
   installs the Wireshark extcap shim for live GUI capture.
 
-### Capturing
+### Capturing advertising
 
 Use `nrfutil` directly. `tshark -i` needs `dumpcap` capabilities via the
 `wireshark` group, which did not work inside the distrobox. The `/dev/serial/by-id`
@@ -286,8 +493,8 @@ timeout 40 cat "$(readlink -f /dev/serial/by-id/*Rainy_75*)"
 
 Following one advertiser is needed to see CONNECT_INDs addressed to it and the
 connection after it. `nrfutil ble-sniffer sniff --follow` is unreliable (about once
-in nine tries, zero in four in another session): it only sends the follow request
-if the device is advertising at the moment it starts.
+in nine tries): it only sends the follow request if the device is advertising at
+the moment it starts.
 
 What works headlessly is Nordic's Python SnifferAPI, driven by
 `reverse/tools/ble_follow_capture.py`. Install the AUR package `nrf-sniffer-ble`
@@ -300,13 +507,21 @@ python3 reverse/tools/ble_follow_capture.py --follow XX:XX:XX:XX:XX:XX \
     --seconds 40 --out reverse/captures/conn.pcapng
 ```
 
-Trigger a reconnect while it runs (for example `bluetoothctl disconnect` on the
-bonded host, which reconnects by itself). In two of two runs it captured the
-CONNECT_IND and the full connection (about 2700 packets in 25 s, none missed
-over the UART). The blob's LLCP sequence after connecting is FEATURE_REQ/RSP,
-PERIPHERAL_FEATURE_REQ, LENGTH_REQ/RSP, then ENC_REQ/RSP and START_ENC_REQ;
-everything after that is encrypted. Live capture with tshark or the Wireshark
-GUI also works from the arch box via `newgrp wireshark` (Arch has no `sg`).
+Trigger a reconnect while it runs. `bluetoothctl disconnect` on the bonded host
+does not always lead to an automatic reconnect; powering the host adapter off
+and on (`bluetoothctl power off`, `power on`) does, within 2 to 6 s.
+
+Notes:
+
+- The dongle buffers packets while no capture runs and delivers them at the
+  start of the next capture. Match connections by access address with the
+  device log (`CONNECT_IND ... AA 0x...`).
+- The sniffer cannot follow the hop sequence after an encrypted
+  LL_CONNECTION_UPDATE_IND, since it cannot decrypt it.
+- Our responses with a T_IFS well above 152 us fall outside the sniffer's
+  capture window and do not appear in the capture at all.
+- Live capture with tshark or the Wireshark GUI also works from the arch box via
+  `newgrp wireshark` (Arch has no `sg`).
 
 ### Sniffer display quirks
 
@@ -314,8 +529,7 @@ GUI also works from the arch box via `newgrp wireshark` (Arch has no `sg`).
   and CONNECT_IND headers, and ChM, Hop and SCA in CONNECT_IND. The displayed
   bytes then fail the CRC. Reconstruct the real values by searching for the
   combination that makes the CRC match (CRC24, polynomial `0x65B`, init
-  `0x555555` on advertising channels). This is how the blob's ADV_IND header
-  `20 21` (ChSel = 1) was found, which the sniffer shows as `00 21`.
+  `0x555555` on advertising channels).
 - For timing between packets use `nordic_ble.delta_time`, which is end to
   start (T_IFS). `nordic_ble.delta_time_ss` is start to start.
 
@@ -329,7 +543,8 @@ a loop during the capture, then `bluetoothctl unblock <addr>`.
 ### `ble_adv_report.py`
 
 `reverse/tools/ble_adv_report.py` summarizes the advertising in a capture
-(needs `tshark` in `PATH`):
+(needs `tshark` in `PATH`; a missing or failing tshark is reported as a one-line
+error):
 
 ```bash
 python3 reverse/tools/ble_adv_report.py adv.pcapng --adva xx:xx:xx:xx:xx:xx
@@ -342,9 +557,7 @@ Output: `per_channel` packet counts, `crc_bad`, `pdu_types`, and
   `True`/`False`, older versions as `1`/`0`; the script handles both and treats
   an empty field as good.
 - The interval is computed from consecutive good channel 37 packets, so missed
-  events inflate it (the sniffer hops and misses some). For the real
-  advInterval, compute event starts and keep only deltas below 1.5 x the
-  minimum interval, as done for the table above.
+  events inflate it (the sniffer hops and misses some).
 - If the sniffer re-syncs during a capture, `frame.time_relative` restarts and
   the minimum interval is bogus.
 
@@ -356,53 +569,39 @@ Tests: `cd reverse/tools && python3 -m unittest test_ble_adv_report`.
 zmk/drivers/bluetooth/openll/tests/run_host_tests.sh
 ```
 
-Builds and runs `test_hci` (opcode handling, event encoding, parameter
-validation, unknown opcodes), `test_pdu` (PDU encoding, SCAN_REQ match,
-CONNECT_IND parsing against captured bytes) and `test_adv` (state machine
-against a fake radio: channel sequence, interval and delay, SCAN_RSP trigger,
-refused late SCAN_RSP, CONNECT_IND callback, late events and stall
-catch-up) with the host gcc.
+Builds and runs with the host gcc (`-Wall -Wextra -Werror`):
 
-## Known limitations
+| Test | Covers |
+|---|---|
+| `test_hci` | Opcode handling, event encoding, parameter validation, unknown opcodes, connection events, ACL framing |
+| `test_pdu` | PDU encoding, SCAN_REQ match, CONNECT_IND parsing against captured bytes |
+| `test_adv` | Advertising state machine against a fake radio |
+| `test_csa1` | CSA #1 against hand-computed sequences |
+| `test_crypt` | AES-CCM and session key against the Core Spec sample data (software AES reference) |
+| `test_txq`, `test_txq_safe` | TX queue against a fake FIFO implementing the measured hardware model, including forced NACKs, the placeholder case and pointer wrap |
+| `test_rxq` | RX queue, data-only queuing, decryption, MIC failure |
+| `test_conn` | Connection timing (transmit window, widening, anchor rule), instants, supervision, termination, RX queue loss |
+| `test_llcp` | Every LLCP PDU, encryption start, lock discipline (no AES under the IRQ lock) |
 
-- No connections. A CONNECT_IND is parsed and logged, then advertising
-  resumes. A bonded host retries endlessly, so BLE typing does not work with
-  this build.
-- SCAN_RSP is about 59 us late (T_IFS about 209 us), see above. Discovery still
-  works because the name is in ADV_IND.
-- We advertise with ChSel = 0 (CSA #1 only). The blob sets ChSel = 1 (CSA #2
-  support). Valid either way; the decision belongs to slice 2.
-- Timing between log timestamps and wall clock disagrees by about 6 %: the
-  "every 2 s" radio reports appear 1.88 s apart in log time and the 10 s
-  CONNECT_IND dumps 9.4..9.8 s apart, while the stimer-based advertising
-  timing is correct on air. To be explained before connection timing work.
-- Under a heavy log flood, aborting an mcumgr upload once wedged the CDC ACM
-  port (the keyboard kept advertising). A host-side USB port reset
-  (`USBDEVFS_RESET`) recovered it. Possibly a `usb_dc_b91` or CDC TX issue,
-  separate from openll.
-- No power management: the radio runs whenever advertising is enabled.
-- An AA-matched comparison of one CONNECT_IND between sniffer and device log is
-  still open (sniffer follow mode).
+## Slice 1 notes: SCAN_RSP turnaround
+
+The advertising SCAN_RSP is software timed: the RX IRQ parses the SCAN_REQ and
+starts a single TX with `rf_start_stx()` at `packet end + 150 us - 78 us` TX
+settle. On air it starts about 209 us after the SCAN_REQ (59 us late), measured
+indirectly with the sniffer: SCAN_REQ end to the next ADV on channel 38 is
+577 us, SCAN_RSP start to the next ADV start 368 us. An attempt with the
+hardware RX->TX turnaround on the advertising path (FSM `0x88`) sent nothing
+within the timebox. A response whose TX trigger would be less than 10 us ahead
+is not started (`rsp_late`), so the advertising state machine cannot stall on a
+trigger in the past. Scanners back off after missing responses, which does not
+matter here because the name is in ADV_IND.
 
 ## Roadmap
 
-Each slice gets its own spec, plan and build cycle once the previous one works.
-
-- **Slice 2: connection follow and empty-PDU keepalive.** Anchor tracking,
-  window widening from SCA, CSA #1 channel hopping, SN/NESN, supervision
-  timeout, LL_TERMINATE_IND, LE Connection Complete and Disconnection Complete
-  events. Prerequisites from slice 1: use the hardware brx/btx turnaround,
-  explain the 6 % clock discrepancy, decide ChSel, get one AA-matched
-  CONNECT_IND capture.
-- **Slice 3: LLCP subset and ACL data.** LL_VERSION_IND, LL_FEATURE_REQ/RSP,
-  LL_CONNECTION_UPDATE_IND, LL_CHANNEL_MAP_IND, LL_UNKNOWN_RSP for everything
-  else (including PHY update, so 2M is avoided), ACL data path, HCI flow control
-  (Number of Completed Packets).
-- **Slice 4: link encryption.** LL_ENC_REQ/RSP, LL_START_ENC, AES-CCM with the
-  B91 hardware AES, LE Long Term Key Request reply. After this, SMP pairing and
-  HID over GATT work end to end.
 - **Slice 5: power management.** CPU sleep between connection events,
-  coordination with deep sleep (`poweroff.c`), 32k RC calibration.
+  peripheral latency, coordination with deep sleep (`poweroff.c`), 32 kHz RC
+  calibration.
 - **Slice 6: privacy and extras.** LE Set Random Address and RPA (the blob hangs
-  on this today), optional 2M PHY, Data Length Extension.
+  on this today), optional 2M PHY, Data Length Extension, CSA #2.
+- **More centrals:** test with Windows, macOS, Android and iOS hosts.
 - **In parallel:** ask Telink for permission to redistribute the blob.

@@ -157,6 +157,7 @@ reverse/
 - Config split: `rainy75_defconfig` hardware-only (shared MCUboot+app), `conf/app.conf` app-specific (BLE, USB, ZMK, mcumgr, WDT)
 - Successful compile: zmk.elf (~92 KB ROM Stage 1) + MCUboot (~51 KB ROM), SDK 0.17.0 required
 - BLE controller thread stack bumped to 2048 (default 1024 was tight per hal_telink references)
+- Kernel clock fix (`fa1fda0`): `SYS_CLOCK_TICKS_PER_SEC=32000` in the board defconfig. Before, 10000 ticks/s on the 32 kHz mtime gave 3 instead of 3.2 cycles per tick, so all kernel time (debounce, tap-hold, sleep timeout) ran 6.67 % fast. Verified -0.025 %/-0.008 % after
 - Flash partition layout verified: storage reduced from 76K→72K to avoid overwriting RF/ADC calibration at 0xFE000
 - `.gitignore` added for build artifacts, fetched modules, toolchain, SDK
 - Boot diagnostic: `boot_diag.c` — `.noinit` SRAM buffer (36 bytes, 28 stage entries) readable via SWS/BDT, PD7 GPIO heartbeat, PA7 SWS restore at POST_KERNEL (keeps SWS debug working while firmware runs), SYS_INIT at all 5 levels + 8 USB attach substages + MCUboot confirm + running marker, `CONFIG_BOOT_DIAG=y` in app.conf
@@ -248,10 +249,10 @@ reverse/
 Own peripheral-only link layer behind the `b91_bt.h` seam on hal_telink `rf.c` (Apache-2.0); the blob is the only prebuilt binary in the image.
 - **Slice 0 (DONE)**: nRF52840 dongle flashed with nRF Sniffer 4.1.1 via `nrfutil device program`, captures with `nrfutil ble-sniffer sniff` (tshark -i blocked in distrobox), blob reference captures (`reverse/captures/`, gitignored), `reverse/tools/ble_adv_report.py`. CLI follow mode unreliable (about 1 in 9 tries).
 - **Slice 1 (DONE)**: blob-free build (`./build.sh -p --iso --openll`, 0 `liblt` in map vs 48). `bt_enable()` OK on first flash. ADV_IND on air with AdvData byte-identical to the blob, interval 100 ms + 0..10 ms (mean 105.07 ms; blob uses 150 ms). Scanners show "Rainy 75 Pro" (name in ADV_IND). CONNECT_IND decoded (Interval 12, Latency 30, Timeout 400, static fields match the sniffer); AA-matched sniffer/log pair still missing. SCAN_RSP on air but T_IFS about 209 us (59 us late): software-triggered TX cannot meet T_IFS, so slice 2 must use hardware brx/btx turnaround. Open issues for slice 2: ChSel 0 vs blob's 1, about 6 % log-clock vs wall-clock discrepancy. Blob regression passed: default blob build reconnects to the bonded host by itself and BLE typing works. See [docs/open-ble-controller.md](docs/open-ble-controller.md)
-- **Slice 2**: connection follow + empty-PDU keepalive (anchor tracking, window widening, CSA#1, SN/NESN, supervision timeout)
-- **Slice 3**: LLCP subset (VERSION/FEATURE/CONN_UPDATE/CHANNEL_MAP, UNKNOWN_RSP incl. PHY update) + ACL data + HCI flow control
-- **Slice 4**: link encryption (LL_ENC/START_ENC, hardware AES-CCM, LTK reply) → SMP pairing + HID over GATT
-- **Slice 5**: power management (sleep between connection events, deep-sleep coordination, 32k RC cal)
+- **Slice 2 (DONE)**: connection follow on the hardware BRX turnaround (TX settle 86 us, on-air T_IFS 148/149 us mode, 86.7 % <= 150 us), anchor rule (first packet only, not after a CRC-bad or acked-retransmission first packet), widening, CSA#1, SN/NESN init per BRX, 5-bit FIFO pointers, guard alarm, alarm lead 500 us; return to advertising without reboot (rptr not resettable but adv works once the DMA is configured only at boot)
+- **Slice 3 (DONE)**: responder LLCP (FEATURE/VERSION/CONN_UPDATE/CHANNEL_MAP/TERMINATE, UNKNOWN_RSP for PING/LENGTH/PHY/...), ACL both ways with Number Of Completed Packets, TX FIFO placeholder rule verified under forced NACKs (2686/2686 encrypted echoes), RX retransmissions filtered in hardware (data-only RX ring, overflow ends the link 0x08); 756 connection updates in the soak
+- **Slice 4 (DONE)**: AES-CCM on the hal AES block (Core Spec sample data, 31-43 us per block), encryption with the existing bond, encrypt outside the IRQ lock under a TX mutex (IRQ lock 360-398 -> 42-86 us). User types over BLE with no blob; 33-min encrypted soak 0 disconnects. See [docs/open-ble-controller.md](docs/open-ble-controller.md)
+- **Slice 5 (NEXT)**: power management (sleep between connection events, peripheral latency, deep-sleep coordination, 32k RC cal). Until then the open build runs with `CONFIG_ZMK_SLEEP=n`
 - **Slice 6**: privacy (LE Set Random Address/RPA), optional 2M PHY, Data Length Extension
 - Parallel: email Telink for blob redistribution permission
 
