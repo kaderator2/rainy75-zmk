@@ -268,16 +268,24 @@ int main(void)
 	fresh();
 	features(0xFF);
 	{
-		static const uint8_t exp[9] = {0x09, LL_FEATURES_LOW, 0, 0, 0, 0, 0, 0, 0};
+		/* ours: LE Encryption (bit 0) + Extended Reject Indication (bit 2) */
+		static const uint8_t exp[9] = {0x09, 0x05, 0, 0, 0, 0, 0, 0, 0};
 
+		CHECK(LL_FEATURES_LOW == 0x05);
 		CHECK(tx.n == 1);
+		CHECK(last_is(exp, 9));
+	}
+	features(0x01);
+	{
+		static const uint8_t exp[9] = {0x09, 0x01, 0, 0, 0, 0, 0, 0, 0};
+
 		CHECK(last_is(exp, 9));
 	}
 	features(0x00);
 	{
 		static const uint8_t exp[9] = {0x09, 0, 0, 0, 0, 0, 0, 0, 0};
 
-		CHECK(tx.n == 2);
+		CHECK(tx.n == 3);
 		CHECK(last_is(exp, 9));
 	}
 
@@ -383,7 +391,31 @@ int main(void)
 		CHECK(tx.n == 0 && cn.end_calls == 0);
 		cn.chm_ret = LL_ST_INSTANT_PASSED;
 		rx(chm, 8);
-		CHECK(cn.end_calls == 0);
+		CHECK(cn.end_calls == 0);   /* ll_conn ends the link itself */
+		cn.chm_ret = LL_ST_INVALID_LL_PARAM;
+		rx(chm, 8);
+		CHECK(cn.end_calls == 1 && cn.end_reason == LL_ST_INVALID_LL_PARAM);
+		CHECK(tx.n == 0);
+	}
+	/* fewer than 2 used channels (bits 0..36; 37..39 do not count): 0x1E,
+	 * ll_conn not asked */
+	{
+		static const uint8_t one[8] = {0x01, 0x00, 0x00, 0x00, 0x10, 0xE0, 0x05, 0x00};
+		static const uint8_t none[8] = {0x01, 0x00, 0x00, 0x00, 0x00, 0xE0, 0x05, 0x00};
+		static const uint8_t two[8] = {0x01, 0x01, 0x00, 0x00, 0x00, 0x10, 0x05, 0x00};
+
+		fresh();
+		rx(one, 8);
+		CHECK(cn.chm_calls == 0);
+		CHECK(cn.end_calls == 1 && cn.end_reason == LL_ST_INVALID_LL_PARAM);
+		fresh();
+		rx(none, 8);
+		CHECK(cn.chm_calls == 0);
+		CHECK(cn.end_calls == 1 && cn.end_reason == LL_ST_INVALID_LL_PARAM);
+		fresh();
+		rx(two, 8);   /* channels 0 and 36 */
+		CHECK(cn.chm_calls == 1 && cn.end_calls == 0);
+		CHECK(tx.n == 0);
 	}
 
 	/* ---- LL_TERMINATE_IND -> ll_conn_end(reason from PDU) ---- */

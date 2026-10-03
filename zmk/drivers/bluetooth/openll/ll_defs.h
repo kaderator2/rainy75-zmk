@@ -52,8 +52,8 @@
 /* LL feature set (Vol 6 Part B 4.6), byte 0; bytes 1..7 are 0. Used by
  * LL_FEATURE_RSP and HCI LE Read Local Supported Features. */
 #define LL_FEAT_LE_ENC        0x01   /* bit 0: LE Encryption */
-#define LL_FEAT_EXT_REJ_IND   0x04   /* bit 2: Extended Reject Indication (peer's bit only) */
-#define LL_FEATURES_LOW       LL_FEAT_LE_ENC
+#define LL_FEAT_EXT_REJ_IND   0x04   /* bit 2: Extended Reject Indication */
+#define LL_FEATURES_LOW       (LL_FEAT_LE_ENC | LL_FEAT_EXT_REJ_IND)
 
 /* Controller identity reported via Read Local Version Information */
 #define LL_HCI_VERSION    0x09   /* Bluetooth Core 5.0 */

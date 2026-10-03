@@ -29,6 +29,13 @@ typedef void (*ll_txq_done_cb_t)(enum ll_txq_kind kind, uint8_t ctrl_opcode);
 
 #define LL_TXQ_BACKLOG 8
 
+/* Invariant: the backlog and the ring are strictly FIFO across all kinds
+ * (no priority lane for control PDUs). The encryption start procedure
+ * relies on it: ACL queued before LL_ENC_RSP leaves before it (plaintext,
+ * counted before the procedure), and everything queued after our encrypted
+ * LL_START_ENC_RSP leaves after it, so on-air order equals the order in
+ * which ll_llcp assigned TX packet counters. */
+
 /* Per connection, after ll_radio_conn_setup() (reset_sn_nesn). */
 void ll_txq_reset(ll_txq_done_cb_t done);
 /* Queue one data PDU into the backlog. payload is already encrypted if

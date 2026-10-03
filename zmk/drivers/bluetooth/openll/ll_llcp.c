@@ -13,9 +13,9 @@
  *   RX LL_START_ENC_RSP (arrives encrypted, ll_rxq decrypted it)
  *      -> tx encryption on, TX LL_START_ENC_RSP encrypted, data PDUs
  *      resume, Encryption Change to the host
- *   LTK negative reply -> LL_REJECT_EXT_IND(LL_ENC_REQ, 0x06), or
- *      LL_REJECT_IND(0x06) when the central did not report Extended Reject
- *      Indication in its LL_FEATURE_REQ; data PDUs resume unencrypted.
+ *   LTK negative reply -> LL_REJECT_EXT_IND(LL_ENC_REQ, 0x06) when both
+ *      sides support Extended Reject Indication (feature exchange done),
+ *      else LL_REJECT_IND(0x06); data PDUs resume unencrypted.
  * The 40 s procedure response timer (5.2) restarts whenever we queue a
  * control PDU of the procedure (LL_ENC_RSP, LL_START_ENC_REQ) and stops
  * when it completes; it expiring ends the link with 0x22.
@@ -142,11 +142,12 @@ static void unknown_rsp(uint8_t op)
 	ctrl(pdu, sizeof(pdu));
 }
 
-/* LL_REJECT_EXT_IND if the central reported Extended Reject Indication,
- * else LL_REJECT_IND (Vol 6 Part B 2.4.2.18 / 5.1.3.1). */
+/* LL_REJECT_EXT_IND if both sides support Extended Reject Indication
+ * (known after the feature exchange), else LL_REJECT_IND (Vol 6 Part B
+ * 2.4.2.18 / 5.1.3.1). */
 static void reject(uint8_t op, uint8_t err)
 {
-	if (s.peer_feat_valid && (s.peer_feat0 & LL_FEAT_EXT_REJ_IND)) {
+	if (s.peer_feat_valid && (s.peer_feat0 & LL_FEATURES_LOW & LL_FEAT_EXT_REJ_IND)) {
 		const uint8_t pdu[3] = {OP_REJECT_EXT_IND, op, err};
 
 		ctrl(pdu, sizeof(pdu));
@@ -260,6 +261,16 @@ static void rx_version_ind(void)
 	ll_plat_unlock(key);
 }
 
+/* Result of ll_conn_update_at / ll_conn_chmap_at. LL_ST_INSTANT_PASSED:
+ * ll_conn already ends the link (0x28). LL_ST_INVALID_LL_PARAM: we end it.
+ * LL_ST_DISALLOWED (no connection any more): nothing to do. */
+static void instant_result(int r)
+{
+	if (r == LL_ST_INVALID_LL_PARAM) {
+		ll_conn_end(LL_ST_INVALID_LL_PARAM);
+	}
+}
+
 static void rx_conn_update(const uint8_t *p)
 {
 	struct ll_conn_params cp = {
@@ -267,12 +278,23 @@ static void rx_conn_update(const uint8_t *p)
 		.latency = ll_get_le16(&p[6]),
 		.timeout = ll_get_le16(&p[8]),
 	};
-	int r = ll_conn_update_at(ll_get_le16(&p[10]), p[1], ll_get_le16(&p[2]), &cp);
+	instant_result(ll_conn_update_at(ll_get_le16(&p[10]), p[1], ll_get_le16(&p[2]), &cp));
+}
 
-	/* LL_ST_INSTANT_PASSED: ll_conn already ends the link */
-	if (r == LL_ST_INVALID_LL_PARAM) {
-		ll_conn_end(LL_ST_INVALID_LL_PARAM);
+/* Channel map with at least 2 used channels (bits 0..36, Vol 6 Part B
+ * 2.4.2.2), else the link ends with 0x1E. */
+static void rx_channel_map(const uint8_t *p)
+{
+	unsigned int used = 0;
+
+	for (unsigned int ch = 0; ch < 37; ch++) {
+		used += (p[1 + ch / 8] >> (ch % 8)) & 1u;
 	}
+	if (used < 2) {
+		ll_conn_end(LL_ST_INVALID_LL_PARAM);
+		return;
+	}
+	instant_result(ll_conn_chmap_at(ll_get_le16(&p[6]), &p[1]));
 }
 
 /* length the request must have, 0 = not a request we answer by content */
@@ -328,8 +350,10 @@ void ll_llcp_rx(const uint8_t *payload, uint8_t len)
 	}
 	want = expected_len(op);
 	if (want == 0 || len != want) {
-		/* unsupported (LENGTH, PHY, PING, PERIPHERAL_FEATURE,
-		 * CONN_PARAM, ...) or malformed */
+		/* Unsupported (LENGTH, PHY, PING, PERIPHERAL_FEATURE,
+		 * CONN_PARAM, ...), or a known request whose length is not
+		 * exactly the specified one: LL_UNKNOWN_RSP, as Zephyr ll_sw
+		 * does for PDUs failing its exact-length validation. */
 		unknown_rsp(op);
 		return;
 	}
@@ -338,8 +362,7 @@ void ll_llcp_rx(const uint8_t *payload, uint8_t len)
 		rx_conn_update(payload);
 		break;
 	case OP_CHANNEL_MAP_IND:
-		/* LL_ST_INSTANT_PASSED: ll_conn already ends the link */
-		(void)ll_conn_chmap_at(ll_get_le16(&payload[6]), &payload[1]);
+		rx_channel_map(payload);
 		break;
 	case OP_TERMINATE_IND:
 		ll_conn_end(payload[1]);
@@ -373,7 +396,15 @@ uint8_t ll_llcp_ltk_reply(const uint8_t ltk[16])
 		s.crypt.tx_ctr = 0;
 		s.crypt.rx_ctr = 0;
 		s.crypt.enc_tx = false;
-		/* the central answers LL_START_ENC_REQ encrypted */
+		/* The central answers LL_START_ENC_REQ encrypted, so decryption
+		 * must be on before that PDU can be on air; enabling it now
+		 * (under the lock, before the push) guarantees that. Turning it
+		 * on early is safe: since its LL_ENC_REQ the central sends no
+		 * data PDUs and no other control PDU of a procedure (5.1.3.1),
+		 * only empty PDUs, which ll_rxq never decrypts. Anything
+		 * non-empty arriving in between would fail its MIC and end the
+		 * link (0x3D), which is the right outcome for such a protocol
+		 * violation. */
 		s.crypt.enc_rx = true;
 		s.enc = ENC_WAIT_START_RSP;
 		(void)tx_locked(LL_TXQ_CTRL, LL_LLID_CTRL, req, sizeof(req));
