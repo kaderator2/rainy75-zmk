@@ -184,9 +184,13 @@ Zephyr or hardware dependencies and is tested on the host with gcc.
 5. **Event end:** CMD_DONE or a first-RX timeout. `ll_txq_event_end()` reads the
    read pointer and completes acked entries, the event counter advances,
    supervision and termination are checked, instants are applied and the next
-   event is planned. A guard alarm ends any event that has no end IRQ after
-   first-RX timeout + 6 ms; three guard-ended events in a row end the link with
-   0x08.
+   event is planned. A guard alarm ends any event that has no end IRQ by
+   RX open + an interval-based cap (interval minus the widening growth, the
+   500 us alarm lead and a 300 us safety, at least the first RX window + 1 ms),
+   so a long MD burst of the central may use almost the whole interval but
+   never overruns the next event. Three guard-ended events in a row that
+   received no valid packet end the link with 0x08 (radio wedged); a guard
+   that cuts a burst with packets resets that count.
 
 **Anchor rule:** the anchor is the start of the event's first packet. If that
 packet had a bad CRC, or was a retransmission the hardware acked without an RX
@@ -262,10 +266,11 @@ PDUs filled the ring while the host processed LE Connection Complete (about
 | LL_CONNECTION_UPDATE_IND | Applied at the instant with the new transmit window; LE Connection Update Complete if interval, latency or timeout changed |
 | LL_CHANNEL_MAP_IND | Applied at the instant. Fewer than 2 used channels end the link with 0x1E |
 | LL_TERMINATE_IND | Disconnection Complete with the reason from the PDU |
-| LL_ENC_REQ | LL_ENC_RSP (SKDs, IVs) right away, then LE LTK Request to the host |
+| LL_ENC_REQ | LL_ENC_RSP (SKDs, IVs) right away, then LE LTK Request to the host. On an already encrypted link (or during the procedure): rejected with 0x24. If LL_ENC_RSP cannot be queued, the link ends with 0x1F |
 | LL_START_ENC_RSP | TX encryption on, encrypted LL_START_ENC_RSP, Encryption Change to the host |
 | LL_PAUSE_ENC_REQ | Rejected (0x1A), key refresh not supported |
-| Anything else (LENGTH, PHY, PING, PERIPHERAL_FEATURE, CONN_PARAM, ...) | LL_UNKNOWN_RSP |
+| Unsupported requests (LENGTH, PHY, PING, PERIPHERAL_FEATURE, CONN_PARAM, ...) and known requests with a wrong length | LL_UNKNOWN_RSP |
+| Response opcodes (UNKNOWN_RSP, FEATURE_RSP, REJECT_IND, REJECT_EXT_IND, PING_RSP, LENGTH_RSP, PHY_RSP, CONN_PARAM_RSP, PAUSE_ENC_RSP) and LL_START_ENC_RSP outside the procedure | Dropped silently |
 | own: HCI Disconnect | LL_TERMINATE_IND, Disconnection Complete (0x16) after the ack or the supervision timeout |
 
 Encryption start (Core Spec Vol 6 Part B 5.1.3.1), peripheral side: on the
@@ -439,6 +444,20 @@ documentation. They may help anyone writing a B91 link layer.
   might not.
 - **One central tested.** Only an Intel controller with Linux/BlueZ. Other
   operating systems and controllers are untested.
+- **Host-tested only, not exercised on the device:** fresh pairing (SMP
+  without an existing bond; the device tests used the bonded PC), the LTK
+  negative reply path, and HCI Reset during a connection.
+- **LL_ENC_REQ on an encrypted link is rejected (0x24)**: encryption pause and
+  key refresh are not supported.
+- **No advertising while connected.** LE Set Advertising Enable is refused while
+  a connection exists (one connection only), so ZMK profile switching to a
+  second host does not advertise until the current link is gone.
+- **Long central MD bursts** (SMP image upload, rgb_mgmt writes) are cut by the
+  guard at the interval-based cap; the central resends the rest in the next
+  event. Such cut events do not count toward the radio-wedge rule.
+- **A plaintext LL_TERMINATE_IND between our LTK reply and the central's
+  receipt of LL_START_ENC_REQ** fails the MIC (RX decryption is already on), so
+  the host sees 0x3D instead of the central's reason. The link ends either way.
 - After LE Connection Complete the Zephyr host's cooperative RX work queue holds
   the CPU for about 300 ms, so our first LLCP answers leave that late. Harmless
   (the central allows 40 s).
