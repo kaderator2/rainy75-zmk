@@ -12,6 +12,14 @@
  *   central packet it answers. The NESN of the central's last received
  *   packet is therefore the SN of our last TX (ll_txq_rx). Acks of the base
  *   PDU do not move rptr, so rptr alone cannot track the SN.
+ * - The expected SN of the central's next new packet (our NESN) is also
+ *   taken from ll_ctrl_1 at the first RX of each BRX command (BRX NESN
+ *   init, Task 9 device trace: with it left at 0, every central packet with
+ *   SN 1 was acked but dropped as a retransmission). The hardware writes
+ *   only new packets into the RX FIFO, so the last one received (ll_txq_rx)
+ *   gives NESN_INIT = its SN ^ 1.
+ * - The FIFO pointers are 5 bits wide (LL_RADIO_FIFO_PTR_MASK, Task 9): wp
+ *   and rp are kept in that range and differences are taken modulo 32.
  * - Entries are written only between events (event_start) and never while
  *   queued; an entry is complete when rptr has passed it (event_end).
  * Runs in ISR context except ll_txq_push / ll_txq_backlog: no allocation,
@@ -27,7 +35,9 @@
 
 #define RING_DEPTH   4      /* hardware entries (tx_chn_dep 2) */
 #define HDR_NESN     0x04
+#define HDR_SN       0x08
 #define PDU_MAX      (LL_DATA_PDU_MAX + LL_MIC_LEN)
+#define PTR(x)       ((uint8_t)((x) & LL_RADIO_FIFO_PTR_MASK))
 
 _Static_assert((LL_TXQ_BACKLOG & (LL_TXQ_BACKLOG - 1)) == 0 && LL_TXQ_BACKLOG <= 128,
 	       "LL_TXQ_BACKLOG must be a power of two that fits the 8-bit counters");
@@ -57,6 +67,7 @@ static struct {
 	uint8_t in_ring;         /* data PDUs (non-placeholder) in the ring */
 	uint8_t sn;              /* SN of our last transmitted packet */
 	uint8_t rx_nesn;         /* NESN of the central's last packet this event */
+	uint8_t nesn;            /* expected SN of the central's next new packet */
 	bool rx_seen;            /* a central packet was received this event */
 	bool base_last;          /* our last transmitted packet was the base PDU */
 } q;
@@ -78,7 +89,7 @@ static void ring_put(uint8_t kind, uint8_t llid, const uint8_t *data, uint8_t le
 	if (!placeholder) {
 		q.in_ring++;
 	}
-	q.wp++;
+	q.wp = PTR(q.wp + 1);
 }
 
 /*
@@ -124,6 +135,7 @@ void ll_txq_reset(ll_txq_done_cb_t done)
 	/* After reset_sn_nesn the central's first NESN is 0 = SN_INIT, so the
 	 * first ack is not judged and no placeholder is needed. */
 	q.sn = 0;
+	q.nesn = 0;
 	q.base_last = false;
 }
 
@@ -152,11 +164,12 @@ int ll_txq_push(enum ll_txq_kind kind, uint8_t llid, const uint8_t *payload, uin
 
 void ll_txq_event_start(void)
 {
-	uint8_t used = (uint8_t)(q.wp - ll_radio_fifo_rptr());
+	uint8_t used = PTR(q.wp - ll_radio_fifo_rptr());
 	bool was_empty = used == 0;
 	uint8_t room;
 
 	ll_radio_conn_set_sn_init(q.sn);
+	ll_radio_conn_set_nesn_init(q.nesn);
 	q.rx_seen = false;
 	if (backlog_count() == 0) {
 		return;
@@ -178,6 +191,7 @@ void ll_txq_event_start(void)
 void ll_txq_rx(uint8_t hdr0)
 {
 	q.rx_nesn = (hdr0 & HDR_NESN) ? 1 : 0;
+	q.nesn = (hdr0 & HDR_SN) ? 0 : 1;
 	q.rx_seen = true;
 }
 
@@ -188,7 +202,7 @@ void ll_txq_event_end(void)
 	while (q.rp != r && q.rp != q.wp) {
 		const struct txq_slot *s = &q.ring[q.rp % RING_DEPTH];
 
-		q.rp++;
+		q.rp = PTR(q.rp + 1);
 		if (s->placeholder) {
 			continue;
 		}

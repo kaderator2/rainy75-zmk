@@ -50,10 +50,15 @@ struct air_pkt {          /* one of our packets as sent on air */
 	int event;
 };
 
+/* Task 9 (device): the pipe 0 TX FIFO pointers are 5-bit registers (values
+ * read back wrap at 32; a written wptr keeps only its low 5 bits). */
+#define HW_PTR_MASK 0x1f
+
 static struct {
 	uint8_t rptr, wptr;
 	struct fake_entry ring[4];
 	uint8_t sn_init;
+	uint8_t nesn_init;    /* BRX NESN init: expected central SN at command start */
 	uint8_t sn, nesn;     /* SN of our last TX, our NESN */
 	bool sent_any;        /* a packet was sent in this connection */
 	bool first;           /* next RX is the first of the command */
@@ -61,6 +66,9 @@ static struct {
 	int overfill;         /* wptr - rptr > 4 */
 	int sn_init_calls;
 	int sn_init_wrong;    /* SN_INIT != SN of our last TX at command start */
+	int nesn_init_calls;
+	int nesn_init_wrong;  /* NESN_INIT != our NESN at command start */
+	int rx_dup;           /* central packets dropped as old (not in the RX FIFO) */
 	int max_data_in_ring; /* non-empty entries queued at a command start */
 	struct air_pkt air[MAX_AIR];
 	int n_air;
@@ -80,19 +88,29 @@ void ll_radio_conn_set_sn_init(uint8_t sn)
 	hw.sn_init_calls++;
 }
 
+/* Task 9 (device): at the first RX of a BRX command the hardware takes the
+ * expected central SN from ll_ctrl_1 BRX NESN init, as it takes the ack
+ * reference from SN init (md-spike). A central packet whose SN differs is
+ * treated as a retransmission: acked, but not written to the RX FIFO. */
+void ll_radio_conn_set_nesn_init(uint8_t nesn)
+{
+	hw.nesn_init = nesn & 1;
+	hw.nesn_init_calls++;
+}
+
 uint8_t ll_radio_fifo_rptr(void)
 {
-	return hw.rptr;
+	return hw.rptr & HW_PTR_MASK;
 }
 
 uint8_t ll_radio_fifo_wptr(void)
 {
-	return hw.wptr;
+	return hw.wptr & HW_PTR_MASK;
 }
 
 void ll_radio_fifo_write(uint8_t idx, uint8_t hdr0, const uint8_t *payload, uint8_t len)
 {
-	if ((uint8_t)(idx - hw.rptr) < (uint8_t)(hw.wptr - hw.rptr)) {
+	if (((idx - hw.rptr) & HW_PTR_MASK) < ((hw.wptr - hw.rptr) & HW_PTR_MASK)) {
 		hw.bad_write++;
 	}
 	hw.ring[idx & 3].hdr0 = hdr0;
@@ -104,7 +122,8 @@ void ll_radio_fifo_write(uint8_t idx, uint8_t hdr0, const uint8_t *payload, uint
 
 void ll_radio_fifo_set_wptr(uint8_t wptr)
 {
-	if ((uint8_t)(wptr - hw.rptr) > 4) {
+	wptr &= HW_PTR_MASK;
+	if (((wptr - hw.rptr) & HW_PTR_MASK) > 4) {
 		hw.overfill++;
 	}
 	hw.wptr = wptr;
@@ -126,14 +145,15 @@ static void fake_conn_setup(void)
 static void fake_power_on(uint8_t ptr)
 {
 	memset(&hw, 0, sizeof(hw));
-	hw.rptr = ptr;
-	hw.wptr = ptr;
+	hw.rptr = ptr & HW_PTR_MASK;
+	hw.wptr = ptr & HW_PTR_MASK;
 	fake_conn_setup();
 }
 
 /* Hardware: the central's packet with header c_hdr was received; decide the
- * ack, pop, and send our response. Returns the index in hw.air. */
-static int hw_rx_and_respond(uint8_t c_hdr)
+ * ack, pop, and send our response. Returns the index in hw.air; *is_new
+ * tells whether the packet went into the RX FIFO (new data). */
+static int hw_rx_and_respond(uint8_t c_hdr, bool *is_new)
 {
 	uint8_t c_nesn = (c_hdr & HDR_NESN) ? 1 : 0;
 	uint8_t c_sn = (c_hdr & HDR_SN) ? 1 : 0;
@@ -143,13 +163,19 @@ static int hw_rx_and_respond(uint8_t c_hdr)
 	const struct fake_entry *e;
 	static const struct fake_entry base = { .hdr0 = LL_LLID_CONT, .len = 0 };
 
+	if (hw.first) {
+		hw.nesn = hw.nesn_init;
+	}
 	hw.first = false;
 	if (acked && hw.rptr != hw.wptr) {
-		hw.rptr++;                                  /* point 4 */
+		hw.rptr = (hw.rptr + 1) & HW_PTR_MASK;     /* point 4 */
 	}
 	hw.sn = acked ? !ref : ref;                         /* point 5 */
-	if (c_sn == hw.nesn) {
+	*is_new = c_sn == hw.nesn;
+	if (*is_new) {
 		hw.nesn ^= 1;
+	} else {
+		hw.rx_dup++;
 	}
 	if (hw.rptr == hw.wptr) {
 		e = &base;                                  /* point 1 */
@@ -160,7 +186,7 @@ static int hw_rx_and_respond(uint8_t c_hdr)
 	}
 	p->hdr0 = (uint8_t)((e->hdr0 & 0x03) | (hw.nesn ? HDR_NESN : 0) |
 			    (hw.sn ? HDR_SN : 0) |
-			    ((uint8_t)(hw.wptr - hw.rptr) > 1 ? HDR_MD : 0)); /* point 3 */
+			    (((hw.wptr - hw.rptr) & HW_PTR_MASK) > 1 ? HDR_MD : 0)); /* point 3 */
 	p->len = e->len;
 	memcpy(p->data, e->data, e->len);
 	p->event = hw.event;
@@ -207,11 +233,16 @@ static int run_event(const struct xchg *x, int n)
 	hw.event++;
 	if (use_txq) {
 		ll_txq_event_start();
+	} else {
+		hw.nesn_init = hw.nesn;   /* the model test is about TX only */
 	}
 	if (hw.sn_init != (hw.sent_any ? hw.sn : 0)) {
 		hw.sn_init_wrong++;
 	}
-	for (uint8_t k = hw.rptr; k != hw.wptr; k++) {
+	if (use_txq && hw.nesn_init != hw.nesn) {
+		hw.nesn_init_wrong++;
+	}
+	for (uint8_t k = hw.rptr; k != hw.wptr; k = (k + 1) & HW_PTR_MASK) {
 		data += hw.ring[k & 3].len ? 1 : 0;
 	}
 	if (data > hw.max_data_in_ring) {
@@ -223,12 +254,13 @@ static int run_event(const struct xchg *x, int n)
 		uint8_t c_hdr = (uint8_t)(LL_LLID_CONT | (central.nesn ? HDR_NESN : 0) |
 					  (central.sn ? HDR_SN : 0) | (e.c_md ? HDR_MD : 0));
 		int a;
+		bool is_new;
 
 		if (e.rx_lost) {
 			break;  /* RX timeout: the command ends */
 		}
-		a = hw_rx_and_respond(c_hdr);
-		if (use_txq) {
+		a = hw_rx_and_respond(c_hdr, &is_new);
+		if (use_txq && is_new) {
 			ll_txq_rx(c_hdr);
 		}
 		done++;
@@ -296,6 +328,7 @@ static void check_hw_clean(void)
 	CHECK(hw.bad_write == 0);
 	CHECK(hw.overfill == 0);
 	CHECK(hw.sn_init_wrong == 0);
+	CHECK(hw.nesn_init_wrong == 0);
 	CHECK(central.bad_content == 0);
 #ifdef LL_TXQ_SAFE_MODE
 	CHECK(hw.max_data_in_ring <= 1);
@@ -311,6 +344,7 @@ static void test_fake_model(void)
 {
 	use_txq = false;
 	fake_power_on(0);
+	hw.nesn_init = 0;
 	ll_radio_conn_set_sn_init(0);
 	run_event(NULL, 0);
 	CHECK(hw.n_air == 1 && hw.air[0].ring == -1);           /* base when empty */
@@ -363,6 +397,43 @@ static void test_single_acl(void)
 	run_ok(3);
 	CHECK(cpl.acl == 1 && central.n_got == 1);
 	CHECK(hw.sn_init_calls == 5);
+	check_hw_clean();
+}
+
+/* Task 9 device finding: NESN init is taken per BRX command. Every new
+ * central packet must reach the RX FIFO (ll_txq_rx), in every event, and a
+ * genuine retransmission (our ack lost) must be dropped without breaking
+ * the expected SN of the next command. */
+static void test_nesn_init_per_event(void)
+{
+	fake_power_on(0);
+	new_conn();
+	run_ok(6);
+	CHECK(hw.nesn_init_calls == 6);
+	CHECK(hw.rx_dup == 0);
+	CHECK(hw.nesn_init_wrong == 0);
+	/* our response lost: the central resends the same SN next event */
+	run_event((const struct xchg[]){ { .tx_lost = true } }, 1);
+	run_ok(3);
+	CHECK(hw.rx_dup == 1);
+	CHECK(hw.nesn_init_wrong == 0);
+	CHECK(hw.sn_init_wrong == 0);
+}
+
+/* Task 9 device finding: the TX FIFO pointers wrap at 32. Sending one PDU
+ * at a time past the wrap must keep working (on the device the queue
+ * stalled after about 20 PDUs: no more acks, LL_UNKNOWN_RSP never sent). */
+static void test_pointer_wrap(void)
+{
+	fake_power_on(0x1c);
+	new_conn();
+	for (uint8_t t = 0; t < 40; t++) {
+		CHECK(push(LL_TXQ_ACL, t) == 0);
+		run_ok(3);
+	}
+	CHECK(central.n_got == 40);
+	CHECK(cpl.acl == 40);
+	CHECK(ll_txq_backlog() == 0);
 	check_hw_clean();
 }
 
@@ -449,7 +520,7 @@ static void test_ring_empty_then_data(void)
 	run_event(NULL, 0);
 	CHECK(central.n_got == 2 && central.got[1] == 2);
 #ifndef LL_TXQ_SAFE_MODE
-	CHECK(hw.wptr - hw.rptr == 1);   /* placeholder popped, data in flight */
+	CHECK(((hw.wptr - hw.rptr) & HW_PTR_MASK) == 1);   /* placeholder popped, data in flight */
 #endif
 	run_ok(1);
 	CHECK(cpl.acl == 2 && cpl.empty == 0);
@@ -590,6 +661,8 @@ int main(void)
 #endif
 	test_fake_model();
 	test_single_acl();
+	test_nesn_init_per_event();
+	test_pointer_wrap();
 	test_nack_retransmit();
 	test_backlog_md();
 	test_ring_empty_then_data();

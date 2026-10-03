@@ -74,8 +74,18 @@ void ll_radio_conn_event(uint8_t ch, uint32_t open_tick, uint32_t first_timeout_
 uint8_t ll_radio_conn_guard_streak(void);
 /* SN of our last transmitted packet, programmed before every BRX. */
 void ll_radio_conn_set_sn_init(uint8_t sn);
+/* BRX NESN init (ll_ctrl_1): the expected SN of the central's packet at the
+ * first RX of the next BRX command. Read per command like SN init (Task 9);
+ * left at 0, every central packet with SN 1 is acked but dropped. */
+void ll_radio_conn_set_nesn_init(uint8_t nesn);
+/* The pipe 0 TX FIFO pointers are 5-bit registers (Task 9: read back
+ * values wrap at 32, a written wptr keeps its low 5 bits). All pointer
+ * arithmetic is modulo LL_RADIO_FIFO_PTR_MASK + 1; RING entries are
+ * pointer & 3. ll_radio_fifo_rptr/wptr return masked values. */
+#define LL_RADIO_FIFO_PTR_MASK 0x1f
 /* TX FIFO (pipe 0): rptr is advanced by hardware on ack, wptr by software.
- * Both are free-running 8-bit counters; the ring has 4 entries (idx & 3). */
+ * Both are 5-bit counters (LL_RADIO_FIFO_PTR_MASK); the ring has 4 entries
+ * (idx & 3). */
 uint8_t ll_radio_fifo_rptr(void);
 uint8_t ll_radio_fifo_wptr(void);
 /* Write data PDU header byte 0 (LLID; NESN/SN/MD are set by hardware) and

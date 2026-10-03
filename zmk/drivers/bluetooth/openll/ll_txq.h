@@ -46,11 +46,13 @@ void ll_txq_reset(ll_txq_done_cb_t done);
 int ll_txq_push(enum ll_txq_kind kind, uint8_t llid, const uint8_t *payload, uint8_t len,
 		uint8_t ctrl_opcode);
 /* ISR, before each BRX: refill the ring from the backlog (placeholder rule)
- * and program SN_INIT via ll_radio_conn_set_sn_init(). */
+ * and program SN_INIT and NESN_INIT via ll_radio_conn_set_sn_init() and
+ * ll_radio_conn_set_nesn_init(). */
 void ll_txq_event_start(void);
 /* ISR, for each LL_RADIO_CONN_RX of the event, in order: header byte 0 of
  * the central's packet. Its NESN is the SN of our response to it (hardware
- * SN/NESN), so the last one gives SN_INIT for the next event. Acks of the
+ * SN/NESN), so the last one gives SN_INIT for the next event; its SN ^ 1 is
+ * NESN_INIT (the hardware delivers only new packets). Acks of the
  * base empty PDU do not move rptr, so the SN cannot be tracked from rptr. */
 void ll_txq_rx(uint8_t hdr0);
 /* ISR, after LL_RADIO_CONN_DONE: read rptr, complete acked entries, track

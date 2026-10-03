@@ -74,6 +74,7 @@ void ll_radio_conn_event(uint8_t ch, uint32_t open_tick, uint32_t first_timeout_
 	rad.fst = first_timeout_us;
 }
 void ll_radio_conn_set_sn_init(uint8_t sn) { rad.sn_init = sn; }
+void ll_radio_conn_set_nesn_init(uint8_t nesn) { (void)nesn; }
 uint8_t ll_radio_fifo_rptr(void) { return rad.rptr; }
 uint8_t ll_radio_fifo_wptr(void) { return rad.wptr; }
 void ll_radio_fifo_write(uint8_t idx, uint8_t hdr0, const uint8_t *payload, uint8_t len)

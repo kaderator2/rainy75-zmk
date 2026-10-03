@@ -17,7 +17,7 @@
  * - Per connection: access address (byte-swapped into 0x80140808), CRC init
  *   as parsed, ll_ctrl_1 BRX SN/NESN init 0 + first-RX timeout enable,
  *   reset_sn_nesn(), TX timestamps on (T_IFS monitor), TX DMA source = ring
- *   base (an empty PDU), RX DMA as a 4-entry ring of 64 bytes.
+ *   base (an empty PDU); the RX DMA ring (4 x 64 bytes) is set up at boot.
  * - TX FIFO (pipe 0): the base is sent while rptr == wptr, else entry
  *   rptr & 3 at base + 64 * (1 + (rptr & 3)); wptr is written by software,
  *   rptr advanced by hardware on the central's ack (never resettable).
@@ -63,11 +63,20 @@ LOG_MODULE_DECLARE(openll, CONFIG_BT_HCI_DRIVER_LOG_LEVEL);
 /* Connection mode */
 #define RING_N                 4    /* TX ring entries (tx_chn_dep 2) and RX DMA entries */
 #define RX_ENTRY_SIZE          64   /* 4 + 2 + 31 + 16 trailer = 53 */
+/* The hardware rx wptr (0x1004f4) is a 5-bit counter (Task 9: maximum seen
+ * 31, then 0); RING_N divides 32, so entry = wptr & (RING_N - 1) holds
+ * across its wrap. */
+#define RX_WPTR_MASK           0x1f
 #define CONN_RX_MAXLEN         (LL_DATA_PDU_MAX + LL_MIC_LEN)
-/* One RX area for both modes: advertising uses its first RX_BUF_SIZE bytes
- * as a single entry, a connection RING_N entries of RX_ENTRY_SIZE. The
+/* One RX DMA ring of RING_N entries of RX_ENTRY_SIZE for both modes (an
+ * advertising PDU of up to 37 bytes needs 4 + 2 + 37 + 16 = 59). The
  * RX_BUF_SIZE behind the ring is slack for an oversize write into the last
- * entry (maxlen enforcement unverified, see above). */
+ * entry (maxlen enforcement unverified, see above).
+ * The RX and TX DMA are configured once, in ll_radio_init(), and never
+ * again: Task 9 found that calling rf_set_rx_dma() while the radio is in
+ * use (connection setup from the CONNECT_IND RX ISR, and again in the
+ * return to advertising) freezes the SoC within microseconds, before any
+ * fault handler runs (watchdog reset, MCUboot revert). */
 #define RX_AREA_SIZE           (RING_N * RX_ENTRY_SIZE + RX_BUF_SIZE)
 /* md-spike Q3: 86 us gives an on-air T_IFS of 148/149 us (blob: same). */
 #define TX_SETTLE_CONN_US      86
@@ -111,7 +120,7 @@ static enum { MODE_ADV, MODE_CONN } mode;
 static struct {
 	uint32_t aa_reg;        /* byte-swapped AA for 0x80140808 */
 	uint32_t crc_init;
-	uint8_t rx_sw;          /* RX DMA ring: next entry to read (follows the hw wptr) */
+	uint8_t rx_sw;          /* RX DMA ring: next entry to read (follows the hw wptr), both modes */
 	bool evt_open;          /* BRX issued, LL_RADIO_CONN_DONE not yet reported */
 	uint8_t n_valid;        /* CRC-valid packets in this event */
 	uint8_t n_any;          /* RX DMA entries (valid or not) in this event */
@@ -150,10 +159,24 @@ static uint16_t tx_ptrs(void)
 
 /* ---- advertising mode ISR ---- */
 
+static uint8_t *rx_entry(uint8_t idx)
+{
+	return &rx_buf[(idx & (RING_N - 1)) * RX_ENTRY_SIZE];
+}
+
 static void adv_isr(uint16_t st)
 {
 	if (st & FLD_RF_IRQ_RX) {
-		uint8_t *p = rx_buf;
+		/* The DMA wrote entry (wptr & 3) and advanced the wptr; the
+		 * advertising RX window ends with this packet, so the newest
+		 * entry is the one to read. */
+		uint8_t hw = rf_get_rx_wptr() & RX_WPTR_MASK;
+		uint8_t *p = rx_entry((uint8_t)(hw - 1));
+
+		if (hw == cn.rx_sw) {
+			atomic_inc(&cnt_rx_ptr_odd);   /* RX IRQ without a new entry */
+		}
+		cn.rx_sw = hw;
 
 		if (!RF_BLE_PACKET_VALIDITY_CHECK(p)) {
 			atomic_inc(&cnt_rx_crc);
@@ -192,11 +215,12 @@ static void adv_isr(uint16_t st)
  * event ends, in case the wptr advanced after an RX IRQ was handled. */
 static void conn_rx(bool rx_irq)
 {
-	uint8_t hw = rf_get_rx_wptr();
-	uint8_t n = (uint8_t)(hw - cn.rx_sw);
+	uint8_t raw = rf_get_rx_wptr();
+	uint8_t hw = raw & RX_WPTR_MASK;
+	uint8_t n = (uint8_t)(hw - cn.rx_sw) & RX_WPTR_MASK;
 
-	if (hw > rx_wptr_max) {
-		rx_wptr_max = hw;   /* tells Task 9 the counter width */
+	if (raw > rx_wptr_max) {
+		rx_wptr_max = raw;   /* counter width check (31 = 5 bits) */
 	}
 	if (n == 0) {
 		if (rx_irq) {
@@ -205,19 +229,18 @@ static void conn_rx(bool rx_irq)
 		return;
 	}
 	if (n > RING_N) {
-		/* Either an overrun or the hardware counter is narrower than 8
-		 * bits and wrapped: the entries cannot be told apart from stale
-		 * ones (old timestamps, old NESN), so deliver none of them. */
+		/* An overrun: the entries cannot be told apart from stale ones
+		 * (old timestamps, old NESN), so deliver none of them. */
 		atomic_inc(&cnt_rx_ptr_odd);
 		atomic_inc(&cnt_rx_ptr_skip);
 		cn.rx_sw = hw;
 		return;
 	}
 	while (n--) {
-		uint8_t *p = &rx_buf[(cn.rx_sw & (RING_N - 1)) * RX_ENTRY_SIZE];
+		uint8_t *p = rx_entry(cn.rx_sw);
 		bool first = cn.n_any == 0;
 
-		cn.rx_sw++;
+		cn.rx_sw = (cn.rx_sw + 1) & RX_WPTR_MASK;
 		cn.n_any++;
 		if (!RF_BLE_PACKET_VALIDITY_CHECK(p)) {
 			/* timestamp at the length-field offset is meaningless
@@ -334,14 +357,17 @@ static void rf_isr(const void *arg)
 	}
 }
 
-/* Baseband setup for advertising (also the state after a restore). */
-static void hw_init_adv(void)
+/* Baseband setup for advertising (also the state after a restore). The DMA
+ * geometry is set only at boot (dma true), see RX_AREA_SIZE. */
+static void hw_init_adv(bool dma)
 {
 	rf_mode_init();
 	rf_set_ble_1M_mode();
 	rf_set_power_level_index((rf_power_level_index_e)POWER_INDEX_0DBM);
-	rf_set_tx_dma(2, DMA_BUF_SIZE);
-	rf_set_rx_dma(rx_buf, 0, RX_BUF_SIZE);   /* single RX FIFO entry */
+	if (dma) {
+		rf_set_tx_dma(2, DMA_BUF_SIZE);
+		rf_set_rx_dma(rx_buf, RING_N - 1, RX_ENTRY_SIZE);
+	}
 	rf_set_rx_maxlen(ADV_RX_MAXLEN);
 	rf_set_ble_access_code_adv();
 	rf_set_ble_crc_adv();
@@ -353,7 +379,8 @@ int ll_radio_init(ll_radio_cb_t cb)
 {
 	radio_cb = cb;
 	mode = MODE_ADV;
-	hw_init_adv();
+	hw_init_adv(true);
+	cn.rx_sw = rf_get_rx_wptr() & RX_WPTR_MASK;
 	IRQ_CONNECT(RF_IRQ, 1, rf_isr, NULL, 0);
 	irq_enable(RF_IRQ);
 	return 0;
@@ -469,10 +496,9 @@ void ll_radio_conn_setup(uint32_t aa, uint32_t crc_init)
 	 * stays at the base for the whole connection (md-spike round 5). */
 	load(conn_tx_buf, empty_pdu, sizeof(empty_pdu));
 	dma_set_src_address(DMA0, convert_ram_addr_cpu2bus(conn_tx_buf));
-	/* RX: 4-entry DMA ring */
-	rf_set_rx_dma(rx_buf, RING_N - 1, RX_ENTRY_SIZE);
+	/* RX: the 4-entry DMA ring set up at boot (not reconfigured here) */
 	rf_set_rx_maxlen(CONN_RX_MAXLEN);
-	cn.rx_sw = rf_get_rx_wptr();
+	cn.rx_sw = rf_get_rx_wptr() & RX_WPTR_MASK;
 	rf_clr_irq_status(FLD_RF_IRQ_ALL);
 	reg_rf_irq_mask = CONN_IRQ_MASK;
 	guard_streak = 0;
@@ -505,7 +531,7 @@ void ll_radio_conn_event(uint8_t ch, uint32_t open_tick, uint32_t first_timeout_
 	rf_clr_irq_status(FLD_RF_IRQ_ALL);
 	/* Skip RX entries written after the previous event was closed (e.g. a
 	 * packet completing after a guard stop): they belong to no event. */
-	cn.rx_sw = rf_get_rx_wptr();
+	cn.rx_sw = rf_get_rx_wptr() & RX_WPTR_MASK;
 	cn.evt_open = true;
 	cn.n_valid = 0;
 	cn.n_any = 0;
@@ -529,14 +555,20 @@ void ll_radio_conn_set_sn_init(uint8_t sn)
 	reg_rf_ll_ctrl_1 = (reg_rf_ll_ctrl_1 & ~FLD_RF_BRX_SN_INIT) | (sn ? FLD_RF_BRX_SN_INIT : 0);
 }
 
+void ll_radio_conn_set_nesn_init(uint8_t nesn)
+{
+	reg_rf_ll_ctrl_1 = (reg_rf_ll_ctrl_1 & ~FLD_RF_BRX_NESN_INIT) |
+			   (nesn ? FLD_RF_BRX_NESN_INIT : 0);
+}
+
 uint8_t ll_radio_fifo_rptr(void)
 {
-	return rf_get_tx_rptr(0);
+	return rf_get_tx_rptr(0) & LL_RADIO_FIFO_PTR_MASK;
 }
 
 uint8_t ll_radio_fifo_wptr(void)
 {
-	return rf_get_tx_wptr(0);
+	return rf_get_tx_wptr(0) & LL_RADIO_FIFO_PTR_MASK;
 }
 
 void ll_radio_fifo_write(uint8_t idx, uint8_t hdr0, const uint8_t *payload, uint8_t len)
@@ -561,15 +593,16 @@ void ll_radio_fifo_write(uint8_t idx, uint8_t hdr0, const uint8_t *payload, uint
 
 void ll_radio_fifo_set_wptr(uint8_t wptr)
 {
-	rf_set_tx_wptr(0, wptr);
+	rf_set_tx_wptr(0, wptr & LL_RADIO_FIFO_PTR_MASK);
 }
 
 /* Return to advertising after a connection (spec "Return to advertising",
- * first choice): baseband reset, then the full advertising init. The MD
- * spike found that STX/STX2RX hang once rptr has moved; whether this reset
- * brings rptr back to 0 is verified on air in Task 9 (pointers before and
- * after are kept in the stats). Thread context, called by ll_adv_enable()
- * under ll_plat_lock(). */
+ * first choice): baseband reset, then the advertising init without touching
+ * the DMA geometry. Task 9: the reset does not bring the TX rptr back to 0
+ * (the "adv restore" log shows it unchanged), yet advertising and the next
+ * connection work; the advertising hang of the MD spike did not reproduce
+ * once the DMA is no longer reconfigured at runtime. Thread context, called
+ * by ll_adv_enable() under ll_plat_lock(). */
 void ll_radio_adv_restore(void)
 {
 	unsigned int key = irq_lock();
@@ -584,7 +617,8 @@ void ll_radio_adv_restore(void)
 		reg_rf_rxtcrcpkt = cn.saved_rxtcrc;
 		cn.saved = false;
 	}
-	hw_init_adv();
+	hw_init_adv(false);
+	cn.rx_sw = rf_get_rx_wptr() & RX_WPTR_MASK;
 	/* Empty FIFO again, whatever survived the reset */
 	rf_set_tx_wptr(0, rf_get_tx_rptr(0));
 	restore_ptrs_after = tx_ptrs();
