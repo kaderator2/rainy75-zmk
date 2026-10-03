@@ -23,6 +23,8 @@ struct ll_adv_params {
 	uint8_t filter_policy;
 };
 
+/* Called (ISR) for every CONNECT_IND addressed to us, before it is handed
+ * to ll_conn_start(); informational (logging). May be NULL. */
 typedef void (*ll_adv_connect_cb_t)(const struct ll_connect_ind *ci);
 
 void ll_adv_init(const uint8_t adva[6], ll_adv_connect_cb_t on_connect);
@@ -30,6 +32,10 @@ void ll_adv_reset(void);
 uint8_t ll_adv_set_params(const struct ll_adv_params *p);
 uint8_t ll_adv_set_data(const uint8_t *data, uint8_t len);
 uint8_t ll_adv_set_scan_rsp(const uint8_t *data, uint8_t len);
+/* Enabling returns LL_ST_DISALLOWED while ll_conn_active(). A CONNECT_IND
+ * accepted by ll_conn_start() disables advertising (the host re-enables it
+ * after the disconnect; no controller-side resume); the next enable first
+ * calls ll_radio_adv_restore(). */
 uint8_t ll_adv_enable(bool enable);
 bool ll_adv_is_enabled(void);
 

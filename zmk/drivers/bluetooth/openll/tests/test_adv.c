@@ -1,6 +1,8 @@
+#include <errno.h>
 #include <string.h>
 #include "test.h"
 #include "../ll_adv.h"
+#include "../ll_conn.h"
 #include "../ll_defs.h"
 #include "../ll_sched.h"
 #include "../ll_plat.h"
@@ -30,6 +32,20 @@ uint32_t ll_plat_rand32(void) { return 1234567; }
 unsigned int ll_plat_lock(void) { return 0; }
 void ll_plat_unlock(unsigned int k) { (void)k; }
 static void on_conn(const struct ll_connect_ind *ci) { conn = *ci; conn_calls++; }
+static int start_ret = -EINVAL, start_calls, restores; static bool conn_is_active;
+static struct ll_connect_ind start_ci; static uint32_t start_tick;
+static bool start_saw_enabled = true, start_saw_sched = true; static int start_saw_stops;
+int ll_conn_start(const struct ll_connect_ind *ci, uint32_t t)
+{
+	start_calls++; start_ci = *ci; start_tick = t;
+	/* advertising must already be stopped when the connection starts */
+	start_saw_enabled = ll_adv_is_enabled(); start_saw_sched = sched_cb != NULL;
+	start_saw_stops = radio_stops;
+	if (start_ret == 0) conn_is_active = true;
+	return start_ret;
+}
+bool ll_conn_active(void) { return conn_is_active; }
+void ll_radio_adv_restore(void) { restores++; }
 
 static const uint8_t adva[6] = {0x01, 0x02, 0x03, 0x38, 0xC1, 0xA4};
 
@@ -109,13 +125,17 @@ int main(void)
 	CHECK(rsp_calls == 1 && radio_ch == 39);
 	req[13] ^= 1;
 
-	/* CONNECT_IND for us on 39 -> callback, advertising continues next event */
+	/* CONNECT_IND for us on 39 that ll_conn refuses (-EINVAL): callback,
+	 * advertising continues next event */
 	uint8_t ci_pdu[36] = {0x65, 34, 0x11, 0x12, 0x13, 0x14, 0x15, 0xD6};
 	memcpy(&ci_pdu[8], adva, 6);
 	ci_pdu[2 + 22] = 24;  /* interval */
+	start_ret = -EINVAL;
 	ll_adv_radio_evt(LL_RADIO_RX_OK, ci_pdu, 36, 7000000);
 	CHECK(conn_calls == 1 && conn.interval == 24);
+	CHECK(start_calls == 1 && start_ci.interval == 24 && start_tick == 7000000);
 	CHECK(sched_cb != NULL);
+	CHECK(ll_adv_is_enabled());
 
 	/* data update while enabled is used on the next TX */
 	const uint8_t ad2[4] = {0x03, 0x19, 0xC1, 0x03};
@@ -171,6 +191,57 @@ int main(void)
 	ll_adv_radio_evt(LL_RADIO_RX_TIMEOUT, NULL, 0, 0);
 	CHECK(sched_calls == sc_before);
 	CHECK(txrx_calls == txrx_before);
+
+	/* a refused CONNECT_IND keeps advertising: the next event transmits */
+	CHECK(ll_adv_enable(false) == LL_ST_SUCCESS);
+	p = params(0, 7);
+	CHECK(ll_adv_set_params(&p) == LL_ST_SUCCESS);
+	CHECK(ll_adv_enable(true) == LL_ST_SUCCESS);
+	fire_sched();
+	CHECK(radio_ch == 37);
+	start_ret = -EBUSY;
+	ll_adv_radio_evt(LL_RADIO_RX_OK, ci_pdu, 36, 7100000);
+	CHECK(start_calls == 2 && ll_adv_is_enabled() && sched_cb != NULL);
+	txrx_before = txrx_calls;
+	fire_sched();
+	CHECK(txrx_calls == txrx_before + 1 && radio_ch == 37);
+
+	/* accepted CONNECT_IND (on 37): advertising is stopped before
+	 * ll_conn_start (Vol 4 Part E 7.8.9), stays disabled, nothing scheduled */
+	int stops_before = radio_stops;
+	start_ret = 0;
+	sc_before = sched_calls;
+	txrx_before = txrx_calls;
+	ll_adv_radio_evt(LL_RADIO_RX_OK, ci_pdu, 36, 7200000);
+	CHECK(start_calls == 3 && start_tick == 7200000);
+	CHECK(!start_saw_enabled && !start_saw_sched);
+	CHECK(start_saw_stops == stops_before + 1);
+	CHECK(!ll_adv_is_enabled());
+	CHECK(sched_cb == NULL && sched_calls == sc_before && txrx_calls == txrx_before);
+	/* late radio events of the old advertising event are ignored */
+	ll_adv_radio_evt(LL_RADIO_RX_TIMEOUT, NULL, 0, 0);
+	ll_adv_radio_evt(LL_RADIO_TX_DONE, NULL, 0, 0);
+	CHECK(sched_calls == sc_before && txrx_calls == txrx_before);
+	/* the host may not re-enable advertising during the connection;
+	 * disable is a harmless no-op */
+	CHECK(ll_adv_enable(true) == LL_ST_DISALLOWED);
+	CHECK(!ll_adv_is_enabled() && sched_cb == NULL && restores == 0);
+	CHECK(ll_adv_enable(false) == LL_ST_SUCCESS);
+	/* parameters and data may still be changed (host prepares resume) */
+	p = params(0, 7);
+	CHECK(ll_adv_set_params(&p) == LL_ST_SUCCESS);
+	/* after the disconnect the host re-enables advertising via HCI: the
+	 * radio is restored once (baseband left connection mode), then events run */
+	conn_is_active = false;
+	CHECK(ll_adv_enable(true) == LL_ST_SUCCESS);
+	CHECK(restores == 1 && ll_adv_is_enabled() && sched_cb != NULL);
+	fire_sched();
+	CHECK(radio_ch == 37 && tx_pdu[0] == LL_PDU_ADV_IND);
+	/* no further restore without another connection */
+	CHECK(ll_adv_enable(false) == LL_ST_SUCCESS);
+	CHECK(ll_adv_enable(true) == LL_ST_SUCCESS);
+	CHECK(restores == 1);
+	CHECK(ll_adv_enable(false) == LL_ST_SUCCESS);
 
 	/* reset disables and restores defaults */
 	ll_adv_reset();

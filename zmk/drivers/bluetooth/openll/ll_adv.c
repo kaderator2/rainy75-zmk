@@ -6,9 +6,22 @@
  * followed by an RX window for SCAN_REQ / CONNECT_IND. Events repeat every
  * advInterval + advDelay (0..10 ms random), Core Spec Vol 6 Part B 4.4.2.
  * Radio callbacks run in ISR context; HCI-facing calls take ll_plat_lock().
+ *
+ * Connection handover: a CONNECT_IND for us stops advertising and hands the
+ * connection to ll_conn_start(). If ll_conn accepts it, advertising stays
+ * disabled, as the controller must do when a connection is created
+ * (Vol 4 Part E 7.8.9, Vol 6 Part B 4.4.2.2); the host re-enables it with
+ * LE Set Advertising Enable after Disconnection Complete (Zephyr:
+ * bt_le_adv_resume() when the peripheral connection object is released).
+ * There is therefore no controller-side resume. Enabling is refused while
+ * the connection is active (we support no advertising + connection state
+ * combination), and the first enable after a connection calls
+ * ll_radio_adv_restore() to bring the baseband back from connection mode.
+ * If ll_conn refuses the CONNECT_IND, advertising continues as before.
  */
 #include <string.h>
 #include "ll_adv.h"
+#include "ll_conn.h"
 #include "ll_defs.h"
 #include "ll_plat.h"
 #include "ll_sched.h"
@@ -38,6 +51,7 @@ static struct {
 	uint8_t rsp_pdu_len;
 	volatile bool enabled;
 	volatile bool in_event; /* true from the first tx_current() until the event ends */
+	volatile bool radio_dirty; /* a connection used the radio since advertising ran */
 	uint8_t ch_idx;       /* 0..2 = channel 37..39 */
 	uint32_t event_tick;  /* start of the current advertising event */
 } adv;
@@ -144,6 +158,14 @@ uint8_t ll_adv_enable(bool enable)
 	unsigned int key = ll_plat_lock();
 
 	if (enable && !adv.enabled) {
+		if (ll_conn_active()) {
+			ll_plat_unlock(key);
+			return LL_ST_DISALLOWED;
+		}
+		if (adv.radio_dirty) {
+			adv.radio_dirty = false;
+			ll_radio_adv_restore();
+		}
 		adv.enabled = true;
 		adv.event_tick = ll_radio_now() + ADV_START_LEAD_TICKS;
 		ll_sched_at(adv.event_tick, start_event);
@@ -239,9 +261,19 @@ void ll_adv_radio_evt(enum ll_radio_evt evt, const uint8_t *pdu, uint8_t len,
 			if (adv.on_connect) {
 				adv.on_connect(&ci);
 			}
-			/* Slice 1 does not follow the connection: end this event and
-			 * keep advertising. Slice 2 replaces this with the conn state. */
+			/* Stop advertising first: ll_conn_start() takes over the
+			 * radio and may report CONNECTED synchronously. No
+			 * advertising alarm is pending inside an event. */
 			adv.in_event = false;
+			adv.enabled = false;
+			ll_radio_stop();
+			if (ll_conn_start(&ci, end_tick) == 0) {
+				adv.radio_dirty = true;
+				return;
+			}
+			/* refused (invalid parameters / busy): nothing touched
+			 * the radio, keep advertising */
+			adv.enabled = true;
 			schedule_next_event();
 			return;
 		}

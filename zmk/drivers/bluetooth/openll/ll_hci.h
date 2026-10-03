@@ -5,6 +5,12 @@
  * HCI command handling for the open B91 link layer. Pure logic: all
  * controller actions go through struct ll_hci_ops, all events leave through
  * the sink as H4 packets (first byte 0x04).
+ *
+ * One connection, handle LL_CONN_HANDLE. Event masks (Set Event Mask, LE
+ * Set Event Mask) are honoured for the events below; Number Of Completed
+ * Packets cannot be masked. Defaults after init/Reset are the Core Spec
+ * ones (Vol 4 Part E 7.3.1, 7.8.1): LE Meta events stay off until the host
+ * sets bit 61, as Zephyr does during init.
  */
 #ifndef LL_HCI_H_
 #define LL_HCI_H_
@@ -12,6 +18,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include "ll_adv.h"
+#include "ll_conn.h"
+#include "ll_defs.h"
 
 /* Largest event: Command Complete for Read Local Supported Commands
  * = H4(1) + evt hdr(2) + ncmd(1) + opcode(2) + status(1) + 64 */
@@ -26,6 +34,11 @@ struct ll_hci_ops {
 	uint8_t (*adv_set_scan_rsp)(const uint8_t *data, uint8_t len);
 	uint8_t (*adv_enable)(bool enable);
 	void (*unknown)(uint16_t opcode); /* may be NULL */
+	/* Connection commands; each returns the HCI status of the command.
+	 * Handle and Disconnect reason are validated before the call. */
+	uint8_t (*disconnect)(uint8_t reason);           /* ll_llcp_terminate */
+	uint8_t (*ltk_reply)(const uint8_t ltk[16]);     /* ll_llcp_ltk_reply */
+	uint8_t (*ltk_neg_reply)(void);                  /* ll_llcp_ltk_neg_reply */
 };
 
 typedef void (*ll_hci_sink_t)(const uint8_t *h4, uint16_t len);
@@ -35,5 +48,51 @@ void ll_hci_init(const struct ll_hci_ops *ops, ll_hci_sink_t sink);
 /* cmd = HCI command packet without the H4 type byte:
  * opcode (LE16), parameter length, parameters */
 void ll_hci_cmd(const uint8_t *cmd, uint16_t len);
+
+/* ---- Events toward the host. Each builds one H4 event and passes it to
+ * the sink unless the event mask suppresses it. Callable from any context
+ * (also ISR: ll_conn and ll_txq callbacks), so the sink must be ISR-safe. */
+/* LE Connection Complete (0x3E/0x01): status 0, handle LL_CONN_HANDLE,
+ * role peripheral, peer address (type) from the CONNECT_IND, interval,
+ * latency, supervision timeout, Central_Clock_Accuracy = ci->sca. */
+void ll_hci_evt_conn_complete(const struct ll_connect_ind *ci);
+/* Disconnection Complete (0x05): status 0, handle, reason. */
+void ll_hci_evt_disconn_complete(uint8_t reason);
+/* Number Of Completed Packets (0x13) for LL_CONN_HANDLE; count 0: nothing
+ * is sent. One per acked ACL PDU (ll_txq completion of kind LL_TXQ_ACL),
+ * or batched by the caller. Never after the Disconnection Complete of the
+ * connection (the host frees its buffers on disconnect itself). */
+void ll_hci_evt_num_completed(uint16_t count);
+/* LE Long Term Key Request (0x3E/0x05): rand as on air (LSB first), EDIV. */
+void ll_hci_evt_ltk_req(const uint8_t rand[8], uint16_t ediv);
+/* Encryption Change (0x08): status, handle, Encryption_Enabled 0/1. */
+void ll_hci_evt_enc_change(uint8_t status, bool enabled);
+/* LE Connection Update Complete (0x3E/0x03): status 0, new parameters. */
+void ll_hci_evt_conn_update(const struct ll_conn_params *p);
+
+/* ---- ACL data framing (no H4 type byte on input, H4 type 0x02 on
+ * output). LE ACL is never fragmented here: LE Read Buffer Size reports
+ * LL_ACL_MTU = LL_DATA_PDU_MAX, so one host ACL packet is one data PDU. */
+struct ll_hci_acl_pdu {
+	uint8_t llid;                      /* LL_LLID_START or LL_LLID_CONT */
+	uint8_t len;                       /* 1..LL_DATA_PDU_MAX */
+	uint8_t data[LL_DATA_PDU_MAX];
+};
+/* Parse one host ACL packet (handle + PB/BC flags LE16, length LE16,
+ * data) into a self-contained PDU the glue can hold until ll_llcp_tx()
+ * accepts it (-EAGAIN while encryption start pauses data, -ENOMEM while
+ * the TX backlog is full). PB 0x00/0x02 (first) -> LLID 2, 0x01
+ * (continuation) -> LLID 1. Returns 0, -ENOTCONN (handle is not
+ * LL_CONN_HANDLE) or -EINVAL (PB 0x03, broadcast flags, length 0 or
+ * > LL_DATA_PDU_MAX, length field not matching len). Pure. */
+int ll_hci_acl_from_host(const uint8_t *acl, uint16_t len, struct ll_hci_acl_pdu *out);
+
+/* H4 type + ACL header + one data PDU payload */
+#define LL_HCI_ACL_MAX (1 + 4 + LL_DATA_PDU_MAX)
+/* Build the H4 ACL packet (type 0x02, handle LL_CONN_HANDLE, PB 0x02 for
+ * LLID 2 / 0x01 for LLID 1, BC 0) for one received data PDU into out
+ * (LL_HCI_ACL_MAX bytes). Returns the packet length, or 0 when the PDU
+ * does not go to the host (LLID 3 / 0, empty, len > LL_DATA_PDU_MAX). */
+uint16_t ll_hci_acl_to_host(uint8_t *out, uint8_t llid, const uint8_t *payload, uint8_t len);
 
 #endif /* LL_HCI_H_ */
