@@ -20,6 +20,8 @@
 #endif
 #endif
 
+_Static_assert(LL_MAX_CONN >= 1 && LL_MAX_CONN <= 5, "LL_MAX_CONN must be 1..5");
+
 /* HCI status codes (Core Spec Vol 1 Part F) */
 #define LL_ST_SUCCESS        0x00
 #define LL_ST_UNKNOWN_CMD    0x01

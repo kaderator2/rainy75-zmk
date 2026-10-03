@@ -67,7 +67,6 @@ struct rxq_entry {
 	uint8_t data[LL_DATA_PDU_MAX + LL_MIC_LEN];
 };
 
-_Static_assert(LL_MAX_CONN >= 1 && LL_MAX_CONN <= 5, "LL_MAX_CONN must be 1..5");
 
 static struct rxq_link {
 	struct rxq_entry ring[RING_DEPTH];

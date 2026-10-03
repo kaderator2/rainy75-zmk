@@ -84,7 +84,6 @@ enum enc_state {
 	ENC_WAIT_START_RSP,  /* LL_START_ENC_REQ queued */
 };
 
-_Static_assert(LL_MAX_CONN >= 1 && LL_MAX_CONN <= 5, "LL_MAX_CONN must be 1..5");
 
 static struct ll_llcp_ops ops;
 
@@ -115,6 +114,11 @@ void llcp_conn_end(uint8_t link, uint8_t reason);
 bool llcp_conn_active(uint8_t link);
 void llcp_conn_kick(uint8_t link);
 #else
+/* Temporary seam: these link-0 wrappers treat every link >= 1 as "no
+ * connection", so a second link would never end on a procedure timeout or
+ * LL_TERMINATE_IND. Replaced when ll_conn takes a link id (slice 6a Task 4). */
+_Static_assert(LL_MAX_CONN == 1, "link-0 LLCP wrappers support LL_MAX_CONN 1 only");
+
 static int llcp_conn_update_at(uint8_t link, uint16_t instant, uint8_t win_size,
 			       uint16_t win_offset, const struct ll_conn_params *p)
 {

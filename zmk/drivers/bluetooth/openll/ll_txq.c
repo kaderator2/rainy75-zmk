@@ -63,7 +63,6 @@
 
 _Static_assert((LL_TXQ_BACKLOG & (LL_TXQ_BACKLOG - 1)) == 0 && LL_TXQ_BACKLOG <= 128,
 	       "LL_TXQ_BACKLOG must be a power of two that fits the 8-bit counters");
-_Static_assert(LL_MAX_CONN >= 1 && LL_MAX_CONN <= 5, "LL_MAX_CONN must be 1..5");
 
 struct txq_pdu {
 	uint8_t kind;
