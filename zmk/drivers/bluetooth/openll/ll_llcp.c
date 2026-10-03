@@ -183,7 +183,7 @@ static void put_le32(uint8_t *p, uint32_t v)
 static void rx_enc_req(const uint8_t *p)
 {
 	uint8_t rsp[13];
-	bool ok;
+	bool ok, sent = false;
 
 	ll_plat_tx_lock();
 	/* a running procedure, or an encrypted link without the pause
@@ -199,14 +199,28 @@ static void rx_enc_req(const uint8_t *p)
 		rsp[0] = OP_ENC_RSP;
 		memcpy(&rsp[1], s.skds, 8);
 		memcpy(&rsp[9], &s.crypt.iv[4], 4);
-		s.enc = ENC_WAIT_LTK;
-		s.paused = true;
-		(void)tx_locked(LL_TXQ_CTRL, LL_LLID_CTRL, rsp, sizeof(rsp));
-		timer_start();
+		if (tx_locked(LL_TXQ_CTRL, LL_LLID_CTRL, rsp, sizeof(rsp)) == 0) {
+			s.enc = ENC_WAIT_LTK;
+			s.paused = true;
+			timer_start();
+			sent = true;
+		} else {
+			/* backlog full: the central waits for LL_ENC_RSP and
+			 * pauses its data meanwhile, so the procedure cannot
+			 * complete. End the link now rather than leave the
+			 * host an LTK request for a procedure the central
+			 * never sees answered (the 40 s timer would end it
+			 * anyway). */
+			memset(&s.crypt, 0, sizeof(s.crypt));
+		}
 	}
 	ll_plat_tx_unlock();
 	if (!ok) {
 		reject(OP_ENC_REQ, LL_ST_LMP_PDU_NOT_ALLOWED);
+		return;
+	}
+	if (!sent) {
+		ll_conn_end(LL_ST_UNSPECIFIED);
 		return;
 	}
 	/* same thread as the ll_rxq consumer; enc_rx is still off */

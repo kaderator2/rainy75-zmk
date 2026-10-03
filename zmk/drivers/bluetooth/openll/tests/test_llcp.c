@@ -723,6 +723,28 @@ int main(void)
 		CHECK(cn.end_calls == 1 && cn.end_reason == LL_ST_LMP_TIMEOUT);
 	}
 
+	/* LL_ENC_RSP push fails (backlog full): the procedure cannot go on
+	 * (the central waits for LL_ENC_RSP), so no LTK request reaches the
+	 * host, nothing stays paused, and the link ends now (0x1F) instead of
+	 * after the 40 s response timer */
+	fresh();
+	{
+		uint8_t req[23];
+
+		sample_rand();
+		build_enc_req(req);
+		tx.fail = 1;
+		rx(req, sizeof(req));
+		CHECK(tx.n == 0);
+		CHECK(hci.ltk_req == 0);
+		CHECK(rxq_set_calls == 0);
+		CHECK(cn.end_calls == 1 && cn.end_reason == LL_ST_UNSPECIFIED);
+		CHECK(ll_llcp_ltk_reply(ltk) == LL_ST_DISALLOWED);
+		CHECK(ll_llcp_tx(LL_TXQ_ACL, LL_LLID_START, data2_clear, 27) == 0);
+		ll_llcp_tick(now + T(TIMEOUT_US));
+		CHECK(cn.end_calls == 1);
+	}
+
 	CHECK(locks == 0);
 	DONE();
 }
