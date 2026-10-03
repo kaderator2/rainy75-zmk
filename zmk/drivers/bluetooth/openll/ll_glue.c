@@ -498,6 +498,7 @@ static void on_connect_ind(const struct ll_connect_ind *ci)
 	if (k_msgq_put(&conn_q, ci, K_NO_WAIT) != 0) {
 		atomic_inc(&conn_drops);
 	}
+	k_sem_give(&wake);   /* no periodic wakeup any more */
 }
 
 /* A bonded central retries CONNECT_IND many times per second when it is
