@@ -12,7 +12,7 @@
 #include <stdint.h>
 
 struct ll_crypt {
-	uint8_t sk[16];   /* session key, byte order as produced by ll_crypt_session_key */
+	uint8_t sk[16];   /* session key, MSB first (FIPS-197 order, as ll_plat_aes_ecb takes it) */
 	uint8_t iv[8];    /* IV = IVm || IVs, LSB first as on air (IVm in iv[0..3]) */
 	uint64_t tx_ctr;  /* 39-bit packet counter, peripheral -> central */
 	uint64_t rx_ctr;  /* 39-bit packet counter, central -> peripheral */
@@ -28,11 +28,14 @@ void ll_crypt_session_key(const uint8_t ltk[16], const uint8_t skdm[8], const ui
 /* Encrypt one data PDU in place (we are the peripheral: directionBit 0,
  * tx_ctr, incremented per call). hdr0 = data PDU header byte 0 (NESN, SN and
  * MD are masked for the AAD), len = plaintext payload length (> 0). payload
- * must have room for len + LL_MIC_LEN. Returns len + LL_MIC_LEN. */
+ * must have room for len + LL_MIC_LEN. Returns len + LL_MIC_LEN, or -1
+ * (counter unchanged) if len is 0 or len + LL_MIC_LEN exceeds 255. */
 int ll_crypt_encrypt(struct ll_crypt *c, uint8_t hdr0, uint8_t *payload, uint8_t len);
 /* Decrypt one data PDU from the central in place (directionBit 1, rx_ctr,
  * incremented only on success). len includes the MIC. Returns
- * len - LL_MIC_LEN, or -1 on MIC failure or len <= LL_MIC_LEN. */
+ * len - LL_MIC_LEN, or -1 on MIC failure or len <= LL_MIC_LEN. After a
+ * MIC failure the payload content is unspecified (the link is terminated
+ * with LL_ST_MIC_FAILURE anyway). */
 int ll_crypt_decrypt(struct ll_crypt *c, uint8_t hdr0, uint8_t *payload, uint8_t len);
 
 #endif /* LL_CRYPT_H_ */

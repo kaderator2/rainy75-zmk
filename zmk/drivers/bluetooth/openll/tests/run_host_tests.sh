@@ -12,4 +12,5 @@ build_run test_hci ../ll_hci.c
 build_run test_pdu ../ll_pdu.c
 build_run test_adv ../ll_adv.c ../ll_pdu.c
 build_run test_csa1 ../ll_csa1.c
+build_run test_crypt ../ll_crypt.c aes_ref.c
 exit 0
