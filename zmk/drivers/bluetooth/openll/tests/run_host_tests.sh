@@ -27,7 +27,8 @@ for n in 1 3 5; do
     build_run_as test_txq_safe_n$n test_txq -DLL_MAX_CONN=$n -DLL_TXQ_SAFE_MODE ../ll_txq.c
     build_run_as test_conn_n$n test_conn -DLL_MAX_CONN=$n \
         ../ll_conn.c ../ll_txq.c ../ll_rxq.c ../ll_csa1.c ../ll_crypt.c aes_ref.c
+    build_run_as test_rxq_n$n test_rxq -DLL_MAX_CONN=$n ../ll_rxq.c ../ll_crypt.c aes_ref.c
+    build_run_as test_llcp_n$n test_llcp -DLL_MAX_CONN=$n -DLL_LLCP_HOST_CONN \
+        ../ll_llcp.c ../ll_crypt.c aes_ref.c
 done
-build_run test_rxq ../ll_rxq.c ../ll_crypt.c aes_ref.c
-build_run test_llcp ../ll_llcp.c ../ll_crypt.c aes_ref.c
 exit 0

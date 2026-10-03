@@ -378,16 +378,40 @@ static void radio_evt(enum ll_radio_evt evt, const uint8_t *pdu, uint8_t len, ui
 	}
 }
 
+/* ll_conn and HCI still follow one link (link 0) until slice 6a Task 4;
+ * ll_llcp is per link already. These adapt the two. */
+static int conn_ctrl_tx(const uint8_t *payload, uint8_t len)
+{
+	return ll_llcp_ctrl_tx(0, payload, len);
+}
+
+static bool conn_busy(void)
+{
+	return ll_llcp_busy(0);
+}
+
 static const struct ll_conn_ops conn_ops = {
 	.evt = conn_evt,
 	.txq_done = txq_done,
-	.ctrl_tx = ll_llcp_ctrl_tx,
-	.busy = ll_llcp_busy,
+	.ctrl_tx = conn_ctrl_tx,
+	.busy = conn_busy,
 };
 
+static void llcp_ltk_req(uint8_t link, const uint8_t rand[8], uint16_t ediv)
+{
+	ARG_UNUSED(link);
+	ll_hci_evt_ltk_req(rand, ediv);
+}
+
+static void llcp_enc_change(uint8_t link, uint8_t status, bool enabled)
+{
+	ARG_UNUSED(link);
+	ll_hci_evt_enc_change(status, enabled);
+}
+
 static const struct ll_llcp_ops llcp_ops = {
-	.ltk_req = ll_hci_evt_ltk_req,
-	.enc_change = ll_hci_evt_enc_change,
+	.ltk_req = llcp_ltk_req,
+	.enc_change = llcp_enc_change,
 };
 
 /* ---- HCI ops ---- */
@@ -477,10 +501,20 @@ static uint8_t adv_enable(bool enable)
  * controller thread, which holds it (nothing else would). */
 static uint8_t ltk_neg_reply(void)
 {
-	uint8_t st = ll_llcp_ltk_neg_reply();
+	uint8_t st = ll_llcp_ltk_neg_reply(0);
 
 	k_sem_give(&wake);
 	return st;
+}
+
+static uint8_t hci_disconnect(uint8_t reason)
+{
+	return ll_llcp_terminate(0, reason);
+}
+
+static uint8_t ltk_reply(const uint8_t ltk[16])
+{
+	return ll_llcp_ltk_reply(0, ltk);
 }
 
 static const struct ll_hci_ops hci_ops = {
@@ -492,8 +526,8 @@ static const struct ll_hci_ops hci_ops = {
 	.adv_set_scan_rsp = ll_adv_set_scan_rsp,
 	.adv_enable = adv_enable,
 	.unknown = unknown_opcode,
-	.disconnect = ll_llcp_terminate,
-	.ltk_reply = ll_llcp_ltk_reply,
+	.disconnect = hci_disconnect,
+	.ltk_reply = ltk_reply,
 	.ltk_neg_reply = ltk_neg_reply,
 };
 
@@ -605,7 +639,7 @@ static void handle_rx(void)
 		if (atomic_test_bit(&pend, PEND_DISCONNECTED)) {
 			return;   /* the link is gone; ll_rxq is reset below */
 		}
-		enum ll_rxq_result r = ll_rxq_get(&pdu);
+		enum ll_rxq_result r = ll_rxq_get(0, &pdu);
 
 		if (r == LL_RXQ_EMPTY) {
 			return;
@@ -623,7 +657,7 @@ static void handle_rx(void)
 		uint8_t llid = pdu.hdr0 & 0x03;
 
 		if (llid == LL_LLID_CTRL) {
-			ll_llcp_rx(pdu.data, pdu.len);
+			ll_llcp_rx(0, pdu.data, pdu.len);
 			continue;
 		}
 		uint16_t n = ll_hci_acl_to_host(h4, llid, pdu.data, pdu.len);
@@ -654,7 +688,7 @@ static void handle_acl_tx(void)
 			held_valid = true;
 		}
 		in_acl_tx = true;
-		int r = ll_llcp_tx(LL_TXQ_ACL, held.pdu.llid, held.pdu.data, held.pdu.len);
+		int r = ll_llcp_tx(0, LL_TXQ_ACL, held.pdu.llid, held.pdu.data, held.pdu.len);
 
 		in_acl_tx = false;
 		if (r == 0) {
@@ -695,8 +729,8 @@ static void handle_disconnected(void)
 	reason = pend_reason;
 	ll_plat_unlock(key);
 
-	ll_rxq_reset();
-	ll_llcp_reset();
+	ll_rxq_reset(0);
+	ll_llcp_reset(0);
 	k_msgq_purge(&acl_q);
 	held_valid = false;
 	atomic_clear_bit(&pend, PEND_UPDATED);
@@ -757,7 +791,7 @@ static void report_stats(struct ll_radio_stats *last, struct ll_conn_stats *last
 			st.conn_fto, st.conn_guard, cs.widen_max_us);
 		LOG_INF("conn: tx %u acked %u tifs<=150 %u 151-152 %u >152 %u rxq_of %u ptr_odd %u",
 			st.conn_tx, (uint32_t)atomic_get(&cnt_tx_acked), st.tifs_le150,
-			st.tifs_151_152, st.tifs_gt152, ll_rxq_overflow_count(), st.rx_ptr_odd);
+			st.tifs_151_152, st.tifs_gt152, ll_rxq_overflow_count(0), st.rx_ptr_odd);
 		LOG_INF("conn: first_bad %u nodata %u outside %u ptr_skip %u wptr_max %u fst_capped %u guard_esc %u",
 			cs.first_bad, cs.first_nodata, cs.first_outside, st.rx_ptr_skip,
 			st.rx_wptr_max, st.fst_capped,
@@ -866,9 +900,10 @@ int b91_bt_controller_init(void)
 	ll_radio_init(radio_evt);
 	ll_sched_init();
 	ll_conn_init(&conn_ops);
-	ll_llcp_init(&llcp_ops);
-	ll_rxq_reset();
-	ll_llcp_reset();
+	ll_llcp_init(&llcp_ops);   /* resets every link's LLCP state */
+	for (uint8_t i = 0; i < LL_MAX_CONN; i++) {
+		ll_rxq_reset(i);
+	}
 	ll_adv_init(bd_addr, on_connect_ind);
 	ll_hci_init(&hci_ops, evt_sink);
 

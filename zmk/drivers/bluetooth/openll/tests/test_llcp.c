@@ -4,6 +4,12 @@
  *
  * ll_llcp host tests. ll_conn, ll_txq_push, ll_rxq_set_crypt and the radio
  * clock are faked; ll_crypt is real (with the test-only software AES).
+ * Built with LL_LLCP_HOST_CONN: ll_llcp calls the link-aware llcp_conn_*
+ * fakes below instead of the (still single-link) ll_conn API.
+ *
+ * Slice 6a: the single-link suite runs on link 0 and on link LL_MAX_CONN - 1
+ * (every fake records per link, the suite reads the records of its link L
+ * through the cn / hci / rxq_crypt macros); the multi-link tests follow.
  *
  * PDU layouts: Core Spec Vol 6 Part B 2.4.2. Encryption procedure: Vol 6
  * Part B 5.1.3.1. Keys and the encrypted LL_START_ENC_RSP: Vol 6 Part C
@@ -79,10 +85,14 @@ void ll_plat_aes_ecb(const uint8_t key[16], const uint8_t in[16], uint8_t out[16
 	aes_ref_encrypt(key, in, out);
 }
 
+/* link the single-link suite runs on */
+static uint8_t L;
+
 #define MAX_PUSH 16
 static struct {
 	int n;
 	struct {
+		uint8_t link;
 		enum ll_txq_kind kind;
 		uint8_t llid, len, op;
 		uint8_t d[40];
@@ -93,7 +103,7 @@ static struct {
 int ll_txq_push(uint8_t link, enum ll_txq_kind kind, uint8_t llid, const uint8_t *payload,
 		uint8_t len, uint8_t ctrl_opcode)
 {
-	CHECK(link == 0);   /* single link until the per-link llcp (slice 6a Task 3) */
+	CHECK(link < LL_MAX_CONN);
 	/* pushed under both: the IRQ lock for the queue, the TX lock for the
 	 * counter order */
 	CHECK(locks > 0);
@@ -106,6 +116,7 @@ int ll_txq_push(uint8_t link, enum ll_txq_kind kind, uint8_t llid, const uint8_t
 		return -EINVAL;
 	}
 	if (tx.n < MAX_PUSH) {
+		tx.p[tx.n].link = link;
 		tx.p[tx.n].kind = kind;
 		tx.p[tx.n].llid = llid;
 		tx.p[tx.n].len = len;
@@ -116,11 +127,13 @@ int ll_txq_push(uint8_t link, enum ll_txq_kind kind, uint8_t llid, const uint8_t
 	return 0;
 }
 
-static struct ll_crypt *rxq_crypt;
+static struct ll_crypt *rxq_crypt_l[LL_MAX_CONN];
 static int rxq_set_calls;
-void ll_rxq_set_crypt(struct ll_crypt *c)
+#define rxq_crypt (rxq_crypt_l[L])
+void ll_rxq_set_crypt(uint8_t link, struct ll_crypt *c)
 {
-	rxq_crypt = c;
+	CHECK(link < LL_MAX_CONN);
+	rxq_crypt_l[link] = c;
 	rxq_set_calls++;
 }
 
@@ -134,49 +147,69 @@ static struct {
 	struct ll_conn_params p;
 	uint8_t chm[5];
 	uint8_t term_reason, end_reason;
-} cn;
+} cnl[LL_MAX_CONN];
+#define cn (cnl[L])
 
-int ll_conn_update_at(uint16_t instant, uint8_t win_size, uint16_t win_offset,
-		      const struct ll_conn_params *p)
+/* link-aware ll_conn fakes (LL_LLCP_HOST_CONN) */
+int llcp_conn_update_at(uint8_t link, uint16_t instant, uint8_t win_size, uint16_t win_offset,
+			const struct ll_conn_params *p);
+int llcp_conn_chmap_at(uint8_t link, uint16_t instant, const uint8_t chm[5]);
+void llcp_conn_terminate(uint8_t link, uint8_t reason);
+void llcp_conn_end(uint8_t link, uint8_t reason);
+bool llcp_conn_active(uint8_t link);
+void llcp_conn_kick(uint8_t link);
+
+int llcp_conn_update_at(uint8_t link, uint16_t instant, uint8_t win_size, uint16_t win_offset,
+			const struct ll_conn_params *p)
 {
-	cn.upd_calls++;
-	cn.instant = instant;
-	cn.win_size = win_size;
-	cn.win_offset = win_offset;
-	cn.p = *p;
-	return cn.upd_ret;
+	CHECK(link < LL_MAX_CONN);
+	cnl[link].upd_calls++;
+	cnl[link].instant = instant;
+	cnl[link].win_size = win_size;
+	cnl[link].win_offset = win_offset;
+	cnl[link].p = *p;
+	return cnl[link].upd_ret;
 }
-int ll_conn_chmap_at(uint16_t instant, const uint8_t chm[5])
+int llcp_conn_chmap_at(uint8_t link, uint16_t instant, const uint8_t chm[5])
 {
-	cn.chm_calls++;
-	cn.instant = instant;
-	memcpy(cn.chm, chm, 5);
-	return cn.chm_ret;
+	CHECK(link < LL_MAX_CONN);
+	cnl[link].chm_calls++;
+	cnl[link].instant = instant;
+	memcpy(cnl[link].chm, chm, 5);
+	return cnl[link].chm_ret;
 }
-void ll_conn_terminate(uint8_t reason)
+void llcp_conn_terminate(uint8_t link, uint8_t reason)
 {
 	CHECK(locks == 0);
-	cn.term_calls++;
-	cn.term_reason = reason;
+	CHECK(link < LL_MAX_CONN);
+	cnl[link].term_calls++;
+	cnl[link].term_reason = reason;
 }
-void ll_conn_end(uint8_t reason)
+void llcp_conn_end(uint8_t link, uint8_t reason)
 {
 	CHECK(locks == 0);
-	cn.end_calls++;
-	cn.end_reason = reason;
+	CHECK(link < LL_MAX_CONN);
+	cnl[link].end_calls++;
+	cnl[link].end_reason = reason;
 }
-bool ll_conn_active(void) { return cn.active; }
+bool llcp_conn_active(uint8_t link)
+{
+	CHECK(link < LL_MAX_CONN);
+	return cnl[link].active;
+}
 
 /* Kick after every successful push (slice 5): outside the IRQ lock, after
- * the PDU is in the queue. n_at_kick: pushes seen at the last kick. */
+ * the PDU is in the queue, on the link of that push. n_at_kick: pushes seen
+ * at the last kick. */
 static struct {
 	int calls;
 	int n_at_kick;
-	int bad;   /* kicks with the IRQ lock held or before a new push */
+	int bad;   /* kicks with the IRQ lock held, before a new push or on another link */
 } kk;
-void ll_conn_kick(void)
+void llcp_conn_kick(uint8_t link)
 {
-	if (locks != 0 || tx.n <= kk.n_at_kick) {
+	if (locks != 0 || tx.n <= kk.n_at_kick ||
+	    (tx.n <= MAX_PUSH && tx.p[tx.n - 1].link != link)) {
 		kk.bad++;
 	}
 	kk.calls++;
@@ -192,22 +225,25 @@ static struct {
 	int enc_change;
 	uint8_t status;
 	bool enabled;
-} hci;
+} hcil[LL_MAX_CONN];
+#define hci (hcil[L])
 
-static void on_ltk_req(const uint8_t r[8], uint16_t e)
+static void on_ltk_req(uint8_t link, const uint8_t r[8], uint16_t e)
 {
 	CHECK(locks == 0);
-	hci.ltk_req++;
-	memcpy(hci.rand, r, 8);
-	hci.ediv = e;
+	CHECK(link < LL_MAX_CONN);
+	hcil[link].ltk_req++;
+	memcpy(hcil[link].rand, r, 8);
+	hcil[link].ediv = e;
 }
 
-static void on_enc_change(uint8_t status, bool enabled)
+static void on_enc_change(uint8_t link, uint8_t status, bool enabled)
 {
 	CHECK(locks == 0);
-	hci.enc_change++;
-	hci.status = status;
-	hci.enabled = enabled;
+	CHECK(link < LL_MAX_CONN);
+	hcil[link].enc_change++;
+	hcil[link].status = status;
+	hcil[link].enabled = enabled;
 }
 
 static const struct ll_llcp_ops ops = {.ltk_req = on_ltk_req, .enc_change = on_enc_change};
@@ -217,21 +253,30 @@ static const struct ll_llcp_ops ops = {.ltk_req = on_ltk_req, .enc_change = on_e
 static void fresh(void)
 {
 	memset(&tx, 0, sizeof(tx));
-	memset(&cn, 0, sizeof(cn));
-	memset(&hci, 0, sizeof(hci));
+	memset(cnl, 0, sizeof(cnl));
+	memset(hcil, 0, sizeof(hcil));
 	memset(&kk, 0, sizeof(kk));
-	rxq_crypt = NULL;
+	memset(rxq_crypt_l, 0, sizeof(rxq_crypt_l));
 	rxq_set_calls = 0;
 	rand_n = rand_i = 0;
 	now = 1000;
-	cn.active = true;
+	for (uint8_t i = 0; i < LL_MAX_CONN; i++) {
+		cnl[i].active = true;
+	}
 	ll_llcp_init(&ops);
-	ll_llcp_reset();
+	ll_llcp_reset(L);
+}
+
+static void rx_l(uint8_t link, const uint8_t *pdu, uint8_t len)
+{
+	ll_llcp_rx(link, pdu, len);
+	CHECK(locks == 0);
+	CHECK(tx_locks == 0);
 }
 
 static void rx(const uint8_t *pdu, uint8_t len)
 {
-	ll_llcp_rx(pdu, len);
+	ll_llcp_rx(L, pdu, len);
 	CHECK(locks == 0);
 	CHECK(tx_locks == 0);
 }
@@ -242,7 +287,8 @@ static int last_is(const uint8_t *exp, uint8_t len)
 	if (tx.n == 0) {
 		return 0;
 	}
-	return tx.p[tx.n - 1].kind == LL_TXQ_CTRL && tx.p[tx.n - 1].llid == LL_LLID_CTRL &&
+	return tx.p[tx.n - 1].link == L &&
+	       tx.p[tx.n - 1].kind == LL_TXQ_CTRL && tx.p[tx.n - 1].llid == LL_LLID_CTRL &&
 	       tx.p[tx.n - 1].len == len && tx.p[tx.n - 1].op == exp[0] &&
 	       memcmp(tx.p[tx.n - 1].d, exp, len) == 0;
 }
@@ -283,7 +329,7 @@ static void start_encryption(void)
 	sample_rand();
 	build_enc_req(req);
 	rx(req, sizeof(req));
-	CHECK(ll_llcp_ltk_reply(ltk) == LL_ST_SUCCESS);
+	CHECK(ll_llcp_ltk_reply(L, ltk) == LL_ST_SUCCESS);
 	CHECK(rxq_crypt != NULL);
 	memcpy(buf, rsp1_air, 5);
 	CHECK(ll_crypt_decrypt(rxq_crypt, 0x0F, buf, 5) == 1);  /* as ll_rxq does */
@@ -292,7 +338,7 @@ static void start_encryption(void)
 	CHECK(tx.n == n0 + 1);
 }
 
-int main(void)
+static void single_link_suite(void)
 {
 	/* ---- LL_FEATURE_REQ -> LL_FEATURE_RSP, byte 0 = ours AND central's ---- */
 	fresh();
@@ -330,7 +376,7 @@ int main(void)
 		CHECK(last_is(exp, 6));
 		rx(vi, 6);
 		CHECK(tx.n == 1);
-		ll_llcp_reset();   /* new connection */
+		ll_llcp_reset(L);   /* new connection */
 		rx(vi, 6);
 		CHECK(tx.n == 2);
 		CHECK(last_is(exp, 6));
@@ -460,10 +506,10 @@ int main(void)
 
 	/* ---- HCI Disconnect -> ll_conn_terminate ---- */
 	fresh();
-	CHECK(ll_llcp_terminate(0x13) == LL_ST_SUCCESS);
+	CHECK(ll_llcp_terminate(L, 0x13) == LL_ST_SUCCESS);
 	CHECK(cn.term_calls == 1 && cn.term_reason == 0x13);
 	cn.active = false;
-	CHECK(ll_llcp_terminate(0x13) == LL_ST_UNKNOWN_CONN_ID);
+	CHECK(ll_llcp_terminate(L, 0x13) == LL_ST_UNKNOWN_CONN_ID);
 	CHECK(cn.term_calls == 1);
 
 	/* ---- LL_PAUSE_ENC_REQ -> reject 0x1A ---- */
@@ -496,12 +542,12 @@ int main(void)
 		uint8_t exp_rsp[13];
 
 		/* nothing to answer yet: no LTK reply without a request */
-		CHECK(ll_llcp_ltk_reply(ltk) == LL_ST_DISALLOWED);
-		CHECK(ll_llcp_ltk_neg_reply() == LL_ST_DISALLOWED);
+		CHECK(ll_llcp_ltk_reply(L, ltk) == LL_ST_DISALLOWED);
+		CHECK(ll_llcp_ltk_neg_reply(L) == LL_ST_DISALLOWED);
 		CHECK(tx.n == 0);
 
 		/* ACL flows before the procedure */
-		CHECK(ll_llcp_tx(LL_TXQ_ACL, LL_LLID_START, data2_clear, 27) == 0);
+		CHECK(ll_llcp_tx(L, LL_TXQ_ACL, LL_LLID_START, data2_clear, 27) == 0);
 		CHECK(tx.n == 1 && tx.p[0].kind == LL_TXQ_ACL && tx.p[0].llid == LL_LLID_START);
 		CHECK(tx.p[0].len == 27 && memcmp(tx.p[0].d, data2_clear, 27) == 0);
 		tx.n = 0;
@@ -523,12 +569,12 @@ int main(void)
 		CHECK(rxq_crypt == NULL || !rxq_crypt->enc_rx);
 
 		/* data PDUs paused from LL_ENC_REQ on; control PDUs not */
-		CHECK(ll_llcp_tx(LL_TXQ_ACL, LL_LLID_START, data2_clear, 27) == -EAGAIN);
+		CHECK(ll_llcp_tx(L, LL_TXQ_ACL, LL_LLID_START, data2_clear, 27) == -EAGAIN);
 		CHECK(tx.n == 1);
 
 		/* LTK reply: SK, LL_START_ENC_REQ plaintext, rx decryption on */
 		now += T(1000);
-		CHECK(ll_llcp_ltk_reply(ltk) == LL_ST_SUCCESS);
+		CHECK(ll_llcp_ltk_reply(L, ltk) == LL_ST_SUCCESS);
 		CHECK(locks == 0);
 		CHECK(tx.n == 2);
 		CHECK(last_is(exp_start_req, 1));
@@ -537,8 +583,8 @@ int main(void)
 		CHECK(memcmp(rxq_crypt->sk, sk_msb, 16) == 0);
 		CHECK(memcmp(rxq_crypt->iv, ivm, 4) == 0 && memcmp(&rxq_crypt->iv[4], ivs, 4) == 0);
 		CHECK(rxq_crypt->tx_ctr == 0 && rxq_crypt->rx_ctr == 0);
-		CHECK(ll_llcp_ltk_reply(ltk) == LL_ST_DISALLOWED);   /* answered already */
-		CHECK(ll_llcp_tx(LL_TXQ_ACL, LL_LLID_START, data2_clear, 27) == -EAGAIN);
+		CHECK(ll_llcp_ltk_reply(L, ltk) == LL_ST_DISALLOWED);   /* answered already */
+		CHECK(ll_llcp_tx(L, LL_TXQ_ACL, LL_LLID_START, data2_clear, 27) == -EAGAIN);
 		CHECK(hci.enc_change == 0);
 
 		/* central's encrypted LL_START_ENC_RSP, decrypted by ll_rxq */
@@ -555,7 +601,7 @@ int main(void)
 		CHECK(hci.enc_change == 1 && hci.status == LL_ST_SUCCESS && hci.enabled);
 
 		/* data flows again, encrypted: the sample's packet 1 */
-		CHECK(ll_llcp_tx(LL_TXQ_ACL, LL_LLID_START, data2_clear, 27) == 0);
+		CHECK(ll_llcp_tx(L, LL_TXQ_ACL, LL_LLID_START, data2_clear, 27) == 0);
 		CHECK(tx.n == 4);
 		CHECK(tx.p[3].kind == LL_TXQ_ACL && tx.p[3].llid == LL_LLID_START);
 		CHECK(tx.p[3].len == 31 && memcmp(tx.p[3].d, data2_air, 31) == 0);
@@ -581,18 +627,18 @@ int main(void)
 		{
 			static const uint8_t ti[2] = {0x02, 0x13};
 
-			CHECK(ll_llcp_ctrl_tx(ti, 2) == 0);
+			CHECK(ll_llcp_ctrl_tx(L, ti, 2) == 0);
 			CHECK(tx.n == 6 && tx.p[5].len == 6 && tx.p[5].op == 0x02);
 			CHECK(tx.p[5].llid == LL_LLID_CTRL && tx.p[5].kind == LL_TXQ_CTRL);
 			CHECK(rxq_crypt->tx_ctr == 4);
 		}
 		/* backlog full: nothing queued, counter unchanged */
 		tx.fail = 1;
-		CHECK(ll_llcp_tx(LL_TXQ_ACL, LL_LLID_START, data2_clear, 27) == -ENOMEM);
+		CHECK(ll_llcp_tx(L, LL_TXQ_ACL, LL_LLID_START, data2_clear, 27) == -ENOMEM);
 		CHECK(rxq_crypt->tx_ctr == 4 && tx.n == 6);
 		/* length limits */
-		CHECK(ll_llcp_tx(LL_TXQ_ACL, LL_LLID_START, data2_clear, 0) == -EINVAL);
-		CHECK(ll_llcp_tx(LL_TXQ_ACL, LL_LLID_START, buf, 28) == -EINVAL);
+		CHECK(ll_llcp_tx(L, LL_TXQ_ACL, LL_LLID_START, data2_clear, 0) == -EINVAL);
+		CHECK(ll_llcp_tx(L, LL_TXQ_ACL, LL_LLID_START, buf, 28) == -EINVAL);
 		CHECK(rxq_crypt->tx_ctr == 4 && tx.n == 6);
 
 		/* LL_ENC_REQ on an encrypted link (no pause): rejected */
@@ -600,8 +646,8 @@ int main(void)
 		CHECK(hci.ltk_req == 1);
 		CHECK(tx.n == 7 && tx.p[6].op == 0x11 && tx.p[6].len == 3 + LL_MIC_LEN);
 		/* new connection: encryption off, plaintext again */
-		ll_llcp_reset();
-		CHECK(ll_llcp_tx(LL_TXQ_ACL, LL_LLID_START, data2_clear, 27) == 0);
+		ll_llcp_reset(L);
+		CHECK(ll_llcp_tx(L, LL_TXQ_ACL, LL_LLID_START, data2_clear, 27) == 0);
 		CHECK(tx.p[7].len == 27 && memcmp(tx.p[7].d, data2_clear, 27) == 0);
 	}
 
@@ -617,15 +663,15 @@ int main(void)
 		build_enc_req(req);
 		rx(req, sizeof(req));
 		CHECK(tx.n == 1 && hci.ltk_req == 1);
-		CHECK(ll_llcp_ltk_neg_reply() == LL_ST_SUCCESS);
+		CHECK(ll_llcp_ltk_neg_reply(L) == LL_ST_SUCCESS);
 		CHECK(tx.n == 2);
 		CHECK(last_is(exp, 3));
 		CHECK(hci.enc_change == 0);
 		CHECK(rxq_crypt == NULL || !rxq_crypt->enc_rx);
-		CHECK(ll_llcp_ltk_neg_reply() == LL_ST_DISALLOWED);
-		CHECK(ll_llcp_ltk_reply(ltk) == LL_ST_DISALLOWED);
+		CHECK(ll_llcp_ltk_neg_reply(L) == LL_ST_DISALLOWED);
+		CHECK(ll_llcp_ltk_reply(L, ltk) == LL_ST_DISALLOWED);
 		/* data resumes, plaintext; timer stopped */
-		CHECK(ll_llcp_tx(LL_TXQ_ACL, LL_LLID_START, data2_clear, 27) == 0);
+		CHECK(ll_llcp_tx(L, LL_TXQ_ACL, LL_LLID_START, data2_clear, 27) == 0);
 		CHECK(tx.p[2].len == 27);
 		now += T(TIMEOUT_US) + 1;
 		ll_llcp_tick(now);
@@ -644,7 +690,7 @@ int main(void)
 		sample_rand();
 		build_enc_req(req);
 		rx(req, sizeof(req));
-		CHECK(ll_llcp_ltk_neg_reply() == LL_ST_SUCCESS);
+		CHECK(ll_llcp_ltk_neg_reply(L) == LL_ST_SUCCESS);
 		CHECK(last_is(exp, 2));
 	}
 
@@ -663,7 +709,7 @@ int main(void)
 		CHECK(cn.end_calls == 1 && cn.end_reason == LL_ST_LMP_TIMEOUT);
 		ll_llcp_tick(now + T(TIMEOUT_US) * 2);
 		CHECK(cn.end_calls == 1);
-		CHECK(ll_llcp_ltk_reply(ltk) == LL_ST_DISALLOWED);
+		CHECK(ll_llcp_ltk_reply(L, ltk) == LL_ST_DISALLOWED);
 	}
 	/* waiting for LL_START_ENC_RSP: restarted at the queued LL_START_ENC_REQ */
 	fresh();
@@ -676,7 +722,7 @@ int main(void)
 		rx(req, sizeof(req));
 		now += T(30000000);
 		t0 = now;
-		CHECK(ll_llcp_ltk_reply(ltk) == LL_ST_SUCCESS);
+		CHECK(ll_llcp_ltk_reply(L, ltk) == LL_ST_SUCCESS);
 		ll_llcp_tick(t0 + T(TIMEOUT_US) - 1);
 		CHECK(cn.end_calls == 0);
 		ll_llcp_tick(t0 + T(TIMEOUT_US));
@@ -704,10 +750,10 @@ int main(void)
 		sample_rand();
 		build_enc_req(req);
 		rx(req, sizeof(req));
-		ll_llcp_reset();
+		ll_llcp_reset(L);
 		ll_llcp_tick(now + T(TIMEOUT_US));
 		CHECK(cn.end_calls == 0);
-		CHECK(ll_llcp_ltk_reply(ltk) == LL_ST_DISALLOWED);
+		CHECK(ll_llcp_ltk_reply(L, ltk) == LL_ST_DISALLOWED);
 	}
 
 	/* ---- encryption start through the helper, then TERMINATE_IND still works ---- */
@@ -730,7 +776,7 @@ int main(void)
 		sample_rand();
 		build_enc_req(req);
 		rx(req, sizeof(req));
-		CHECK(ll_llcp_ltk_reply(ltk) == LL_ST_SUCCESS);
+		CHECK(ll_llcp_ltk_reply(L, ltk) == LL_ST_SUCCESS);
 		memcpy(buf, rsp1_air, 5);
 		CHECK(ll_crypt_decrypt(rxq_crypt, 0x0F, buf, 5) == 1);
 		tx.fail = 1;
@@ -757,8 +803,8 @@ int main(void)
 		CHECK(hci.ltk_req == 0);
 		CHECK(rxq_set_calls == 0);
 		CHECK(cn.end_calls == 1 && cn.end_reason == LL_ST_UNSPECIFIED);
-		CHECK(ll_llcp_ltk_reply(ltk) == LL_ST_DISALLOWED);
-		CHECK(ll_llcp_tx(LL_TXQ_ACL, LL_LLID_START, data2_clear, 27) == 0);
+		CHECK(ll_llcp_ltk_reply(L, ltk) == LL_ST_DISALLOWED);
+		CHECK(ll_llcp_tx(L, LL_TXQ_ACL, LL_LLID_START, data2_clear, 27) == 0);
 		ll_llcp_tick(now + T(TIMEOUT_US));
 		CHECK(cn.end_calls == 1);
 	}
@@ -767,14 +813,14 @@ int main(void)
 	fresh();
 	features(0xFF);                       /* LLCP response */
 	CHECK(kk.calls == 1 && kk.bad == 0);
-	CHECK(ll_llcp_tx(LL_TXQ_ACL, LL_LLID_START, data2_clear, 27) == 0);
+	CHECK(ll_llcp_tx(L, LL_TXQ_ACL, LL_LLID_START, data2_clear, 27) == 0);
 	CHECK(kk.calls == 2 && kk.bad == 0);
-	CHECK(ll_llcp_ctrl_tx((const uint8_t[]){0x02, 0x13}, 2) == 0);   /* ops.ctrl_tx path */
+	CHECK(ll_llcp_ctrl_tx(L, (const uint8_t[]){0x02, 0x13}, 2) == 0);   /* ops.ctrl_tx path */
 	CHECK(kk.calls == 3 && kk.bad == 0);
 	/* nothing queued: no kick */
 	tx.fail = 1;
-	CHECK(ll_llcp_tx(LL_TXQ_ACL, LL_LLID_START, data2_clear, 27) == -ENOMEM);
-	CHECK(ll_llcp_tx(LL_TXQ_ACL, LL_LLID_START, data2_clear, 0) == -EINVAL);
+	CHECK(ll_llcp_tx(L, LL_TXQ_ACL, LL_LLID_START, data2_clear, 27) == -ENOMEM);
+	CHECK(ll_llcp_tx(L, LL_TXQ_ACL, LL_LLID_START, data2_clear, 0) == -EINVAL);
 	CHECK(kk.calls == 3);
 	/* encryption start: LL_ENC_RSP, LL_START_ENC_REQ (HCI thread),
 	 * LL_START_ENC_RSP each kick; paused ACL does not */
@@ -786,14 +832,14 @@ int main(void)
 		build_enc_req(req);
 		rx(req, sizeof(req));
 		CHECK(kk.calls == 1);
-		CHECK(ll_llcp_tx(LL_TXQ_ACL, LL_LLID_START, data2_clear, 27) == -EAGAIN);
+		CHECK(ll_llcp_tx(L, LL_TXQ_ACL, LL_LLID_START, data2_clear, 27) == -EAGAIN);
 		CHECK(kk.calls == 1);
 	}
 	fresh();
 	start_encryption();
 	CHECK(kk.calls == 3 && kk.bad == 0);
 	/* encrypted ACL kicks too */
-	CHECK(ll_llcp_tx(LL_TXQ_ACL, LL_LLID_START, data2_clear, 27) == 0);
+	CHECK(ll_llcp_tx(L, LL_TXQ_ACL, LL_LLID_START, data2_clear, 27) == 0);
 	CHECK(kk.calls == 4 && kk.bad == 0);
 	/* negative LTK reply: the reject kicks */
 	fresh();
@@ -803,15 +849,15 @@ int main(void)
 		sample_rand();
 		build_enc_req(req);
 		rx(req, sizeof(req));
-		CHECK(ll_llcp_ltk_neg_reply() == LL_ST_SUCCESS);
+		CHECK(ll_llcp_ltk_neg_reply(L) == LL_ST_SUCCESS);
 		CHECK(kk.calls == 2 && kk.bad == 0);
 	}
 
 	/* ---- ll_llcp_busy: a procedure waits (slice 5 latency hook) ---- */
 	fresh();
-	CHECK(!ll_llcp_busy());
+	CHECK(!ll_llcp_busy(L));
 	features(0xFF);
-	CHECK(!ll_llcp_busy());               /* answered at once: not a waiting procedure */
+	CHECK(!ll_llcp_busy(L));               /* answered at once: not a waiting procedure */
 	{
 		uint8_t req[23], buf[8];
 		int calls;
@@ -821,15 +867,15 @@ int main(void)
 		rx(req, sizeof(req));
 		/* ISR-called: never takes the TX mutex */
 		calls = tx_lock_calls;
-		CHECK(ll_llcp_busy());            /* waiting for the host's LTK */
+		CHECK(ll_llcp_busy(L));            /* waiting for the host's LTK */
 		CHECK(tx_lock_calls == calls && locks == 0);
-		CHECK(ll_llcp_ltk_reply(ltk) == LL_ST_SUCCESS);
-		CHECK(ll_llcp_busy());            /* waiting for LL_START_ENC_RSP */
+		CHECK(ll_llcp_ltk_reply(L, ltk) == LL_ST_SUCCESS);
+		CHECK(ll_llcp_busy(L));            /* waiting for LL_START_ENC_RSP */
 		memcpy(buf, rsp1_air, 5);
 		CHECK(ll_crypt_decrypt(rxq_crypt, 0x0F, buf, 5) == 1);
 		rx(buf, 1);
 		CHECK(hci.enc_change == 1);
-		CHECK(!ll_llcp_busy());           /* done */
+		CHECK(!ll_llcp_busy(L));           /* done */
 	}
 	/* negative reply, timeout and reset end it */
 	fresh();
@@ -839,19 +885,19 @@ int main(void)
 		sample_rand();
 		build_enc_req(req);
 		rx(req, sizeof(req));
-		CHECK(ll_llcp_busy());
-		CHECK(ll_llcp_ltk_neg_reply() == LL_ST_SUCCESS);
-		CHECK(!ll_llcp_busy());
+		CHECK(ll_llcp_busy(L));
+		CHECK(ll_llcp_ltk_neg_reply(L) == LL_ST_SUCCESS);
+		CHECK(!ll_llcp_busy(L));
 		sample_rand();
 		rx(req, sizeof(req));
-		CHECK(ll_llcp_busy());
+		CHECK(ll_llcp_busy(L));
 		ll_llcp_tick(now + T(TIMEOUT_US));
-		CHECK(!ll_llcp_busy());
+		CHECK(!ll_llcp_busy(L));
 		sample_rand();
 		rx(req, sizeof(req));
-		CHECK(ll_llcp_busy());
-		ll_llcp_reset();
-		CHECK(!ll_llcp_busy());
+		CHECK(ll_llcp_busy(L));
+		ll_llcp_reset(L);
+		CHECK(!ll_llcp_busy(L));
 	}
 
 	/* ---- ll_llcp_timeout_ticks: arm the 40 s timer only while running ---- */
@@ -872,9 +918,9 @@ int main(void)
 		CHECK(ll_llcp_timeout_ticks(t0 + T(TIMEOUT_US) + 100) == 0);
 		/* restarted by LL_START_ENC_REQ */
 		now = t0 + T(10000000);
-		CHECK(ll_llcp_ltk_reply(ltk) == LL_ST_SUCCESS);
+		CHECK(ll_llcp_ltk_reply(L, ltk) == LL_ST_SUCCESS);
 		CHECK(ll_llcp_timeout_ticks(t0 + T(TIMEOUT_US)) == (int32_t)T(10000000));
-		ll_llcp_reset();
+		ll_llcp_reset(L);
 		CHECK(ll_llcp_timeout_ticks(now) == -1);
 	}
 	/* across the 32-bit tick wrap */
@@ -887,11 +933,309 @@ int main(void)
 		build_enc_req(req);
 		rx(req, sizeof(req));
 		CHECK(ll_llcp_timeout_ticks(now + 0x200) == (int32_t)T(TIMEOUT_US) - 0x200);
-		CHECK(ll_llcp_ltk_neg_reply() == LL_ST_SUCCESS);
+		CHECK(ll_llcp_ltk_neg_reply(L) == LL_ST_SUCCESS);
 		CHECK(ll_llcp_timeout_ticks(now) == -1);
 	}
 	CHECK(tx_locks == 0);
-
 	CHECK(locks == 0);
+}
+
+/* ---------------- multi-link (slice 6a) ---------------- */
+
+static uint8_t pushes_on(uint8_t link)
+{
+	uint8_t n = 0;
+
+	for (int i = 0; i < tx.n && i < MAX_PUSH; i++) {
+		n += tx.p[i].link == link;
+	}
+	return n;
+}
+
+static void enc_req_l(uint8_t link)
+{
+	uint8_t req[23];
+
+	sample_rand();
+	build_enc_req(req);
+	rx_l(link, req, sizeof(req));
+}
+
+/* Out-of-range link ids: refused, nothing queued, no callback, no link touched. */
+static void test_link_bounds(void)
+{
+	static const uint8_t vi[6] = {0x0C, 0x0A, 0x02, 0x00, 0x34, 0x12};
+	uint8_t req[23];
+
+	fresh();
+	sample_rand();
+	build_enc_req(req);
+	ll_llcp_rx(LL_MAX_CONN, req, sizeof(req));
+	ll_llcp_rx(LL_MAX_CONN, vi, sizeof(vi));
+	CHECK(tx.n == 0 && rxq_set_calls == 0);
+	CHECK(ll_llcp_ltk_reply(LL_MAX_CONN, ltk) == LL_ST_DISALLOWED);
+	CHECK(ll_llcp_ltk_neg_reply(LL_MAX_CONN) == LL_ST_DISALLOWED);
+	CHECK(ll_llcp_terminate(LL_MAX_CONN, 0x13) == LL_ST_UNKNOWN_CONN_ID);
+	CHECK(ll_llcp_tx(LL_MAX_CONN, LL_TXQ_ACL, LL_LLID_START, data2_clear, 27) == -EINVAL);
+	CHECK(ll_llcp_ctrl_tx(0xFF, vi, 6) == -EINVAL);
+	CHECK(!ll_llcp_busy(LL_MAX_CONN));
+	ll_llcp_reset(LL_MAX_CONN);
+	CHECK(tx.n == 0 && kk.calls == 0);
+	for (uint8_t i = 0; i < LL_MAX_CONN; i++) {
+		CHECK(hcil[i].ltk_req == 0 && cnl[i].term_calls == 0 && cnl[i].end_calls == 0);
+	}
+	CHECK(ll_llcp_timeout_ticks(now) == -1);
+}
+
+/* Encryption start on link 1 while link 0 sends ACL: link 0 stays
+ * plaintext and is never paused; link 1 gets the sample's exact
+ * ciphertexts (its counter starts at 0 whatever link 0 queued). Then link 0
+ * is encrypted too: again the sample's packets 0 and 1, so the counters
+ * are independent, and the two links hold separate contexts. */
+static void test_enc_one_link_while_other_sends(void)
+{
+	const uint8_t a = 0, b = 1;
+	uint8_t buf[8];
+	struct ll_crypt *cb;
+
+	if (LL_MAX_CONN < 2) {
+		return;
+	}
+	fresh();
+	CHECK(ll_llcp_tx(a, LL_TXQ_ACL, LL_LLID_START, data2_clear, 27) == 0);
+	enc_req_l(b);
+	CHECK(hcil[b].ltk_req == 1 && hcil[a].ltk_req == 0);
+	CHECK(ll_llcp_busy(b) && !ll_llcp_busy(a));
+	CHECK(rxq_crypt_l[b] != NULL && rxq_crypt_l[a] == NULL);
+	/* link 0 is not paused; link 1 is */
+	CHECK(ll_llcp_tx(a, LL_TXQ_ACL, LL_LLID_START, data2_clear, 27) == 0);
+	CHECK(ll_llcp_tx(b, LL_TXQ_ACL, LL_LLID_START, data2_clear, 27) == -EAGAIN);
+	/* the LTK reply of link 0 has nothing to answer */
+	CHECK(ll_llcp_ltk_reply(a, ltk) == LL_ST_DISALLOWED);
+	CHECK(ll_llcp_ltk_neg_reply(a) == LL_ST_DISALLOWED);
+	CHECK(ll_llcp_busy(b));
+	CHECK(ll_llcp_ltk_reply(b, ltk) == LL_ST_SUCCESS);
+	cb = rxq_crypt_l[b];
+	CHECK(cb->enc_rx && !cb->enc_tx);
+	CHECK(memcmp(cb->sk, sk_msb, 16) == 0);
+	CHECK(ll_llcp_tx(a, LL_TXQ_ACL, LL_LLID_START, data2_clear, 27) == 0);
+	memcpy(buf, rsp1_air, 5);
+	CHECK(ll_crypt_decrypt(cb, 0x0F, buf, 5) == 1);
+	rx_l(b, buf, 1);
+	CHECK(hcil[b].enc_change == 1 && hcil[b].enabled && hcil[a].enc_change == 0);
+	CHECK(tx.n == 6);
+	CHECK(tx.p[5].link == b && tx.p[5].len == 5 && memcmp(tx.p[5].d, rsp2_air, 5) == 0);
+	/* link 0's ACL all plaintext */
+	for (int i = 0; i < tx.n; i++) {
+		if (tx.p[i].link == a) {
+			CHECK(tx.p[i].kind == LL_TXQ_ACL && tx.p[i].len == 27);
+			CHECK(memcmp(tx.p[i].d, data2_clear, 27) == 0);
+		}
+	}
+	CHECK(pushes_on(a) == 3 && pushes_on(b) == 3);   /* ENC_RSP, START_ENC_REQ, START_ENC_RSP */
+	/* link 1 data: sample packet 1 */
+	CHECK(ll_llcp_tx(b, LL_TXQ_ACL, LL_LLID_START, data2_clear, 27) == 0);
+	CHECK(tx.p[6].link == b && tx.p[6].len == 31 && memcmp(tx.p[6].d, data2_air, 31) == 0);
+	CHECK(cb->tx_ctr == 2 && cb->rx_ctr == 1);
+	CHECK(kk.bad == 0);
+
+	/* now link 0: its own context and counters from 0 */
+	enc_req_l(a);
+	CHECK(hcil[a].ltk_req == 1 && hcil[b].ltk_req == 1);
+	CHECK(rxq_crypt_l[a] != NULL && rxq_crypt_l[a] != cb);
+	CHECK(ll_llcp_busy(a) && !ll_llcp_busy(b));
+	/* link 1 keeps sending encrypted while link 0 is paused */
+	CHECK(ll_llcp_tx(b, LL_TXQ_ACL, LL_LLID_START, data2_clear, 27) == 0);
+	CHECK(tx.p[tx.n - 1].link == b && tx.p[tx.n - 1].len == 31);
+	CHECK(cb->tx_ctr == 3);
+	CHECK(ll_llcp_tx(a, LL_TXQ_ACL, LL_LLID_START, data2_clear, 27) == -EAGAIN);
+	/* the second LTK reply on link 1 has nothing to answer */
+	CHECK(ll_llcp_ltk_reply(b, ltk) == LL_ST_DISALLOWED);
+	CHECK(ll_llcp_ltk_reply(a, ltk) == LL_ST_SUCCESS);
+	memcpy(buf, rsp1_air, 5);
+	CHECK(ll_crypt_decrypt(rxq_crypt_l[a], 0x0F, buf, 5) == 1);
+	rx_l(a, buf, 1);
+	CHECK(hcil[a].enc_change == 1);
+	CHECK(tx.p[tx.n - 1].link == a && tx.p[tx.n - 1].len == 5);
+	CHECK(memcmp(tx.p[tx.n - 1].d, rsp2_air, 5) == 0);   /* counter 0 on link 0 */
+	CHECK(ll_llcp_tx(a, LL_TXQ_ACL, LL_LLID_START, data2_clear, 27) == 0);
+	CHECK(tx.p[tx.n - 1].link == a && memcmp(tx.p[tx.n - 1].d, data2_air, 31) == 0);
+	CHECK(rxq_crypt_l[a]->tx_ctr == 2 && cb->tx_ctr == 3);
+	CHECK(rxq_crypt_l[a]->rx_ctr == 1 && cb->rx_ctr == 1);
+
+	/* link 1 ends (reset): link 0 stays encrypted and keeps its counter */
+	ll_llcp_reset(b);
+	CHECK(!cb->enc_tx && !cb->enc_rx);
+	CHECK(ll_llcp_tx(b, LL_TXQ_ACL, LL_LLID_START, data2_clear, 27) == 0);
+	CHECK(tx.p[tx.n - 1].len == 27);   /* plaintext on the reset link */
+	CHECK(ll_llcp_tx(a, LL_TXQ_ACL, LL_LLID_START, data2_clear, 27) == 0);
+	CHECK(tx.p[tx.n - 1].len == 31 && rxq_crypt_l[a]->tx_ctr == 3);
+	CHECK(kk.bad == 0);
+	for (uint8_t i = 0; i < LL_MAX_CONN; i++) {
+		CHECK(cnl[i].end_calls == 0);
+	}
+}
+
+/* A MIC failure is detected in ll_rxq (test_rxq) and ends the link via
+ * ll_conn; here: a link that went through an encryption start and ended
+ * leaves another link's encrypted traffic and procedure untouched, and
+ * the ended link starts over cleanly on reuse. */
+static void test_link_end_isolated(void)
+{
+	const uint8_t a = 0, b = (uint8_t)(LL_MAX_CONN - 1);
+	uint8_t buf[8];
+
+	if (LL_MAX_CONN < 2) {
+		return;
+	}
+	fresh();
+	enc_req_l(a);
+	enc_req_l(b);
+	CHECK(ll_llcp_ltk_reply(b, ltk) == LL_ST_SUCCESS);
+	/* link b fails (e.g. MIC failure: the glue ends it and resets it) */
+	ll_llcp_reset(b);
+	CHECK(!ll_llcp_busy(b) && ll_llcp_busy(a));
+	CHECK(ll_llcp_ltk_reply(a, ltk) == LL_ST_SUCCESS);
+	memcpy(buf, rsp1_air, 5);
+	CHECK(ll_crypt_decrypt(rxq_crypt_l[a], 0x0F, buf, 5) == 1);
+	rx_l(a, buf, 1);
+	CHECK(hcil[a].enc_change == 1 && hcil[b].enc_change == 0);
+	CHECK(memcmp(tx.p[tx.n - 1].d, rsp2_air, 5) == 0);
+	/* link b reused: a fresh procedure with the same sample data */
+	enc_req_l(b);
+	CHECK(hcil[b].ltk_req == 2);
+	CHECK(ll_llcp_ltk_reply(b, ltk) == LL_ST_SUCCESS);
+	memcpy(buf, rsp1_air, 5);
+	CHECK(ll_crypt_decrypt(rxq_crypt_l[b], 0x0F, buf, 5) == 1);
+	rx_l(b, buf, 1);
+	CHECK(hcil[b].enc_change == 1);
+	CHECK(tx.p[tx.n - 1].link == b && memcmp(tx.p[tx.n - 1].d, rsp2_air, 5) == 0);
+}
+
+/* Per-link 40 s timers: ll_llcp_timeout_ticks is the minimum over the
+ * running ones; each expiry ends only its link. The links start in reverse
+ * order (the last one first), 1 s apart. */
+static void test_timeouts_per_link(void)
+{
+	uint32_t t0;
+
+	fresh();
+	t0 = now;
+	for (int i = LL_MAX_CONN - 1; i >= 0; i--) {
+		enc_req_l((uint8_t)i);
+		now += T(1000000);
+	}
+	/* link N-1 started at t0, link i at t0 + (N-1-i) s */
+	CHECK(ll_llcp_timeout_ticks(t0) == (int32_t)T(TIMEOUT_US));
+	CHECK(ll_llcp_timeout_ticks(t0 + T(500000)) == (int32_t)T(TIMEOUT_US) - (int32_t)T(500000));
+	/* a negative reply on the earliest link drops it from the minimum */
+	if (LL_MAX_CONN > 1) {
+		CHECK(ll_llcp_ltk_neg_reply(LL_MAX_CONN - 1) == LL_ST_SUCCESS);
+		CHECK(ll_llcp_timeout_ticks(t0) == (int32_t)T(TIMEOUT_US) + (int32_t)T(1000000));
+		CHECK(!ll_llcp_busy(LL_MAX_CONN - 1));
+		/* restart it as the latest one */
+		enc_req_l(LL_MAX_CONN - 1);   /* at t0 + N s */
+	}
+	for (int k = 0; k < LL_MAX_CONN; k++) {
+		/* expiry order: links N-2 .. 0, then N-1 (restarted last) */
+		uint8_t link = LL_MAX_CONN == 1 ? 0 :
+			       (k < LL_MAX_CONN - 1 ? (uint8_t)(LL_MAX_CONN - 2 - k) :
+						      (uint8_t)(LL_MAX_CONN - 1));
+		uint32_t start = LL_MAX_CONN == 1 ? t0 :
+				 (k < LL_MAX_CONN - 1 ? t0 + T(1000000) * (uint32_t)(k + 1) :
+							t0 + T(1000000) * LL_MAX_CONN);
+		uint32_t due = start + T(TIMEOUT_US);
+
+		CHECK(ll_llcp_timeout_ticks(due - 7) == 7);
+		ll_llcp_tick(due - 1);
+		for (uint8_t i = 0; i < LL_MAX_CONN; i++) {
+			CHECK(cnl[i].end_calls == 0 || cnl[i].end_reason == LL_ST_LMP_TIMEOUT);
+		}
+		CHECK(cnl[link].end_calls == 0);
+		ll_llcp_tick(due);
+		CHECK(cnl[link].end_calls == 1 && cnl[link].end_reason == LL_ST_LMP_TIMEOUT);
+		CHECK(!ll_llcp_busy(link));
+		CHECK(ll_llcp_ltk_reply(link, ltk) == LL_ST_DISALLOWED);
+		/* only this link ended now; the others still run (or ended before) */
+		for (uint8_t i = 0; i < LL_MAX_CONN; i++) {
+			int ended = 0;
+
+			for (int j = 0; j <= k; j++) {
+				uint8_t lj = LL_MAX_CONN == 1 ? 0 :
+					     (j < LL_MAX_CONN - 1 ? (uint8_t)(LL_MAX_CONN - 2 - j) :
+								    (uint8_t)(LL_MAX_CONN - 1));
+				ended |= lj == i;
+			}
+			CHECK(cnl[i].end_calls == ended);
+			CHECK(ll_llcp_busy(i) == !ended);
+		}
+	}
+	CHECK(ll_llcp_timeout_ticks(now) == -1);
+	ll_llcp_tick(now + T(TIMEOUT_US) * 3);
+	for (uint8_t i = 0; i < LL_MAX_CONN; i++) {
+		CHECK(cnl[i].end_calls == 1);
+	}
+}
+
+/* busy, terminate and the instant procedures act on their own link only. */
+static void test_routing_per_link(void)
+{
+	static const uint8_t upd[12] = {0x00, 0x02, 0x03, 0x00, 0x06, 0x00, 0x1E, 0x00,
+					0x90, 0x01, 0x34, 0x12};
+	static const uint8_t chm[8] = {0x01, 0xFF, 0x00, 0xF0, 0x0F, 0x1F, 0x05, 0x00};
+	static const uint8_t term[2] = {0x02, 0x13};
+
+	for (uint8_t k = 0; k < LL_MAX_CONN; k++) {
+		fresh();
+		enc_req_l(k);
+		for (uint8_t i = 0; i < LL_MAX_CONN; i++) {
+			CHECK(ll_llcp_busy(i) == (i == k));
+		}
+		CHECK(ll_llcp_terminate(k, 0x13) == LL_ST_SUCCESS);
+		cnl[k].upd_ret = LL_ST_INVALID_LL_PARAM;
+		rx_l(k, upd, 12);
+		rx_l(k, chm, 8);
+		rx_l(k, term, 2);
+		for (uint8_t i = 0; i < LL_MAX_CONN; i++) {
+			int me = i == k;
+
+			CHECK(cnl[i].term_calls == me && cnl[i].upd_calls == me);
+			CHECK(cnl[i].chm_calls == me);
+			CHECK(cnl[i].end_calls == 2 * me);   /* invalid update + TERMINATE_IND */
+		}
+		CHECK(cnl[k].end_reason == 0x13);
+		/* a link without a connection */
+		cnl[k].active = false;
+		CHECK(ll_llcp_terminate(k, 0x13) == LL_ST_UNKNOWN_CONN_ID);
+		for (uint8_t i = 0; i < LL_MAX_CONN; i++) {
+			if (i != k) {
+				CHECK(ll_llcp_terminate(i, 0x13) == LL_ST_SUCCESS);
+			}
+		}
+		/* reset of another link leaves the procedure running */
+		for (uint8_t i = 0; i < LL_MAX_CONN; i++) {
+			if (i != k) {
+				ll_llcp_reset(i);
+			}
+		}
+		CHECK(ll_llcp_busy(k));
+		CHECK(pushes_on(k) == 1);
+		CHECK(tx.n == 1 && kk.bad == 0);
+	}
+}
+
+int main(void)
+{
+	L = 0;
+	single_link_suite();
+	L = (uint8_t)(LL_MAX_CONN - 1);
+	single_link_suite();
+	L = 0;
+	test_link_bounds();
+	test_enc_one_link_while_other_sends();
+	test_link_end_isolated();
+	test_timeouts_per_link();
+	test_routing_per_link();
+	CHECK(locks == 0 && tx_locks == 0);
 	DONE();
 }

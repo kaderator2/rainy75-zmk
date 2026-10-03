@@ -25,8 +25,11 @@ void ll_plat_aes_ecb(const uint8_t key[16], const uint8_t in[16], uint8_t out[16
 
 #define HDR_SN 0x08
 
-/* Build an ISR-delivered PDU buffer (header + payload) and feed it in. */
-static void put(uint8_t hdr0, const uint8_t *payload, uint8_t paylen)
+/* Link the single-link suite runs on (slice 6a: every link behaves alike). */
+static uint8_t L;
+
+/* Build an ISR-delivered PDU buffer (header + payload); returns the put result. */
+static bool try_put_l(uint8_t link, uint8_t hdr0, const uint8_t *payload, uint8_t paylen)
 {
 	uint8_t pdu[2 + LL_DATA_PDU_MAX + LL_MIC_LEN];
 
@@ -35,7 +38,17 @@ static void put(uint8_t hdr0, const uint8_t *payload, uint8_t paylen)
 	if (paylen) {
 		memcpy(&pdu[2], payload, paylen);
 	}
-	CHECK(ll_rxq_isr_put(pdu, (uint8_t)(2 + paylen)));
+	return ll_rxq_isr_put(link, pdu, (uint8_t)(2 + paylen));
+}
+
+static void put_l(uint8_t link, uint8_t hdr0, const uint8_t *payload, uint8_t paylen)
+{
+	CHECK(try_put_l(link, hdr0, payload, paylen));
+}
+
+static void put(uint8_t hdr0, const uint8_t *payload, uint8_t paylen)
+{
+	put_l(L, hdr0, payload, paylen);
 }
 
 /* LTK 0x4C68384139F574D836BCF34E9DFB01BF in HCI order (LSB first). */
@@ -65,7 +78,8 @@ static void crypt_setup(struct ll_crypt *c)
 	c->enc_rx = true;
 }
 
-int main(void)
+/* The single-link suite (slices 2-5) on link L. */
+static void single_link_suite(void)
 {
 	struct ll_rx_pdu out;
 
@@ -73,30 +87,30 @@ int main(void)
 	{
 		static const uint8_t payload[3] = {0x11, 0x22, 0x33};
 
-		ll_rxq_reset();
+		ll_rxq_reset(L);
 		put(0x02, payload, 3);   /* LLID 2 (ACL start), NESN/SN/MD = 0 */
-		CHECK(ll_rxq_get(&out) == LL_RXQ_OK);
+		CHECK(ll_rxq_get(L, &out) == LL_RXQ_OK);
 		CHECK(out.hdr0 == 0x02);
 		CHECK(out.len == 3);
 		CHECK(memcmp(out.data, payload, 3) == 0);
-		CHECK(ll_rxq_get(&out) == LL_RXQ_EMPTY);
+		CHECK(ll_rxq_get(L, &out) == LL_RXQ_EMPTY);
 	}
 
 	/* Empty PDU (LLID 1, length 0): dropped, but ll_rxq_get must have
 	 * consumed the ring entry (not left pending). */
 	{
-		ll_rxq_reset();
+		ll_rxq_reset(L);
 		put(0x01, NULL, 0);
-		CHECK(ll_rxq_get(&out) == LL_RXQ_EMPTY);
+		CHECK(ll_rxq_get(L, &out) == LL_RXQ_EMPTY);
 	}
 
 	/* First packet of a connection is accepted whatever its SN bit. */
 	{
 		static const uint8_t payload[1] = {0xAA};
 
-		ll_rxq_reset();
+		ll_rxq_reset(L);
 		put(0x02 | HDR_SN, payload, 1);
-		CHECK(ll_rxq_get(&out) == LL_RXQ_OK);
+		CHECK(ll_rxq_get(L, &out) == LL_RXQ_OK);
 		CHECK(out.data[0] == 0xAA);
 	}
 
@@ -110,23 +124,23 @@ int main(void)
 		static const uint8_t p1[1] = {0x01};
 		static const uint8_t p3[1] = {0x03};
 
-		ll_rxq_reset();
+		ll_rxq_reset(L);
 		put(0x02, p1, 1);                /* SN 0 */
 		put(0x02, p3, 1);                /* SN 0: new (an SN 1 packet in between was
 						  * empty, or lost by an RX ring overflow) */
 
-		CHECK(ll_rxq_get(&out) == LL_RXQ_OK);
+		CHECK(ll_rxq_get(L, &out) == LL_RXQ_OK);
 		CHECK(out.data[0] == 0x01);
-		CHECK(ll_rxq_get(&out) == LL_RXQ_OK);
+		CHECK(ll_rxq_get(L, &out) == LL_RXQ_OK);
 		CHECK(out.data[0] == 0x03);
-		CHECK(ll_rxq_get(&out) == LL_RXQ_EMPTY);
+		CHECK(ll_rxq_get(L, &out) == LL_RXQ_EMPTY);
 	}
 
 	/* Empty PDUs never take ring room (Task 10: the host's LE Connection
 	 * Complete processing blocks the controller thread for about 300 ms,
 	 * 20 events whose empty PDUs overflowed the 16-entry ring). */
 	{
-		ll_rxq_reset();
+		ll_rxq_reset(L);
 		for (int i = 0; i < 40; i++) {
 			put((uint8_t)(0x01 | ((i & 1) ? HDR_SN : 0)), NULL, 0);
 		}
@@ -135,19 +149,19 @@ int main(void)
 
 			put(0x02, payload, 1);
 		}
-		CHECK(ll_rxq_overflow_count() == 0);
+		CHECK(ll_rxq_overflow_count(L) == 0);
 		for (int i = 0; i < 16; i++) {
-			CHECK(ll_rxq_get(&out) == LL_RXQ_OK);
+			CHECK(ll_rxq_get(L, &out) == LL_RXQ_OK);
 			CHECK(out.data[0] == (uint8_t)i);
 		}
-		CHECK(ll_rxq_get(&out) == LL_RXQ_EMPTY);
+		CHECK(ll_rxq_get(L, &out) == LL_RXQ_EMPTY);
 	}
 
 	/* Overflow: 16-entry ring, the 17th isr_put is refused and counted;
 	 * the 16 already queued are still delivered in order. */
 	{
-		ll_rxq_reset();
-		CHECK(ll_rxq_overflow_count() == 0);
+		ll_rxq_reset(L);
+		CHECK(ll_rxq_overflow_count(L) == 0);
 		for (int i = 0; i < 16; i++) {
 			uint8_t payload[1] = {(uint8_t)i};
 			uint8_t hdr0 = (uint8_t)(0x02 | ((i & 1) ? HDR_SN : 0));
@@ -157,14 +171,14 @@ int main(void)
 		{
 			uint8_t pdu[3] = {0x02, 1, 0xFF};
 
-			CHECK(!ll_rxq_isr_put(pdu, 3));
+			CHECK(!ll_rxq_isr_put(L, pdu, 3));
 		}
-		CHECK(ll_rxq_overflow_count() == 1);
+		CHECK(ll_rxq_overflow_count(L) == 1);
 		for (int i = 0; i < 16; i++) {
-			CHECK(ll_rxq_get(&out) == LL_RXQ_OK);
+			CHECK(ll_rxq_get(L, &out) == LL_RXQ_OK);
 			CHECK(out.data[0] == (uint8_t)i);
 		}
-		CHECK(ll_rxq_get(&out) == LL_RXQ_EMPTY);
+		CHECK(ll_rxq_get(L, &out) == LL_RXQ_EMPTY);
 	}
 
 	/* Decrypt via ll_crypt when enc_rx: Core Spec sample packets, two in a
@@ -178,65 +192,65 @@ int main(void)
 		struct ll_crypt c;
 
 		crypt_setup(&c);
-		ll_rxq_reset();
-		ll_rxq_set_crypt(&c);
+		ll_rxq_reset(L);
+		ll_rxq_set_crypt(L, &c);
 
 		put(0x0F, rsp1_air, sizeof(rsp1_air));         /* SN 1 */
-		CHECK(ll_rxq_get(&out) == LL_RXQ_OK);
+		CHECK(ll_rxq_get(L, &out) == LL_RXQ_OK);
 		CHECK(out.hdr0 == 0x0F);
 		CHECK(out.len == 1);
 		CHECK(out.data[0] == 0x06);
 		CHECK(c.rx_ctr == 1);
 
 		put(0x06, data1_air, sizeof(data1_air));       /* SN 0: new */
-		CHECK(ll_rxq_get(&out) == LL_RXQ_OK);
+		CHECK(ll_rxq_get(L, &out) == LL_RXQ_OK);
 		CHECK(out.len == 27);
 		CHECK(memcmp(out.data, data1_clear, 27) == 0);
 		CHECK(c.rx_ctr == 2);
-		CHECK(ll_rxq_get(&out) == LL_RXQ_EMPTY);
+		CHECK(ll_rxq_get(L, &out) == LL_RXQ_EMPTY);
 	}
 
 	/* MIC failure: reported distinctly (LL_RXQ_MIC_FAIL), counter
 	 * unchanged. The caller is expected to terminate the connection on
 	 * this result (Core Spec: MIC failure ends the link immediately), so
 	 * there is no in-connection "retry"; a later connection starts clean
-	 * via ll_rxq_reset(). */
+	 * via ll_rxq_reset(L). */
 	{
 		struct ll_crypt c;
 		uint8_t bad[sizeof(rsp1_air)];
 
 		crypt_setup(&c);
-		ll_rxq_reset();
-		ll_rxq_set_crypt(&c);
+		ll_rxq_reset(L);
+		ll_rxq_set_crypt(L, &c);
 
 		memcpy(bad, rsp1_air, sizeof(bad));
 		bad[0] ^= 0x01;
 		put(0x0F, bad, sizeof(bad));
-		CHECK(ll_rxq_get(&out) == LL_RXQ_MIC_FAIL);
+		CHECK(ll_rxq_get(L, &out) == LL_RXQ_MIC_FAIL);
 		CHECK(c.rx_ctr == 0);
 
-		/* Sticky until ll_rxq_reset(): no later PDU of this link is
+		/* Sticky until ll_rxq_reset(L): no later PDU of this link is
 		 * delivered, even one that would decrypt (the stream has a hole
 		 * and the link is going away), and an empty ring still reports
 		 * the failure rather than EMPTY. */
-		CHECK(ll_rxq_get(&out) == LL_RXQ_MIC_FAIL);
+		CHECK(ll_rxq_get(L, &out) == LL_RXQ_MIC_FAIL);
 		put(0x0F, rsp1_air, sizeof(rsp1_air));
 		out.len = 0xEE;
-		CHECK(ll_rxq_get(&out) == LL_RXQ_MIC_FAIL);
+		CHECK(ll_rxq_get(L, &out) == LL_RXQ_MIC_FAIL);
 		CHECK(out.len == 0xEE);
 		CHECK(c.rx_ctr == 0);
-		CHECK(ll_rxq_get(&out) == LL_RXQ_MIC_FAIL);
+		CHECK(ll_rxq_get(L, &out) == LL_RXQ_MIC_FAIL);
 
 		/* Next connection: fresh crypt state. */
-		ll_rxq_reset();
-		ll_rxq_set_crypt(&c);
+		ll_rxq_reset(L);
+		ll_rxq_set_crypt(L, &c);
 		put(0x0F, rsp1_air, sizeof(rsp1_air));
-		CHECK(ll_rxq_get(&out) == LL_RXQ_OK);
+		CHECK(ll_rxq_get(L, &out) == LL_RXQ_OK);
 		CHECK(out.data[0] == 0x06);
 		CHECK(c.rx_ctr == 1);
 	}
 
-	/* ll_rxq_reset() clears the crypt context too: after a reset without
+	/* ll_rxq_reset(L) clears the crypt context too: after a reset without
 	 * ll_rxq_set_crypt(), delivery is unencrypted even though the old
 	 * context object still has enc_rx set. */
 	{
@@ -244,15 +258,15 @@ int main(void)
 		static const uint8_t payload[2] = {0x55, 0x66};
 
 		crypt_setup(&c);
-		ll_rxq_set_crypt(&c);
-		ll_rxq_reset();
+		ll_rxq_set_crypt(L, &c);
+		ll_rxq_reset(L);
 		put(0x02, payload, 2);
-		CHECK(ll_rxq_get(&out) == LL_RXQ_OK);
+		CHECK(ll_rxq_get(L, &out) == LL_RXQ_OK);
 		CHECK(memcmp(out.data, payload, 2) == 0);
 	}
 
 	/* ---- ll_rxq_isr_take_queued: wake the consumer only for data PDUs ---- */
-	ll_rxq_reset();
+	ll_rxq_reset(L);
 	CHECK(!ll_rxq_isr_take_queued());
 	put(0x01, NULL, 0);                       /* empty PDU: nothing queued */
 	put(0x09, NULL, 0);
@@ -266,17 +280,210 @@ int main(void)
 		put(0x01, NULL, 0);
 		CHECK(ll_rxq_isr_take_queued());
 		CHECK(!ll_rxq_isr_take_queued());     /* cleared by the take */
-		CHECK(!ll_rxq_isr_put(bad, 1));       /* malformed: dropped, not queued */
+		CHECK(!ll_rxq_isr_put(L, bad, 1));       /* malformed: dropped, not queued */
 		CHECK(!ll_rxq_isr_take_queued());
 		/* consuming does not clear a pending flag of a later put */
 		put(0x02, d, 3);
-		CHECK(ll_rxq_get(&out) == LL_RXQ_OK);
-		CHECK(ll_rxq_get(&out) == LL_RXQ_OK);
+		CHECK(ll_rxq_get(L, &out) == LL_RXQ_OK);
+		CHECK(ll_rxq_get(L, &out) == LL_RXQ_OK);
 		CHECK(ll_rxq_isr_take_queued());
 		/* reset clears it */
 		put(0x02, d, 3);
-		ll_rxq_reset();
+		ll_rxq_reset(L);
 		CHECK(!ll_rxq_isr_take_queued());
 	}
+}
+
+
+static void reset_all(void)
+{
+	for (uint8_t i = 0; i < LL_MAX_CONN; i++) {
+		ll_rxq_reset(i);
+	}
+	(void)ll_rxq_isr_take_queued();
+}
+
+/* Out-of-range link ids are refused and touch no link. */
+static void test_link_bounds(void)
+{
+	struct ll_rx_pdu out;
+	static const uint8_t d[2] = {0x12, 0x34};
+	struct ll_crypt c;
+
+	reset_all();
+	CHECK(!try_put_l(LL_MAX_CONN, 0x02, d, 2));
+	CHECK(!try_put_l(0xFF, 0x02, d, 2));
+	CHECK(!ll_rxq_isr_take_queued());
+	CHECK(ll_rxq_get(LL_MAX_CONN, &out) == LL_RXQ_EMPTY);
+	CHECK(ll_rxq_overflow_count(LL_MAX_CONN) == 0);
+	crypt_setup(&c);
+	ll_rxq_set_crypt(LL_MAX_CONN, &c);   /* ignored */
+	ll_rxq_reset(LL_MAX_CONN);           /* ignored */
+	for (uint8_t i = 0; i < LL_MAX_CONN; i++) {
+		CHECK(ll_rxq_overflow_count(i) == 0);
+		put_l(i, 0x02, d, 2);
+		CHECK(ll_rxq_get(i, &out) == LL_RXQ_OK && out.len == 2);
+		CHECK(memcmp(out.data, d, 2) == 0);   /* plaintext: no crypt on any link */
+		CHECK(ll_rxq_get(i, &out) == LL_RXQ_EMPTY);
+	}
+}
+
+/* Interleaved puts are delivered per link, in order; overflow and reset of
+ * one link leave the others' queues intact. */
+static void test_links_isolated(void)
+{
+	struct ll_rx_pdu out;
+
+	reset_all();
+	for (int k = 0; k < 10; k++) {
+		for (uint8_t i = 0; i < LL_MAX_CONN; i++) {
+			uint8_t d[2] = {i, (uint8_t)k};
+
+			put_l(i, 0x02, d, 2);
+		}
+	}
+	/* fill link 0 to overflow: its 16-entry ring has 10 */
+	for (int k = 10; k < 16; k++) {
+		uint8_t d[2] = {0, (uint8_t)k};
+
+		put_l(0, 0x02, d, 2);
+	}
+	{
+		uint8_t d[2] = {0, 99};
+
+		CHECK(!try_put_l(0, 0x02, d, 2));
+	}
+	CHECK(ll_rxq_overflow_count(0) == 1);
+	for (uint8_t i = 1; i < LL_MAX_CONN; i++) {
+		uint8_t d[2] = {i, 10};
+
+		CHECK(ll_rxq_overflow_count(i) == 0);
+		put_l(i, 0x02, d, 2);   /* the others still have room */
+	}
+	/* reset the last link: the others keep their data */
+	if (LL_MAX_CONN > 1) {
+		ll_rxq_reset(LL_MAX_CONN - 1);
+		CHECK(ll_rxq_get(LL_MAX_CONN - 1, &out) == LL_RXQ_EMPTY);
+	}
+	for (uint8_t i = 0; i < LL_MAX_CONN; i++) {
+		int n = i == 0 ? 16 : (i == LL_MAX_CONN - 1 ? 0 : 11);
+
+		for (int k = 0; k < n; k++) {
+			CHECK(ll_rxq_get(i, &out) == LL_RXQ_OK);
+			CHECK(out.len == 2 && out.data[0] == i && out.data[1] == (uint8_t)k);
+		}
+		CHECK(ll_rxq_get(i, &out) == LL_RXQ_EMPTY);
+	}
+}
+
+/* Each link decrypts with its own context: independent counters. A MIC
+ * failure on one link is sticky there only; the others keep delivering. */
+static void test_crypt_per_link(void)
+{
+	struct ll_crypt c[LL_MAX_CONN];
+	struct ll_rx_pdu out;
+	uint8_t bad[sizeof(rsp1_air)];
+	const uint8_t fail = (uint8_t)(LL_MAX_CONN / 2);   /* 0, 1, 2 for N 1, 3, 5 */
+	static const uint8_t plain[3] = {0xA1, 0xA2, 0xA3};
+
+	reset_all();
+	for (uint8_t i = 0; i < LL_MAX_CONN; i++) {
+		crypt_setup(&c[i]);
+		/* the last link of N > 1 stays unencrypted */
+		if (LL_MAX_CONN == 1 || i != LL_MAX_CONN - 1) {
+			ll_rxq_set_crypt(i, &c[i]);
+		}
+	}
+	memcpy(bad, rsp1_air, sizeof(bad));
+	bad[2] ^= 0x40;
+	/* packet 0 on every link (the failing link gets the corrupted one) */
+	for (uint8_t i = 0; i < LL_MAX_CONN; i++) {
+		if (i == fail) {
+			put_l(i, 0x0F, bad, sizeof(bad));
+		} else if (LL_MAX_CONN > 1 && i == LL_MAX_CONN - 1) {
+			put_l(i, 0x02, plain, 3);
+		} else {
+			put_l(i, 0x0F, rsp1_air, sizeof(rsp1_air));
+		}
+	}
+	for (uint8_t i = 0; i < LL_MAX_CONN; i++) {
+		if (i == fail) {
+			CHECK(ll_rxq_get(i, &out) == LL_RXQ_MIC_FAIL);
+			CHECK(c[i].rx_ctr == 0);
+		} else if (LL_MAX_CONN > 1 && i == LL_MAX_CONN - 1) {
+			CHECK(ll_rxq_get(i, &out) == LL_RXQ_OK);
+			CHECK(out.len == 3 && memcmp(out.data, plain, 3) == 0);
+		} else {
+			CHECK(ll_rxq_get(i, &out) == LL_RXQ_OK);
+			CHECK(out.len == 1 && out.data[0] == 0x06);
+			CHECK(c[i].rx_ctr == 1);
+		}
+	}
+	/* packet 1 everywhere: the failed link stays failed, the others deliver */
+	for (uint8_t i = 0; i < LL_MAX_CONN; i++) {
+		if (LL_MAX_CONN > 1 && i == LL_MAX_CONN - 1) {
+			put_l(i, 0x02, plain, 3);
+		} else {
+			put_l(i, 0x06, data1_air, sizeof(data1_air));
+		}
+	}
+	for (uint8_t i = 0; i < LL_MAX_CONN; i++) {
+		if (i == fail) {
+			CHECK(ll_rxq_get(i, &out) == LL_RXQ_MIC_FAIL);
+			CHECK(c[i].rx_ctr == 0);
+		} else if (LL_MAX_CONN > 1 && i == LL_MAX_CONN - 1) {
+			CHECK(ll_rxq_get(i, &out) == LL_RXQ_OK && out.len == 3);
+			CHECK(ll_rxq_get(i, &out) == LL_RXQ_EMPTY);
+		} else {
+			CHECK(ll_rxq_get(i, &out) == LL_RXQ_OK);
+			CHECK(out.len == 27 && memcmp(out.data, data1_clear, 27) == 0);
+			CHECK(c[i].rx_ctr == 2);
+			CHECK(ll_rxq_get(i, &out) == LL_RXQ_EMPTY);
+		}
+	}
+	/* a reset of the failed link clears only its failure */
+	ll_rxq_reset(fail);
+	CHECK(ll_rxq_get(fail, &out) == LL_RXQ_EMPTY);
+	for (uint8_t i = 0; i < LL_MAX_CONN; i++) {
+		CHECK(ll_rxq_get(i, &out) == LL_RXQ_EMPTY);
+	}
+}
+
+/* The wake flag covers every link; a reset of one link keeps the flag of
+ * another link's data. */
+static void test_take_queued_any_link(void)
+{
+	static const uint8_t d[1] = {0x42};
+	struct ll_rx_pdu out;
+	const uint8_t last = (uint8_t)(LL_MAX_CONN - 1);
+
+	reset_all();
+	CHECK(!ll_rxq_isr_take_queued());
+	put_l(last, 0x02, d, 1);
+	CHECK(ll_rxq_isr_take_queued());
+	CHECK(!ll_rxq_isr_take_queued());
+	if (LL_MAX_CONN > 1) {
+		put_l(last, 0x02, d, 1);
+		ll_rxq_reset(0);
+		CHECK(ll_rxq_isr_take_queued());
+		put_l(0, 0x02, d, 1);
+		put_l(last, 0x02, d, 1);
+		ll_rxq_reset(last);
+		CHECK(ll_rxq_isr_take_queued());   /* link 0 still has data */
+		CHECK(ll_rxq_get(0, &out) == LL_RXQ_OK);
+	}
+	reset_all();
+}
+
+int main(void)
+{
+	L = 0;
+	single_link_suite();
+	L = (uint8_t)(LL_MAX_CONN - 1);
+	single_link_suite();
+	test_link_bounds();
+	test_links_isolated();
+	test_crypt_per_link();
+	test_take_queued_any_link();
 	DONE();
 }

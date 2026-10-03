@@ -2,7 +2,7 @@
  * Copyright (c) 2026 scholzri
  * SPDX-License-Identifier: Apache-2.0
  *
- * RX queue: a lock-free 16-entry software ring between the RX ISR (single
+ * RX queue: per link, a lock-free 16-entry software ring between the RX ISR (single
  * producer, ll_rxq_isr_put, copies each CRC-valid connection PDU out of the
  * RX DMA ring before it is overwritten) and the controller thread (single
  * consumer, ll_rxq_get). head/tail are free-running 8-bit counters, each
@@ -38,6 +38,11 @@
  * the controller thread is blocked (the host's LE Connection Complete
  * processing holds it for about 300 ms, Task 10).
  *
+ * Slice 6a: one ring, crypt pointer, overflow count, MIC failure and wake
+ * flag per link (LL_MAX_CONN). The RX DMA ring stays shared; the radio ISR
+ * puts each packet into the ring of the link that owns the running event.
+ * The rules above hold per link.
+ *
  * Decryption happens in the consumer, in RX order. On LL_RXQ_MIC_FAIL the
  * caller is expected to terminate the connection (Core Spec Vol 6 Part B
  * 5.1.3.1), so there is no in-connection retry. The failure is sticky:
@@ -62,7 +67,9 @@ struct rxq_entry {
 	uint8_t data[LL_DATA_PDU_MAX + LL_MIC_LEN];
 };
 
-static struct {
+_Static_assert(LL_MAX_CONN >= 1 && LL_MAX_CONN <= 5, "LL_MAX_CONN must be 1..5");
+
+static struct rxq_link {
 	struct rxq_entry ring[RING_DEPTH];
 	volatile uint8_t head;   /* next free slot, advanced by the producer (ISR) */
 	volatile uint8_t tail;   /* next slot to consume, advanced by the consumer (thread) */
@@ -70,76 +77,96 @@ static struct {
 	struct ll_crypt *crypt;
 	bool mic_failed;         /* sticky until ll_rxq_reset() (consumer only) */
 	bool queued;             /* data PDU queued since the last take (producer only) */
-} q;
+} links[LL_MAX_CONN];
 
-void ll_rxq_reset(void)
+void ll_rxq_reset(uint8_t link)
 {
-	memset(&q, 0, sizeof(q));
+	if (link < LL_MAX_CONN) {
+		memset(&links[link], 0, sizeof(links[link]));
+	}
 }
 
 bool ll_rxq_isr_take_queued(void)
 {
-	bool r = q.queued;
+	bool r = false;
 
-	q.queued = false;
+	for (uint8_t i = 0; i < LL_MAX_CONN; i++) {
+		r |= links[i].queued;
+		links[i].queued = false;
+	}
 	return r;
 }
 
-void ll_rxq_set_crypt(struct ll_crypt *c)
+void ll_rxq_set_crypt(uint8_t link, struct ll_crypt *c)
 {
-	q.crypt = c;
+	if (link < LL_MAX_CONN) {
+		links[link].crypt = c;
+	}
 }
 
-bool ll_rxq_isr_put(const uint8_t *pdu, uint8_t len)
+bool ll_rxq_isr_put(uint8_t link, const uint8_t *pdu, uint8_t len)
 {
-	uint8_t head = q.head;
+	struct rxq_link *q;
+	uint8_t head;
 	uint8_t paylen;
 	struct rxq_entry *e;
 
+	if (link >= LL_MAX_CONN) {
+		return false;
+	}
+	q = &links[link];
+	head = q->head;
 	if (len < 2) {
-		q.overflow++;
+		q->overflow++;
 		return false;
 	}
 	paylen = (uint8_t)(len - 2);
 	if (paylen == 0) {
 		return true;   /* empty PDU: nothing to deliver */
 	}
-	if ((uint8_t)(head - q.tail) >= RING_DEPTH) {
-		q.overflow++;
+	if ((uint8_t)(head - q->tail) >= RING_DEPTH) {
+		q->overflow++;
 		return false;
 	}
-	e = &q.ring[head & RING_MASK];
+	e = &q->ring[head & RING_MASK];
 	if (paylen > sizeof(e->data)) {
-		q.overflow++;
+		q->overflow++;
 		return false;
 	}
 	e->hdr0 = pdu[0];
 	e->len = paylen;
 	memcpy(e->data, &pdu[2], paylen);
 	RING_BARRIER();   /* publish: slot complete before head moves */
-	q.head = (uint8_t)(head + 1);
-	q.queued = true;
+	q->head = (uint8_t)(head + 1);
+	q->queued = true;
 	return true;
 }
 
-enum ll_rxq_result ll_rxq_get(struct ll_rx_pdu *out)
+enum ll_rxq_result ll_rxq_get(uint8_t link, struct ll_rx_pdu *out)
 {
-	uint8_t tail = q.tail;
+	struct rxq_link *q;
+	uint8_t tail;
 
-	if (q.mic_failed) {
+	if (link >= LL_MAX_CONN) {
+		return LL_RXQ_EMPTY;
+	}
+	q = &links[link];
+	tail = q->tail;
+
+	if (q->mic_failed) {
 		return LL_RXQ_MIC_FAIL;   /* sticky: nothing more of this link */
 	}
-	if (tail != q.head) {
-		struct rxq_entry *e = &q.ring[tail & RING_MASK];
+	if (tail != q->head) {
+		struct rxq_entry *e = &q->ring[tail & RING_MASK];
 		enum ll_rxq_result res = LL_RXQ_OK;
 
 		RING_BARRIER();   /* consume: head observed before the slot is read */
-		if (q.crypt && q.crypt->enc_rx) {
-			int r = ll_crypt_decrypt(q.crypt, e->hdr0, e->data, e->len);
+		if (q->crypt && q->crypt->enc_rx) {
+			int r = ll_crypt_decrypt(q->crypt, e->hdr0, e->data, e->len);
 
 			if (r < 0) {
 				res = LL_RXQ_MIC_FAIL;
-				q.mic_failed = true;
+				q->mic_failed = true;
 			} else {
 				out->len = (uint8_t)r;
 			}
@@ -151,13 +178,13 @@ enum ll_rxq_result ll_rxq_get(struct ll_rx_pdu *out)
 			memcpy(out->data, e->data, out->len);
 		}
 		RING_BARRIER();   /* release: slot fully read before tail frees it */
-		q.tail = (uint8_t)(tail + 1);
+		q->tail = (uint8_t)(tail + 1);
 		return res;
 	}
 	return LL_RXQ_EMPTY;
 }
 
-uint32_t ll_rxq_overflow_count(void)
+uint32_t ll_rxq_overflow_count(uint8_t link)
 {
-	return q.overflow;
+	return link < LL_MAX_CONN ? links[link].overflow : 0;
 }

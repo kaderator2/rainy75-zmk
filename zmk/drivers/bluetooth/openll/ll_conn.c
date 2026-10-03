@@ -439,7 +439,7 @@ static void on_rx(const uint8_t *pdu, uint8_t len, uint32_t tick)
 	}
 	stats.rx_pkts++;
 	ll_txq_rx(0, pdu[0]);
-	if (!ll_rxq_isr_put(pdu, len)) {
+	if (!ll_rxq_isr_put(0, pdu, len)) {
 		/* The hardware has acked this data PDU already, so the central
 		 * will never resend it: it is lost for good, and continuing
 		 * would leave a hole in the L2CAP stream (and, encrypted, a

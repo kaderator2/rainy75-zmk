@@ -2,9 +2,11 @@
  * Copyright (c) 2026 scholzri
  * SPDX-License-Identifier: Apache-2.0
  *
- * RX queue: ISR-filled software ring of received data PDUs, consumed by the
- * controller thread (decrypt). Empty PDUs are dropped at the put; there is
- * no SN duplicate check, the baseband delivers only new packets (ll_rxq.c).
+ * RX queue: ISR-filled software ring of received data PDUs per link,
+ * consumed by the controller thread (decrypt). Empty PDUs are dropped at
+ * the put; there is no SN duplicate check, the baseband delivers only new
+ * packets (ll_rxq.c). Every entry point takes the link id (0 <= link <
+ * LL_MAX_CONN); an out-of-range id is ignored (put: false, get: EMPTY).
  */
 #ifndef LL_RXQ_H_
 #define LL_RXQ_H_
@@ -28,31 +30,37 @@ enum ll_rxq_result {
 			   * caller terminates the connection (LL_ST_MIC_FAILURE).
 			   * Sticky: every later ll_rxq_get() returns MIC_FAIL
 			   * (nothing is delivered, out untouched) until
-			   * ll_rxq_reset(). */
+			   * ll_rxq_reset() of that link. */
 };
 
-void ll_rxq_reset(void);
-/* Set (or clear, with NULL) the encryption context used to decrypt incoming
- * PDUs. Thread context; call once the LLCP encryption procedure has enabled
- * enc_rx on *c (ll_crypt itself is owned by ll_llcp/ll_conn). */
-void ll_rxq_set_crypt(struct ll_crypt *c);
-/* ISR: copy one CRC-valid PDU (2-byte header + payload, as delivered by
- * LL_RADIO_CONN_RX: pdu[0] = header byte 0, pdu[1] = on-air length,
- * pdu[2..] = payload; len = 2 + payload length). Single producer. An empty
+/* Empty the link's ring, clear its crypt pointer, overflow count, MIC
+ * failure and wake flag. Thread (the link's consumer), while the link
+ * produces nothing (before it starts or after it ended). */
+void ll_rxq_reset(uint8_t link);
+/* Set (or clear, with NULL) the encryption context used to decrypt the
+ * link's incoming PDUs. Thread context; ll_llcp sets the link's own
+ * context when the encryption procedure starts (enc_rx turns on later,
+ * under ll_plat_lock()). */
+void ll_rxq_set_crypt(uint8_t link, struct ll_crypt *c);
+/* ISR: copy one CRC-valid PDU of the link that owns the running event
+ * (2-byte header + payload, as delivered by LL_RADIO_CONN_RX: pdu[0] =
+ * header byte 0, pdu[1] = on-air length, pdu[2..] = payload; len = 2 +
+ * payload length). Single producer (the radio ISR). An empty
  * PDU is accepted and not queued. Returns false on overflow or a malformed
  * length (dropped and counted). A dropped data PDU is lost for good (the
  * hardware has acked it), so the caller ends the link (ll_conn: 0x08). */
-bool ll_rxq_isr_put(const uint8_t *pdu, uint8_t len);
+bool ll_rxq_isr_put(uint8_t link, const uint8_t *pdu, uint8_t len);
 /* ISR (the producer side, e.g. at LL_RADIO_CONN_DONE): true if a data PDU
- * was queued since the last call or ll_rxq_reset(), and clears that flag.
- * Empty and dropped PDUs do not count, so the consumer is woken only when
- * there is something to deliver. */
+ * was queued on any link since the last call (or that link's
+ * ll_rxq_reset()), and clears that flag for all links. Empty and dropped
+ * PDUs do not count, so the consumer is woken only when there is something
+ * to deliver. */
 bool ll_rxq_isr_take_queued(void);
-/* Thread: next queued PDU, decrypted when encryption is on; call again
- * after LL_RXQ_OK to continue draining. Single consumer. */
-enum ll_rxq_result ll_rxq_get(struct ll_rx_pdu *out);
-/* Count of ll_rxq_isr_put() calls dropped for lack of ring room (or a
- * malformed length), since the last ll_rxq_reset(). */
-uint32_t ll_rxq_overflow_count(void);
+/* Thread: the link's next queued PDU, decrypted when the link's encryption
+ * is on; call again after LL_RXQ_OK to continue draining. Single consumer. */
+enum ll_rxq_result ll_rxq_get(uint8_t link, struct ll_rx_pdu *out);
+/* Count of the link's ll_rxq_isr_put() calls dropped for lack of ring room
+ * (or a malformed length), since its last ll_rxq_reset(). */
+uint32_t ll_rxq_overflow_count(uint8_t link);
 
 #endif /* LL_RXQ_H_ */

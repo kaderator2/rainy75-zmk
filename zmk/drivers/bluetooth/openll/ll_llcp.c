@@ -27,6 +27,11 @@
  * (interrupts off) is held only for ll_txq_push() and for the switch of
  * the RX decryption context, never across AES (Task 10: encrypt + push
  * under the IRQ lock held it for 360-398 us).
+ *
+ * Slice 6a: the state above exists once per link (links[LL_MAX_CONN]); a
+ * procedure, timer or MIC failure of one link never touches another. The
+ * single ll_plat_tx_lock() mutex serializes all links (cheap, and keeps
+ * each link's TX counter order).
  */
 #include <errno.h>
 #include <string.h>
@@ -79,9 +84,11 @@ enum enc_state {
 	ENC_WAIT_START_RSP,  /* LL_START_ENC_REQ queued */
 };
 
+_Static_assert(LL_MAX_CONN >= 1 && LL_MAX_CONN <= 5, "LL_MAX_CONN must be 1..5");
+
 static struct ll_llcp_ops ops;
 
-static struct {
+static struct llcp_link {
 	struct ll_crypt crypt;
 	enum enc_state enc;
 	bool paused;          /* data PDUs held back (encryption procedure) */
@@ -92,11 +99,65 @@ static struct {
 	uint8_t skds[8];
 	bool tmr_on;
 	uint32_t tmr_start;
-} s;
+} links[LL_MAX_CONN];
 
-/* Caller holds ll_plat_tx_lock(). */
-static int tx_locked(enum ll_txq_kind kind, uint8_t llid, const uint8_t *payload, uint8_t len)
+/* ll_conn entry points for one link. ll_conn follows a single connection
+ * until slice 6a Task 4 gives its API the link id; until then only link 0
+ * can be connected (Kconfig MAX_CONN default 1) and another link acts as
+ * "no connection". The host tests (LL_LLCP_HOST_CONN) provide link-aware
+ * fakes of these instead. */
+#ifdef LL_LLCP_HOST_CONN
+int llcp_conn_update_at(uint8_t link, uint16_t instant, uint8_t win_size, uint16_t win_offset,
+			const struct ll_conn_params *p);
+int llcp_conn_chmap_at(uint8_t link, uint16_t instant, const uint8_t chm[5]);
+void llcp_conn_terminate(uint8_t link, uint8_t reason);
+void llcp_conn_end(uint8_t link, uint8_t reason);
+bool llcp_conn_active(uint8_t link);
+void llcp_conn_kick(uint8_t link);
+#else
+static int llcp_conn_update_at(uint8_t link, uint16_t instant, uint8_t win_size,
+			       uint16_t win_offset, const struct ll_conn_params *p)
 {
+	return link == 0 ? ll_conn_update_at(instant, win_size, win_offset, p) : LL_ST_DISALLOWED;
+}
+
+static int llcp_conn_chmap_at(uint8_t link, uint16_t instant, const uint8_t chm[5])
+{
+	return link == 0 ? ll_conn_chmap_at(instant, chm) : LL_ST_DISALLOWED;
+}
+
+static void llcp_conn_terminate(uint8_t link, uint8_t reason)
+{
+	if (link == 0) {
+		ll_conn_terminate(reason);
+	}
+}
+
+static void llcp_conn_end(uint8_t link, uint8_t reason)
+{
+	if (link == 0) {
+		ll_conn_end(reason);
+	}
+}
+
+static bool llcp_conn_active(uint8_t link)
+{
+	return link == 0 && ll_conn_active();
+}
+
+static void llcp_conn_kick(uint8_t link)
+{
+	if (link == 0) {
+		ll_conn_kick();
+	}
+}
+#endif
+
+/* Caller holds ll_plat_tx_lock(); link < LL_MAX_CONN. */
+static int tx_locked(uint8_t link, enum ll_txq_kind kind, uint8_t llid, const uint8_t *payload,
+		     uint8_t len)
+{
+	struct llcp_link *s = &links[link];
 	uint8_t buf[LL_DATA_PDU_MAX + LL_MIC_LEN];
 	uint8_t n = len;
 	unsigned int key;
@@ -105,20 +166,20 @@ static int tx_locked(enum ll_txq_kind kind, uint8_t llid, const uint8_t *payload
 	if (len == 0 || len > LL_DATA_PDU_MAX) {
 		return -EINVAL;
 	}
-	if (kind == LL_TXQ_ACL && s.paused) {
+	if (kind == LL_TXQ_ACL && s->paused) {
 		return -EAGAIN;
 	}
 	memcpy(buf, payload, len);
-	if (s.crypt.enc_tx) {
+	if (s->crypt.enc_tx) {
 		/* the AAD only uses the LLID of hdr0 */
-		n = (uint8_t)ll_crypt_encrypt(&s.crypt, llid, buf, len);
+		n = (uint8_t)ll_crypt_encrypt(&s->crypt, llid, buf, len);
 	}
 	key = ll_plat_lock();
-	ret = ll_txq_push(0, kind, llid, buf, n, kind == LL_TXQ_CTRL ? payload[0] : 0);
+	ret = ll_txq_push(link, kind, llid, buf, n, kind == LL_TXQ_CTRL ? payload[0] : 0);
 	ll_plat_unlock(key);
 	if (ret != 0) {
-		if (s.crypt.enc_tx) {
-			s.crypt.tx_ctr--;   /* not queued: the counter value is reused */
+		if (s->crypt.enc_tx) {
+			s->crypt.tx_ctr--;   /* not queued: the counter value is reused */
 		}
 		return ret;
 	}
@@ -126,60 +187,66 @@ static int tx_locked(enum ll_txq_kind kind, uint8_t llid, const uint8_t *payload
 	 * the planned (skipped-ahead) one. Outside the IRQ lock (it takes
 	 * ll_plat_lock() itself), after the push, so a plan racing with it
 	 * either sees the backlog or is re-planned here. */
-	ll_conn_kick();
+	llcp_conn_kick(link);
 	return 0;
 }
 
-int ll_llcp_tx(enum ll_txq_kind kind, uint8_t llid, const uint8_t *payload, uint8_t len)
+int ll_llcp_tx(uint8_t link, enum ll_txq_kind kind, uint8_t llid, const uint8_t *payload,
+	       uint8_t len)
 {
 	int ret;
 
+	if (link >= LL_MAX_CONN) {
+		return -EINVAL;
+	}
 	ll_plat_tx_lock();
-	ret = tx_locked(kind, llid, payload, len);
+	ret = tx_locked(link, kind, llid, payload, len);
 	ll_plat_tx_unlock();
 	return ret;
 }
 
-int ll_llcp_ctrl_tx(const uint8_t *payload, uint8_t len)
+int ll_llcp_ctrl_tx(uint8_t link, const uint8_t *payload, uint8_t len)
 {
-	return ll_llcp_tx(LL_TXQ_CTRL, LL_LLID_CTRL, payload, len);
+	return ll_llcp_tx(link, LL_TXQ_CTRL, LL_LLID_CTRL, payload, len);
 }
 
 /* Responses are not retried when the backlog is full: the central's own
  * response timeout then ends the link. */
-static void ctrl(const uint8_t *pdu, uint8_t len)
+static void ctrl(uint8_t link, const uint8_t *pdu, uint8_t len)
 {
-	(void)ll_llcp_ctrl_tx(pdu, len);
+	(void)ll_llcp_ctrl_tx(link, pdu, len);
 }
 
-static void unknown_rsp(uint8_t op)
+static void unknown_rsp(uint8_t link, uint8_t op)
 {
 	const uint8_t pdu[2] = {OP_UNKNOWN_RSP, op};
 
-	ctrl(pdu, sizeof(pdu));
+	ctrl(link, pdu, sizeof(pdu));
 }
 
 /* LL_REJECT_EXT_IND if both sides support Extended Reject Indication
  * (known after the feature exchange), else LL_REJECT_IND (Vol 6 Part B
  * 2.4.2.18 / 5.1.3.1). */
-static void reject(uint8_t op, uint8_t err)
+static void reject(uint8_t link, uint8_t op, uint8_t err)
 {
-	if (s.peer_feat_valid && (s.peer_feat0 & LL_FEATURES_LOW & LL_FEAT_EXT_REJ_IND)) {
+	const struct llcp_link *s = &links[link];
+
+	if (s->peer_feat_valid && (s->peer_feat0 & LL_FEATURES_LOW & LL_FEAT_EXT_REJ_IND)) {
 		const uint8_t pdu[3] = {OP_REJECT_EXT_IND, op, err};
 
-		ctrl(pdu, sizeof(pdu));
+		ctrl(link, pdu, sizeof(pdu));
 	} else {
 		const uint8_t pdu[2] = {OP_REJECT_IND, err};
 
-		ctrl(pdu, sizeof(pdu));
+		ctrl(link, pdu, sizeof(pdu));
 	}
 }
 
 /* caller holds ll_plat_tx_lock() */
-static void timer_start(void)
+static void timer_start(struct llcp_link *s)
 {
-	s.tmr_on = true;
-	s.tmr_start = ll_radio_now();
+	s->tmr_on = true;
+	s->tmr_start = ll_radio_now();
 }
 
 static void put_le32(uint8_t *p, uint32_t v)
@@ -188,29 +255,30 @@ static void put_le32(uint8_t *p, uint32_t v)
 	ll_put_le16(p + 2, (uint16_t)(v >> 16));
 }
 
-static void rx_enc_req(const uint8_t *p)
+static void rx_enc_req(uint8_t link, const uint8_t *p)
 {
+	struct llcp_link *s = &links[link];
 	uint8_t rsp[13];
 	bool ok, sent = false;
 
 	ll_plat_tx_lock();
 	/* a running procedure, or an encrypted link without the pause
 	 * procedure (unsupported): not allowed */
-	ok = s.enc == ENC_IDLE && !s.crypt.enc_tx;
+	ok = s->enc == ENC_IDLE && !s->crypt.enc_tx;
 	if (ok) {
-		memset(&s.crypt, 0, sizeof(s.crypt));
-		memcpy(s.skdm, &p[11], 8);
-		memcpy(&s.crypt.iv[0], &p[19], 4);   /* IVm */
-		put_le32(&s.skds[0], ll_plat_rand32());
-		put_le32(&s.skds[4], ll_plat_rand32());
-		put_le32(&s.crypt.iv[4], ll_plat_rand32());   /* IVs */
+		memset(&s->crypt, 0, sizeof(s->crypt));
+		memcpy(s->skdm, &p[11], 8);
+		memcpy(&s->crypt.iv[0], &p[19], 4);   /* IVm */
+		put_le32(&s->skds[0], ll_plat_rand32());
+		put_le32(&s->skds[4], ll_plat_rand32());
+		put_le32(&s->crypt.iv[4], ll_plat_rand32());   /* IVs */
 		rsp[0] = OP_ENC_RSP;
-		memcpy(&rsp[1], s.skds, 8);
-		memcpy(&rsp[9], &s.crypt.iv[4], 4);
-		if (tx_locked(LL_TXQ_CTRL, LL_LLID_CTRL, rsp, sizeof(rsp)) == 0) {
-			s.enc = ENC_WAIT_LTK;
-			s.paused = true;
-			timer_start();
+		memcpy(&rsp[1], s->skds, 8);
+		memcpy(&rsp[9], &s->crypt.iv[4], 4);
+		if (tx_locked(link, LL_TXQ_CTRL, LL_LLID_CTRL, rsp, sizeof(rsp)) == 0) {
+			s->enc = ENC_WAIT_LTK;
+			s->paused = true;
+			timer_start(s);
 			sent = true;
 		} else {
 			/* backlog full: the central waits for LL_ENC_RSP and
@@ -219,74 +287,77 @@ static void rx_enc_req(const uint8_t *p)
 			 * host an LTK request for a procedure the central
 			 * never sees answered (the 40 s timer would end it
 			 * anyway). */
-			memset(&s.crypt, 0, sizeof(s.crypt));
+			memset(&s->crypt, 0, sizeof(s->crypt));
 		}
 	}
 	ll_plat_tx_unlock();
 	if (!ok) {
-		reject(OP_ENC_REQ, LL_ST_LMP_PDU_NOT_ALLOWED);
+		reject(link, OP_ENC_REQ, LL_ST_LMP_PDU_NOT_ALLOWED);
 		return;
 	}
 	if (!sent) {
-		ll_conn_end(LL_ST_UNSPECIFIED);
+		llcp_conn_end(link, LL_ST_UNSPECIFIED);
 		return;
 	}
 	/* same thread as the ll_rxq consumer; enc_rx is still off */
-	ll_rxq_set_crypt(&s.crypt);
+	ll_rxq_set_crypt(link, &s->crypt);
 	if (ops.ltk_req) {
-		ops.ltk_req(&p[1], ll_get_le16(&p[9]));
+		ops.ltk_req(link, &p[1], ll_get_le16(&p[9]));
 	}
 }
 
-static void rx_start_enc_rsp(void)
+static void rx_start_enc_rsp(uint8_t link)
 {
 	static const uint8_t rsp[1] = {OP_START_ENC_RSP};
+	struct llcp_link *s = &links[link];
 	bool done = false;
 
 	ll_plat_tx_lock();
-	if (s.enc == ENC_WAIT_START_RSP) {
-		s.crypt.enc_tx = true;
-		if (tx_locked(LL_TXQ_CTRL, LL_LLID_CTRL, rsp, sizeof(rsp)) == 0) {
-			s.enc = ENC_IDLE;
-			s.paused = false;
-			s.tmr_on = false;
+	if (s->enc == ENC_WAIT_START_RSP) {
+		s->crypt.enc_tx = true;
+		if (tx_locked(link, LL_TXQ_CTRL, LL_LLID_CTRL, rsp, sizeof(rsp)) == 0) {
+			s->enc = ENC_IDLE;
+			s->paused = false;
+			s->tmr_on = false;
 			done = true;
 		} else {
 			/* backlog full: stay in the procedure, the
 			 * response timer ends the link */
-			s.crypt.enc_tx = false;
+			s->crypt.enc_tx = false;
 		}
 	}
 	ll_plat_tx_unlock();
 	if (done && ops.enc_change) {
-		ops.enc_change(LL_ST_SUCCESS, true);
+		ops.enc_change(link, LL_ST_SUCCESS, true);
 	}
 }
 
-static void rx_feature_req(const uint8_t *p)
+static void rx_feature_req(uint8_t link, const uint8_t *p)
 {
+	struct llcp_link *s = &links[link];
 	uint8_t rsp[9] = {OP_FEATURE_RSP};
 
 	ll_plat_tx_lock();
-	s.peer_feat_valid = true;
-	s.peer_feat0 = p[1];
+	s->peer_feat_valid = true;
+	s->peer_feat0 = p[1];
 	ll_plat_tx_unlock();
 	/* byte 0: the features used on this link (ours AND the central's),
 	 * the other bytes are ours (none) */
 	rsp[1] = LL_FEATURES_LOW & p[1];
-	ctrl(rsp, sizeof(rsp));
+	ctrl(link, rsp, sizeof(rsp));
 }
 
-static void rx_version_ind(void)
+static void rx_version_ind(uint8_t link)
 {
 	static const uint8_t rsp[6] = {OP_VERSION_IND, LL_HCI_VERSION,
 				       LL_COMPANY_ID & 0xFF, LL_COMPANY_ID >> 8,
 				       LL_SUBVERSION & 0xFF, LL_SUBVERSION >> 8};
+	struct llcp_link *s = &links[link];
 
 	ll_plat_tx_lock();
 	/* answered once per connection (Vol 6 Part B 5.1.5) */
-	if (!s.version_sent && tx_locked(LL_TXQ_CTRL, LL_LLID_CTRL, rsp, sizeof(rsp)) == 0) {
-		s.version_sent = true;
+	if (!s->version_sent && tx_locked(link, LL_TXQ_CTRL, LL_LLID_CTRL, rsp, sizeof(rsp)) == 0) {
+		s->version_sent = true;
 	}
 	ll_plat_tx_unlock();
 }
@@ -294,26 +365,27 @@ static void rx_version_ind(void)
 /* Result of ll_conn_update_at / ll_conn_chmap_at. LL_ST_INSTANT_PASSED:
  * ll_conn already ends the link (0x28). LL_ST_INVALID_LL_PARAM: we end it.
  * LL_ST_DISALLOWED (no connection any more): nothing to do. */
-static void instant_result(int r)
+static void instant_result(uint8_t link, int r)
 {
 	if (r == LL_ST_INVALID_LL_PARAM) {
-		ll_conn_end(LL_ST_INVALID_LL_PARAM);
+		llcp_conn_end(link, LL_ST_INVALID_LL_PARAM);
 	}
 }
 
-static void rx_conn_update(const uint8_t *p)
+static void rx_conn_update(uint8_t link, const uint8_t *p)
 {
 	struct ll_conn_params cp = {
 		.interval = ll_get_le16(&p[4]),
 		.latency = ll_get_le16(&p[6]),
 		.timeout = ll_get_le16(&p[8]),
 	};
-	instant_result(ll_conn_update_at(ll_get_le16(&p[10]), p[1], ll_get_le16(&p[2]), &cp));
+	instant_result(link, llcp_conn_update_at(link, ll_get_le16(&p[10]), p[1],
+						 ll_get_le16(&p[2]), &cp));
 }
 
 /* Channel map with at least 2 used channels (bits 0..36, Vol 6 Part B
  * 2.4.2.2), else the link ends with 0x1E. */
-static void rx_channel_map(const uint8_t *p)
+static void rx_channel_map(uint8_t link, const uint8_t *p)
 {
 	unsigned int used = 0;
 
@@ -321,10 +393,10 @@ static void rx_channel_map(const uint8_t *p)
 		used += (p[1 + ch / 8] >> (ch % 8)) & 1u;
 	}
 	if (used < 2) {
-		ll_conn_end(LL_ST_INVALID_LL_PARAM);
+		llcp_conn_end(link, LL_ST_INVALID_LL_PARAM);
 		return;
 	}
-	instant_result(ll_conn_chmap_at(ll_get_le16(&p[6]), &p[1]));
+	instant_result(link, llcp_conn_chmap_at(link, ll_get_le16(&p[6]), &p[1]));
 }
 
 /* length the request must have, 0 = not a request we answer by content */
@@ -363,16 +435,16 @@ static bool ignored(uint8_t op)
 	}
 }
 
-void ll_llcp_rx(const uint8_t *payload, uint8_t len)
+void ll_llcp_rx(uint8_t link, const uint8_t *payload, uint8_t len)
 {
 	uint8_t op, want;
 
-	if (len == 0) {
+	if (len == 0 || link >= LL_MAX_CONN) {
 		return;
 	}
 	op = payload[0];
 	if (op == OP_START_ENC_RSP && len == LEN_START_ENC_RSP) {
-		rx_start_enc_rsp();
+		rx_start_enc_rsp(link);
 		return;
 	}
 	if (ignored(op)) {
@@ -384,47 +456,52 @@ void ll_llcp_rx(const uint8_t *payload, uint8_t len)
 		 * CONN_PARAM, ...), or a known request whose length is not
 		 * exactly the specified one: LL_UNKNOWN_RSP, as Zephyr ll_sw
 		 * does for PDUs failing its exact-length validation. */
-		unknown_rsp(op);
+		unknown_rsp(link, op);
 		return;
 	}
 	switch (op) {
 	case OP_CONN_UPDATE_IND:
-		rx_conn_update(payload);
+		rx_conn_update(link, payload);
 		break;
 	case OP_CHANNEL_MAP_IND:
-		rx_channel_map(payload);
+		rx_channel_map(link, payload);
 		break;
 	case OP_TERMINATE_IND:
-		ll_conn_end(payload[1]);
+		llcp_conn_end(link, payload[1]);
 		break;
 	case OP_ENC_REQ:
-		rx_enc_req(payload);
+		rx_enc_req(link, payload);
 		break;
 	case OP_FEATURE_REQ:
-		rx_feature_req(payload);
+		rx_feature_req(link, payload);
 		break;
 	case OP_VERSION_IND:
-		rx_version_ind();
+		rx_version_ind(link);
 		break;
 	case OP_PAUSE_ENC_REQ:
 		/* encryption pause / key refresh not supported */
-		reject(OP_PAUSE_ENC_REQ, LL_ST_UNSUPP_REMOTE);
+		reject(link, OP_PAUSE_ENC_REQ, LL_ST_UNSUPP_REMOTE);
 		break;
 	default:
 		break;
 	}
 }
 
-uint8_t ll_llcp_ltk_reply(const uint8_t ltk[16])
+uint8_t ll_llcp_ltk_reply(uint8_t link, const uint8_t ltk[16])
 {
 	static const uint8_t req[1] = {OP_START_ENC_REQ};
 	uint8_t st = LL_ST_DISALLOWED;
+	struct llcp_link *s;
 	uint8_t sk[16];
 
+	if (link >= LL_MAX_CONN) {
+		return LL_ST_DISALLOWED;
+	}
+	s = &links[link];
 	ll_plat_tx_lock();
-	if (s.enc == ENC_WAIT_LTK) {
+	if (s->enc == ENC_WAIT_LTK) {
 		/* AES outside the IRQ lock */
-		ll_crypt_session_key(ltk, s.skdm, s.skds, sk);
+		ll_crypt_session_key(ltk, s->skdm, s->skds, sk);
 
 		/* The controller thread decrypts (ll_rxq) without the TX
 		 * lock: the key, counters and enc_rx change together under the
@@ -446,89 +523,116 @@ uint8_t ll_llcp_ltk_reply(const uint8_t ltk[16])
 		 * rather than special-casing a plaintext TERMINATE_IND. */
 		unsigned int key = ll_plat_lock();
 
-		memcpy(s.crypt.sk, sk, sizeof(sk));
-		s.crypt.tx_ctr = 0;
-		s.crypt.rx_ctr = 0;
-		s.crypt.enc_tx = false;
-		s.crypt.enc_rx = true;
+		memcpy(s->crypt.sk, sk, sizeof(sk));
+		s->crypt.tx_ctr = 0;
+		s->crypt.rx_ctr = 0;
+		s->crypt.enc_tx = false;
+		s->crypt.enc_rx = true;
 		ll_plat_unlock(key);
 		ll_crypt_wipe(sk, sizeof(sk));
-		s.enc = ENC_WAIT_START_RSP;
-		(void)tx_locked(LL_TXQ_CTRL, LL_LLID_CTRL, req, sizeof(req));
-		timer_start();
+		s->enc = ENC_WAIT_START_RSP;
+		(void)tx_locked(link, LL_TXQ_CTRL, LL_LLID_CTRL, req, sizeof(req));
+		timer_start(s);
 		st = LL_ST_SUCCESS;
 	}
 	ll_plat_tx_unlock();
 	return st;
 }
 
-uint8_t ll_llcp_ltk_neg_reply(void)
+uint8_t ll_llcp_ltk_neg_reply(uint8_t link)
 {
+	struct llcp_link *s;
 	bool ok;
 
+	if (link >= LL_MAX_CONN) {
+		return LL_ST_DISALLOWED;
+	}
+	s = &links[link];
 	ll_plat_tx_lock();
-	ok = s.enc == ENC_WAIT_LTK;
+	ok = s->enc == ENC_WAIT_LTK;
 	if (ok) {
-		s.enc = ENC_IDLE;
-		s.paused = false;
-		s.tmr_on = false;
+		s->enc = ENC_IDLE;
+		s->paused = false;
+		s->tmr_on = false;
 	}
 	ll_plat_tx_unlock();
 	if (!ok) {
 		return LL_ST_DISALLOWED;
 	}
-	reject(OP_ENC_REQ, LL_ST_PIN_KEY_MISSING);
+	reject(link, OP_ENC_REQ, LL_ST_PIN_KEY_MISSING);
 	return LL_ST_SUCCESS;
 }
 
-uint8_t ll_llcp_terminate(uint8_t reason)
+uint8_t ll_llcp_terminate(uint8_t link, uint8_t reason)
 {
-	if (!ll_conn_active()) {
+	if (link >= LL_MAX_CONN || !llcp_conn_active(link)) {
 		return LL_ST_UNKNOWN_CONN_ID;
 	}
-	ll_conn_terminate(reason);
+	llcp_conn_terminate(link, reason);
 	return LL_ST_SUCCESS;
 }
 
 void ll_llcp_tick(uint32_t now_tick)
 {
-	bool expired;
+	bool expired[LL_MAX_CONN];
 
 	ll_plat_tx_lock();
-	expired = s.tmr_on && (int32_t)(now_tick - s.tmr_start) >= (int32_t)RSP_TIMEOUT_TICKS;
-	if (expired) {
-		s.tmr_on = false;
-		s.enc = ENC_IDLE;
-		s.paused = false;
+	for (uint8_t i = 0; i < LL_MAX_CONN; i++) {
+		struct llcp_link *s = &links[i];
+
+		expired[i] = s->tmr_on &&
+			     (int32_t)(now_tick - s->tmr_start) >= (int32_t)RSP_TIMEOUT_TICKS;
+		if (expired[i]) {
+			s->tmr_on = false;
+			s->enc = ENC_IDLE;
+			s->paused = false;
+		}
 	}
 	ll_plat_tx_unlock();
-	if (expired) {
-		ll_conn_end(LL_ST_LMP_TIMEOUT);
+	for (uint8_t i = 0; i < LL_MAX_CONN; i++) {
+		if (expired[i]) {
+			llcp_conn_end(i, LL_ST_LMP_TIMEOUT);
+		}
 	}
 }
 
 int32_t ll_llcp_timeout_ticks(uint32_t now_tick)
 {
-	int32_t left = -1;
+	int32_t min = -1;
 
 	ll_plat_tx_lock();
-	if (s.tmr_on) {
-		left = (int32_t)RSP_TIMEOUT_TICKS - (int32_t)(now_tick - s.tmr_start);
+	for (uint8_t i = 0; i < LL_MAX_CONN; i++) {
+		const struct llcp_link *s = &links[i];
+		int32_t left;
+
+		if (!s->tmr_on) {
+			continue;
+		}
+		left = (int32_t)RSP_TIMEOUT_TICKS - (int32_t)(now_tick - s->tmr_start);
 		if (left < 0) {
 			left = 0;
 		}
+		if (min < 0 || left < min) {
+			min = left;
+		}
 	}
 	ll_plat_tx_unlock();
-	return left;
+	return min;
 }
 
 /* ISR context, no lock: each field is one aligned word or byte (a single
  * load), written by threads under ll_plat_tx_lock(). volatile so the
  * compiler reads the current values. */
-bool ll_llcp_busy(void)
+bool ll_llcp_busy(uint8_t link)
 {
-	return *(volatile enum enc_state *)&s.enc != ENC_IDLE ||
-	       *(volatile bool *)&s.paused || *(volatile bool *)&s.tmr_on;
+	struct llcp_link *s;
+
+	if (link >= LL_MAX_CONN) {
+		return false;
+	}
+	s = &links[link];
+	return *(volatile enum enc_state *)&s->enc != ENC_IDLE ||
+	       *(volatile bool *)&s->paused || *(volatile bool *)&s->tmr_on;
 }
 
 void ll_llcp_init(const struct ll_llcp_ops *o)
@@ -537,12 +641,17 @@ void ll_llcp_init(const struct ll_llcp_ops *o)
 	if (o) {
 		ops = *o;
 	}
-	ll_llcp_reset();
+	for (uint8_t i = 0; i < LL_MAX_CONN; i++) {
+		ll_llcp_reset(i);
+	}
 }
 
-void ll_llcp_reset(void)
+void ll_llcp_reset(uint8_t link)
 {
+	if (link >= LL_MAX_CONN) {
+		return;
+	}
 	ll_plat_tx_lock();
-	memset(&s, 0, sizeof(s));   /* also wipes the session key */
+	memset(&links[link], 0, sizeof(links[link]));   /* also wipes the session key */
 	ll_plat_tx_unlock();
 }

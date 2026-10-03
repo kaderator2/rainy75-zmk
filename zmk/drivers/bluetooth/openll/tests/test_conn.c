@@ -190,7 +190,7 @@ static void reset_all(bool hook)
 	memset(&sch, 0, sizeof(sch));
 	memset(&cbs, 0, sizeof(cbs));
 	ll_conn_init(&ops);
-	ll_rxq_reset();   /* the glue's job (controller thread), not ll_conn's */
+	ll_rxq_reset(0);   /* the glue's job (controller thread), not ll_conn's */
 }
 
 static struct ll_connect_ind mk_ci(uint16_t interval, uint16_t timeout, uint8_t sca,
@@ -366,11 +366,11 @@ static void test_rx_path(void)
 	rx(500000 + T(1250 + 100), LL_LLID_START, 5);
 	rx(500000 + T(1250 + 500), LL_LLID_CTRL | HDR_SN, 3);
 	done(2);
-	CHECK(ll_rxq_get(&out) == LL_RXQ_OK);
+	CHECK(ll_rxq_get(0, &out) == LL_RXQ_OK);
 	CHECK(out.len == 5 && out.data[0] == 0xA0 && (out.hdr0 & 3) == LL_LLID_START);
-	CHECK(ll_rxq_get(&out) == LL_RXQ_OK);
+	CHECK(ll_rxq_get(0, &out) == LL_RXQ_OK);
 	CHECK(out.len == 3 && (out.hdr0 & 3) == LL_LLID_CTRL);
-	CHECK(ll_rxq_get(&out) == LL_RXQ_EMPTY);
+	CHECK(ll_rxq_get(0, &out) == LL_RXQ_EMPTY);
 	ll_conn_end(LL_ST_REMOTE_TERM);
 }
 
@@ -410,12 +410,12 @@ static void test_rxq_overflow_ends_link(void)
 	CHECK(!ll_conn_active());
 	CHECK(cbs.disconnected == 1 && cbs.reason == LL_ST_CONN_TIMEOUT);
 	CHECK(sch.cb == NULL);
-	CHECK(ll_rxq_overflow_count() == 1);
+	CHECK(ll_rxq_overflow_count(0) == 1);
 	/* the 16 queued PDUs are still delivered in order */
 	for (int i = 0; i < 16; i++) {
-		CHECK(ll_rxq_get(&out) == LL_RXQ_OK && out.len == 4);
+		CHECK(ll_rxq_get(0, &out) == LL_RXQ_OK && out.len == 4);
 	}
-	CHECK(ll_rxq_get(&out) == LL_RXQ_EMPTY);
+	CHECK(ll_rxq_get(0, &out) == LL_RXQ_EMPTY);
 }
 
 /* ll_conn_start runs in ISR context and must not reset ll_rxq (the
@@ -428,11 +428,11 @@ static void test_start_keeps_rxq(void)
 	struct ll_rx_pdu out;
 
 	reset_all(false);
-	CHECK(ll_rxq_isr_put(pdu, sizeof(pdu)));
+	CHECK(ll_rxq_isr_put(0, pdu, sizeof(pdu)));
 	CHECK(ll_conn_start(&ci, 500000) == 0);
-	CHECK(ll_rxq_get(&out) == LL_RXQ_OK);
+	CHECK(ll_rxq_get(0, &out) == LL_RXQ_OK);
 	CHECK(out.len == 1 && out.data[0] == 0x5A);
-	CHECK(ll_rxq_get(&out) == LL_RXQ_EMPTY);
+	CHECK(ll_rxq_get(0, &out) == LL_RXQ_EMPTY);
 	ll_conn_end(LL_ST_REMOTE_TERM);
 }
 
@@ -501,7 +501,7 @@ static void test_first_packet_retransmission(void)
 	 * widening: 25 us); the chained PDU still reaches ll_rxq */
 	fire_alarm();
 	CHECK(rad.open == a1 + T(30000) - T(25 + LL_CONN_RX_MARGIN_US));
-	CHECK(ll_rxq_get(&out) == LL_RXQ_OK && out.len == 4);
+	CHECK(ll_rxq_get(0, &out) == LL_RXQ_OK && out.len == 4);
 	/* a normal event re-anchors again */
 	rx(a1 + T(30001), 0x01, 0);
 	done(1);
