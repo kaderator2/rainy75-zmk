@@ -351,6 +351,50 @@ static void test_rx_path(void)
 	ll_conn_end(LL_ST_REMOTE_TERM);
 }
 
+/* A data PDU that does not fit into ll_rxq is lost for good: the hardware
+ * has acked it already, the central will not resend it. The link must end
+ * deterministically (0x08, at the end of the event) instead of continuing
+ * with a hole in the L2CAP stream or the CCM packet counter. Empty PDUs
+ * never fill the ring, so a full ring of data PDUs alone is fine. */
+static void test_rxq_overflow_ends_link(void)
+{
+	struct ll_connect_ind ci = mk_ci(12, 400, 1, 1, 0);
+	struct ll_rx_pdu out;
+	uint32_t a1;
+	uint8_t sn = 0;
+
+	reset_all(false);
+	CHECK(ll_conn_start(&ci, 500000) == 0);
+	a1 = 500000 + T(1250 + 300);
+	/* 16 data PDUs (the ring depth) over 4 events, nothing drained */
+	for (uint32_t k = 0; k < 4; k++) {
+		fire_alarm();
+		for (uint32_t i = 0; i < 4; i++) {
+			rx(a1 + T(15000 * k + 400 * i), LL_LLID_START | sn, 4);
+			sn ^= HDR_SN;
+		}
+		rx(a1 + T(15000 * k + 1600), 0x01 | sn, 0);   /* empty: not queued */
+		sn ^= HDR_SN;
+		done(5);
+		CHECK(ll_conn_active());
+	}
+	CHECK(cbs.disconnected == 0);
+	/* the 17th data PDU overflows: the event completes, then the link ends */
+	fire_alarm();
+	rx(a1 + T(60000), LL_LLID_START | sn, 4);
+	CHECK(ll_conn_active());
+	done(1);
+	CHECK(!ll_conn_active());
+	CHECK(cbs.disconnected == 1 && cbs.reason == LL_ST_CONN_TIMEOUT);
+	CHECK(sch.cb == NULL);
+	CHECK(ll_rxq_overflow_count() == 1);
+	/* the 16 queued PDUs are still delivered in order */
+	for (int i = 0; i < 16; i++) {
+		CHECK(ll_rxq_get(&out) == LL_RXQ_OK && out.len == 4);
+	}
+	CHECK(ll_rxq_get(&out) == LL_RXQ_EMPTY);
+}
+
 /* ll_conn_start runs in ISR context and must not reset ll_rxq (the
  * controller thread may be inside ll_rxq_get); the glue resets it in its
  * thread on DISCONNECTED. A PDU already in the ring survives the start. */
@@ -1029,6 +1073,7 @@ int main(void)
 	test_first_events();
 	test_rx_path();
 	test_start_keeps_rxq();
+	test_rxq_overflow_ends_link();
 	test_first_packet_bad_crc();
 	test_first_packet_retransmission();
 	test_first_packet_after_window();

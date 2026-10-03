@@ -40,7 +40,8 @@ void ll_rxq_set_crypt(struct ll_crypt *c);
  * LL_RADIO_CONN_RX: pdu[0] = header byte 0, pdu[1] = on-air length,
  * pdu[2..] = payload; len = 2 + payload length). Single producer. An empty
  * PDU is accepted and not queued. Returns false on overflow or a malformed
- * length (dropped and counted). */
+ * length (dropped and counted). A dropped data PDU is lost for good (the
+ * hardware has acked it), so the caller ends the link (ll_conn: 0x08). */
 bool ll_rxq_isr_put(const uint8_t *pdu, uint8_t len);
 /* Thread: next queued PDU, decrypted when encryption is on; call again
  * after LL_RXQ_OK to continue draining. Single consumer. */

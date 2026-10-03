@@ -393,6 +393,18 @@ void ll_llcp_rx(const uint8_t *payload, uint8_t len)
 	}
 }
 
+/* Wipe key material in a way the compiler cannot elide: a memset of a local
+ * that is dead afterwards may legally be removed (dead store elimination),
+ * stores through a volatile pointer may not. */
+static void wipe(void *p, size_t n)
+{
+	volatile uint8_t *v = p;
+
+	while (n--) {
+		*v++ = 0;
+	}
+}
+
 uint8_t ll_llcp_ltk_reply(const uint8_t ltk[16])
 {
 	static const uint8_t req[1] = {OP_START_ENC_REQ};
@@ -423,7 +435,7 @@ uint8_t ll_llcp_ltk_reply(const uint8_t ltk[16])
 		s.crypt.enc_tx = false;
 		s.crypt.enc_rx = true;
 		ll_plat_unlock(key);
-		memset(sk, 0, sizeof(sk));
+		wipe(sk, sizeof(sk));
 		s.enc = ENC_WAIT_START_RSP;
 		(void)tx_locked(LL_TXQ_CTRL, LL_LLID_CTRL, req, sizeof(req));
 		timer_start();

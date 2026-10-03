@@ -22,7 +22,9 @@
  * supervision timer, unless the event's first packet was not delivered
  * (bad CRC, or an acked retransmission without an RX entry) or the packet
  * starts after the RX window (it is then a chained packet, not the
- * anchor). CONN_DONE: ll_txq_event_end(), counter++, termination
+ * anchor). A data PDU that ll_rxq cannot take (ring full) is lost, as the
+ * hardware has acked it: the link then ends with 0x08 at CONN_DONE.
+ * CONN_DONE: ll_txq_event_end(), counter++, termination
  * and supervision checks, plan the next event (applying instants).
  *
  * Everything runs in ISR context except the public calls documented as
@@ -276,7 +278,10 @@ static void on_rx_bad(void)
 
 /* A packet the hardware received but did not deliver (the central resent a
  * packet we have; Task 10): same as a bad first packet. With MD the event
- * continues with a new packet some 400..700 us after the anchor. */
+ * continues with a new packet some 400..700 us after the anchor. An event
+ * with only such retransmissions has no rx_this_event and so counts as
+ * missed in the stats (it still proves the central is there, but it does
+ * not refresh supervision; the next new packet does). */
 static void on_rx_nodata(void)
 {
 	if (!c.first_seen) {
@@ -295,7 +300,17 @@ static void on_rx(const uint8_t *pdu, uint8_t len, uint32_t tick)
 	}
 	stats.rx_pkts++;
 	ll_txq_rx(pdu[0]);
-	(void)ll_rxq_isr_put(pdu, len);   /* overflow counted by ll_rxq */
+	if (!ll_rxq_isr_put(pdu, len)) {
+		/* The hardware has acked this data PDU already, so the central
+		 * will never resend it: it is lost for good, and continuing
+		 * would leave a hole in the L2CAP stream (and, encrypted, a
+		 * CCM packet counter mismatch at the next PDU). End the link
+		 * deterministically at the end of this event. 0x08: we stop
+		 * following the link without an LL_TERMINATE_IND, so the
+		 * central sees a supervision timeout too and both hosts treat
+		 * it as an ordinary link loss (reconnect). */
+		request_end(LL_ST_CONN_TIMEOUT);
+	}
 	c.rx_this_event = true;
 	first = !c.first_seen;
 	c.first_seen = true;

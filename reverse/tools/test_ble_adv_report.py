@@ -1,4 +1,10 @@
+import io
+import subprocess
 import unittest
+from contextlib import redirect_stderr
+from unittest import mock
+
+import ble_adv_report
 from ble_adv_report import parse_fields_line, summarize
 
 class ParseTest(unittest.TestCase):
@@ -18,6 +24,34 @@ class ParseTest(unittest.TestCase):
         bad = parse_fields_line("3.0\t37\t0x00\taa:bb:cc:dd:ee:ff\tFalse")
         self.assertTrue(good["crc_ok"])
         self.assertFalse(bad["crc_ok"])
+
+    def test_parse_line_crc_empty(self):
+        # a packet without the field (e.g. older sniffer headers) counts as good
+        r = parse_fields_line("4.0\t39\t0x00\taa:bb:cc:dd:ee:ff\t")
+        self.assertTrue(r["crc_ok"])
+        r = parse_fields_line("4.0\t39\t0x00\taa:bb:cc:dd:ee:ff")
+        self.assertTrue(r["crc_ok"])
+
+class MainTest(unittest.TestCase):
+    def test_tshark_failure_is_a_clean_error(self):
+        err = subprocess.CalledProcessError(
+            2, ["tshark"], output="", stderr="tshark: The file \"x\" doesn't exist.\n")
+        buf = io.StringIO()
+        with mock.patch.object(ble_adv_report.subprocess, "run", side_effect=err), \
+                redirect_stderr(buf), self.assertRaises(SystemExit) as cm:
+            ble_adv_report.main(["x.pcapng"])
+        self.assertEqual(cm.exception.code, 1)
+        self.assertIn("doesn't exist", buf.getvalue())
+        self.assertNotIn("Traceback", buf.getvalue())
+
+    def test_tshark_missing_is_a_clean_error(self):
+        buf = io.StringIO()
+        with mock.patch.object(ble_adv_report.subprocess, "run",
+                               side_effect=FileNotFoundError("tshark")), \
+                redirect_stderr(buf), self.assertRaises(SystemExit) as cm:
+            ble_adv_report.main(["x.pcapng"])
+        self.assertEqual(cm.exception.code, 1)
+        self.assertIn("tshark", buf.getvalue())
 
 class SummarizeTest(unittest.TestCase):
     def rows(self):

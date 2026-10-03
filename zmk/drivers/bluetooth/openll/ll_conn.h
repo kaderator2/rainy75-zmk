@@ -71,7 +71,9 @@ struct ll_conn_ops {
 	 * encrypting it when the link is encrypted, via ll_txq_push(LL_TXQ_CTRL,
 	 * LL_LLID_CTRL, ..., ctrl_opcode = payload[0]). Thread context; takes
 	 * ll_plat_lock() itself. Returns 0 or a negative errno. NULL: ll_conn
-	 * pushes the plaintext PDU itself (fine while unencrypted). */
+	 * pushes the plaintext PDU itself (fine while unencrypted). The glue's
+	 * hook (ll_llcp_ctrl_tx) also takes the ll_plat_tx_lock() mutex, so it
+	 * may block: never call it from an ISR or with ll_plat_lock() held. */
 	int (*ctrl_tx)(const uint8_t *payload, uint8_t len);
 };
 

@@ -123,7 +123,15 @@ static struct {
 	uint8_t rx_sw;          /* RX DMA ring: next entry to read (follows the hw wptr), both modes */
 	bool evt_open;          /* BRX issued, LL_RADIO_CONN_DONE not yet reported */
 	uint8_t n_valid;        /* CRC-valid packets in this event */
-	uint8_t n_any;          /* RX DMA entries (valid or not) in this event */
+	/* RX DMA entries (valid or not) in this event, plus the NODATA
+	 * pseudo-entry: an RX IRQ that finds no new entry before any entry of
+	 * the event counts as one (the acked retransmission of the anchor
+	 * packet, conn_rx). Should an RX IRQ ever run before the DMA has
+	 * advanced the wptr for a new packet, that packet is taken for a
+	 * retransmission, reported as NODATA and then delivered as a later
+	 * (non-first) packet: benign, ll_conn only skips one re-anchor and
+	 * the T_IFS estimate skips that event (n_any != 1). */
+	uint8_t n_any;
 	bool first_valid;       /* the event's first packet had a valid CRC */
 	uint32_t first_ts;
 	uint8_t first_len;

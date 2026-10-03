@@ -79,8 +79,8 @@ struct acl_item {
 };
 K_MSGQ_DEFINE(acl_q, sizeof(struct acl_item), LL_ACL_NUM + 1, 4);
 
-K_SEM_DEFINE(wake, 0, 1);
-K_SEM_DEFINE(reset_done, 0, 1);
+static K_SEM_DEFINE(wake, 0, 1);
+static K_SEM_DEFINE(reset_done, 0, 1);
 
 static K_THREAD_STACK_DEFINE(ctrl_stack, CONFIG_BT_HCI_B91_RX_STACK_SIZE);
 static struct k_thread ctrl_thread;
@@ -151,7 +151,7 @@ void ll_plat_unlock(unsigned int key)
 /* TX producer serialization (ll_plat.h): encrypt + push of one PDU, from
  * the controller thread or the HCI thread. k_mutex is recursive and has
  * priority inheritance. */
-K_MUTEX_DEFINE(tx_mutex);
+static K_MUTEX_DEFINE(tx_mutex);
 
 void ll_plat_tx_lock(void)
 {

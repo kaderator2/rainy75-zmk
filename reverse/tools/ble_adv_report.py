@@ -61,7 +61,16 @@ def main(argv):
     ap.add_argument("pcap")
     ap.add_argument("--adva", help="filter on advertiser address")
     a = ap.parse_args(argv)
-    s = summarize(run_tshark(a.pcap), a.adva)
+    try:
+        rows = run_tshark(a.pcap)
+    except FileNotFoundError:
+        print("error: tshark not found (install Wireshark's tshark)", file=sys.stderr)
+        sys.exit(1)
+    except subprocess.CalledProcessError as e:
+        msg = (e.stderr or "").strip() or f"exit status {e.returncode}"
+        print(f"error: tshark failed: {msg}", file=sys.stderr)
+        sys.exit(1)
+    s = summarize(rows, a.adva)
     for k, v in s.items():
         print(f"{k}: {v}")
 

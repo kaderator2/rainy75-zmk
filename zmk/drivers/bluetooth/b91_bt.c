@@ -53,15 +53,6 @@ typedef int32_t  s32;
 #define B91_PLIC_IRQ_EN0        0xe4002000UL
 #define B91_IRQ1_SYSTIMER       1
 
-/* Analog register serial interface (shared with USB driver).
- * Layout from SDK analog_reg.h: addr +0, ctrl +2, len +3, data +4. */
-#define B91_ANA_ADDR_REG        0x80140180UL
-#define B91_ANA_CTRL_REG        0x80140182UL
-#define B91_ANA_LEN_REG         0x80140183UL
-#define B91_ANA_DATA_REG        0x80140184UL
-#define B91_ANA_CTRL_CYC        BIT(6)  /* cycle/trigger */
-#define B91_ANA_CTRL_BUSY       BIT(7)  /* busy status */
-
 /* PM wakeup status (read from analog reg 0x64) */
 #define B91_WAKEUP_STATUS_TIMER BIT(1)
 #define B91_STATUS_ENTER_SUSPEND BIT(30)
@@ -176,11 +167,8 @@ extern void blc_ll_setAclConnMaxOctetsNumber(int maxRxOct, int maxMasTxOct, int 
 
 /* Connection config */
 extern void blc_ll_setMaxConnectionNumber(int masterNum, int slaveNum);
-extern void blc_ll_setAclMasterConnectionInterval(int intervalIdx);
-extern void blc_ll_setCreateConnectionTimeout(int timeoutMs);
 
 /* PHY / CSA */
-extern void blc_ll_init2MPhyCodedPhy_feature(void);
 extern void blc_ll_initChannelSelectionAlgorithm_2_feature(void);
 
 /* HCI FIFO init */
@@ -357,25 +345,6 @@ static int b91_bt_hci_rx_handler(void)
 	}
 
 	return 0;
-}
-
-/* -------------------------------------------------------------------------
- * Analog register access (serial interface, not memory-mapped)
- * ----------------------------------------------------------------------- */
-
-static u8 b91_analog_read(u8 addr)
-{
-	unsigned int key = irq_lock();
-
-	sys_write8(addr, B91_ANA_ADDR_REG);
-	sys_write8(1, B91_ANA_LEN_REG);
-	sys_write8(B91_ANA_CTRL_CYC, B91_ANA_CTRL_REG);
-	while (sys_read8(B91_ANA_CTRL_REG) & B91_ANA_CTRL_BUSY) {
-	}
-	u8 val = sys_read8(B91_ANA_DATA_REG);
-
-	irq_unlock(key);
-	return val;
 }
 
 #ifdef CONFIG_POWEROFF

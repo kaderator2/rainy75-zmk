@@ -42,6 +42,9 @@ uint8_t ll_csa1_next(struct ll_csa1 *c)
 	uint8_t unmapped = (uint8_t)((c->last_unmapped + c->hop) % LL_DATA_CHANNELS);
 
 	c->last_unmapped = unmapped;
+	/* n_used == 0 is only a crash guard (no division by zero): the spec
+	 * requires at least 2 used channels, and ll_conn / ll_llcp reject a
+	 * CONNECT_IND or LL_CHANNEL_MAP_IND with fewer before a map gets here. */
 	if (c->n_used == 0 || ch_used(c->chm, unmapped)) {
 		return unmapped;
 	}
