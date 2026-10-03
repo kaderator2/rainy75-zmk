@@ -482,6 +482,74 @@ static void test_update_restarts_supervision(void)
 	CHECK(!ll_conn_active() && cbs.reason == LL_ST_CONN_TIMEOUT);
 }
 
+/* long intervals: the widening clamp (interval / 2 - T_IFS) must not wrap */
+static void test_long_interval(void)
+{
+	struct ll_connect_ind ci = mk_ci(210, 3200, 1, 1, 0);   /* 262.5 ms */
+	struct ll_conn_stats st;
+	uint32_t a = 1000000 + T(1250 + 100);
+
+	reset_all(false);
+	CHECK(ll_conn_start(&ci, 1000000) == 0);
+	ev_rx(a);
+	for (int k = 0; k < 3; k++) {
+		ev_miss();
+	}
+	/* 4 intervals = 1.05 s at 300 ppm: 315 + 16 = 331 us */
+	fire_alarm();
+	CHECK(rad.open == a + T(4 * 262500) - T(331 + 60));
+	CHECK(rad.fst == 2 * (331 + 60) + 40);
+	ll_conn_get_stats(&st);
+	CHECK(st.widen_max_us >= 331);
+	done(0);
+	ll_conn_end(0x13);
+}
+
+/* LL_CONNECTION_UPDATE_IND parameters are validated; invalid ones are
+ * refused with LL_ST_INVALID_LL_PARAM and change nothing */
+static void test_update_validation(void)
+{
+	struct ll_connect_ind ci = mk_ci(12, 400, 1, 1, 0);
+	uint32_t a = 4000000 + T(1250 + 300);
+	static const struct { uint16_t iv, lat, to; uint8_t ws; uint16_t wo; } bad[] = {
+		{0, 0, 400, 1, 0}, {5, 0, 400, 1, 0}, {3201, 0, 3200, 1, 0},
+		{12, 500, 3200, 1, 0}, {12, 0, 9, 1, 0}, {12, 0, 3201, 1, 0},
+		{12, 0, 3, 1, 0},       /* 30 ms <= 2 * 15 ms */
+		{12, 4, 15, 1, 0},      /* 150 ms <= 5 * 15 ms * 2 */
+		{12, 0, 400, 0, 0}, {12, 0, 400, 9, 0}, {6, 0, 400, 6, 0},
+		{12, 0, 400, 1, 13},
+	};
+	struct ll_conn_params p;
+	uint16_t c;
+
+	reset_all(false);
+	CHECK(ll_conn_start(&ci, 4000000) == 0);
+	ev_rx(a);
+	c = ll_conn_event_counter();
+	for (unsigned int i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+		p.interval = bad[i].iv;
+		p.latency = bad[i].lat;
+		p.timeout = bad[i].to;
+		CHECK(ll_conn_update_at(c + 2, bad[i].ws, bad[i].wo, &p) == LL_ST_INVALID_LL_PARAM);
+	}
+	CHECK(ll_conn_active() && cbs.disconnected == 0);
+	/* nothing was scheduled: the events stay on the old 15 ms grid */
+	for (int k = 1; k <= 4; k++) {
+		a += T(15000);
+		ev_rx(a);
+	}
+	fire_alarm();
+	CHECK(rad.open == a + T(15000) - T(widen(300, 15000) + 60));
+	CHECK(cbs.updated == 0);
+	done(0);
+	/* boundary values are accepted */
+	p.interval = 6;
+	p.latency = 0;
+	p.timeout = 10;
+	CHECK(ll_conn_update_at(ll_conn_event_counter() + 2, 5, 6, &p) == 0);
+	ll_conn_end(0x13);
+}
+
 /* an update that keeps the parameters is applied but not reported */
 static void test_conn_update_same_params(void)
 {
@@ -580,7 +648,7 @@ static void test_instant_replan(void)
 	CHECK(cbs.disconnected == 1 && cbs.reason == LL_ST_INSTANT_PASSED);
 }
 
-/* instant in the past: (instant - counter) mod 65536 >= 32767 -> 0x28 */
+/* instant in the past: (instant - counter) mod 65536 > 32767 -> 0x28 */
 static void test_instant_passed(void)
 {
 	struct ll_connect_ind ci = mk_ci(12, 400, 1, 1, 0);
@@ -596,9 +664,9 @@ static void test_instant_passed(void)
 	}
 	c = ll_conn_event_counter();
 	CHECK(c == 10);
-	CHECK(ll_conn_update_at((uint16_t)(c + 32766), 1, 0, &np) == 0);
+	CHECK(ll_conn_update_at((uint16_t)(c + 32767), 1, 0, &np) == 0);
 	CHECK(ll_conn_active());
-	CHECK(ll_conn_chmap_at((uint16_t)(c + 32767), no0to9) == LL_ST_INSTANT_PASSED);
+	CHECK(ll_conn_chmap_at((uint16_t)(c + 32768), no0to9) == LL_ST_INSTANT_PASSED);
 	CHECK(!ll_conn_active());
 	CHECK(cbs.disconnected == 1 && cbs.reason == LL_ST_INSTANT_PASSED);
 	CHECK(sch.cb == NULL);
@@ -823,5 +891,7 @@ int main(void)
 	test_end();
 	test_late_alarm();
 	test_start_validation();
+	test_long_interval();
+	test_update_validation();
 	DONE();
 }

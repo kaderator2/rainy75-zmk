@@ -8,7 +8,10 @@
  * ll_sched.h, and calls the ll_txq / ll_rxq per-event hooks.
  *
  * Timing uses stimer ticks only (LL_TICKS_PER_US). Peripheral latency is
- * not used (slice 5): every connection event is attended.
+ * accepted (CONNECT_IND, connection update) but not used before slice 5:
+ * every connection event is listened to. Window widening above
+ * connInterval / 2 - T_IFS is clamped; the supervision timeout then ends
+ * the link.
  */
 #ifndef LL_CONN_H_
 #define LL_CONN_H_
@@ -81,9 +84,14 @@ int ll_conn_start(const struct ll_connect_ind *ci, uint32_t connect_ind_end_tick
 void ll_conn_radio_evt(enum ll_radio_evt evt, const uint8_t *pdu, uint8_t len, uint32_t tick);
 /* Schedule LL_CONNECTION_UPDATE_IND / LL_CHANNEL_MAP_IND parameters for the
  * event with counter == instant. Return 0, or LL_ST_INSTANT_PASSED when
- * (instant - counter) mod 65536 >= 32767, or when instant is the event
+ * (instant - counter) mod 65536 > 32767, or when instant is the event
  * already on air (the connection is then terminated with 0x28). Without an
- * active connection: LL_ST_DISALLOWED. Thread. */
+ * active connection: LL_ST_DISALLOWED. ll_conn_update_at checks the
+ * parameters first (interval 6..3200, latency <= 499, timeout 10..3200 and
+ * > (1 + latency) * interval * 2, WinSize 1..min(8, interval - 1), WinOffset
+ * <= interval) and returns LL_ST_INVALID_LL_PARAM for invalid ones without
+ * changing anything (the caller, ll_llcp, decides how to end the link).
+ * Thread. */
 int ll_conn_update_at(uint16_t instant, uint8_t win_size, uint16_t win_offset,
 		      const struct ll_conn_params *p);
 int ll_conn_chmap_at(uint16_t instant, const uint8_t chm[5]);
@@ -107,7 +115,7 @@ struct ll_conn_stats {
 	uint32_t missed;      /* events without a valid packet (incl. late) */
 	uint32_t late;        /* events skipped: alarm too late to issue BRX */
 	uint32_t rx_pkts;     /* CRC-valid packets */
-	uint16_t widen_max_us;
+	uint32_t widen_max_us;
 };
 /* Cumulative since boot. */
 void ll_conn_get_stats(struct ll_conn_stats *s);

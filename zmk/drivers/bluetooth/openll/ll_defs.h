@@ -21,6 +21,7 @@
 #define LL_ST_LOCAL_TERM      0x16
 #define LL_ST_UNSUPP_REMOTE   0x1A
 #define LL_ST_LMP_TIMEOUT     0x22
+#define LL_ST_INVALID_LL_PARAM 0x1E
 #define LL_ST_INSTANT_PASSED  0x28
 #define LL_ST_MIC_FAILURE     0x3D
 #define LL_ST_CONN_FAIL_EST   0x3E

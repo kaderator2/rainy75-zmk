@@ -42,7 +42,7 @@
 #define SUP_UNIT_US      10000u    /* supervision timeout unit */
 #define NOT_ESTAB_EVENTS 6
 #define OP_TERMINATE_IND 0x02
-#define INSTANT_PAST     32767u
+#define INSTANT_PAST     32767u   /* passed: (instant - counter) mod 65536 > this */
 
 /* SCA field -> worst-case ppm (Vol 6 Part B 2.3.3.1, Table 2.17) */
 static const uint16_t sca_ppm[8] = {500, 250, 150, 100, 75, 50, 30, 20};
@@ -59,7 +59,7 @@ static struct {
 	uint32_t interval_ticks;
 	uint32_t sup_ticks;
 	uint16_t ppm;         /* central SCA + own */
-	uint16_t widen_max_us;
+	uint32_t widen_max_us; /* interval / 2 - T_IFS (exceeds 16 bits) */
 	struct ll_csa1 csa;
 	struct ll_csa1 csa_prev; /* before the planned event's channel (re-plan) */
 	uint16_t counter;     /* next event not yet completed */
@@ -126,6 +126,8 @@ static void request_end(uint8_t reason)
 	end(reason);
 }
 
+/* 4.5.4 window widening. Above interval / 2 - T_IFS it is clamped (4.5.7
+ * says the link is then lost; the supervision timeout ends it). */
 static uint32_t widening_us(uint32_t dt_ticks)
 {
 	uint32_t dt_us = dt_ticks / LL_TICKS_PER_US;
@@ -147,7 +149,7 @@ static void set_params(const struct ll_conn_params *p)
 	c.p = *p;
 	c.interval_ticks = (uint32_t)p->interval * US(UNIT_US);
 	c.sup_ticks = (uint32_t)p->timeout * US(SUP_UNIT_US);
-	c.widen_max_us = (uint16_t)((uint32_t)p->interval * UNIT_US / 2u - LL_T_IFS_US);
+	c.widen_max_us = (uint32_t)p->interval * UNIT_US / 2u - LL_T_IFS_US;
 }
 
 /* Instants of the event about to be planned (counter == instant). */
@@ -188,7 +190,7 @@ static void plan(void)
 	base = anchor_of(c.counter);
 	widen = widening_us(base + US(c.win_us) - c.sync_tick);
 	if (widen > stats.widen_max_us) {
-		stats.widen_max_us = (uint16_t)widen;
+		stats.widen_max_us = widen;
 	}
 	margin = c.win_us ? LL_CONN_WIN_MARGIN_US : LL_CONN_RX_MARGIN_US;
 	c.open_tick = base - US(widen + margin);
@@ -323,23 +325,32 @@ void ll_conn_init(const struct ll_conn_ops *ops)
 	}
 }
 
-static bool params_valid(const struct ll_connect_ind *ci, const struct ll_csa1 *csa)
+/* Connection parameters and transmit window (Vol 6 Part B 2.3.3.1 and
+ * 5.1.1), shared by CONNECT_IND and LL_CONNECTION_UPDATE_IND. */
+static bool timing_valid(uint16_t interval, uint16_t latency, uint16_t timeout,
+			 uint8_t win_size, uint16_t win_offset)
 {
-	uint32_t max_win = ci->interval - 1u;
+	uint32_t max_win;
 
+	if (interval < 6 || interval > 3200) {
+		return false;
+	}
+	max_win = interval - 1u;
 	if (max_win > 8) {
 		max_win = 8;
 	}
-	return ci->interval >= 6 && ci->interval <= 3200 &&
-	       ci->timeout >= 10 && ci->timeout <= 3200 &&
-	       ci->latency <= 499 &&
+	return timeout >= 10 && timeout <= 3200 && latency <= 499 &&
 	       /* timeout > (1 + latency) * interval * 2 */
-	       (uint32_t)ci->timeout * SUP_UNIT_US >
-		       (1u + ci->latency) * (uint32_t)ci->interval * UNIT_US * 2u &&
-	       ci->win_size >= 1 && ci->win_size <= max_win &&
-	       ci->win_offset <= ci->interval &&
-	       ci->hop >= 5 && ci->hop <= 16 &&
-	       csa->n_used >= 2;
+	       (uint32_t)timeout * SUP_UNIT_US >
+		       (1u + latency) * (uint32_t)interval * UNIT_US * 2u &&
+	       win_size >= 1 && win_size <= max_win && win_offset <= interval;
+}
+
+static bool params_valid(const struct ll_connect_ind *ci, const struct ll_csa1 *csa)
+{
+	return timing_valid(ci->interval, ci->latency, ci->timeout, ci->win_size,
+			    ci->win_offset) &&
+	       ci->hop >= 5 && ci->hop <= 16 && csa->n_used >= 2;
 }
 
 int ll_conn_start(const struct ll_connect_ind *ci, uint32_t connect_ind_end_tick)
@@ -388,7 +399,10 @@ static int check_instant(uint16_t instant)
 {
 	uint16_t d = (uint16_t)(instant - c.counter);
 
-	if (d >= INSTANT_PAST || (d == 0 && c.in_event)) {
+	/* d == 0 with the event already on air: its timing and channel were
+	 * issued with the old values, so the instant cannot be honoured any
+	 * more; treat it like a passed instant. */
+	if (d > INSTANT_PAST || (d == 0 && c.in_event)) {
 		request_end(LL_ST_INSTANT_PASSED);
 		return LL_ST_INSTANT_PASSED;
 	}
@@ -401,7 +415,9 @@ int ll_conn_update_at(uint16_t instant, uint8_t win_size, uint16_t win_offset,
 	unsigned int key = ll_plat_lock();
 	int ret = LL_ST_DISALLOWED;
 
-	if (c.active && !c.end_pending) {
+	if (!timing_valid(p->interval, p->latency, p->timeout, win_size, win_offset)) {
+		ret = LL_ST_INVALID_LL_PARAM;
+	} else if (c.active && !c.end_pending) {
 		ret = check_instant(instant);
 		if (ret == 0) {
 			c.upd_pending = true;
