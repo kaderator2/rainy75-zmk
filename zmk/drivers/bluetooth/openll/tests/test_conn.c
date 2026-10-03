@@ -1,0 +1,827 @@
+/*
+ * Copyright (c) 2026 scholzri
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * ll_conn host tests with a fake radio (connection mode + a passive TX FIFO
+ * whose rptr the test moves) and a fake one-shot alarm. The real ll_txq,
+ * ll_rxq, ll_csa1 (and ll_crypt, linked by ll_rxq) are used.
+ *
+ * Expected timing values are worked out by hand from the Core Spec Vol 6
+ * Part B 4.5.3 (transmit window), 4.5.4 (window widening), 4.5.2/4.5.5
+ * (supervision), 5.1.1 (connection update), 5.1.2 (channel map). Window
+ * widening is rounded up to whole us: ceil((SCA_ppm + 50) * dt / 1e6) + 16.
+ */
+#include <errno.h>
+#include <string.h>
+#include "test.h"
+#include "../ll_conn.h"
+#include "../ll_csa1.h"
+#include "../ll_defs.h"
+#include "../ll_plat.h"
+#include "../ll_rxq.h"
+#include "../ll_sched.h"
+#include "../ll_txq.h"
+
+#define T(us)      ((uint32_t)(us) * LL_TICKS_PER_US)
+#define HDR_NESN   0x04
+#define HDR_SN     0x08
+
+void aes_ref_encrypt(const uint8_t key[16], const uint8_t in[16], uint8_t out[16]);
+
+void ll_plat_aes_ecb(const uint8_t key[16], const uint8_t in[16], uint8_t out[16])
+{
+	aes_ref_encrypt(key, in, out);
+}
+
+/* ---------------- fakes ---------------- */
+
+static uint32_t now;
+
+static struct {
+	int setups;
+	uint32_t aa, crc;
+	int events;
+	uint8_t ch;
+	uint32_t open;
+	uint32_t fst;
+	uint8_t sn_init;
+	uint8_t rptr, wptr;
+	uint8_t fifo[4][LL_DATA_PDU_MAX + LL_MIC_LEN];
+	uint8_t fifo_len[4];
+	uint8_t fifo_hdr[4];
+} rad;
+
+static struct {
+	uint32_t tick;
+	ll_sched_cb_t cb;
+	int cancels;
+} sch;
+
+static int locks;
+
+uint32_t ll_radio_now(void) { return now; }
+void ll_radio_conn_setup(uint32_t aa, uint32_t crc_init)
+{
+	rad.setups++;
+	rad.aa = aa;
+	rad.crc = crc_init;
+}
+void ll_radio_conn_event(uint8_t ch, uint32_t open_tick, uint32_t first_timeout_us)
+{
+	rad.events++;
+	rad.ch = ch;
+	rad.open = open_tick;
+	rad.fst = first_timeout_us;
+}
+void ll_radio_conn_set_sn_init(uint8_t sn) { rad.sn_init = sn; }
+uint8_t ll_radio_fifo_rptr(void) { return rad.rptr; }
+uint8_t ll_radio_fifo_wptr(void) { return rad.wptr; }
+void ll_radio_fifo_write(uint8_t idx, uint8_t hdr0, const uint8_t *payload, uint8_t len)
+{
+	rad.fifo_hdr[idx & 3] = hdr0;
+	rad.fifo_len[idx & 3] = len;
+	if (len) {
+		memcpy(rad.fifo[idx & 3], payload, len);
+	}
+}
+void ll_radio_fifo_set_wptr(uint8_t wptr) { rad.wptr = wptr; }
+void ll_sched_init(void) {}
+void ll_sched_at(uint32_t tick, ll_sched_cb_t cb)
+{
+	sch.tick = tick;
+	sch.cb = cb;
+}
+void ll_sched_cancel(void)
+{
+	sch.cb = NULL;
+	sch.cancels++;
+}
+uint32_t ll_plat_rand32(void) { return 42; }
+unsigned int ll_plat_lock(void) { locks++; return 0; }
+void ll_plat_unlock(unsigned int k) { (void)k; locks--; }
+
+/* ---------------- callbacks ---------------- */
+
+static struct {
+	int connected, disconnected, updated;
+	uint8_t reason;
+	struct ll_conn_params p;
+	int done_ctrl;
+	uint8_t done_op;
+	int ctrl_tx_calls;
+	uint8_t ctrl_tx_pdu[4];
+	uint8_t ctrl_tx_len;
+} cbs;
+
+static void on_evt(enum ll_conn_evt what, const void *arg)
+{
+	switch (what) {
+	case LL_CONN_EVT_CONNECTED:
+		cbs.connected++;
+		break;
+	case LL_CONN_EVT_DISCONNECTED:
+		cbs.disconnected++;
+		cbs.reason = *(const uint8_t *)arg;
+		CHECK(!ll_conn_active());
+		CHECK(sch.cb == NULL);
+		break;
+	case LL_CONN_EVT_UPDATED:
+		cbs.updated++;
+		cbs.p = *(const struct ll_conn_params *)arg;
+		break;
+	}
+}
+
+static void on_txq_done(enum ll_txq_kind kind, uint8_t op)
+{
+	if (kind == LL_TXQ_CTRL) {
+		cbs.done_ctrl++;
+		cbs.done_op = op;
+	}
+}
+
+static int hook_ctrl_tx(const uint8_t *payload, uint8_t len)
+{
+	cbs.ctrl_tx_calls++;
+	cbs.ctrl_tx_len = len;
+	memcpy(cbs.ctrl_tx_pdu, payload, len);
+	return 0;
+}
+
+/* ---------------- helpers ---------------- */
+
+static const uint8_t all37[5] = {0xFF, 0xFF, 0xFF, 0xFF, 0x1F};
+static const uint8_t no0to9[5] = {0x00, 0xFC, 0xFF, 0xFF, 0x1F};
+static const uint8_t no35[5] = {0xFF, 0xFF, 0xFF, 0xFF, 0x17};
+
+static void reset_all(bool hook)
+{
+	struct ll_conn_ops ops = {
+		.evt = on_evt,
+		.txq_done = on_txq_done,
+		.ctrl_tx = hook ? hook_ctrl_tx : NULL,
+	};
+
+	now = 0;
+	memset(&rad, 0, sizeof(rad));
+	memset(&sch, 0, sizeof(sch));
+	memset(&cbs, 0, sizeof(cbs));
+	ll_conn_init(&ops);
+}
+
+static struct ll_connect_ind mk_ci(uint16_t interval, uint16_t timeout, uint8_t sca,
+				   uint8_t win_size, uint16_t win_offset)
+{
+	struct ll_connect_ind ci;
+
+	memset(&ci, 0, sizeof(ci));
+	ci.aa = 0x8e89bed6u ^ 0x12345678u;
+	ci.crc_init = 0x555555;
+	ci.win_size = win_size;
+	ci.win_offset = win_offset;
+	ci.interval = interval;
+	ci.latency = 0;
+	ci.timeout = timeout;
+	memcpy(ci.chm, all37, 5);
+	ci.hop = 7;
+	ci.sca = sca;
+	return ci;
+}
+
+static void fire_alarm(void)
+{
+	ll_sched_cb_t cb = sch.cb;
+
+	CHECK(cb != NULL);
+	if (!cb) {
+		return;
+	}
+	sch.cb = NULL;
+	if ((int32_t)(sch.tick - now) > 0) {
+		now = sch.tick;   /* time never runs backwards */
+	}
+	cb();
+}
+
+/* the alarm of the planned event fires LL_CONN_ARM_LEAD_US before its RX opens */
+static void check_alarm_lead(void)
+{
+	CHECK(sch.tick == rad.open - T(LL_CONN_ARM_LEAD_US));
+}
+
+static void rx(uint32_t anchor, uint8_t hdr0, uint8_t paylen)
+{
+	uint8_t pdu[2 + LL_DATA_PDU_MAX] = {hdr0, paylen};
+
+	for (uint8_t i = 0; i < paylen; i++) {
+		pdu[2 + i] = (uint8_t)(0xA0 + i);
+	}
+	now = anchor + T(LL_CONN_SYNC_US);
+	ll_conn_radio_evt(LL_RADIO_CONN_RX, pdu, (uint8_t)(2 + paylen), now);
+}
+
+static void done(uint8_t n_rx)
+{
+	if ((int32_t)(rad.open + T(rad.fst) - now) > 0) {
+		now = rad.open + T(rad.fst);
+	}
+	ll_conn_radio_evt(LL_RADIO_CONN_DONE, NULL, n_rx, now);
+}
+
+/* one event: alarm, one empty central packet with its anchor at anchor */
+static void ev_rx(uint32_t anchor)
+{
+	fire_alarm();
+	rx(anchor, 0x01, 0);
+	done(1);
+}
+
+static void ev_miss(void)
+{
+	fire_alarm();
+	done(0);
+}
+
+static uint32_t widen(uint32_t ppm, uint32_t dt_us)
+{
+	return (uint32_t)(((uint64_t)ppm * dt_us + 999999u) / 1000000u) + 16;
+}
+
+/* ---------------- tests ---------------- */
+
+/* 4.5.3 transmit window, 4.5.4 widening, anchor re-sync, CSA#1, counter */
+static void test_first_events(void)
+{
+	struct ll_connect_ind ci = mk_ci(12, 400, 1, 2, 3);
+	const uint32_t t0 = 1000000;
+	uint32_t a1, a2;
+
+	reset_all(false);
+	CHECK(!ll_conn_active());
+	CHECK(ll_conn_start(&ci, t0) == 0);
+	CHECK(ll_conn_active());
+	CHECK(cbs.connected == 1);
+	CHECK(rad.setups == 1 && rad.aa == ci.aa && rad.crc == ci.crc_init);
+	CHECK(ll_conn_event_counter() == 0);
+	CHECK(ll_conn_start(&ci, t0) == -EBUSY);
+
+	/* window start = t0 + 1.25 ms + 3 * 1.25 ms = t0 + 80000 ticks, size 2.5 ms.
+	 * widening: SCA 1 = 250 ppm + 50 own = 300 ppm over 7500 us (to window
+	 * end) = 2.25 -> 3, + 16 = 19 us. open = 1080000 - (19 + 200) * 16. */
+	fire_alarm();
+	CHECK(rad.events == 1);
+	CHECK(rad.ch == 7);
+	CHECK(rad.open == 1076496);
+	CHECK(rad.fst == 2500 + 2 * (19 + 200) + 40);
+	CHECK(sch.tick == 0 || sch.cb == NULL);
+	CHECK(rad.sn_init == 0);
+
+	/* first packet 1 ms into the window, a second chained packet later
+	 * must not move the anchor */
+	a1 = 1080000 + T(1000);
+	rx(a1, 0x01, 0);
+	rx(a1 + T(400), 0x05 | HDR_SN, 0);
+	done(2);
+	CHECK(ll_conn_event_counter() == 1);
+	/* next anchor a1 + 15 ms, widening 300 ppm * 15000 us = 4.5 -> 5 + 16 */
+	CHECK(sch.cb != NULL);
+	fire_alarm();
+	CHECK(rad.ch == 14);
+	CHECK(rad.open == a1 + T(15000) - T(21 + LL_CONN_RX_MARGIN_US));
+	CHECK(rad.fst == 2 * (21 + 60) + 40);
+	check_alarm_lead();
+	/* SN_INIT = NESN of the central's last packet (via ll_txq_rx) */
+	CHECK(rad.sn_init == 1);
+	done(0);
+	CHECK(ll_conn_event_counter() == 2);
+
+	/* missed event: widening over 2 intervals: 9 + 16 = 25 */
+	fire_alarm();
+	CHECK(rad.ch == 21);
+	CHECK(rad.open == a1 + T(30000) - T(25 + 60));
+	CHECK(rad.fst == 2 * (25 + 60) + 40);
+	/* central 2 us late: re-anchor on it */
+	a2 = a1 + T(30002);
+	rx(a2, 0x01, 0);
+	done(1);
+	fire_alarm();
+	CHECK(rad.ch == 28);
+	CHECK(rad.open == a2 + T(15000) - T(21 + 60));
+	done(0);
+	CHECK(ll_conn_event_counter() == 4);
+	ll_conn_end(LL_ST_REMOTE_TERM);
+	CHECK(cbs.disconnected == 1 && cbs.reason == LL_ST_REMOTE_TERM);
+}
+
+/* RX path: every CONN_RX goes to ll_rxq in order */
+static void test_rx_path(void)
+{
+	struct ll_connect_ind ci = mk_ci(12, 400, 1, 1, 0);
+	struct ll_rx_pdu out;
+
+	reset_all(false);
+	CHECK(ll_conn_start(&ci, 500000) == 0);
+	fire_alarm();
+	rx(500000 + T(1250 + 100), LL_LLID_START, 5);
+	rx(500000 + T(1250 + 500), LL_LLID_CTRL | HDR_SN, 3);
+	done(2);
+	CHECK(ll_rxq_get(&out) == LL_RXQ_OK);
+	CHECK(out.len == 5 && out.data[0] == 0xA0 && (out.hdr0 & 3) == LL_LLID_START);
+	CHECK(ll_rxq_get(&out) == LL_RXQ_OK);
+	CHECK(out.len == 3 && (out.hdr0 & 3) == LL_LLID_CTRL);
+	CHECK(ll_rxq_get(&out) == LL_RXQ_EMPTY);
+	ll_conn_end(LL_ST_REMOTE_TERM);
+}
+
+/* 4.5.2: not established within 6 connection events -> 0x3E; a missed
+ * transmit window repeats one interval later with the same window */
+static void test_six_interval_rule(void)
+{
+	struct ll_connect_ind ci = mk_ci(12, 400, 1, 2, 3);
+	const uint32_t ws = 1000000 + 80000;
+
+	reset_all(false);
+	CHECK(ll_conn_start(&ci, 1000000) == 0);
+	ev_miss();
+	/* event 1: window at ws + 15 ms, widening over 22.5 ms: 6.75 -> 7 + 16 */
+	fire_alarm();
+	CHECK(rad.open == ws + T(15000) - T(23 + LL_CONN_WIN_MARGIN_US));
+	CHECK(rad.fst == 2500 + 2 * (23 + 200) + 40);
+	done(0);
+	for (int i = 2; i < 5; i++) {
+		ev_miss();
+	}
+	CHECK(ll_conn_active() && cbs.disconnected == 0);
+	CHECK(ll_conn_event_counter() == 5);
+	ev_miss();
+	CHECK(!ll_conn_active());
+	CHECK(cbs.disconnected == 1 && cbs.reason == LL_ST_CONN_FAIL_EST);
+	CHECK(sch.cb == NULL);
+}
+
+/* 4.5.5: supervision timeout after established -> 0x08 */
+static void test_supervision(void)
+{
+	struct ll_connect_ind ci = mk_ci(12, 10, 1, 1, 0);   /* 100 ms */
+	const uint32_t a0 = 2000000 + T(1250 + 200);
+
+	reset_all(false);
+	CHECK(ll_conn_start(&ci, 2000000) == 0);
+	ev_rx(a0);
+	/* events 1..6 end at about a0 + k * 15 ms + 0.1 ms < 100 ms */
+	for (int k = 1; k <= 6; k++) {
+		ev_miss();
+		CHECK(ll_conn_active());
+	}
+	/* event 7 ends at a0 + 105 ms */
+	ev_miss();
+	CHECK(!ll_conn_active());
+	CHECK(cbs.disconnected == 1 && cbs.reason == LL_ST_CONN_TIMEOUT);
+	CHECK(sch.cb == NULL);
+	/* nothing more happens on a late radio callback */
+	done(0);
+	CHECK(cbs.disconnected == 1);
+}
+
+/* widening is clamped to connInterval / 2 - T_IFS */
+static void test_widening_clamp(void)
+{
+	struct ll_connect_ind ci = mk_ci(6, 3200, 0, 1, 0);  /* 7.5 ms, 32 s, 500 ppm */
+	struct ll_conn_stats st;
+
+	reset_all(false);
+	CHECK(ll_conn_start(&ci, 3000000) == 0);
+	ev_rx(3000000 + T(1250 + 100));
+	for (int k = 0; k < 1000; k++) {
+		ev_miss();
+	}
+	CHECK(ll_conn_active());
+	fire_alarm();
+	CHECK(rad.fst == 2 * (3600 + 60) + 40);
+	ll_conn_get_stats(&st);
+	CHECK(st.widen_max_us == 3600);
+	done(0);
+	ll_conn_end(LL_ST_REMOTE_TERM);
+}
+
+/* 5.1.1 connection update: at the instant, the window starts at the old
+ * anchor of the instant event + WinOffset, size WinSize */
+static void test_conn_update(void)
+{
+	struct ll_connect_ind ci = mk_ci(12, 400, 1, 1, 0);
+	struct ll_conn_params np = {.interval = 6, .latency = 2, .timeout = 50};
+	uint32_t a, ws, a_new;
+	uint16_t c;
+
+	reset_all(false);
+	CHECK(ll_conn_start(&ci, 4000000) == 0);
+	a = 4000000 + T(1250 + 300);
+	ev_rx(a);
+	c = ll_conn_event_counter();
+	CHECK(c == 1);
+	CHECK(ll_conn_update_at(c + 6, 1, 2, &np) == 0);
+	for (int k = 1; k <= 5; k++) {
+		a += T(15000);
+		ev_rx(a);
+	}
+	CHECK(ll_conn_event_counter() == c + 5);
+	CHECK(cbs.updated == 0);
+	a += T(15000);
+	ev_rx(a);
+	/* applied when the instant event c + 6 is planned */
+	CHECK(cbs.updated == 1);
+	/* instant event c + 6: old anchor a + 15 ms, window + 2.5 ms, 1.25 ms
+	 * wide; widening 300 ppm over 15 + 2.5 + 1.25 ms = 5.625 -> 6 + 16 */
+	ws = a + T(15000) + T(2500);
+	fire_alarm();
+	CHECK(cbs.p.interval == 6 && cbs.p.latency == 2 && cbs.p.timeout == 50);
+	CHECK(rad.open == ws - T(22 + LL_CONN_WIN_MARGIN_US));
+	CHECK(rad.fst == 1250 + 2 * (22 + 200) + 40);
+	CHECK(ll_conn_event_counter() == c + 6);
+	/* window missed: next event one new interval later, same window,
+	 * widening over 7.5 + 2.5 + 15 + 1.25 = 26.25 ms -> 7.875 -> 8 + 16 */
+	done(0);
+	fire_alarm();
+	CHECK(rad.open == ws + T(7500) - T(24 + 200));
+	CHECK(rad.fst == 1250 + 2 * (24 + 200) + 40);
+	/* found it 300 us into the window: synced, new interval 7.5 ms */
+	a_new = ws + T(7500) + T(300);
+	rx(a_new, 0x01, 0);
+	done(1);
+	fire_alarm();
+	CHECK(rad.open == a_new + T(7500) - T(widen(300, 7500) + 60));
+	CHECK(rad.fst == 2 * (19 + 60) + 40);
+	done(0);
+	/* new supervision timeout (500 ms) in force: 66 * 7.5 ms = 495 ms ok */
+	for (int k = 2; k <= 66; k++) {
+		ev_miss();
+	}
+	CHECK(ll_conn_active());
+	ev_miss();
+	CHECK(!ll_conn_active() && cbs.reason == LL_ST_CONN_TIMEOUT);
+}
+
+/* 5.1.1: the supervision timer restarts at the instant (old anchor of the
+ * instant event) */
+static void test_update_restarts_supervision(void)
+{
+	struct ll_connect_ind ci = mk_ci(12, 10, 1, 1, 0);   /* 100 ms */
+	struct ll_conn_params np = {.interval = 12, .latency = 0, .timeout = 10};
+	uint32_t a = 4000000 + T(1250 + 300);
+
+	reset_all(false);
+	CHECK(ll_conn_start(&ci, 4000000) == 0);
+	ev_rx(a);
+	CHECK(ll_conn_update_at(1, 1, 0, &np) == 0);
+	/* event k ends at about a + k * 15 ms + 1.5 ms; timer from a + 15 ms */
+	for (int k = 1; k <= 7; k++) {
+		ev_miss();
+		CHECK(ll_conn_active());
+	}
+	ev_miss();
+	CHECK(!ll_conn_active() && cbs.reason == LL_ST_CONN_TIMEOUT);
+}
+
+/* an update that keeps the parameters is applied but not reported */
+static void test_conn_update_same_params(void)
+{
+	struct ll_connect_ind ci = mk_ci(12, 400, 1, 1, 0);
+	struct ll_conn_params same = {.interval = 12, .latency = 0, .timeout = 400};
+	uint32_t a = 4000000 + T(1250 + 300);
+
+	reset_all(false);
+	CHECK(ll_conn_start(&ci, 4000000) == 0);
+	ev_rx(a);
+	CHECK(ll_conn_update_at(ll_conn_event_counter() + 1, 1, 0, &same) == 0);
+	a += T(15000);
+	ev_rx(a);
+	fire_alarm();
+	/* window at the old anchor + 0, 1.25 ms wide */
+	CHECK(rad.open == a + T(15000) - T(widen(300, 16250) + LL_CONN_WIN_MARGIN_US));
+	CHECK(cbs.updated == 0);
+	done(0);
+	ll_conn_end(LL_ST_REMOTE_TERM);
+}
+
+/* 5.1.2 channel map at the instant; CSA#1 keeps lastUnmappedChannel */
+static void test_chmap(void)
+{
+	struct ll_connect_ind ci = mk_ci(12, 400, 1, 1, 0);
+	struct ll_csa1 ref;
+	uint32_t a = 5000000 + T(1250 + 100);
+	uint16_t inst;
+
+	reset_all(false);
+	ll_csa1_init(&ref, 7, all37);
+	CHECK(ll_conn_start(&ci, 5000000) == 0);
+	fire_alarm();
+	CHECK(rad.ch == ll_csa1_next(&ref));
+	rx(a, 0x01, 0);
+	done(1);
+	inst = ll_conn_event_counter() + 6;
+	CHECK(ll_conn_chmap_at(inst, no0to9) == 0);
+	for (int k = 1; k < 30; k++) {
+		if (ll_conn_event_counter() == inst) {
+			ll_csa1_set_map(&ref, no0to9);
+		}
+		a += T(15000);
+		fire_alarm();
+		CHECK(rad.ch == ll_csa1_next(&ref));
+		if (k >= 7) {
+			CHECK(rad.ch >= 10);
+		}
+		rx(a, 0x01, 0);
+		done(1);
+	}
+	ll_conn_end(LL_ST_REMOTE_TERM);
+}
+
+/* instant == counter of the planned (not yet issued) event: re-planned
+ * with the new map, the CSA#1 sequence is not advanced twice */
+static void test_instant_replan(void)
+{
+	struct ll_connect_ind ci = mk_ci(12, 400, 1, 1, 0);
+	struct ll_csa1 ref;
+	uint32_t a = 5000000 + T(1250 + 100);
+	uint8_t ch;
+
+	reset_all(false);
+	ll_csa1_init(&ref, 7, all37);
+	CHECK(ll_conn_start(&ci, 5000000) == 0);
+	for (int k = 0; k < 4; k++) {
+		fire_alarm();
+		CHECK(rad.ch == ll_csa1_next(&ref));
+		rx(a, 0x01, 0);
+		done(1);
+		a += T(15000);
+	}
+	/* event 4 is planned on unmapped channel 5 * 7 mod 37 = 35; the new
+	 * map drops 35, so the re-planned event must use the remapped 36 */
+	CHECK(ll_conn_chmap_at(ll_conn_event_counter(), no35) == 0);
+	ll_csa1_set_map(&ref, no35);
+	fire_alarm();
+	ch = ll_csa1_next(&ref);
+	CHECK(ch == 36);
+	CHECK(rad.ch == ch);
+	CHECK(rad.open == a - T(widen(300, 15000) + 60));
+	rx(a, 0x01, 0);
+	done(1);
+	a += T(15000);
+	fire_alarm();
+	CHECK(rad.ch == ll_csa1_next(&ref));
+	done(0);
+
+	/* instant == the event on air: too late -> 0x28 after the event */
+	CHECK(ll_conn_chmap_at(ll_conn_event_counter(), all37) == 0);  /* planned */
+	fire_alarm();
+	CHECK(ll_conn_chmap_at(ll_conn_event_counter(), all37) == LL_ST_INSTANT_PASSED);
+	CHECK(cbs.disconnected == 0);
+	done(0);
+	CHECK(cbs.disconnected == 1 && cbs.reason == LL_ST_INSTANT_PASSED);
+}
+
+/* instant in the past: (instant - counter) mod 65536 >= 32767 -> 0x28 */
+static void test_instant_passed(void)
+{
+	struct ll_connect_ind ci = mk_ci(12, 400, 1, 1, 0);
+	struct ll_conn_params np = {.interval = 6, .latency = 0, .timeout = 50};
+	uint32_t a = 6000000 + T(1250 + 100);
+	uint16_t c;
+
+	reset_all(false);
+	CHECK(ll_conn_start(&ci, 6000000) == 0);
+	for (int k = 0; k < 10; k++) {
+		ev_rx(a);
+		a += T(15000);
+	}
+	c = ll_conn_event_counter();
+	CHECK(c == 10);
+	CHECK(ll_conn_update_at((uint16_t)(c + 32766), 1, 0, &np) == 0);
+	CHECK(ll_conn_active());
+	CHECK(ll_conn_chmap_at((uint16_t)(c + 32767), no0to9) == LL_ST_INSTANT_PASSED);
+	CHECK(!ll_conn_active());
+	CHECK(cbs.disconnected == 1 && cbs.reason == LL_ST_INSTANT_PASSED);
+	CHECK(sch.cb == NULL);
+
+	reset_all(false);
+	CHECK(ll_conn_update_at(1, 1, 0, &np) == LL_ST_DISALLOWED);
+	CHECK(ll_conn_start(&ci, 6000000) == 0);
+	a = 6000000 + T(1250 + 100);
+	for (int k = 0; k < 10; k++) {
+		ev_rx(a);
+		a += T(15000);
+	}
+	CHECK(ll_conn_update_at(5, 1, 0, &np) == LL_ST_INSTANT_PASSED);
+	CHECK(cbs.disconnected == 1 && cbs.reason == LL_ST_INSTANT_PASSED);
+}
+
+/* 16-bit event counter wraps; instants across the wrap */
+static void test_counter_wrap(void)
+{
+	struct ll_connect_ind ci = mk_ci(6, 3200, 7, 1, 0);
+	struct ll_csa1 ref;
+	uint32_t a = 7000000 + T(1250 + 100);
+
+	reset_all(false);
+	ll_csa1_init(&ref, 7, all37);
+	CHECK(ll_conn_start(&ci, 7000000) == 0);
+	for (uint32_t k = 0; k < 65534; k++) {
+		fire_alarm();
+		(void)ll_csa1_next(&ref);
+		rx(a, 0x01, 0);
+		done(1);
+		a += T(7500);
+	}
+	CHECK(ll_conn_event_counter() == 65534);
+	CHECK(ll_conn_chmap_at(2, no0to9) == 0);
+	for (int k = 0; k < 6; k++) {
+		if (ll_conn_event_counter() == 2) {
+			ll_csa1_set_map(&ref, no0to9);
+		}
+		fire_alarm();
+		CHECK(rad.ch == ll_csa1_next(&ref));
+		rx(a, 0x01, 0);
+		done(1);
+		a += T(7500);
+	}
+	CHECK(ll_conn_event_counter() == 4);
+	CHECK(ll_conn_active());
+	ll_conn_end(LL_ST_REMOTE_TERM);
+}
+
+/* local terminate: LL_TERMINATE_IND via txq, end with 0x16 once acked */
+static void test_local_terminate_ack(void)
+{
+	struct ll_connect_ind ci = mk_ci(12, 400, 1, 1, 0);
+	uint32_t a = 8000000 + T(1250 + 100);
+	int slot = -1;
+
+	reset_all(false);
+	CHECK(ll_conn_start(&ci, 8000000) == 0);
+	ev_rx(a);
+	a += T(15000);
+	ll_conn_terminate(0x13);
+	CHECK(locks == 0);
+	CHECK(ll_conn_active());
+	fire_alarm();
+	/* the ring holds a placeholder (base sent last) and the PDU */
+	for (uint8_t i = rad.rptr; i != rad.wptr; i++) {
+		if (rad.fifo_len[i & 3] == 2 && rad.fifo[i & 3][0] == 0x02) {
+			slot = i & 3;
+		}
+	}
+	CHECK(slot >= 0);
+	if (slot >= 0) {
+		CHECK(rad.fifo[slot][1] == 0x13 && rad.fifo_hdr[slot] == LL_LLID_CTRL);
+	}
+	/* not acked in this event */
+	rx(a, 0x01 | HDR_NESN, 0);
+	done(1);
+	CHECK(ll_conn_active());
+	a += T(15000);
+	fire_alarm();
+	rx(a, 0x01, 0);
+	rad.rptr = rad.wptr;   /* hardware popped everything: acked */
+	done(1);
+	CHECK(cbs.done_ctrl == 1 && cbs.done_op == 0x02);
+	CHECK(!ll_conn_active());
+	CHECK(cbs.disconnected == 1 && cbs.reason == LL_ST_LOCAL_TERM);
+	CHECK(sch.cb == NULL);
+}
+
+/* local terminate without ack: end after connSupervisionTimeout; the PDU
+ * goes through ops.ctrl_tx when given */
+static void test_local_terminate_timeout(void)
+{
+	struct ll_connect_ind ci = mk_ci(12, 10, 1, 1, 0);   /* 100 ms */
+	uint32_t a = 9000000 + T(1250 + 100);
+	int k;
+
+	reset_all(true);
+	CHECK(ll_conn_start(&ci, 9000000) == 0);
+	ev_rx(a);
+	ll_conn_terminate(0x15);
+	CHECK(cbs.ctrl_tx_calls == 1 && cbs.ctrl_tx_len == 2);
+	CHECK(cbs.ctrl_tx_pdu[0] == 0x02 && cbs.ctrl_tx_pdu[1] == 0x15);
+	CHECK(ll_txq_backlog() == 0);   /* ll_conn did not push itself */
+	/* the central keeps talking but never acks: end once 100 ms passed */
+	for (k = 0; k < 20 && ll_conn_active(); k++) {
+		a += T(15000);
+		ev_rx(a);
+	}
+	CHECK(!ll_conn_active());
+	/* terminate called ~1.6 ms after a0; the 7th event ends at a0 + 105 ms */
+	CHECK(k == 7);
+	CHECK(cbs.disconnected == 1 && cbs.reason == LL_ST_LOCAL_TERM);
+}
+
+/* ll_conn_end: immediate between events, deferred during an event */
+static void test_end(void)
+{
+	struct ll_connect_ind ci = mk_ci(12, 400, 1, 1, 0);
+	uint32_t a = 10000000 + T(1250 + 100);
+	int ev;
+
+	reset_all(false);
+	CHECK(ll_conn_start(&ci, 10000000) == 0);
+	ev_rx(a);
+	CHECK(sch.cb != NULL);
+	ll_conn_end(LL_ST_MIC_FAILURE);
+	CHECK(!ll_conn_active() && sch.cb == NULL);
+	CHECK(cbs.disconnected == 1 && cbs.reason == LL_ST_MIC_FAILURE);
+	ll_conn_end(LL_ST_MIC_FAILURE);
+	CHECK(cbs.disconnected == 1);
+
+	reset_all(false);
+	CHECK(ll_conn_start(&ci, 10000000) == 0);
+	fire_alarm();
+	ll_conn_end(0x13);
+	CHECK(ll_conn_active() && cbs.disconnected == 0);
+	ev = rad.events;
+	rx(a, 0x01, 0);
+	done(1);
+	CHECK(!ll_conn_active() && cbs.disconnected == 1 && cbs.reason == 0x13);
+	CHECK(sch.cb == NULL && rad.events == ev);
+	/* a new connection can start afterwards */
+	CHECK(ll_conn_start(&ci, 20000000) == 0);
+	CHECK(rad.setups == 2 && cbs.connected == 2);
+	ll_conn_end(0x13);
+}
+
+/* the alarm came too late to issue the BRX: event skipped, counted missed */
+static void test_late_alarm(void)
+{
+	struct ll_connect_ind ci = mk_ci(12, 400, 1, 1, 0);
+	struct ll_conn_stats s0, s1;
+	uint32_t a = 11000000 + T(1250 + 100);
+	uint32_t open1;
+	int ev;
+
+	reset_all(false);
+	ll_conn_get_stats(&s0);
+	CHECK(ll_conn_start(&ci, 11000000) == 0);
+	ev_rx(a);
+	open1 = a + T(15000) - T(widen(300, 15000) + 60);
+	ev = rad.events;
+	CHECK(sch.tick == open1 - T(LL_CONN_ARM_LEAD_US));
+	sch.tick = open1 - T(LL_CONN_MIN_PREP_US) + 1;   /* alarm delivered late */
+	fire_alarm();
+	CHECK(rad.events == ev);
+	CHECK(ll_conn_event_counter() == 2);
+	CHECK(sch.cb != NULL);
+	fire_alarm();
+	CHECK(rad.events == ev + 1);
+	CHECK(rad.ch == 21);
+	CHECK(rad.open == a + T(30000) - T(widen(300, 30000) + 60));
+	done(0);
+	ll_conn_get_stats(&s1);
+	CHECK(s1.late - s0.late == 1);
+	CHECK(s1.missed - s0.missed == 2);
+	CHECK(s1.events - s0.events == 2);
+	ll_conn_end(0x13);
+}
+
+static void test_start_validation(void)
+{
+	struct ll_connect_ind ci;
+
+	reset_all(false);
+	ci = mk_ci(0, 400, 1, 1, 0);
+	CHECK(ll_conn_start(&ci, 1) == -EINVAL);
+	ci = mk_ci(3201, 3200, 1, 1, 0);
+	CHECK(ll_conn_start(&ci, 1) == -EINVAL);
+	ci = mk_ci(12, 400, 1, 0, 0);       /* WinSize 0 */
+	CHECK(ll_conn_start(&ci, 1) == -EINVAL);
+	ci = mk_ci(12, 3, 1, 1, 0);         /* timeout 30 ms <= 2 * 15 ms */
+	CHECK(ll_conn_start(&ci, 1) == -EINVAL);
+	ci = mk_ci(12, 400, 1, 1, 0);
+	memset(ci.chm, 0, 5);
+	ci.chm[0] = 0x01;                   /* one channel */
+	CHECK(ll_conn_start(&ci, 1) == -EINVAL);
+	ci = mk_ci(12, 400, 1, 1, 0);
+	ci.hop = 4;
+	CHECK(ll_conn_start(&ci, 1) == -EINVAL);
+	CHECK(!ll_conn_active() && cbs.connected == 0 && rad.setups == 0);
+}
+
+int main(void)
+{
+	test_first_events();
+	test_rx_path();
+	test_six_interval_rule();
+	test_supervision();
+	test_widening_clamp();
+	test_conn_update();
+	test_conn_update_same_params();
+	test_update_restarts_supervision();
+	test_chmap();
+	test_instant_replan();
+	test_instant_passed();
+	test_counter_wrap();
+	test_local_terminate_ack();
+	test_local_terminate_timeout();
+	test_end();
+	test_late_alarm();
+	test_start_validation();
+	DONE();
+}

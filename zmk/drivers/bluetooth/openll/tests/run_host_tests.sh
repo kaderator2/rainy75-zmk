@@ -23,4 +23,5 @@ build_run test_crypt ../ll_crypt.c aes_ref.c
 build_run test_txq ../ll_txq.c
 build_run_as test_txq_safe test_txq -DLL_TXQ_SAFE_MODE ../ll_txq.c
 build_run test_rxq ../ll_rxq.c ../ll_crypt.c aes_ref.c
+build_run test_conn ../ll_conn.c ../ll_txq.c ../ll_rxq.c ../ll_csa1.c ../ll_crypt.c aes_ref.c
 exit 0
