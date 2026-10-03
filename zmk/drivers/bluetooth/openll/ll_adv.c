@@ -158,7 +158,10 @@ uint8_t ll_adv_enable(bool enable)
 	unsigned int key = ll_plat_lock();
 
 	if (enable && !adv.enabled) {
-		if (ll_conn_active()) {
+		/* any link taken (active or awaiting release): no
+		 * advertising + connection combination yet (slice 6a Task 6
+		 * allows it while a link is free) */
+		if (ll_conn_count() != 0) {
 			ll_plat_unlock(key);
 			return LL_ST_DISALLOWED;
 		}
@@ -267,7 +270,7 @@ void ll_adv_radio_evt(enum ll_radio_evt evt, const uint8_t *pdu, uint8_t len,
 			adv.in_event = false;
 			adv.enabled = false;
 			ll_radio_stop();
-			if (ll_conn_start(&ci, end_tick) == 0) {
+			if (ll_conn_start(&ci, end_tick) >= 0) {   /* link id */
 				adv.radio_dirty = true;
 				return;
 			}

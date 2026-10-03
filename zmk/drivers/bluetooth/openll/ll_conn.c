@@ -2,8 +2,8 @@
  * Copyright (c) 2026 scholzri
  * SPDX-License-Identifier: Apache-2.0
  *
- * Connection state machine, peripheral role, one connection, CSA#1,
- * peripheral latency (rules in ll_conn.h). Core Spec Vol 6 Part B: 4.5.1 connection events,
+ * Connection state machine, peripheral role, LL_MAX_CONN links (slice 6a),
+ * CSA#1, peripheral latency (rules in ll_conn.h). Core Spec Vol 6 Part B: 4.5.1 connection events,
  * 4.5.2 supervision (6 events before the first packet), 4.5.3 transmit
  * window, 4.5.4 window widening, 4.5.5 connection setup, 5.1.1 connection
  * update, 5.1.2 channel map update, 5.1.3 termination.
@@ -18,8 +18,12 @@
  *
  * Per event: alarm LL_CONN_ARM_LEAD_US before the RX opens -> prepare():
  * ll_radio_conn_select() (the link's AA and CRC init), ll_txq_event_start()
- * (ring rebuilt for this link), BRX via ll_radio_conn_event(). ll_conn
- * still follows one link, id 0 in the per-link ll_txq calls. Each CONN_RX:
+ * (ring rebuilt for this link), BRX via ll_radio_conn_event(); the link
+ * becomes the event owner (ev_owner), and the radio callbacks of the event
+ * go to it. The main alarm is armed for the earliest planned event of all
+ * links (arm(); the arbiter replaces this in slice 6a Task 5): an alarm
+ * that fires while another link's event is on air skips its event
+ * (stats.collisions). Each CONN_RX:
  * ll_txq_rx(), ll_rxq_isr_put(), the first one re-syncs the anchor and the
  * supervision timer, unless the event's first packet was not delivered
  * (bad CRC, or an acked retransmission without an RX entry) or the packet
@@ -60,9 +64,12 @@
 /* SCA field -> worst-case ppm (Vol 6 Part B 2.3.3.1, Table 2.17) */
 static const uint16_t sca_ppm[8] = {500, 250, 150, 100, 75, 50, 30, 20};
 
-static struct {
-	struct ll_conn_ops ops;
-	bool active;
+enum link_state { LINK_FREE, LINK_ACTIVE, LINK_ENDED };
+
+struct ll_link {
+	uint8_t id;
+	uint8_t state;        /* enum link_state */
+	bool active;          /* state == LINK_ACTIVE */
 	bool planned;         /* alarm pending for event `counter` */
 	bool in_event;        /* BRX issued, CONN_DONE pending */
 	bool established;     /* a packet was received in this connection */
@@ -109,104 +116,162 @@ static struct {
 	uint32_t term_tick;
 	bool end_pending;
 	uint8_t end_reason;
-} c;
+	uint8_t end_r;        /* reason reported with DISCONNECTED (arg storage) */
+};
 
-static struct ll_conn_stats stats;
+static struct ll_link links[LL_MAX_CONN];
+static struct ll_conn_ops ops;
+static struct ll_conn_stats stats[LL_MAX_CONN];
+/* Link whose BRX is on air (radio callbacks go to it), -1: none. */
+static int8_t ev_owner = -1;
+/* Link whose alarm is armed with ll_sched_at, -1: none (until Task 5). */
+static int8_t alarm_link = -1;
 
-static void prepare(void);
+#define ST(c) (&stats[(c)->id])
 
-static void report(enum ll_conn_evt what, const void *arg)
+static void arm(void);
+static void prepare(struct ll_link *c);
+
+static struct ll_link *link_of(uint8_t link)
 {
-	if (c.ops.evt) {
-		c.ops.evt(what, arg);
+	return link < LL_MAX_CONN ? &links[link] : NULL;
+}
+
+static void report(struct ll_link *c, enum ll_conn_evt what, const void *arg)
+{
+	if (ops.evt) {
+		ops.evt(c->id, what, arg);
 	}
 }
 
-static void end(uint8_t reason)
+/* The main alarm follows the earliest planned event of all links (until
+ * the arbiter, Task 5). Alarm ticks of planned events lie within one
+ * supervision timeout (at most 32 s) of each other, so a signed tick
+ * difference orders them. */
+static uint32_t alarm_tick(const struct ll_link *c)
 {
-	static uint8_t r;
+	return c->open_tick - US(LL_CONN_ARM_LEAD_US);
+}
 
-	c.active = false;
-	c.planned = false;
-	c.in_event = false;
-	c.end_pending = false;
-	ll_sched_cancel();
-	r = reason;
-	report(LL_CONN_EVT_DISCONNECTED, &r);
+static void alarm_fired(void)
+{
+	int8_t id = alarm_link;
+
+	alarm_link = -1;
+	if (id >= 0) {
+		prepare(&links[id]);
+	}
+	arm();
+}
+
+static void arm(void)
+{
+	struct ll_link *best = NULL;
+
+	for (uint8_t i = 0; i < LL_MAX_CONN; i++) {
+		struct ll_link *l = &links[i];
+
+		if (l->active && l->planned &&
+		    (!best || (int32_t)(alarm_tick(l) - alarm_tick(best)) < 0)) {
+			best = l;
+		}
+	}
+	if (best) {
+		alarm_link = (int8_t)best->id;
+		ll_sched_at(alarm_tick(best), alarm_fired);
+	} else if (alarm_link >= 0) {
+		alarm_link = -1;
+		ll_sched_cancel();
+	}
+}
+
+static void end(struct ll_link *c, uint8_t reason)
+{
+	c->active = false;
+	c->state = LINK_ENDED;
+	c->planned = false;
+	c->in_event = false;
+	c->end_pending = false;
+	if (ev_owner == (int8_t)c->id) {
+		ev_owner = -1;
+	}
+	arm();
+	c->end_r = reason;
+	report(c, LL_CONN_EVT_DISCONNECTED, &c->end_r);
 }
 
 /* End now, or at CONN_DONE when an event is on air (first reason wins). */
-static void request_end(uint8_t reason)
+static void request_end(struct ll_link *c, uint8_t reason)
 {
-	if (c.in_event) {
-		if (!c.end_pending) {
-			c.end_pending = true;
-			c.end_reason = reason;
+	if (c->in_event) {
+		if (!c->end_pending) {
+			c->end_pending = true;
+			c->end_reason = reason;
 		}
 		return;
 	}
-	end(reason);
+	end(c, reason);
 }
 
 /* 4.5.4 window widening. Above interval / 2 - T_IFS it is clamped (4.5.7
  * says the link is then lost; the supervision timeout ends it). */
-static uint32_t widening_us(uint32_t dt_ticks)
+static uint32_t widening_us(const struct ll_link *c, uint32_t dt_ticks)
 {
 	uint32_t dt_us = dt_ticks / LL_TICKS_PER_US;
-	uint32_t w = (uint32_t)(((uint64_t)c.ppm * dt_us + 999999u) / 1000000u) + 16u;
+	uint32_t w = (uint32_t)(((uint64_t)c->ppm * dt_us + 999999u) / 1000000u) + 16u;
 
-	if (w > c.widen_max_us) {
-		w = c.widen_max_us;
+	if (w > c->widen_max_us) {
+		w = c->widen_max_us;
 	}
 	return w;
 }
 
-static uint32_t anchor_of(uint16_t counter)
+static uint32_t anchor_of(const struct ll_link *c, uint16_t counter)
 {
-	return c.ref_tick + (uint32_t)(uint16_t)(counter - c.ref_counter) * c.interval_ticks;
+	return c->ref_tick + (uint32_t)(uint16_t)(counter - c->ref_counter) * c->interval_ticks;
 }
 
-static void set_params(const struct ll_conn_params *p)
+static void set_params(struct ll_link *c, const struct ll_conn_params *p)
 {
-	c.p = *p;
-	c.interval_ticks = (uint32_t)p->interval * US(UNIT_US);
-	c.sup_ticks = (uint32_t)p->timeout * US(SUP_UNIT_US);
-	c.widen_max_us = (uint32_t)p->interval * UNIT_US / 2u - LL_T_IFS_US;
+	c->p = *p;
+	c->interval_ticks = (uint32_t)p->interval * US(UNIT_US);
+	c->sup_ticks = (uint32_t)p->timeout * US(SUP_UNIT_US);
+	c->widen_max_us = (uint32_t)p->interval * UNIT_US / 2u - LL_T_IFS_US;
 }
 
 /* Instants of the event about to be planned (counter == instant). */
-static void apply_instants(void)
+static void apply_instants(struct ll_link *c)
 {
-	if (c.chm_pending && c.chm_instant == c.counter) {
-		c.chm_pending = false;
-		ll_csa1_set_map(&c.csa, c.chm);
+	if (c->chm_pending && c->chm_instant == c->counter) {
+		c->chm_pending = false;
+		ll_csa1_set_map(&c->csa, c->chm);
 	}
-	if (c.upd_pending && c.upd_instant == c.counter) {
+	if (c->upd_pending && c->upd_instant == c->counter) {
 		/* 5.1.1: the transmit window starts WinOffset after the anchor
 		 * the instant event would have had with the old parameters. */
-		uint32_t old_anchor = anchor_of(c.counter);
-		bool changed = c.upd_p.interval != c.p.interval ||
-			       c.upd_p.latency != c.p.latency ||
-			       c.upd_p.timeout != c.p.timeout;
+		uint32_t old_anchor = anchor_of(c, c->counter);
+		bool changed = c->upd_p.interval != c->p.interval ||
+			       c->upd_p.latency != c->p.latency ||
+			       c->upd_p.timeout != c->p.timeout;
 
-		c.upd_pending = false;
-		c.ref_tick = old_anchor + (uint32_t)c.upd_win_offset * US(UNIT_US);
-		c.ref_counter = c.counter;
-		c.win_us = (uint32_t)c.upd_win_size * UNIT_US;
-		c.sup_tick = old_anchor;
-		set_params(&c.upd_p);
+		c->upd_pending = false;
+		c->ref_tick = old_anchor + (uint32_t)c->upd_win_offset * US(UNIT_US);
+		c->ref_counter = c->counter;
+		c->win_us = (uint32_t)c->upd_win_size * UNIT_US;
+		c->sup_tick = old_anchor;
+		set_params(c, &c->upd_p);
 		if (changed) {
-			report(LL_CONN_EVT_UPDATED, &c.p);
+			report(c, LL_CONN_EVT_UPDATED, &c->p);
 		}
 	}
 }
 
 /* RX open tick of event `counter` (current timing state); widening out. */
-static uint32_t open_of(uint16_t counter, uint32_t *widen_out)
+static uint32_t open_of(const struct ll_link *c, uint16_t counter, uint32_t *widen_out)
 {
-	uint32_t base = anchor_of(counter);
-	uint32_t widen = widening_us(base + US(c.win_us) - c.sync_tick);
-	uint32_t margin = c.win_us ? LL_CONN_WIN_MARGIN_US : LL_CONN_RX_MARGIN_US;
+	uint32_t base = anchor_of(c, counter);
+	uint32_t widen = widening_us(c, base + US(c->win_us) - c->sync_tick);
+	uint32_t margin = c->win_us ? LL_CONN_WIN_MARGIN_US : LL_CONN_RX_MARGIN_US;
 
 	if (widen_out) {
 		*widen_out = widen;
@@ -215,75 +280,75 @@ static uint32_t open_of(uint16_t counter, uint32_t *widen_out)
 }
 
 /* Plan event `counter` (listened to): instants, channel, RX window, alarm. */
-static void plan_event(void)
+static void plan_event(struct ll_link *c)
 {
 	uint32_t widen, margin;
 
-	apply_instants();
-	if (c.skip_n == 0) {
+	apply_instants(c);
+	if (c->skip_n == 0) {
 		/* re-plan point: the state after this event's instants */
-		c.csa_base = c.csa;
+		c->csa_base = c->csa;
 	}
-	c.ch = ll_csa1_next(&c.csa);
-	c.open_tick = open_of(c.counter, &widen);
-	if (widen > stats.widen_max_us) {
-		stats.widen_max_us = widen;
+	c->ch = ll_csa1_next(&c->csa);
+	c->open_tick = open_of(c, c->counter, &widen);
+	if (widen > ST(c)->widen_max_us) {
+		ST(c)->widen_max_us = widen;
 	}
-	margin = c.win_us ? LL_CONN_WIN_MARGIN_US : LL_CONN_RX_MARGIN_US;
-	c.fst_us = c.win_us + 2u * (widen + margin) + LL_CONN_SYNC_US;
-	c.planned = true;
-	ll_sched_at(c.open_tick - US(LL_CONN_ARM_LEAD_US), prepare);
+	margin = c->win_us ? LL_CONN_WIN_MARGIN_US : LL_CONN_RX_MARGIN_US;
+	c->fst_us = c->win_us + 2u * (widen + margin) + LL_CONN_SYNC_US;
+	c->planned = true;
+	arm();
 }
 
 /* An instant in [counter, counter + n]: its event must be listened to. */
-static bool instant_within(bool pending, uint16_t instant, uint16_t n)
+static bool instant_within(const struct ll_link *c, bool pending, uint16_t instant, uint16_t n)
 {
-	return pending && (uint16_t)(instant - c.counter) <= n;
+	return pending && (uint16_t)(instant - c->counter) <= n;
 }
 
 /* Peripheral latency: events to skip before the next listened one (rules
- * in ll_conn.h). c.counter is the first candidate. */
-static uint16_t skip_count(void)
+ * in ll_conn.h). c->counter is the first candidate. */
+static uint16_t skip_count(struct ll_link *c)
 {
-	uint16_t n = c.p.latency;
+	uint16_t n = c->p.latency;
 	uint32_t deadline;
 	int32_t room;
 
-	if (n == 0 || !c.anchored || c.term_local || ll_txq_backlog(0) != 0 ||
-	    (c.ops.busy && c.ops.busy())) {
+	if (n == 0 || !c->anchored || c->term_local || ll_txq_backlog(c->id) != 0 ||
+	    (ops.busy && ops.busy(c->id))) {
 		return 0;
 	}
-	if (instant_within(c.chm_pending, c.chm_instant, n) ||
-	    instant_within(c.upd_pending, c.upd_instant, n)) {
+	if (instant_within(c, c->chm_pending, c->chm_instant, n) ||
+	    instant_within(c, c->upd_pending, c->upd_instant, n)) {
 		return 0;
 	}
 	/* supervision: listened anchor <= last RX + timeout - 2 * interval */
-	deadline = c.sup_tick + c.sup_ticks - 2u * c.interval_ticks;
-	room = (int32_t)(deadline - anchor_of(c.counter));
+	deadline = c->sup_tick + c->sup_ticks - 2u * c->interval_ticks;
+	room = (int32_t)(deadline - anchor_of(c, c->counter));
 	if (room < 0) {
 		return 0;
 	}
-	if ((uint32_t)room / c.interval_ticks < n) {
-		n = (uint16_t)((uint32_t)room / c.interval_ticks);
+	if ((uint32_t)room / c->interval_ticks < n) {
+		n = (uint16_t)((uint32_t)room / c->interval_ticks);
 	}
 	return n;
 }
 
 /* Plan the next event, skipping idle events where allowed. */
-static void plan(void)
+static void plan(struct ll_link *c)
 {
-	uint16_t n = skip_count();
+	uint16_t n = skip_count(c);
 
-	c.skip_base = c.counter;
-	c.csa_base = c.csa;
-	c.skip_n = n;
+	c->skip_base = c->counter;
+	c->csa_base = c->csa;
+	c->skip_n = n;
 	for (uint16_t i = 0; i < n; i++) {
-		(void)ll_csa1_next(&c.csa);
+		(void)ll_csa1_next(&c->csa);
 	}
-	c.counter = (uint16_t)(c.counter + n);
-	stats.skipped += n;
-	stats.planned++;
-	plan_event();
+	c->counter = (uint16_t)(c->counter + n);
+	ST(c)->skipped += n;
+	ST(c)->planned++;
+	plan_event(c);
 }
 
 /* Re-plan the planned (not yet issued) listen to event `target` in
@@ -294,124 +359,131 @@ static void plan(void)
  * earlier event (csa_base is the state after them, see plan_event). This
  * keeps the invariant that skip_n > 0 only while no instant is applied at
  * the planned event, which ll_conn_kick() / first_reachable() rely on. */
-static void replan_to(uint16_t target)
+static void replan_to(struct ll_link *c, uint16_t target)
 {
-	uint16_t k = (uint16_t)(target - c.skip_base);
+	uint16_t k = (uint16_t)(target - c->skip_base);
 
-	ll_sched_cancel();
-	c.csa = c.csa_base;
+	c->planned = false;
+	c->csa = c->csa_base;
 	for (uint16_t i = 0; i < k; i++) {
-		(void)ll_csa1_next(&c.csa);
+		(void)ll_csa1_next(&c->csa);
 	}
-	stats.skipped -= (uint32_t)(c.skip_n - k);
-	c.skip_n = 0;
-	c.counter = target;
-	c.skip_base = target;
-	plan_event();
+	ST(c)->skipped -= (uint32_t)(c->skip_n - k);
+	c->skip_n = 0;
+	c->counter = target;
+	c->skip_base = target;
+	plan_event(c);
 }
 
 /* Index (from skip_base) of the first event of the planned window whose
  * alarm (LL_CONN_ARM_LEAD_US before its RX opens) is still ahead; skip_n
- * if none before the planned one is. Caller holds the lock, c.planned.
+ * if none before the planned one is. Caller holds the lock, c->planned.
  * Only meaningful with skip_n > 0, i.e. on pre-instant timing state: plan()
  * never skips with an instant pending in the window and replan_to() sets
  * skip_n = 0 once it applied one, so the timing and map used here are
  * those of every event in [skip_base, counter]. */
-static uint16_t first_reachable(void)
+static uint16_t first_reachable(const struct ll_link *c)
 {
 	uint32_t now = ll_radio_now();
-	int32_t elapsed = (int32_t)(now - anchor_of(c.skip_base));
+	int32_t elapsed = (int32_t)(now - anchor_of(c, c->skip_base));
 	uint32_t i = 0;
 
 	/* events whose anchor already passed cannot be reached: start there */
 	if (elapsed > 0) {
-		i = (uint32_t)elapsed / c.interval_ticks;
+		i = (uint32_t)elapsed / c->interval_ticks;
 	}
-	while (i < c.skip_n &&
-	       (int32_t)(open_of((uint16_t)(c.skip_base + i), NULL) - US(LL_CONN_ARM_LEAD_US) -
-			 now) <= 0) {
+	while (i < c->skip_n &&
+	       (int32_t)(open_of(c, (uint16_t)(c->skip_base + i), NULL) -
+			 US(LL_CONN_ARM_LEAD_US) - now) <= 0) {
 		i++;
 	}
-	return i < c.skip_n ? (uint16_t)i : c.skip_n;
+	return i < c->skip_n ? (uint16_t)i : c->skip_n;
 }
 
 /* An event ended (or was skipped): advance, check, plan the next one. */
-static void event_closed(uint32_t now)
+static void event_closed(struct ll_link *c, uint32_t now)
 {
-	c.counter++;
-	if (c.end_pending) {
-		end(c.end_reason);
+	c->counter++;
+	if (c->end_pending) {
+		end(c, c->end_reason);
 		return;
 	}
-	if (c.term_acked) {
-		end(LL_ST_LOCAL_TERM);
+	if (c->term_acked) {
+		end(c, LL_ST_LOCAL_TERM);
 		return;
 	}
-	if (!c.established) {
-		if (c.counter >= NOT_ESTAB_EVENTS) {
-			end(LL_ST_CONN_FAIL_EST);
+	if (!c->established) {
+		if (c->counter >= NOT_ESTAB_EVENTS) {
+			end(c, LL_ST_CONN_FAIL_EST);
 			return;
 		}
-	} else if ((int32_t)(now - c.sup_tick) >= (int32_t)c.sup_ticks) {
-		end(LL_ST_CONN_TIMEOUT);
+	} else if ((int32_t)(now - c->sup_tick) >= (int32_t)c->sup_ticks) {
+		end(c, LL_ST_CONN_TIMEOUT);
 		return;
 	}
-	if (c.term_local && (int32_t)(now - c.term_tick) >= (int32_t)c.sup_ticks) {
+	if (c->term_local && (int32_t)(now - c->term_tick) >= (int32_t)c->sup_ticks) {
 		/* 5.1.3: no ack of LL_TERMINATE_IND within the timeout */
-		end(LL_ST_LOCAL_TERM);
+		end(c, LL_ST_LOCAL_TERM);
 		return;
 	}
-	plan();
+	plan(c);
 }
 
 /* Event length cap for the radio guard (see LL_CONN_EVENT_SAFETY_US): the
  * next event opens no earlier than one interval after this one, minus the
  * widening growth over that interval (no re-sync in this event). */
-static uint32_t event_max_us(void)
+static uint32_t event_max_us(const struct ll_link *c)
 {
-	uint32_t ival_us = (uint32_t)c.p.interval * UNIT_US;
-	uint32_t growth = (uint32_t)(((uint64_t)c.ppm * ival_us + 999999u) / 1000000u);
+	uint32_t ival_us = (uint32_t)c->p.interval * UNIT_US;
+	uint32_t growth = (uint32_t)(((uint64_t)c->ppm * ival_us + 999999u) / 1000000u);
 	uint32_t reserve = growth + LL_CONN_ARM_LEAD_US + LL_CONN_EVENT_SAFETY_US;
-	uint32_t floor_us = c.fst_us + LL_CONN_GUARD_MIN_TAIL_US;
+	uint32_t floor_us = c->fst_us + LL_CONN_GUARD_MIN_TAIL_US;
 	uint32_t cap = ival_us > reserve ? ival_us - reserve : 0;
 
 	return cap > floor_us ? cap : floor_us;
 }
 
-/* Alarm: issue the BRX for the planned event. */
-static void prepare(void)
+/* Alarm: issue the BRX for the planned event of link c. */
+static void prepare(struct ll_link *c)
 {
 	uint32_t now;
 
-	if (!c.active || !c.planned) {
+	if (!c->active || !c->planned) {
 		return;
 	}
-	c.planned = false;
-	c.anchored = false;
+	c->planned = false;
+	c->anchored = false;
 	now = ll_radio_now();
-	if ((int32_t)(c.open_tick - now) < (int32_t)US(LL_CONN_MIN_PREP_US)) {
-		stats.late++;
-		stats.missed++;
-		event_closed(now);
+	if (ev_owner >= 0) {
+		/* another link's event is on air (no arbiter yet): skip */
+		ST(c)->collisions++;
+		event_closed(c, now);
 		return;
 	}
-	ll_radio_conn_select(c.ci.aa, c.ci.crc_init);
-	ll_txq_event_start(0);
-	c.rx_this_event = false;
-	c.first_seen = false;
-	c.in_event = true;
-	stats.events++;
-	stats.listened++;
-	ll_radio_conn_event(c.ch, c.open_tick, c.fst_us, event_max_us());
+	if ((int32_t)(c->open_tick - now) < (int32_t)US(LL_CONN_MIN_PREP_US)) {
+		ST(c)->late++;
+		ST(c)->missed++;
+		event_closed(c, now);
+		return;
+	}
+	ll_radio_conn_select(c->ci.aa, c->ci.crc_init);
+	ll_txq_event_start(c->id);
+	c->rx_this_event = false;
+	c->first_seen = false;
+	c->in_event = true;
+	ev_owner = (int8_t)c->id;
+	ST(c)->events++;
+	ST(c)->listened++;
+	ll_radio_conn_event(c->ch, c->open_tick, c->fst_us, event_max_us(c));
 }
 
 /* A packet with a bad CRC: if it is the event's first, it still was the
  * anchor packet, so a later valid packet of the event must not re-anchor. */
-static void on_rx_bad(void)
+static void on_rx_bad(struct ll_link *c)
 {
-	if (!c.first_seen) {
-		c.first_seen = true;
-		stats.first_bad++;
+	if (!c->first_seen) {
+		c->first_seen = true;
+		ST(c)->first_bad++;
 	}
 }
 
@@ -421,15 +493,15 @@ static void on_rx_bad(void)
  * with only such retransmissions has no rx_this_event and so counts as
  * missed in the stats (it still proves the central is there, but it does
  * not refresh supervision; the next new packet does). */
-static void on_rx_nodata(void)
+static void on_rx_nodata(struct ll_link *c)
 {
-	if (!c.first_seen) {
-		c.first_seen = true;
-		stats.first_nodata++;
+	if (!c->first_seen) {
+		c->first_seen = true;
+		ST(c)->first_nodata++;
 	}
 }
 
-static void on_rx(const uint8_t *pdu, uint8_t len, uint32_t tick)
+static void on_rx(struct ll_link *c, const uint8_t *pdu, uint8_t len, uint32_t tick)
 {
 	uint32_t anchor;
 	bool first;
@@ -437,9 +509,9 @@ static void on_rx(const uint8_t *pdu, uint8_t len, uint32_t tick)
 	if (len < 2) {
 		return;
 	}
-	stats.rx_pkts++;
-	ll_txq_rx(0, pdu[0]);
-	if (!ll_rxq_isr_put(0, pdu, len)) {
+	ST(c)->rx_pkts++;
+	ll_txq_rx(c->id, pdu[0]);
+	if (!ll_rxq_isr_put(c->id, pdu, len)) {
 		/* The hardware has acked this data PDU already, so the central
 		 * will never resend it: it is lost for good, and continuing
 		 * would leave a hole in the L2CAP stream (and, encrypted, a
@@ -448,61 +520,68 @@ static void on_rx(const uint8_t *pdu, uint8_t len, uint32_t tick)
 		 * following the link without an LL_TERMINATE_IND, so the
 		 * central sees a supervision timeout too and both hosts treat
 		 * it as an ordinary link loss (reconnect). */
-		request_end(LL_ST_CONN_TIMEOUT);
+		request_end(c, LL_ST_CONN_TIMEOUT);
 	}
-	c.rx_this_event = true;
-	first = !c.first_seen;
-	c.first_seen = true;
+	c->rx_this_event = true;
+	first = !c->first_seen;
+	c->first_seen = true;
 	/* The hardware syncs the event's first packet only inside the RX
 	 * window (first-RX timeout); a packet whose access address ends after
 	 * it (plus one sync time of slack) is a chained one whose anchor
 	 * packet was not reported (e.g. both in one late ISR). */
-	if (first && (int32_t)(tick - (c.open_tick + US(c.fst_us + LL_CONN_SYNC_US))) > 0) {
-		stats.first_outside++;
+	if (first && (int32_t)(tick - (c->open_tick + US(c->fst_us + LL_CONN_SYNC_US))) > 0) {
+		ST(c)->first_outside++;
 		first = false;
 	}
 	if (!first) {
 		/* later packet of the event: proof of life only (4.5.2); it is
 		 * not at the anchor, so timing stays as it was */
-		c.sup_tick = tick - US(LL_CONN_SYNC_US);
-		c.established = true;
+		c->sup_tick = tick - US(LL_CONN_SYNC_US);
+		c->established = true;
 		return;
 	}
 	/* first packet of the event: its start is the anchor point */
 	anchor = tick - US(LL_CONN_SYNC_US);
-	c.ref_tick = anchor;
-	c.ref_counter = c.counter;
-	c.win_us = 0;
-	c.sync_tick = anchor;
-	c.sup_tick = anchor;
-	c.established = true;
-	c.anchored = true;
+	c->ref_tick = anchor;
+	c->ref_counter = c->counter;
+	c->win_us = 0;
+	c->sync_tick = anchor;
+	c->sup_tick = anchor;
+	c->established = true;
+	c->anchored = true;
 }
 
 void ll_conn_radio_evt(enum ll_radio_evt evt, const uint8_t *pdu, uint8_t len, uint32_t tick)
 {
-	if (!c.active || !c.in_event) {
+	struct ll_link *c;
+
+	if (ev_owner < 0) {
+		return;
+	}
+	c = &links[ev_owner];
+	if (!c->active || !c->in_event) {
 		return;
 	}
 	switch (evt) {
 	case LL_RADIO_CONN_RX:
-		on_rx(pdu, len, tick);
+		on_rx(c, pdu, len, tick);
 		break;
 	case LL_RADIO_CONN_RX_CRC_ERR:
-		on_rx_bad();
+		on_rx_bad(c);
 		break;
 	case LL_RADIO_CONN_RX_NODATA:
-		on_rx_nodata();
+		on_rx_nodata(c);
 		break;
 	case LL_RADIO_CONN_DONE:
-		c.in_event = false;
-		ll_txq_event_end(0);
-		if (c.rx_this_event) {
-			stats.rx_events++;
+		c->in_event = false;
+		ev_owner = -1;
+		ll_txq_event_end(c->id);
+		if (c->rx_this_event) {
+			ST(c)->rx_events++;
 		} else {
-			stats.missed++;
+			ST(c)->missed++;
 		}
-		event_closed(tick);
+		event_closed(c, tick);
 		break;
 	default:
 		break;
@@ -511,20 +590,34 @@ void ll_conn_radio_evt(enum ll_radio_evt evt, const uint8_t *pdu, uint8_t len, u
 
 static void txq_done(uint8_t link, enum ll_txq_kind kind, uint8_t ctrl_opcode)
 {
-	if (kind == LL_TXQ_CTRL && ctrl_opcode == OP_TERMINATE_IND && c.term_local) {
-		c.term_acked = true;   /* ended at this event's CONN_DONE */
+	struct ll_link *c = link_of(link);
+
+	if (c && kind == LL_TXQ_CTRL && ctrl_opcode == OP_TERMINATE_IND && c->term_local) {
+		c->term_acked = true;   /* ended at this event's CONN_DONE */
 	}
-	if (c.ops.txq_done) {
-		c.ops.txq_done(link, kind, ctrl_opcode);
+	if (ops.txq_done) {
+		ops.txq_done(link, kind, ctrl_opcode);
 	}
 }
 
-void ll_conn_init(const struct ll_conn_ops *ops)
+static void link_clear(uint8_t i)
 {
-	memset(&c, 0, sizeof(c));
-	if (ops) {
-		c.ops = *ops;
+	memset(&links[i], 0, sizeof(links[i]));
+	links[i].id = i;
+	links[i].state = LINK_FREE;
+}
+
+void ll_conn_init(const struct ll_conn_ops *o)
+{
+	for (uint8_t i = 0; i < LL_MAX_CONN; i++) {
+		link_clear(i);
 	}
+	memset(&ops, 0, sizeof(ops));
+	if (o) {
+		ops = *o;
+	}
+	ev_owner = -1;
+	alarm_link = -1;
 	ll_txq_init(txq_done);
 }
 
@@ -560,60 +653,64 @@ int ll_conn_start(const struct ll_connect_ind *ci, uint32_t connect_ind_end_tick
 {
 	struct ll_conn_params p;
 	struct ll_csa1 csa;
+	struct ll_link *c = NULL;
 
-	if (c.active) {
+	for (uint8_t i = 0; i < LL_MAX_CONN; i++) {
+		if (links[i].state == LINK_FREE) {
+			c = &links[i];
+			break;
+		}
+	}
+	if (!c) {
 		return -EBUSY;
 	}
 	ll_csa1_init(&csa, ci->hop, ci->chm);
 	if (!params_valid(ci, &csa)) {
 		return -EINVAL;
 	}
-	{
-		struct ll_conn_ops ops = c.ops;
-
-		memset(&c, 0, sizeof(c));
-		c.ops = ops;
-	}
-	c.ci = *ci;
-	c.csa = csa;
+	link_clear(c->id);
+	c->ci = *ci;
+	c->csa = csa;
 	p.interval = ci->interval;
 	p.latency = ci->latency;
 	p.timeout = ci->timeout;
-	set_params(&p);
-	c.ppm = (uint16_t)(sca_ppm[ci->sca & 7] + LL_OWN_SCA_PPM);
+	set_params(c, &p);
+	c->ppm = (uint16_t)(sca_ppm[ci->sca & 7] + LL_OWN_SCA_PPM);
 	/* 4.5.3: transmitWindowDelay 1.25 ms + WinOffset, size WinSize */
-	c.ref_tick = connect_ind_end_tick + US(UNIT_US) + (uint32_t)ci->win_offset * US(UNIT_US);
-	c.ref_counter = 0;
-	c.win_us = (uint32_t)ci->win_size * UNIT_US;
-	c.sync_tick = connect_ind_end_tick;
-	c.sup_tick = connect_ind_end_tick;
-	c.active = true;
+	c->ref_tick = connect_ind_end_tick + US(UNIT_US) + (uint32_t)ci->win_offset * US(UNIT_US);
+	c->ref_counter = 0;
+	c->win_us = (uint32_t)ci->win_size * UNIT_US;
+	c->sync_tick = connect_ind_end_tick;
+	c->sup_tick = connect_ind_end_tick;
+	c->active = true;
+	c->state = LINK_ACTIVE;
 
+	/* one-time radio setup; a no-op while other links are live */
 	ll_radio_conn_init();
-	ll_txq_reset(0);
+	ll_txq_reset(c->id);
 	/* No ll_rxq_reset() here: this runs in ISR context while the controller
-	 * thread may be inside ll_rxq_get(). The glue resets ll_rxq in its
-	 * thread when it handles LL_CONN_EVT_DISCONNECTED, before advertising
-	 * (and so a new connection) can be enabled again. */
-	plan();
-	report(LL_CONN_EVT_CONNECTED, &c.ci);
-	return 0;
+	 * thread may be inside ll_rxq_get(). The glue resets the link's ll_rxq
+	 * in its thread when it handles LL_CONN_EVT_DISCONNECTED and releases
+	 * the id only then (ll_conn_release). */
+	plan(c);
+	report(c, LL_CONN_EVT_CONNECTED, &c->ci);
+	return c->id;
 }
 
 /* 0, or LL_ST_INSTANT_PASSED (connection ending). With a latency skip
  * planned, an instant for a skipped event whose alarm time has gone by is
  * passed too (that event can no longer be listened to). */
-static int check_instant(uint16_t instant)
+static int check_instant(struct ll_link *c, uint16_t instant)
 {
-	uint16_t cur = c.planned ? c.skip_base : c.counter;
+	uint16_t cur = c->planned ? c->skip_base : c->counter;
 	uint16_t d = (uint16_t)(instant - cur);
 
 	/* d == 0 with the event already on air: its timing and channel were
 	 * issued with the old values, so the instant cannot be honoured any
 	 * more; treat it like a passed instant. */
-	if (d > INSTANT_PAST || (d == 0 && c.in_event) ||
-	    (c.planned && d < c.skip_n && d < first_reachable())) {
-		request_end(LL_ST_INSTANT_PASSED);
+	if (d > INSTANT_PAST || (d == 0 && c->in_event) ||
+	    (c->planned && d < c->skip_n && d < first_reachable(c))) {
+		request_end(c, LL_ST_INSTANT_PASSED);
 		return LL_ST_INSTANT_PASSED;
 	}
 	return 0;
@@ -628,27 +725,28 @@ static int check_instant(uint16_t instant)
  * instant is listened to. Re-planning to the instant itself would leave
  * skip_n = 0 at the instant event, so a kick in between could not pull the
  * listen earlier and TX would wait for the instant. */
-static void instant_replan(uint16_t instant)
+static void instant_replan(struct ll_link *c, uint16_t instant)
 {
-	uint16_t d = (uint16_t)(instant - c.skip_base);
+	uint16_t d = (uint16_t)(instant - c->skip_base);
 
-	if (c.planned && d <= c.skip_n) {
-		uint16_t i = c.skip_n > 0 ? first_reachable() : 0;
+	if (c->planned && d <= c->skip_n) {
+		uint16_t i = c->skip_n > 0 ? first_reachable(c) : 0;
 
-		replan_to((uint16_t)(c.skip_base + (i < d ? i : d)));
+		replan_to(c, (uint16_t)(c->skip_base + (i < d ? i : d)));
 	}
 }
 
-int ll_conn_update_at(uint16_t instant, uint8_t win_size, uint16_t win_offset,
+int ll_conn_update_at(uint8_t link, uint16_t instant, uint8_t win_size, uint16_t win_offset,
 		      const struct ll_conn_params *p)
 {
+	struct ll_link *c = link_of(link);
 	unsigned int key = ll_plat_lock();
 	int ret = LL_ST_DISALLOWED;
 
 	if (!timing_valid(p->interval, p->latency, p->timeout, win_size, win_offset)) {
 		ret = LL_ST_INVALID_LL_PARAM;
-	} else if (c.active && !c.end_pending) {
-		ret = check_instant(instant);
+	} else if (c && c->active && !c->end_pending) {
+		ret = check_instant(c, instant);
 		if (ret == 0) {
 			/* A second LL_CONNECTION_UPDATE_IND while one is
 			 * pending replaces it (instant and parameters). The
@@ -656,101 +754,157 @@ int ll_conn_update_at(uint16_t instant, uint8_t win_size, uint16_t win_offset,
 			 * this is a protocol violation for which the spec
 			 * allows ending the link; following the latest one is
 			 * accepted as the more forgiving choice. */
-			c.upd_pending = true;
-			c.upd_instant = instant;
-			c.upd_win_size = win_size;
-			c.upd_win_offset = win_offset;
-			c.upd_p = *p;
-			instant_replan(instant);
+			c->upd_pending = true;
+			c->upd_instant = instant;
+			c->upd_win_size = win_size;
+			c->upd_win_offset = win_offset;
+			c->upd_p = *p;
+			instant_replan(c, instant);
 		}
 	}
 	ll_plat_unlock(key);
 	return ret;
 }
 
-int ll_conn_chmap_at(uint16_t instant, const uint8_t chm[5])
+int ll_conn_chmap_at(uint8_t link, uint16_t instant, const uint8_t chm[5])
 {
+	struct ll_link *c = link_of(link);
 	unsigned int key = ll_plat_lock();
 	int ret = LL_ST_DISALLOWED;
 
-	if (c.active && !c.end_pending) {
-		ret = check_instant(instant);
+	if (c && c->active && !c->end_pending) {
+		ret = check_instant(c, instant);
 		if (ret == 0) {
-			c.chm_pending = true;
-			c.chm_instant = instant;
-			memcpy(c.chm, chm, sizeof(c.chm));
-			instant_replan(instant);
+			c->chm_pending = true;
+			c->chm_instant = instant;
+			memcpy(c->chm, chm, sizeof(c->chm));
+			instant_replan(c, instant);
 		}
 	}
 	ll_plat_unlock(key);
 	return ret;
 }
 
-void ll_conn_terminate(uint8_t reason)
+void ll_conn_terminate(uint8_t link, uint8_t reason)
 {
 	const uint8_t pdu[2] = {OP_TERMINATE_IND, reason};
-	unsigned int key = ll_plat_lock();
-	bool go = c.active && !c.term_local && !c.end_pending;
+	struct ll_link *c = link_of(link);
+	unsigned int key;
+	bool go;
 
+	if (!c) {
+		return;
+	}
+	key = ll_plat_lock();
+	go = c->active && !c->term_local && !c->end_pending;
 	if (go) {
-		c.term_local = true;
-		c.term_acked = false;
-		c.term_tick = ll_radio_now();
+		c->term_local = true;
+		c->term_acked = false;
+		c->term_tick = ll_radio_now();
 	}
 	ll_plat_unlock(key);
 	if (!go) {
 		return;
 	}
 	/* A failed push is not retried: the timeout then ends the link. */
-	if (c.ops.ctrl_tx) {
-		(void)c.ops.ctrl_tx(pdu, sizeof(pdu));
+	if (ops.ctrl_tx) {
+		(void)ops.ctrl_tx(link, pdu, sizeof(pdu));
 	} else {
 		key = ll_plat_lock();
-		(void)ll_txq_push(0, LL_TXQ_CTRL, LL_LLID_CTRL, pdu, sizeof(pdu),
+		(void)ll_txq_push(link, LL_TXQ_CTRL, LL_LLID_CTRL, pdu, sizeof(pdu),
 				  OP_TERMINATE_IND);
 		ll_plat_unlock(key);
 	}
 }
 
-void ll_conn_end(uint8_t reason)
+void ll_conn_end(uint8_t link, uint8_t reason)
 {
-	unsigned int key = ll_plat_lock();
+	struct ll_link *c = link_of(link);
+	unsigned int key;
 
-	if (c.active) {
-		request_end(reason);
+	if (!c) {
+		return;
+	}
+	key = ll_plat_lock();
+	if (c->active) {
+		request_end(c, reason);
 	}
 	ll_plat_unlock(key);
 }
 
-bool ll_conn_active(void)
+bool ll_conn_active(uint8_t link)
 {
-	return c.active;
+	struct ll_link *c = link_of(link);
+
+	return c && c->active;
 }
 
-uint16_t ll_conn_event_counter(void)
+uint8_t ll_conn_count(void)
 {
-	return c.planned ? c.skip_base : c.counter;
+	uint8_t n = 0;
+
+	for (uint8_t i = 0; i < LL_MAX_CONN; i++) {
+		if (links[i].state != LINK_FREE) {
+			n++;
+		}
+	}
+	return n;
 }
 
-void ll_conn_kick(void)
+void ll_conn_release(uint8_t link)
 {
-	unsigned int key = ll_plat_lock();
+	struct ll_link *c = link_of(link);
+	unsigned int key;
 
-	if (c.active && c.planned && c.skip_n > 0) {
-		uint16_t i = first_reachable();
+	if (!c) {
+		return;
+	}
+	key = ll_plat_lock();
+	if (c->state == LINK_ENDED) {
+		c->state = LINK_FREE;
+	}
+	ll_plat_unlock(key);
+}
 
-		if (i < c.skip_n) {
-			replan_to((uint16_t)(c.skip_base + i));
-			stats.kicks++;
+uint16_t ll_conn_event_counter(uint8_t link)
+{
+	struct ll_link *c = link_of(link);
+
+	if (!c) {
+		return 0;
+	}
+	return c->planned ? c->skip_base : c->counter;
+}
+
+void ll_conn_kick(uint8_t link)
+{
+	struct ll_link *c = link_of(link);
+	unsigned int key;
+
+	if (!c) {
+		return;
+	}
+	key = ll_plat_lock();
+	if (c->active && c->planned && c->skip_n > 0) {
+		uint16_t i = first_reachable(c);
+
+		if (i < c->skip_n) {
+			replan_to(c, (uint16_t)(c->skip_base + i));
+			ST(c)->kicks++;
 		}
 	}
 	ll_plat_unlock(key);
 }
 
-void ll_conn_get_stats(struct ll_conn_stats *s)
+void ll_conn_get_stats(uint8_t link, struct ll_conn_stats *s)
 {
-	unsigned int key = ll_plat_lock();
+	unsigned int key;
 
-	*s = stats;
+	if (link >= LL_MAX_CONN) {
+		memset(s, 0, sizeof(*s));
+		return;
+	}
+	key = ll_plat_lock();
+	*s = stats[link];
 	ll_plat_unlock(key);
 }

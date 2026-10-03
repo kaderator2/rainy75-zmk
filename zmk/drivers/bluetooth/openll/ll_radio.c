@@ -14,9 +14,10 @@
  * timestamp (4), freq offset (2), RSSI (1), status (see ext_rf.h).
  *
  * Connection mode, register recipe from the spikes:
- * - Once (ll_radio_conn_init, at every connection start, idempotent): save
- *   the advertising values of ll_ctrl_1 and rxtcrcpkt, base entry = an empty
- *   PDU, reset_sn_nesn(); the RX DMA ring (4 x 64 bytes) is set up at boot.
+ * - Once (ll_radio_conn_init, called at every connection start, a no-op
+ *   until the next ll_radio_adv_restore): save the advertising values of
+ *   ll_ctrl_1 and rxtcrcpkt, base entry = an empty PDU, reset_sn_nesn(); the
+ *   RX DMA ring (4 x 64 bytes) is set up at boot.
  * - Per event (ll_radio_conn_select, ml-spike-report S2/S3, register writes
  *   only): access address (byte-swapped into 0x80140808) and CRC init (as
  *   parsed) of the link that owns the event, ll_ctrl_1 = connection value
@@ -527,6 +528,17 @@ void ll_radio_conn_init(void)
 	static const uint8_t empty_pdu[2] = {LL_LLID_CONT, 0};
 	unsigned int key = irq_lock();
 
+	/* Done since the last ll_radio_adv_restore() (which clears
+	 * cn.saved): other links may be live, possibly with an event on air,
+	 * so nothing here may touch the FSM, the SN/NESN state, the guard
+	 * streak or the RX ring position. Per event, ll_radio_conn_select()
+	 * and ll_txq_event_start() set everything a link needs. With one link
+	 * every connection follows an adv restore, so the full setup below
+	 * runs at every connection start, as in slice 5. */
+	if (cn.saved) {
+		irq_unlock(key);
+		return;
+	}
 	rf_set_tx_rx_off_auto_mode();
 	rsp_in_flight = false;
 	cn.evt_open = false;

@@ -41,10 +41,11 @@ int ll_conn_start(const struct ll_connect_ind *ci, uint32_t t)
 	/* advertising must already be stopped when the connection starts */
 	start_saw_enabled = ll_adv_is_enabled(); start_saw_sched = sched_cb != NULL;
 	start_saw_stops = radio_stops;
-	if (start_ret == 0) conn_is_active = true;
+	if (start_ret >= 0) conn_is_active = true;
 	return start_ret;
 }
-bool ll_conn_active(void) { return conn_is_active; }
+/* links taken (active or awaiting release) */
+uint8_t ll_conn_count(void) { return conn_is_active ? 1 : 0; }
 void ll_radio_adv_restore(void) { restores++; }
 
 static const uint8_t adva[6] = {0x01, 0x02, 0x03, 0x38, 0xC1, 0xA4};
@@ -209,7 +210,7 @@ int main(void)
 	/* accepted CONNECT_IND (on 37): advertising is stopped before
 	 * ll_conn_start (Vol 4 Part E 7.8.9), stays disabled, nothing scheduled */
 	int stops_before = radio_stops;
-	start_ret = 0;
+	start_ret = 2;   /* a link id: any id >= 0 means accepted (slice 6a) */
 	sc_before = sched_calls;
 	txrx_before = txrx_calls;
 	ll_adv_radio_evt(LL_RADIO_RX_OK, ci_pdu, 36, 7200000);

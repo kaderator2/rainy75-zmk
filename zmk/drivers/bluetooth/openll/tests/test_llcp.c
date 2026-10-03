@@ -4,8 +4,8 @@
  *
  * ll_llcp host tests. ll_conn, ll_txq_push, ll_rxq_set_crypt and the radio
  * clock are faked; ll_crypt is real (with the test-only software AES).
- * Built with LL_LLCP_HOST_CONN: ll_llcp calls the link-aware llcp_conn_*
- * fakes below instead of the (still single-link) ll_conn API.
+ * The link-aware ll_conn fakes below replace ll_conn.c (slice 6a Task 4:
+ * ll_llcp calls the per-link ll_conn API directly).
  *
  * Slice 6a: the single-link suite runs on link 0 and on link LL_MAX_CONN - 1
  * (every fake records per link, the suite reads the records of its link L
@@ -150,16 +150,9 @@ static struct {
 } cnl[LL_MAX_CONN];
 #define cn (cnl[L])
 
-/* link-aware ll_conn fakes (LL_LLCP_HOST_CONN) */
-int llcp_conn_update_at(uint8_t link, uint16_t instant, uint8_t win_size, uint16_t win_offset,
-			const struct ll_conn_params *p);
-int llcp_conn_chmap_at(uint8_t link, uint16_t instant, const uint8_t chm[5]);
-void llcp_conn_terminate(uint8_t link, uint8_t reason);
-void llcp_conn_end(uint8_t link, uint8_t reason);
-bool llcp_conn_active(uint8_t link);
-void llcp_conn_kick(uint8_t link);
+/* link-aware ll_conn fakes */
 
-int llcp_conn_update_at(uint8_t link, uint16_t instant, uint8_t win_size, uint16_t win_offset,
+int ll_conn_update_at(uint8_t link, uint16_t instant, uint8_t win_size, uint16_t win_offset,
 			const struct ll_conn_params *p)
 {
 	CHECK(link < LL_MAX_CONN);
@@ -170,7 +163,7 @@ int llcp_conn_update_at(uint8_t link, uint16_t instant, uint8_t win_size, uint16
 	cnl[link].p = *p;
 	return cnl[link].upd_ret;
 }
-int llcp_conn_chmap_at(uint8_t link, uint16_t instant, const uint8_t chm[5])
+int ll_conn_chmap_at(uint8_t link, uint16_t instant, const uint8_t chm[5])
 {
 	CHECK(link < LL_MAX_CONN);
 	cnl[link].chm_calls++;
@@ -178,21 +171,21 @@ int llcp_conn_chmap_at(uint8_t link, uint16_t instant, const uint8_t chm[5])
 	memcpy(cnl[link].chm, chm, 5);
 	return cnl[link].chm_ret;
 }
-void llcp_conn_terminate(uint8_t link, uint8_t reason)
+void ll_conn_terminate(uint8_t link, uint8_t reason)
 {
 	CHECK(locks == 0);
 	CHECK(link < LL_MAX_CONN);
 	cnl[link].term_calls++;
 	cnl[link].term_reason = reason;
 }
-void llcp_conn_end(uint8_t link, uint8_t reason)
+void ll_conn_end(uint8_t link, uint8_t reason)
 {
 	CHECK(locks == 0);
 	CHECK(link < LL_MAX_CONN);
 	cnl[link].end_calls++;
 	cnl[link].end_reason = reason;
 }
-bool llcp_conn_active(uint8_t link)
+bool ll_conn_active(uint8_t link)
 {
 	CHECK(link < LL_MAX_CONN);
 	return cnl[link].active;
@@ -206,7 +199,7 @@ static struct {
 	int n_at_kick;
 	int bad;   /* kicks with the IRQ lock held, before a new push or on another link */
 } kk;
-void llcp_conn_kick(uint8_t link)
+void ll_conn_kick(uint8_t link)
 {
 	if (locks != 0 || tx.n <= kk.n_at_kick ||
 	    (tx.n <= MAX_PUSH && tx.p[tx.n - 1].link != link)) {

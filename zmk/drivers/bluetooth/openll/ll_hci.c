@@ -139,10 +139,10 @@ static void disconnect(uint16_t op, const uint8_t *p, uint8_t plen)
 {
 	if (plen != 3 || !disconnect_reason_ok(p[2])) {
 		cmd_status(op, LL_ST_INVALID_PARAM);
-	} else if (ll_get_le16(p) != LL_CONN_HANDLE) {
+	} else if (!hci_ops->handle_valid(ll_get_le16(p))) {
 		cmd_status(op, LL_ST_UNKNOWN_CONN_ID);
 	} else {
-		cmd_status(op, hci_ops->disconnect(p[2]));
+		cmd_status(op, hci_ops->disconnect(ll_get_le16(p), p[2]));
 	}
 }
 
@@ -158,12 +158,12 @@ static void ltk_reply(uint16_t op, const uint8_t *p, uint8_t plen)
 		return;
 	}
 	memcpy(&ret[1], p, 2);
-	if (ll_get_le16(p) != LL_CONN_HANDLE) {
+	if (!hci_ops->handle_valid(ll_get_le16(p))) {
 		ret[0] = LL_ST_UNKNOWN_CONN_ID;
 	} else if (op == OP_LE_LTK_REPLY) {
-		ret[0] = hci_ops->ltk_reply(&p[2]);
+		ret[0] = hci_ops->ltk_reply(ll_get_le16(p), &p[2]);
 	} else {
-		ret[0] = hci_ops->ltk_neg_reply();
+		ret[0] = hci_ops->ltk_neg_reply(ll_get_le16(p));
 	}
 	cmd_complete(op, ret, 3);
 }
@@ -327,13 +327,13 @@ static void send_le_evt(const uint8_t *params, uint8_t plen)
 	send_evt(EVT_LE_META, params, plen);
 }
 
-void ll_hci_evt_conn_complete(const struct ll_connect_ind *ci)
+void ll_hci_evt_conn_complete(uint16_t handle, const struct ll_connect_ind *ci)
 {
 	uint8_t p[19];
 
 	p[0] = SUBEVT_CONN_COMPLETE;
 	p[1] = LL_ST_SUCCESS;
-	ll_put_le16(&p[2], LL_CONN_HANDLE);
+	ll_put_le16(&p[2], handle);
 	p[4] = HCI_ROLE_PERIPHERAL;
 	p[5] = ci->init_addr_random ? 0x01 : 0x00;
 	memcpy(&p[6], ci->init_a, 6);
@@ -344,7 +344,7 @@ void ll_hci_evt_conn_complete(const struct ll_connect_ind *ci)
 	send_le_evt(p, sizeof(p));
 }
 
-void ll_hci_evt_disconn_complete(uint8_t reason)
+void ll_hci_evt_disconn_complete(uint16_t handle, uint8_t reason)
 {
 	uint8_t p[4];
 
@@ -352,12 +352,12 @@ void ll_hci_evt_disconn_complete(uint8_t reason)
 		return;
 	}
 	p[0] = LL_ST_SUCCESS;
-	ll_put_le16(&p[1], LL_CONN_HANDLE);
+	ll_put_le16(&p[1], handle);
 	p[3] = reason;
 	send_evt(EVT_DISCONN_COMPLETE, p, sizeof(p));
 }
 
-void ll_hci_evt_num_completed(uint16_t count)
+void ll_hci_evt_num_completed(uint16_t handle, uint16_t count)
 {
 	uint8_t p[5];
 
@@ -365,23 +365,23 @@ void ll_hci_evt_num_completed(uint16_t count)
 		return;
 	}
 	p[0] = 1;                    /* Num_Handles */
-	ll_put_le16(&p[1], LL_CONN_HANDLE);
+	ll_put_le16(&p[1], handle);
 	ll_put_le16(&p[3], count);
 	send_evt(EVT_NUM_COMPLETED, p, sizeof(p));
 }
 
-void ll_hci_evt_ltk_req(const uint8_t rand[8], uint16_t ediv)
+void ll_hci_evt_ltk_req(uint16_t handle, const uint8_t rand[8], uint16_t ediv)
 {
 	uint8_t p[13];
 
 	p[0] = SUBEVT_LTK_REQ;
-	ll_put_le16(&p[1], LL_CONN_HANDLE);
+	ll_put_le16(&p[1], handle);
 	memcpy(&p[3], rand, 8);
 	ll_put_le16(&p[11], ediv);
 	send_le_evt(p, sizeof(p));
 }
 
-void ll_hci_evt_enc_change(uint8_t status, bool enabled)
+void ll_hci_evt_enc_change(uint16_t handle, uint8_t status, bool enabled)
 {
 	uint8_t p[4];
 
@@ -389,18 +389,18 @@ void ll_hci_evt_enc_change(uint8_t status, bool enabled)
 		return;
 	}
 	p[0] = status;
-	ll_put_le16(&p[1], LL_CONN_HANDLE);
+	ll_put_le16(&p[1], handle);
 	p[3] = enabled ? 0x01 : 0x00; /* 0x01: on, AES-CCM for LE */
 	send_evt(EVT_ENC_CHANGE, p, sizeof(p));
 }
 
-void ll_hci_evt_conn_update(const struct ll_conn_params *prm)
+void ll_hci_evt_conn_update(uint16_t handle, const struct ll_conn_params *prm)
 {
 	uint8_t p[10];
 
 	p[0] = SUBEVT_CONN_UPDATE;
 	p[1] = LL_ST_SUCCESS;
-	ll_put_le16(&p[2], LL_CONN_HANDLE);
+	ll_put_le16(&p[2], handle);
 	ll_put_le16(&p[4], prm->interval);
 	ll_put_le16(&p[6], prm->latency);
 	ll_put_le16(&p[8], prm->timeout);
@@ -419,13 +419,14 @@ int ll_hci_acl_from_host(const uint8_t *acl, uint16_t len, struct ll_hci_acl_pdu
 	}
 	hf = ll_get_le16(acl);
 	dlen = ll_get_le16(&acl[2]);
+	out->handle = hf & 0x0FFF;
 	pb = (hf >> 12) & 0x3;
 	bc = (hf >> 14) & 0x3;
 	if (dlen != len - 4 || dlen == 0 || dlen > LL_DATA_PDU_MAX || bc != 0 ||
 	    (pb != ACL_PB_FIRST_NONFLUSH && pb != ACL_PB_CONT && pb != ACL_PB_FIRST_FLUSH)) {
 		return -EINVAL;
 	}
-	if ((hf & 0x0FFF) != LL_CONN_HANDLE) {
+	if (!hci_ops->handle_valid(out->handle)) {
 		return -ENOTCONN;
 	}
 	out->llid = pb == ACL_PB_CONT ? LL_LLID_CONT : LL_LLID_START;
@@ -434,7 +435,8 @@ int ll_hci_acl_from_host(const uint8_t *acl, uint16_t len, struct ll_hci_acl_pdu
 	return 0;
 }
 
-uint16_t ll_hci_acl_to_host(uint8_t *out, uint8_t llid, const uint8_t *payload, uint8_t len)
+uint16_t ll_hci_acl_to_host(uint8_t *out, uint16_t handle, uint8_t llid, const uint8_t *payload,
+			    uint8_t len)
 {
 	uint8_t pb;
 
@@ -449,7 +451,7 @@ uint16_t ll_hci_acl_to_host(uint8_t *out, uint8_t llid, const uint8_t *payload, 
 		return 0;
 	}
 	out[0] = 0x02;               /* H4: ACL data */
-	ll_put_le16(&out[1], (uint16_t)(LL_CONN_HANDLE | (pb << 12)));
+	ll_put_le16(&out[1], (uint16_t)((handle & 0x0FFF) | (pb << 12)));
 	ll_put_le16(&out[3], len);
 	memcpy(&out[5], payload, len);
 	return (uint16_t)(5 + len);

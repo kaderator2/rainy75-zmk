@@ -73,17 +73,23 @@ void ll_radio_quiesce(void);
  * tests). Peripheral role, 1M PHY. One radio: the links' connection events
  * and advertising events take turns (slice 6a, ml-spike-report). ---- */
 /* One-time connection-mode setup (TX ring base, empty base PDU,
- * reset_sn_nesn); idempotent, call before the first connection event ever.
- * Replaces the one-time part of the former ll_radio_conn_setup(). Called
- * at every connection start (CONNECT_IND RX ISR, radio idle) so that it
- * also covers a baseband reset by ll_radio_adv_restore(). ISR or thread. */
+ * reset_sn_nesn, FSM off, guard streak and RX ring position reset);
+ * idempotent, call before the first connection event ever. Replaces the
+ * one-time part of the former ll_radio_conn_setup(). Called at every
+ * connection start (CONNECT_IND RX ISR) so that it also covers a baseband
+ * reset by ll_radio_adv_restore(): the setup runs once after boot and after
+ * each restore, every other call returns without touching the radio, so
+ * starting link N never disturbs an open event or another link's state.
+ * ISR or thread. */
 void ll_radio_conn_init(void);
 /* Per event, register writes only (about 8 us, S2/S3): the access address
  * and CRC init of the link that owns the next BRX, plus the connection
  * values of the registers an advertising event changes (ll_ctrl_1 with
  * first-RX timeout, keeping the SN/NESN init bits ll_txq programs; TX
  * timestamps; TX DMA source = ring base; RX maxlen; IRQ mask; mode). Call
- * before ll_txq_event_start() and ll_radio_conn_event() of the event. ISR. */
+ * before ll_txq_event_start() and ll_radio_conn_event() of the event. ISR:
+ * stimer ISR context only; it must not be preempted by the RF ISR (no
+ * event may be open, and the RF IRQ must not see half-written registers). */
 void ll_radio_conn_select(uint32_t aa, uint32_t crc_init);
 /* Advertising event after connection events (ml-spike-report S3): set
  * wptr = rptr (empty ring, else stx2rx wedges the FSM in 0x03), then the
@@ -104,7 +110,8 @@ void ll_radio_adv_enter(void);
 void ll_radio_conn_event(uint8_t ch, uint32_t open_tick, uint32_t first_timeout_us,
 			 uint32_t max_event_us);
 /* Consecutive guard-ended connection events that received no CRC-valid
- * packet: the radio-wedge indicator (the glue ends the link at 3). A guard
+ * packet: the radio-wedge indicator, counted on the shared radio over all
+ * links (the glue ends every active link with 0x08 at 3). A guard
  * that cut a long MD burst (packets received) is a healthy event and resets
  * the streak to 0, as does any event that ended with a radio IRQ and a new
  * connection. ISR context. */

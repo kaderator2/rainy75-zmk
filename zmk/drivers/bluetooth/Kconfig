@@ -49,7 +49,9 @@ config BT_HCI_B91_OPENLL_MAX_CONN
 	help
 	  Number of simultaneous peripheral links the open link layer keeps
 	  (link ids and HCI connection handles 0..N-1). Multilink is being
-	  built up in slice 6a; until it is complete only 1 is supported.
+	  built up in slice 6a: ll_conn, HCI and the glue are per link, but
+	  the links share the main alarm without an arbiter and advertising
+	  stays off while any link exists, so use 1 until slice 6a is done.
 
 config BT_HCI_B91_OPENLL_STATS_LOG
 	bool "Open link layer: periodic radio/connection stats log"

@@ -23,15 +23,26 @@ static uint8_t enable(bool e) { enable_arg = e; return 0; }
 static void unknown(uint16_t op) { unknown_calls++; unknown_op = op; }
 static int disc_calls, ltk_calls, neg_calls;
 static uint8_t disc_reason, got_ltk[16];
-static uint8_t disconnect(uint8_t r) { disc_calls++; disc_reason = r; return next_status; }
-static uint8_t ltk_reply(const uint8_t ltk[16]) { ltk_calls++; memcpy(got_ltk, ltk, 16); return next_status; }
-static uint8_t ltk_neg(void) { neg_calls++; return next_status; }
+static uint16_t got_handle = 0xFFFF;
+/* handles the fake controller reports as active links (bit per handle) */
+static uint32_t valid_mask = 0x1;
+static uint8_t disconnect(uint16_t h, uint8_t r)
+{
+	disc_calls++; disc_reason = r; got_handle = h; return next_status;
+}
+static uint8_t ltk_reply(uint16_t h, const uint8_t ltk[16])
+{
+	ltk_calls++; memcpy(got_ltk, ltk, 16); got_handle = h; return next_status;
+}
+static uint8_t ltk_neg(uint16_t h) { neg_calls++; got_handle = h; return next_status; }
+static bool handle_valid(uint16_t h) { return h < 32 && ((valid_mask >> h) & 1u); }
 
 static const struct ll_hci_ops ops = {
 	.get_bd_addr = get_addr, .rand = rnd, .reset = reset,
 	.adv_set_params = set_params, .adv_set_data = set_data,
 	.adv_set_scan_rsp = set_data, .adv_enable = enable, .unknown = unknown,
 	.disconnect = disconnect, .ltk_reply = ltk_reply, .ltk_neg_reply = ltk_neg,
+	.handle_valid = handle_valid,
 };
 
 static void cmd(uint16_t op, const uint8_t *p, uint8_t plen)
@@ -157,7 +168,7 @@ static void test_events(void)
 	ci.init_addr_random = 1;
 	ci.interval = 0x000C; ci.latency = 0x001E; ci.timeout = 0x0190; ci.sca = 5;
 	evt_len = 0;
-	ll_hci_evt_conn_complete(&ci);
+	ll_hci_evt_conn_complete(0, &ci);
 	static const uint8_t cc[] = {0x04, 0x3E, 19, 0x01, 0x00, 0x00, 0x00, 0x01, 0x01,
 				     0x10, 0x11, 0x12, 0x13, 0x14, 0x15,
 				     0x0C, 0x00, 0x1E, 0x00, 0x90, 0x01, 0x05};
@@ -165,40 +176,40 @@ static void test_events(void)
 
 	/* Disconnection Complete */
 	evt_len = 0;
-	ll_hci_evt_disconn_complete(0x13);
+	ll_hci_evt_disconn_complete(0, 0x13);
 	static const uint8_t dc[] = {0x04, 0x05, 4, 0x00, 0x00, 0x00, 0x13};
 	CHECK(evt_len == sizeof(dc) && memcmp(evt, dc, sizeof(dc)) == 0);
 
 	/* Number Of Completed Packets */
 	evt_len = 0;
-	ll_hci_evt_num_completed(3);
+	ll_hci_evt_num_completed(0, 3);
 	static const uint8_t nc[] = {0x04, 0x13, 5, 0x01, 0x00, 0x00, 0x03, 0x00};
 	CHECK(evt_len == sizeof(nc) && memcmp(evt, nc, sizeof(nc)) == 0);
 	evt_len = 0;
-	ll_hci_evt_num_completed(0);
+	ll_hci_evt_num_completed(0, 0);
 	CHECK(evt_len == 0);    /* nothing to report */
 
 	/* LE Long Term Key Request */
 	static const uint8_t rnd8[8] = {0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7};
 	evt_len = 0;
-	ll_hci_evt_ltk_req(rnd8, 0x1234);
+	ll_hci_evt_ltk_req(0, rnd8, 0x1234);
 	static const uint8_t lr[] = {0x04, 0x3E, 13, 0x05, 0x00, 0x00,
 				     0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7, 0x34, 0x12};
 	CHECK(evt_len == sizeof(lr) && memcmp(evt, lr, sizeof(lr)) == 0);
 
 	/* Encryption Change */
 	evt_len = 0;
-	ll_hci_evt_enc_change(LL_ST_SUCCESS, true);
+	ll_hci_evt_enc_change(0, LL_ST_SUCCESS, true);
 	static const uint8_t ec[] = {0x04, 0x08, 4, 0x00, 0x00, 0x00, 0x01};
 	CHECK(evt_len == sizeof(ec) && memcmp(evt, ec, sizeof(ec)) == 0);
 	evt_len = 0;
-	ll_hci_evt_enc_change(LL_ST_MIC_FAILURE, false);
+	ll_hci_evt_enc_change(0, LL_ST_MIC_FAILURE, false);
 	CHECK(evt_len == 7 && evt[3] == LL_ST_MIC_FAILURE && evt[6] == 0x00);
 
 	/* LE Connection Update Complete */
 	struct ll_conn_params p = {.interval = 6, .latency = 30, .timeout = 300};
 	evt_len = 0;
-	ll_hci_evt_conn_update(&p);
+	ll_hci_evt_conn_update(0, &p);
 	static const uint8_t cu[] = {0x04, 0x3E, 10, 0x03, 0x00, 0x00, 0x00,
 				     0x06, 0x00, 0x1E, 0x00, 0x2C, 0x01};
 	CHECK(evt_len == sizeof(cu) && memcmp(evt, cu, sizeof(cu)) == 0);
@@ -217,13 +228,13 @@ static void test_event_masks(void)
 	 * (LE Meta, bit 61, is off), LE event mask 0x1F */
 	cmd(0x0C03, NULL, 0);
 	evt_len = 0;
-	ll_hci_evt_conn_complete(&ci);
+	ll_hci_evt_conn_complete(0, &ci);
 	CHECK(evt_len == 0);
 	evt_len = 0;
-	ll_hci_evt_disconn_complete(0x08);
+	ll_hci_evt_disconn_complete(0, 0x08);
 	CHECK(evt_len == 7);
 	evt_len = 0;
-	ll_hci_evt_enc_change(0, true);
+	ll_hci_evt_enc_change(0, 0, true);
 	CHECK(evt_len == 7);
 
 	/* Zephyr-like mask: LE Meta on, Disconnection Complete off */
@@ -233,16 +244,16 @@ static void test_event_masks(void)
 	cmd(0x0C01, m, 8);
 	CHECK(is_cc(0x0C01, LL_ST_SUCCESS));
 	evt_len = 0;
-	ll_hci_evt_disconn_complete(0x08);
+	ll_hci_evt_disconn_complete(0, 0x08);
 	CHECK(evt_len == 0);
 	evt_len = 0;
-	ll_hci_evt_enc_change(0, true);
+	ll_hci_evt_enc_change(0, 0, true);
 	CHECK(evt_len == 7);
 	evt_len = 0;
-	ll_hci_evt_conn_complete(&ci);     /* LE default mask has bit 0 */
+	ll_hci_evt_conn_complete(0, &ci);     /* LE default mask has bit 0 */
 	CHECK(evt_len == 22);
 	evt_len = 0;
-	ll_hci_evt_num_completed(1);       /* not maskable */
+	ll_hci_evt_num_completed(0, 1);       /* not maskable */
 	CHECK(evt_len == 8);
 
 	/* LE mask: only LTK Request (bit 4) */
@@ -250,21 +261,21 @@ static void test_event_masks(void)
 	m[0] = 0x10;
 	cmd(0x2001, m, 8);
 	evt_len = 0;
-	ll_hci_evt_conn_complete(&ci);
+	ll_hci_evt_conn_complete(0, &ci);
 	CHECK(evt_len == 0);
 	evt_len = 0;
-	ll_hci_evt_conn_update(&p);
+	ll_hci_evt_conn_update(0, &p);
 	CHECK(evt_len == 0);
 	evt_len = 0;
-	ll_hci_evt_ltk_req(rnd8, 0);
+	ll_hci_evt_ltk_req(0, rnd8, 0);
 	CHECK(evt_len == 16);
 	m[0] = 0x05;                       /* Conn Complete + Conn Update Complete */
 	cmd(0x2001, m, 8);
 	evt_len = 0;
-	ll_hci_evt_conn_update(&p);
+	ll_hci_evt_conn_update(0, &p);
 	CHECK(evt_len == 13);
 	evt_len = 0;
-	ll_hci_evt_ltk_req(rnd8, 0);
+	ll_hci_evt_ltk_req(0, rnd8, 0);
 	CHECK(evt_len == 0);
 
 	all_events_on();
@@ -308,7 +319,8 @@ static void test_acl(void)
 	a[3] = 1;                          /* 16-bit length 0x0105 */
 	CHECK(ll_hci_acl_from_host(a, 4 + 5, &pdu) == -EINVAL);
 	a[3] = 0;
-	/* other handle */
+	CHECK(pdu.handle == 0);
+	/* other handle (not an active link) */
 	a[0] = 0x01;
 	CHECK(ll_hci_acl_from_host(a, 4 + 5, &pdu) == -ENOTCONN);
 	a[0] = 0x00; a[1] = 0x01;          /* handle 0x100 */
@@ -318,19 +330,116 @@ static void test_acl(void)
 	uint8_t out[LL_HCI_ACL_MAX];
 	static const uint8_t pl[3] = {0x07, 0x00, 0x04};
 	memset(out, 0xEE, sizeof(out));
-	CHECK(ll_hci_acl_to_host(out, LL_LLID_START, pl, 3) == 8);
+	CHECK(ll_hci_acl_to_host(out, 0, LL_LLID_START, pl, 3) == 8);
 	static const uint8_t st[] = {0x02, 0x00, 0x20, 0x03, 0x00, 0x07, 0x00, 0x04};
 	CHECK(memcmp(out, st, sizeof(st)) == 0);
-	CHECK(ll_hci_acl_to_host(out, LL_LLID_CONT, pl, 3) == 8);
+	CHECK(ll_hci_acl_to_host(out, 0, LL_LLID_CONT, pl, 3) == 8);
 	CHECK(out[2] == 0x10);
 	uint8_t big[27] = {0};
-	CHECK(ll_hci_acl_to_host(out, LL_LLID_START, big, 27) == LL_HCI_ACL_MAX);
+	CHECK(ll_hci_acl_to_host(out, 0, LL_LLID_START, big, 27) == LL_HCI_ACL_MAX);
 	CHECK(out[3] == 27 && out[4] == 0);
 	/* not ACL: control, reserved, empty, too long */
-	CHECK(ll_hci_acl_to_host(out, LL_LLID_CTRL, pl, 3) == 0);
-	CHECK(ll_hci_acl_to_host(out, 0, pl, 3) == 0);
-	CHECK(ll_hci_acl_to_host(out, LL_LLID_CONT, pl, 0) == 0);
-	CHECK(ll_hci_acl_to_host(out, LL_LLID_START, big, 28) == 0);
+	CHECK(ll_hci_acl_to_host(out, 0, LL_LLID_CTRL, pl, 3) == 0);
+	CHECK(ll_hci_acl_to_host(out, 0, 0, pl, 3) == 0);
+	CHECK(ll_hci_acl_to_host(out, 0, LL_LLID_CONT, pl, 0) == 0);
+	CHECK(ll_hci_acl_to_host(out, 0, LL_LLID_START, big, 28) == 0);
+}
+
+/* Slice 6a: handle == link id; commands reach the given handle, events and
+ * ACL carry it, handles that are not an active link are refused. */
+static void test_handles(void)
+{
+	const uint16_t n = LL_MAX_CONN;
+	const uint16_t last = n - 1;
+	uint8_t d[3] = {0x00, 0x00, 0x13};
+	uint8_t r[18] = {0};
+	uint8_t h[2] = {0};
+	struct ll_hci_acl_pdu pdu;
+	uint8_t a[4 + 5] = {0x00, 0x00, 5, 0, 1, 2, 3, 4, 5};
+	uint8_t out[LL_HCI_ACL_MAX];
+	static const uint8_t pl[3] = {0x07, 0x00, 0x04};
+
+	all_events_on();
+	valid_mask = (1u << n) - 1u;
+	next_status = LL_ST_SUCCESS;
+
+	/* Disconnect on the last handle (handle 2 with N = 3) reaches it */
+	disc_calls = 0;
+	ll_put_le16(d, last);
+	cmd(0x0406, d, 3);
+	CHECK(is_cs(0x0406, LL_ST_SUCCESS) && disc_calls == 1 && got_handle == last);
+	/* the first handle past the links, and an inactive link */
+	ll_put_le16(d, n);
+	cmd(0x0406, d, 3);
+	CHECK(is_cs(0x0406, LL_ST_UNKNOWN_CONN_ID) && disc_calls == 1);
+	valid_mask &= ~(1u << last);
+	ll_put_le16(d, last);
+	cmd(0x0406, d, 3);
+	CHECK(is_cs(0x0406, LL_ST_UNKNOWN_CONN_ID) && disc_calls == 1);
+	valid_mask |= 1u << last;
+
+	/* LTK reply / negative reply on each handle */
+	for (uint16_t k = 0; k < n; k++) {
+		ll_put_le16(r, k);
+		ltk_calls = 0;
+		cmd(0x201A, r, 18);
+		CHECK(is_cc(0x201A, LL_ST_SUCCESS) && ll_get_le16(&evt[7]) == k);
+		CHECK(ltk_calls == 1 && got_handle == k);
+		ll_put_le16(h, k);
+		neg_calls = 0;
+		cmd(0x201B, h, 2);
+		CHECK(is_cc(0x201B, LL_ST_SUCCESS) && ll_get_le16(&evt[7]) == k);
+		CHECK(neg_calls == 1 && got_handle == k);
+	}
+	ll_put_le16(r, n);
+	ltk_calls = 0;
+	cmd(0x201A, r, 18);
+	CHECK(is_cc(0x201A, LL_ST_UNKNOWN_CONN_ID) && ltk_calls == 0);
+
+	/* events carry the handle */
+	{
+		struct ll_connect_ind ci;
+		struct ll_conn_params p = {.interval = 6, .latency = 30, .timeout = 300};
+		static const uint8_t rnd8[8] = {0};
+
+		memset(&ci, 0, sizeof(ci));
+		ll_hci_evt_conn_complete(last, &ci);
+		CHECK(evt_len == 22 && evt[3] == 0x01 && ll_get_le16(&evt[5]) == last);
+		ll_hci_evt_disconn_complete(last, 0x13);
+		CHECK(evt_len == 7 && ll_get_le16(&evt[4]) == last && evt[6] == 0x13);
+		ll_hci_evt_num_completed(last, 2);
+		CHECK(evt_len == 8 && evt[3] == 1 && ll_get_le16(&evt[4]) == last &&
+		      ll_get_le16(&evt[6]) == 2);
+		ll_hci_evt_ltk_req(last, rnd8, 0x1234);
+		CHECK(evt_len == 16 && evt[3] == 0x05 && ll_get_le16(&evt[4]) == last);
+		ll_hci_evt_enc_change(last, LL_ST_SUCCESS, true);
+		CHECK(evt_len == 7 && ll_get_le16(&evt[4]) == last && evt[6] == 0x01);
+		ll_hci_evt_conn_update(last, &p);
+		CHECK(evt_len == 13 && evt[3] == 0x03 && ll_get_le16(&evt[5]) == last);
+	}
+
+	/* ACL: host -> LL keeps the handle; an invalid one is -ENOTCONN */
+	for (uint16_t k = 0; k < n; k++) {
+		a[0] = (uint8_t)k;
+		memset(&pdu, 0xEE, sizeof(pdu));
+		CHECK(ll_hci_acl_from_host(a, sizeof(a), &pdu) == 0 && pdu.handle == k);
+	}
+	a[0] = (uint8_t)n;
+	CHECK(ll_hci_acl_from_host(a, sizeof(a), &pdu) == -ENOTCONN && pdu.handle == n);
+	valid_mask &= ~(1u << last);
+	a[0] = (uint8_t)last;
+	CHECK(ll_hci_acl_from_host(a, sizeof(a), &pdu) == -ENOTCONN && pdu.handle == last);
+	/* -EINVAL still reports the handle (credit back) */
+	a[1] = 0x30;
+	CHECK(ll_hci_acl_from_host(a, sizeof(a), &pdu) == -EINVAL && pdu.handle == last);
+	a[1] = 0x00;
+	valid_mask = 0x1;
+
+	/* LL -> host on the last handle */
+	CHECK(ll_hci_acl_to_host(out, last, LL_LLID_START, pl, 3) == 8);
+	CHECK(out[0] == 0x02 && ll_get_le16(&out[1]) == (uint16_t)(last | 0x2000));
+	CHECK(ll_hci_acl_to_host(out, last, LL_LLID_CONT, pl, 3) == 8);
+	CHECK(ll_get_le16(&out[1]) == (uint16_t)(last | 0x1000));
 }
 
 int main(void)
@@ -469,6 +578,7 @@ int main(void)
 	test_events();
 	test_event_masks();
 	test_acl();
+	test_handles();
 
 	DONE();
 }

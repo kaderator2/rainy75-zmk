@@ -2,10 +2,22 @@
  * Copyright (c) 2026 scholzri
  * SPDX-License-Identifier: Apache-2.0
  *
- * Connection state (peripheral, one connection): transmit window, window
- * widening, anchor re-sync, CSA#1, event counter, instants, supervision
- * timeout, termination. Drives the radio via ll_radio.h, the alarm via
- * ll_sched.h, and calls the ll_txq / ll_rxq per-event hooks.
+ * Connection state (peripheral, LL_MAX_CONN links, slice 6a): transmit
+ * window, window widening, anchor re-sync, CSA#1, event counter, instants,
+ * supervision timeout, termination, per link. Drives the radio via
+ * ll_radio.h, the alarm via ll_sched.h, and calls the ll_txq / ll_rxq
+ * per-event hooks of the link that owns the event.
+ *
+ * Link ids: uint8_t link, 0 <= link < LL_MAX_CONN (== the HCI connection
+ * handle). A link is free, active, or ended and awaiting
+ * ll_conn_release() (the consumer thread resets the link's ll_rxq and
+ * ll_llcp state first). Calls with an id out of range or of a link that is
+ * not active do nothing (or return LL_ST_DISALLOWED / false / 0).
+ *
+ * Until the arbiter (slice 6a Task 5) the alarm is shared directly: the
+ * main alarm (ll_sched_at) is armed for the earliest planned event of all
+ * links; when it fires while another link's event is on air, the event is
+ * skipped and counted in that link's stats.collisions.
  *
  * Timing uses stimer ticks only (LL_TICKS_PER_US). Window widening above
  * connInterval / 2 - T_IFS is clamped; the supervision timeout then ends
@@ -15,8 +27,8 @@
  * the next one is planned up to connPeripheralLatency events ahead (the
  * latency from CONNECT_IND or the last applied connection update) when all
  * of these hold, else the next event is listened to:
- *  - ll_txq_backlog() == 0 (nothing queued, nothing unacked);
- *  - ops.busy() is false (no LLCP procedure waiting) and no local
+ *  - ll_txq_backlog(link) == 0 (nothing queued, nothing unacked);
+ *  - ops.busy(link) is false (no LLCP procedure waiting) and no local
  *    termination is running;
  *  - no channel map / connection update instant is pending in the
  *    candidate window [next, next + latency] (the instant event is always
@@ -90,8 +102,9 @@ enum ll_conn_evt {
 
 /* ISR context (radio/stimer path), or thread context with ll_plat_lock()
  * held when the event results from a thread call (ll_conn_start,
- * ll_conn_end, ll_conn_update_at/chmap_at with an instant in the past). */
-typedef void (*ll_conn_evt_cb_t)(enum ll_conn_evt what, const void *arg);
+ * ll_conn_end, ll_conn_update_at/chmap_at with an instant in the past).
+ * link: the link the event belongs to. */
+typedef void (*ll_conn_evt_cb_t)(uint8_t link, enum ll_conn_evt what, const void *arg);
 
 struct ll_conn_ops {
 	ll_conn_evt_cb_t evt;
@@ -105,30 +118,36 @@ struct ll_conn_ops {
 	 * pushes the plaintext PDU itself (fine while unencrypted). The glue's
 	 * hook (ll_llcp_ctrl_tx) also takes the ll_plat_tx_lock() mutex, so it
 	 * may block: never call it from an ISR or with ll_plat_lock() held. */
-	int (*ctrl_tx)(const uint8_t *payload, uint8_t len);
+	int (*ctrl_tx)(uint8_t link, const uint8_t *payload, uint8_t len);
 	/* Peripheral latency: true while an LL control procedure waits on us
 	 * or on the central (encryption start, a response not queued yet).
 	 * Called from ISR context when the next event is planned, so it must
 	 * not block or take ll_plat_tx_lock(); reading a flag is enough (a
 	 * stale answer costs at most one skip window, the response itself
 	 * kicks via ll_conn_kick()). NULL: never busy. */
-	bool (*busy)(void);
+	bool (*busy)(uint8_t link);
 };
 
-/* ops is copied; also ll_txq_init() (completions go to ops->txq_done). */
+/* ops is copied; also ll_txq_init() (completions go to ops->txq_done).
+ * Frees every link; the stats stay cumulative. */
 void ll_conn_init(const struct ll_conn_ops *ops);
-/* Start following a connection: ll_radio_conn_init(), ll_txq_reset(0),
- * plan the first event in the transmit window, report
+/* Start following a connection on the lowest free link:
+ * ll_radio_conn_init() (one-time radio setup, a no-op while it is done),
+ * ll_txq_reset(link), plan the first event in the transmit window, report
  * LL_CONN_EVT_CONNECTED. ll_rxq is NOT reset here (ISR context, the
  * consumer thread may be inside ll_rxq_get()): the owner of the consumer
- * thread resets it when it handles LL_CONN_EVT_DISCONNECTED, before
- * advertising can be enabled again (boot state is reset already). connect_ind_end_tick = end of the CONNECT_IND
- * packet (LL_RADIO_RX_OK end_tick); the caller has stopped advertising.
- * Returns 0, or -EINVAL for unusable parameters (nothing started, the
- * caller keeps advertising) or -EBUSY (a connection is active). ISR. */
+ * thread resets the link's ll_rxq / ll_llcp when it handles
+ * LL_CONN_EVT_DISCONNECTED and then calls ll_conn_release(), and only then
+ * is the id free again (boot state is reset already).
+ * connect_ind_end_tick = end of the CONNECT_IND packet (LL_RADIO_RX_OK
+ * end_tick); the caller has stopped advertising. Returns the new link id
+ * (>= 0), or -EINVAL for unusable parameters (nothing started, the caller
+ * keeps advertising) or -EBUSY (no free link; checked first). ISR. */
 int ll_conn_start(const struct ll_connect_ind *ci, uint32_t connect_ind_end_tick);
 /* Radio callback in connection mode (same signature as ll_radio_cb_t). ISR.
- * Handles LL_RADIO_CONN_RX / LL_RADIO_CONN_DONE, ignores the rest. */
+ * Handles LL_RADIO_CONN_RX / _RX_CRC_ERR / _RX_NODATA / _DONE for the link
+ * whose event is on air (the owner recorded when the BRX was issued),
+ * ignores the rest and everything while no event is on air. */
 void ll_conn_radio_evt(enum ll_radio_evt evt, const uint8_t *pdu, uint8_t len, uint32_t tick);
 /* Schedule LL_CONNECTION_UPDATE_IND / LL_CHANNEL_MAP_IND parameters for the
  * event with counter == instant. Return 0, or LL_ST_INSTANT_PASSED when
@@ -140,19 +159,25 @@ void ll_conn_radio_evt(enum ll_radio_evt evt, const uint8_t *pdu, uint8_t len, u
  * <= interval) and returns LL_ST_INVALID_LL_PARAM for invalid ones without
  * changing anything (the caller, ll_llcp, decides how to end the link).
  * Thread. */
-int ll_conn_update_at(uint16_t instant, uint8_t win_size, uint16_t win_offset,
+int ll_conn_update_at(uint8_t link, uint16_t instant, uint8_t win_size, uint16_t win_offset,
 		      const struct ll_conn_params *p);
-int ll_conn_chmap_at(uint16_t instant, const uint8_t chm[5]);
+int ll_conn_chmap_at(uint8_t link, uint16_t instant, const uint8_t chm[5]);
 /* Local termination (HCI Disconnect via ll_llcp): queue LL_TERMINATE_IND
  * with reason (via ops.ctrl_tx), then end with LL_ST_LOCAL_TERM once it is
  * acked, or after connSupervisionTimeout without ack. Thread. */
-void ll_conn_terminate(uint8_t reason);
+void ll_conn_terminate(uint8_t link, uint8_t reason);
 /* Immediate end with an HCI reason, no PDU sent: remote LL_TERMINATE_IND
  * (reason from the PDU; our response in the receiving event already acked
  * it), MIC failure (0x3D), LLCP response timeout (0x22). Deferred to the
  * end of the current event if one is on air. Thread or ISR. */
-void ll_conn_end(uint8_t reason);
-bool ll_conn_active(void);
+void ll_conn_end(uint8_t link, uint8_t reason);
+bool ll_conn_active(uint8_t link);
+/* Links not free (active, or ended and awaiting ll_conn_release()). */
+uint8_t ll_conn_count(void);
+/* Thread: the consumer has reset the link's rxq and llcp after
+ * LL_CONN_EVT_DISCONNECTED; the id may be reused. No-op for a link that is
+ * not awaiting release. Takes ll_plat_lock(). */
+void ll_conn_release(uint8_t link);
 /* Counter of the next connection event not yet completed (the one on air,
  * if any). Instants are relative to this. While a latency skip is planned
  * this is the first skipped event (conservative: an instant for a skipped
@@ -162,7 +187,7 @@ bool ll_conn_active(void);
  * event, so an instant for an earlier event is treated as passed (0x28); a
  * conforming central never sends one (the instant is >= 6 events after the
  * PDU, which arrives in a listened event). */
-uint16_t ll_conn_event_counter(void);
+uint16_t ll_conn_event_counter(uint8_t link);
 /* New TX data was queued (call after a successful ll_txq_push; the
  * ll_plat_lock() it takes nests, so the caller may hold it): if the planned
  * event lies beyond the next regular event that can still be prepared
@@ -173,7 +198,7 @@ uint16_t ll_conn_event_counter(void);
  * ll_conn_event_counter), and no skip is planned while an instant is
  * pending within the latency window, so a kick never waits for an instant.
  * ISR-safe; takes ll_plat_lock(). */
-void ll_conn_kick(void);
+void ll_conn_kick(uint8_t link);
 
 struct ll_conn_stats {
 	uint32_t events;      /* events issued to the radio */
@@ -197,8 +222,13 @@ struct ll_conn_stats {
 	uint32_t listened;
 	uint32_t skipped;
 	uint32_t kicks;
+	/* Slice 6a: events not issued because another link's event was on
+	 * air when the alarm fired (counted neither in listened nor missed;
+	 * planned - listened includes them). */
+	uint32_t collisions;
 };
-/* Cumulative since boot. */
-void ll_conn_get_stats(struct ll_conn_stats *s);
+/* Per link, cumulative since boot (not reset per connection). Out-of-range
+ * link: all zero. */
+void ll_conn_get_stats(uint8_t link, struct ll_conn_stats *s);
 
 #endif /* LL_CONN_H_ */

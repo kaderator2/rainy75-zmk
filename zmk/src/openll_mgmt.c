@@ -7,7 +7,7 @@
  *                       "skip": uint, "kick": uint, "ev": uint, "miss": uint,
  *                       "wake": uint, "mv": uint (battery, 0 if unavailable)}
  *   All counters are cumulative since boot and uint32 (wrap after 49 days).
- *   plan/listen/skip/kick/ev/miss come from ll_conn_get_stats (ev = events
+ *   plan/listen/skip/kick/ev/miss come from ll_conn_get_stats of link 0 (ev = events
  *   issued to the radio, miss = events without any CRC-valid packet plus
  *   late alarms), wake counts controller-thread passes. With peripheral
  *   latency active and idle, skip grows much faster than listen.
@@ -84,7 +84,7 @@ static int openll_mgmt_stats(struct smp_streamer *ctxt)
 	zcbor_state_t *zse = ctxt->writer->zs;
 	struct ll_conn_stats s;
 
-	ll_conn_get_stats(&s);
+	ll_conn_get_stats(0, &s);   /* link 0 (per-link fields: slice 6a Task 6) */
 
 	bool ok = zcbor_tstr_put_lit(zse, "rc") && zcbor_int32_put(zse, 0) &&
 		  zcbor_tstr_put_lit(zse, "up") &&

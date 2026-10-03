@@ -100,63 +100,6 @@ static struct llcp_link {
 	uint32_t tmr_start;
 } links[LL_MAX_CONN];
 
-/* ll_conn entry points for one link. ll_conn follows a single connection
- * until slice 6a Task 4 gives its API the link id; until then only link 0
- * can be connected (Kconfig MAX_CONN default 1) and another link acts as
- * "no connection". The host tests (LL_LLCP_HOST_CONN) provide link-aware
- * fakes of these instead. */
-#ifdef LL_LLCP_HOST_CONN
-int llcp_conn_update_at(uint8_t link, uint16_t instant, uint8_t win_size, uint16_t win_offset,
-			const struct ll_conn_params *p);
-int llcp_conn_chmap_at(uint8_t link, uint16_t instant, const uint8_t chm[5]);
-void llcp_conn_terminate(uint8_t link, uint8_t reason);
-void llcp_conn_end(uint8_t link, uint8_t reason);
-bool llcp_conn_active(uint8_t link);
-void llcp_conn_kick(uint8_t link);
-#else
-/* Temporary seam: these link-0 wrappers treat every link >= 1 as "no
- * connection", so a second link would never end on a procedure timeout or
- * LL_TERMINATE_IND. Replaced when ll_conn takes a link id (slice 6a Task 4). */
-_Static_assert(LL_MAX_CONN == 1, "link-0 LLCP wrappers support LL_MAX_CONN 1 only");
-
-static int llcp_conn_update_at(uint8_t link, uint16_t instant, uint8_t win_size,
-			       uint16_t win_offset, const struct ll_conn_params *p)
-{
-	return link == 0 ? ll_conn_update_at(instant, win_size, win_offset, p) : LL_ST_DISALLOWED;
-}
-
-static int llcp_conn_chmap_at(uint8_t link, uint16_t instant, const uint8_t chm[5])
-{
-	return link == 0 ? ll_conn_chmap_at(instant, chm) : LL_ST_DISALLOWED;
-}
-
-static void llcp_conn_terminate(uint8_t link, uint8_t reason)
-{
-	if (link == 0) {
-		ll_conn_terminate(reason);
-	}
-}
-
-static void llcp_conn_end(uint8_t link, uint8_t reason)
-{
-	if (link == 0) {
-		ll_conn_end(reason);
-	}
-}
-
-static bool llcp_conn_active(uint8_t link)
-{
-	return link == 0 && ll_conn_active();
-}
-
-static void llcp_conn_kick(uint8_t link)
-{
-	if (link == 0) {
-		ll_conn_kick();
-	}
-}
-#endif
-
 /* Caller holds ll_plat_tx_lock(); link < LL_MAX_CONN. */
 static int tx_locked(uint8_t link, enum ll_txq_kind kind, uint8_t llid, const uint8_t *payload,
 		     uint8_t len)
@@ -191,7 +134,7 @@ static int tx_locked(uint8_t link, enum ll_txq_kind kind, uint8_t llid, const ui
 	 * the planned (skipped-ahead) one. Outside the IRQ lock (it takes
 	 * ll_plat_lock() itself), after the push, so a plan racing with it
 	 * either sees the backlog or is re-planned here. */
-	llcp_conn_kick(link);
+	ll_conn_kick(link);
 	return 0;
 }
 
@@ -300,7 +243,7 @@ static void rx_enc_req(uint8_t link, const uint8_t *p)
 		return;
 	}
 	if (!sent) {
-		llcp_conn_end(link, LL_ST_UNSPECIFIED);
+		ll_conn_end(link, LL_ST_UNSPECIFIED);
 		return;
 	}
 	/* same thread as the ll_rxq consumer; enc_rx is still off */
@@ -372,7 +315,7 @@ static void rx_version_ind(uint8_t link)
 static void instant_result(uint8_t link, int r)
 {
 	if (r == LL_ST_INVALID_LL_PARAM) {
-		llcp_conn_end(link, LL_ST_INVALID_LL_PARAM);
+		ll_conn_end(link, LL_ST_INVALID_LL_PARAM);
 	}
 }
 
@@ -383,7 +326,7 @@ static void rx_conn_update(uint8_t link, const uint8_t *p)
 		.latency = ll_get_le16(&p[6]),
 		.timeout = ll_get_le16(&p[8]),
 	};
-	instant_result(link, llcp_conn_update_at(link, ll_get_le16(&p[10]), p[1],
+	instant_result(link, ll_conn_update_at(link, ll_get_le16(&p[10]), p[1],
 						 ll_get_le16(&p[2]), &cp));
 }
 
@@ -397,10 +340,10 @@ static void rx_channel_map(uint8_t link, const uint8_t *p)
 		used += (p[1 + ch / 8] >> (ch % 8)) & 1u;
 	}
 	if (used < 2) {
-		llcp_conn_end(link, LL_ST_INVALID_LL_PARAM);
+		ll_conn_end(link, LL_ST_INVALID_LL_PARAM);
 		return;
 	}
-	instant_result(link, llcp_conn_chmap_at(link, ll_get_le16(&p[6]), &p[1]));
+	instant_result(link, ll_conn_chmap_at(link, ll_get_le16(&p[6]), &p[1]));
 }
 
 /* length the request must have, 0 = not a request we answer by content */
@@ -471,7 +414,7 @@ void ll_llcp_rx(uint8_t link, const uint8_t *payload, uint8_t len)
 		rx_channel_map(link, payload);
 		break;
 	case OP_TERMINATE_IND:
-		llcp_conn_end(link, payload[1]);
+		ll_conn_end(link, payload[1]);
 		break;
 	case OP_ENC_REQ:
 		rx_enc_req(link, payload);
@@ -569,10 +512,10 @@ uint8_t ll_llcp_ltk_neg_reply(uint8_t link)
 
 uint8_t ll_llcp_terminate(uint8_t link, uint8_t reason)
 {
-	if (link >= LL_MAX_CONN || !llcp_conn_active(link)) {
+	if (link >= LL_MAX_CONN || !ll_conn_active(link)) {
 		return LL_ST_UNKNOWN_CONN_ID;
 	}
-	llcp_conn_terminate(link, reason);
+	ll_conn_terminate(link, reason);
 	return LL_ST_SUCCESS;
 }
 
@@ -595,7 +538,7 @@ void ll_llcp_tick(uint32_t now_tick)
 	ll_plat_tx_unlock();
 	for (uint8_t i = 0; i < LL_MAX_CONN; i++) {
 		if (expired[i]) {
-			llcp_conn_end(i, LL_ST_LMP_TIMEOUT);
+			ll_conn_end(i, LL_ST_LMP_TIMEOUT);
 		}
 	}
 }

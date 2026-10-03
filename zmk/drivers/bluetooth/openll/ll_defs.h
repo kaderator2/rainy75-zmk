@@ -54,8 +54,7 @@ _Static_assert(LL_MAX_CONN >= 1 && LL_MAX_CONN <= 5, "LL_MAX_CONN must be 1..5")
 #define LL_ADV_DATA_MAX   31
 #define LL_ADV_PDU_MAX    (2 + 6 + LL_ADV_DATA_MAX)
 
-/* Data channel PDUs (Vol 6 Part B 2.4), single connection, no DLE */
-#define LL_CONN_HANDLE    0x0000
+/* Data channel PDUs (Vol 6 Part B 2.4), no DLE */
 #define LL_DATA_PDU_MAX   27     /* payload bytes */
 #define LL_MIC_LEN        4
 #define LL_LLID_CONT      0x1    /* ACL continuation fragment or empty PDU */
