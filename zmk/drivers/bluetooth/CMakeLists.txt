@@ -17,6 +17,7 @@ if(CONFIG_BT_HCI_B91_CTLR_OPEN)
     openll/ll_sched.c
     openll/ll_arb.c
     openll/ll_csa1.c
+    openll/ll_csa2.c
     openll/ll_crypt.c
     openll/ll_txq.c
     openll/ll_rxq.c

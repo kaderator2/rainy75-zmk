@@ -38,6 +38,7 @@
 #define SUBEVT_CONN_COMPLETE     0x01
 #define SUBEVT_CONN_UPDATE       0x03
 #define SUBEVT_LTK_REQ           0x05
+#define SUBEVT_CHAN_SEL_ALGO     0x14
 
 /* Event mask bits (7.3.1) and defaults (7.3.1, 7.8.1) */
 #define MASK_DISCONN_COMPLETE    (1ULL << 4)
@@ -278,6 +279,7 @@ void ll_hci_cmd(const uint8_t *cmd, uint16_t len)
 	case OP_LE_READ_FEATURES:
 		memset(&ret[1], 0, 8);
 		ret[1] = LL_FEATURES_LOW;
+		ret[2] = LL_FEATURES_BYTE1;
 		cmd_complete(op, ret, 9);
 		break;
 	case OP_LE_RAND:
@@ -409,6 +411,16 @@ void ll_hci_evt_conn_update(uint16_t handle, const struct ll_conn_params *prm)
 	ll_put_le16(&p[6], prm->latency);
 	ll_put_le16(&p[8], prm->timeout);
 	send_le_evt(p, sizeof(p));
+}
+
+void ll_hci_evt_chan_sel_algo(uint16_t handle, uint8_t algo)
+{
+	uint8_t p[4];
+
+	p[0] = SUBEVT_CHAN_SEL_ALGO;
+	ll_put_le16(&p[1], handle);
+	p[3] = algo;
+	send_le_evt(p, sizeof(p));   /* LE event mask bit 19 */
 }
 
 /* ---- ACL framing ---- */

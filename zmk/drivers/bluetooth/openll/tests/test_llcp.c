@@ -337,8 +337,9 @@ static void single_link_suite(void)
 	fresh();
 	features(0xFF);
 	{
-		/* ours: LE Encryption (bit 0) + Extended Reject Indication (bit 2) */
-		static const uint8_t exp[9] = {0x09, 0x05, 0, 0, 0, 0, 0, 0, 0};
+		/* ours: LE Encryption (bit 0) + Extended Reject Indication (bit 2);
+		 * byte 1 is ours: CSA#2 (bit 14) */
+		static const uint8_t exp[9] = {0x09, 0x05, 0x40, 0, 0, 0, 0, 0, 0};
 
 		CHECK(LL_FEATURES_LOW == 0x05);
 		CHECK(tx.n == 1);
@@ -346,13 +347,13 @@ static void single_link_suite(void)
 	}
 	features(0x01);
 	{
-		static const uint8_t exp[9] = {0x09, 0x01, 0, 0, 0, 0, 0, 0, 0};
+		static const uint8_t exp[9] = {0x09, 0x01, 0x40, 0, 0, 0, 0, 0, 0};
 
 		CHECK(last_is(exp, 9));
 	}
 	features(0x00);
 	{
-		static const uint8_t exp[9] = {0x09, 0, 0, 0, 0, 0, 0, 0, 0};
+		static const uint8_t exp[9] = {0x09, 0, 0x40, 0, 0, 0, 0, 0, 0};
 
 		CHECK(tx.n == 3);
 		CHECK(last_is(exp, 9));

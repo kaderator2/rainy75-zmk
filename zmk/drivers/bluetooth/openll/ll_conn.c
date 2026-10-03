@@ -3,7 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * Connection state machine, peripheral role, LL_MAX_CONN links (slice 6a),
- * CSA#1, peripheral latency (rules in ll_conn.h). Core Spec Vol 6 Part B: 4.5.1 connection events,
+ * CSA#1 / CSA#2 (4.5.8.2 / 4.5.8.3, per link from the CONNECT_IND ChSel),
+ * peripheral latency (rules in ll_conn.h). Core Spec Vol 6 Part B: 4.5.1 connection events,
  * 4.5.2 supervision (6 events before the first packet), 4.5.3 transmit
  * window, 4.5.4 window widening, 4.5.5 connection setup, 5.1.1 connection
  * update, 5.1.2 channel map update, 5.1.3 termination.
@@ -62,6 +63,7 @@
 #include "ll_arb.h"
 #include "ll_conn.h"
 #include "ll_csa1.h"
+#include "ll_csa2.h"
 #include "ll_defs.h"
 #include "ll_plat.h"
 #include "ll_radio.h"
@@ -99,6 +101,12 @@ struct ll_link {
 	uint32_t sup_ticks;
 	uint16_t ppm;         /* central SCA + own */
 	uint32_t widen_max_us; /* interval / 2 - T_IFS (exceeds 16 bits) */
+	/* CSA#2 (4.5.8.3) when the CONNECT_IND has ChSel 1 (our ADV_IND
+	 * always has ChSel 1): the channel is a function of chan_id, the event
+	 * counter and the map, so skips, yields and re-plans need no stepping.
+	 * csa below is stepped for both algorithms; it holds the map in force. */
+	bool csa2;
+	uint16_t chan_id;
 	struct ll_csa1 csa;
 	/* CSA#1 state before the skipped events and the planned one; with
 	 * skip_n == 0 after a re-plan (replan_to): the state after the
@@ -285,6 +293,9 @@ static void plan_event(struct ll_link *c)
 	}
 	c->csa_evt = c->csa;
 	c->ch = ll_csa1_next(&c->csa);
+	if (c->csa2) {
+		c->ch = ll_csa2_channel(c->chan_id, c->counter, c->csa.chm);
+	}
 	c->open_tick = open_of(c, c->counter, &widen);
 	if (widen > ST(c)->widen_max_us) {
 		ST(c)->widen_max_us = widen;
@@ -833,6 +844,8 @@ int ll_conn_start(const struct ll_connect_ind *ci, uint32_t connect_ind_end_tick
 	link_clear(c->id);
 	c->ci = *ci;
 	c->csa = csa;
+	c->csa2 = ci->chsel != 0;
+	c->chan_id = ll_csa2_chan_id(ci->aa);
 	p.interval = ci->interval;
 	p.latency = ci->latency;
 	p.timeout = ci->timeout;

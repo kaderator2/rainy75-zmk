@@ -8,13 +8,20 @@
 
 #define HDR_TYPE(h)   ((h) & 0x0F)
 #define HDR_CHSEL(h)  (((h) >> 5) & 1)
+#define HDR_CHSEL_BIT 0x20
 #define HDR_TXADD(h)  (((h) >> 6) & 1)
 #define HDR_RXADD(h)  (((h) >> 7) & 1)
 
 uint8_t ll_pdu_build_adv(uint8_t *out, uint8_t pdu_type, const uint8_t adva[6],
 			 const uint8_t *data, uint8_t len)
 {
-	out[0] = pdu_type & 0x0F; /* ChSel 0, TxAdd 0: public AdvA */
+	/* TxAdd 0: public AdvA. ChSel 1 (CSA#2 supported, Vol 6 Part B
+	 * 2.3.1) in the connectable PDUs; RFU (0) in the others. A link uses
+	 * CSA#2 only when the CONNECT_IND has ChSel 1 too (4.5.8.1). */
+	out[0] = pdu_type & 0x0F;
+	if (out[0] == LL_PDU_ADV_IND || out[0] == LL_PDU_ADV_DIRECT_IND) {
+		out[0] |= HDR_CHSEL_BIT;
+	}
 	out[1] = 6 + len;
 	memcpy(&out[2], adva, 6);
 	if (len) {

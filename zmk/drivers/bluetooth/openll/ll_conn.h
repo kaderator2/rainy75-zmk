@@ -3,7 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * Connection state (peripheral, LL_MAX_CONN links, slice 6a): transmit
- * window, window widening, anchor re-sync, CSA#1, event counter, instants,
+ * window, window widening, anchor re-sync, CSA#1 or CSA#2 (CSA#2 when the
+ * CONNECT_IND has ChSel 1, ll_csa2.h), event counter, instants,
  * supervision timeout, termination, per link. Drives the radio via
  * ll_radio.h, requests its events from the arbiter (ll_arb.h), and calls
  * the ll_txq / ll_rxq

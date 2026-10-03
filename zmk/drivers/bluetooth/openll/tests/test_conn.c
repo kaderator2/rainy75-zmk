@@ -4,7 +4,7 @@
  *
  * ll_conn host tests with a fake radio (connection mode + a passive TX FIFO
  * whose rptr the test moves) and a fake one-shot alarm. The real ll_txq,
- * ll_rxq, ll_csa1 (and ll_crypt, linked by ll_rxq) are used.
+ * ll_rxq, ll_csa1, ll_csa2 (and ll_crypt, linked by ll_rxq) are used.
  *
  * Expected timing values are worked out by hand from the Core Spec Vol 6
  * Part B 4.5.3 (transmit window), 4.5.4 (window widening), 4.5.2/4.5.5
@@ -17,6 +17,7 @@
 #include "../ll_arb.h"
 #include "../ll_conn.h"
 #include "../ll_csa1.h"
+#include "../ll_csa2.h"
 #include "../ll_defs.h"
 #include "../ll_plat.h"
 #include "../ll_rxq.h"
@@ -2164,6 +2165,202 @@ static void test_instant_prio_after_wrap(void)
 	ll_conn_end(0, LL_ST_REMOTE_TERM);
 }
 
+/* ---------------- CSA#2 (Vol 6 Part B 4.5.8.3) ---------------- */
+
+/* the Core Spec sample data access address: channel identifier 0x305F */
+#define CSA2_AA    0x8E89BED6u
+#define CSA2_CHID  0x305F
+/* Vol 6 Part C 3.2: 9 used channels */
+static const uint8_t nine[5] = {0x00, 0x06, 0xE0, 0x00, 0x1E};
+
+static uint8_t csa2_ch(uint16_t chid, uint16_t counter, const uint8_t chm[5])
+{
+	return ll_csa2_channel(chid, counter, chm);
+}
+
+/* ChSel 1 in the CONNECT_IND: the link hops with CSA#2. With the sample
+ * data AA the first events give the published channels (Part C 3.1), and
+ * after a channel map update to the 9-channel map at instant 6 the
+ * published 3.2 channels for events 6, 7, 8. */
+static void test_csa2_sequence(void)
+{
+	struct ll_connect_ind ci = mk_ci(12, 400, 1, 1, 0);
+	uint32_t a = 5000000 + T(1250 + 100);
+	static const uint8_t exp[9] = {25, 20, 6, 21, 0, 0, 23, 9, 34};
+
+	ci.aa = CSA2_AA;
+	ci.chsel = 1;
+	reset_all(false);
+	CHECK(ll_conn_start(&ci, 5000000) == 0);
+	for (uint16_t k = 0; k < 9; k++) {
+		fire_alarm();
+		CHECK(ll_conn_event_counter(0) == k);
+		if (k == 4 || k == 5) {
+			CHECK(rad.ch == csa2_ch(CSA2_CHID, k, all37));
+		} else {
+			CHECK(rad.ch == exp[k]);
+		}
+		rx(a, 0x01, 0);
+		done(1);
+		if (k == 2) {
+			CHECK(ll_conn_chmap_at(0, 6, nine) == 0);
+		}
+		a += T(15000);
+	}
+	/* later events keep following CSA#2 on the new map */
+	for (uint16_t k = 9; k < 200; k++) {
+		fire_alarm();
+		CHECK(rad.ch == csa2_ch(CSA2_CHID, k, nine));
+		rx(a, 0x01, 0);
+		done(1);
+		a += T(15000);
+	}
+	ll_conn_end(0, LL_ST_REMOTE_TERM);
+}
+
+/* ChSel 0 (a central without CSA#2, or any link before this slice): the
+ * same access address still hops with CSA#1 (hop 7: 7, 14, 21, 28) */
+static void test_csa1_when_chsel0(void)
+{
+	struct ll_connect_ind ci = mk_ci(12, 400, 1, 1, 0);
+	uint32_t a = 5000000 + T(1250 + 100);
+	struct ll_csa1 ref;
+
+	ci.aa = CSA2_AA;
+	ci.chsel = 0;
+	reset_all(false);
+	ll_csa1_init(&ref, 7, all37);
+	CHECK(ll_conn_start(&ci, 5000000) == 0);
+	for (int k = 0; k < 100; k++) {
+		fire_alarm();
+		CHECK(rad.ch == ll_csa1_next(&ref));
+		if (k < 4) {
+			CHECK(rad.ch == 7 * (k + 1));
+		}
+		rx(a, 0x01, 0);
+		done(1);
+		a += T(15000);
+	}
+	ll_conn_end(0, LL_ST_REMOTE_TERM);
+}
+
+/* Latency skips, kicks back to an earlier event and instants inside a
+ * skipped window keep the CSA#2 channel exact: it is always the channel of
+ * the event counter that goes on air. */
+static void test_csa2_latency(void)
+{
+	struct ll_connect_ind ci = mk_ci(12, 400, 1, 1, 0);
+	const uint32_t t0 = 1000000;
+	uint32_t a0 = t0 + T(1250 + 300), a1;
+
+	ci.aa = CSA2_AA;
+	ci.chsel = 1;
+	ci.latency = 4;
+	reset_all(false);
+	CHECK(ll_conn_start(&ci, t0) == 0);
+	fire_alarm();
+	CHECK(ll_conn_event_counter(0) == 0 && rad.ch == 25);
+	rx(a0, 0x01, 0);
+	done(1);
+	/* skip 1..4, listen to 5, then 10 */
+	fire_alarm();
+	CHECK(ll_conn_event_counter(0) == 5);
+	CHECK(rad.ch == csa2_ch(CSA2_CHID, 5, all37));
+	CHECK(rad.open == open_at(a0, 5));
+	rx(a0 + T(75000), 0x01, 0);
+	done(1);
+	a1 = a0 + T(75000);
+	/* skip planned (6..9, listen 10); a kick takes the next reachable
+	 * event 6 back, with event 6's channel */
+	ll_conn_kick(0);
+	fire_alarm();
+	CHECK(ll_conn_event_counter(0) == 6);
+	CHECK(rad.ch == csa2_ch(CSA2_CHID, 6, all37));
+	CHECK(rad.open == open_at(a1, 1));
+	rx(a1 + T(15000), 0x01, 0);
+	done(1);
+	a1 += T(15000);
+	/* a channel map instant at event 9: the events up to the instant are
+	 * listened to (no skip over an instant), event 9 and later use the
+	 * new map, then skipping resumes (14) */
+	CHECK(ll_conn_chmap_at(0, 9, nine) == 0);
+	for (uint16_t k = 7; k <= 9; k++) {
+		fire_alarm();
+		CHECK(ll_conn_event_counter(0) == k);
+		CHECK(rad.ch == csa2_ch(CSA2_CHID, k, k >= 9 ? nine : all37));
+		a1 += T(15000);
+		rx(a1, 0x01, 0);
+		done(1);
+	}
+	fire_alarm();
+	CHECK(ll_conn_event_counter(0) == 14);
+	CHECK(rad.ch == csa2_ch(CSA2_CHID, 14, nine));
+	done(0);
+	ll_conn_end(0, LL_ST_REMOTE_TERM);
+}
+
+/* Arbiter yields (collision with another link's event) skip the event
+ * like latency: the next listened event has its own CSA#2 channel. Each
+ * link uses its own channel identifier; one link may use CSA#1 next to a
+ * CSA#2 link. */
+static void test_csa2_yield(void)
+{
+	struct ll_connect_ind ci0 = mk_ci_link(0), ci1 = mk_ci_link(1);
+	const uint32_t t0 = 1000000;
+	uint16_t id0, last1 = 0, seen0 = 0, seen1 = 0;
+	struct ll_conn_stats s0;
+	struct ll_csa1 ref1;
+	bool gap0 = false;
+	uint16_t prev0 = 0;
+
+	if (LL_MAX_CONN < 2) {
+		return;
+	}
+	ci0.chsel = 1;   /* link 0: CSA#2, link 1: CSA#1 */
+	id0 = ll_csa2_chan_id(ci0.aa);
+	reset_all(false);
+	ll_csa1_init(&ref1, 7, all37);
+	CHECK(ll_conn_start(&ci0, t0) == 0);
+	/* link 1's window overlaps link 0's events: they keep colliding */
+	CHECK(ll_conn_start(&ci1, t0 + T(500)) == 1);
+	for (int i = 0; i < 60; i++) {
+		uint8_t ch;
+
+		fire_alarm();
+		if (rad.aa == ci0.aa) {
+			uint16_t n = ll_conn_event_counter(0);
+
+			CHECK(rad.ch == csa2_ch(id0, n, all37));
+			if (seen0 && (uint16_t)(n - prev0) > 1) {
+				gap0 = true;
+			}
+			prev0 = n;
+			seen0++;
+		} else {
+			uint16_t n = ll_conn_event_counter(1);
+
+			CHECK(rad.aa == ci1.aa);
+			ch = 0;
+			for (uint16_t k = last1; k <= n; k++) {
+				ch = ll_csa1_next(&ref1);
+			}
+			last1 = (uint16_t)(n + 1);
+			CHECK(rad.ch == ch);
+			seen1++;
+		}
+		/* the central's packet at the middle of the RX window */
+		rx(rad.open + T(rad.fst / 2) - T(LL_CONN_SYNC_US), 0x01, 0);
+		done(1);
+	}
+	ll_conn_get_stats(0, &s0);
+	CHECK(seen0 > 10 && seen1 > 10);
+	/* link 0 yielded events and kept the exact channel after the gaps */
+	CHECK(s0.collisions > 0 && gap0);
+	CHECK(ll_conn_active(0) && ll_conn_active(1));
+	ll_conn_end(0, 0x13);
+	ll_conn_end(1, 0x13);
+}
+
 int main(void)
 {
 	test_first_events();
@@ -2208,5 +2405,9 @@ int main(void)
 	test_last_link_alone();
 	test_end_all();
 	test_instant_prio_after_wrap();
+	test_csa2_sequence();
+	test_csa1_when_chsel0();
+	test_csa2_latency();
+	test_csa2_yield();
 	DONE();
 }

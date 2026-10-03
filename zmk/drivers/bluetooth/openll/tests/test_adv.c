@@ -393,7 +393,7 @@ int main(void)
 	/* event: 37 -> 38 -> 39 on RX timeouts */
 	fire_sched();
 	CHECK(radio_ch == 37 && txrx_calls == 1);
-	CHECK(tx_len == 11 && tx_pdu[0] == LL_PDU_ADV_IND && tx_pdu[1] == 9);
+	CHECK(tx_len == 11 && tx_pdu[0] == (LL_PDU_ADV_IND | 0x20) && tx_pdu[1] == 9); /* ChSel 1 */
 	CHECK(memcmp(&tx_pdu[2], adva, 6) == 0);
 	CHECK(rsp_len == 11 && rsp_pdu[0] == LL_PDU_SCAN_RSP);  /* prepared */
 	ll_adv_radio_evt(LL_RADIO_RX_TIMEOUT, NULL, 0, 0);
@@ -545,7 +545,7 @@ int main(void)
 	CHECK(ll_adv_enable(true) == LL_ST_SUCCESS);
 	CHECK(restores == 1 && ll_adv_is_enabled() && sched_cb != NULL);
 	fire_sched();
-	CHECK(radio_ch == 37 && tx_pdu[0] == LL_PDU_ADV_IND);
+	CHECK(radio_ch == 37 && tx_pdu[0] == (LL_PDU_ADV_IND | 0x20));
 	/* no further restore without another connection */
 	CHECK(ll_adv_enable(false) == LL_ST_SUCCESS);
 	CHECK(ll_adv_enable(true) == LL_ST_SUCCESS);

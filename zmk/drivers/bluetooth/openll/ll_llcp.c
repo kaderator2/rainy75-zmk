@@ -289,8 +289,10 @@ static void rx_feature_req(uint8_t link, const uint8_t *p)
 	s->peer_feat0 = p[1];
 	ll_plat_tx_unlock();
 	/* byte 0: the features used on this link (ours AND the central's),
-	 * the other bytes are ours (none) */
+	 * the other bytes are ours (byte 1: CSA#2, valid from controller to
+	 * controller) */
 	rsp[1] = LL_FEATURES_LOW & p[1];
+	rsp[2] = LL_FEATURES_BYTE1;
 	ctrl(link, rsp, sizeof(rsp));
 }
 

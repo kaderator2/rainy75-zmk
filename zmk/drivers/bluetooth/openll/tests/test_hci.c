@@ -218,6 +218,19 @@ static void test_events(void)
 	static const uint8_t cu[] = {0x04, 0x3E, 10, 0x03, 0x00, 0x00, 0x00,
 				     0x06, 0x00, 0x1E, 0x00, 0x2C, 0x01};
 	CHECK(evt_len == sizeof(cu) && memcmp(evt, cu, sizeof(cu)) == 0);
+
+	/* LE Channel Selection Algorithm (0x3E/0x14, Vol 4 Part E 7.7.65.20):
+	 * handle, algorithm 0x01 = CSA#2 / 0x00 = CSA#1 */
+	evt_len = 0;
+	ll_hci_evt_chan_sel_algo(LL_MAX_CONN - 1, 1);
+	{
+		const uint8_t cs[] = {0x04, 0x3E, 4, 0x14, (uint8_t)(LL_MAX_CONN - 1), 0x00, 0x01};
+
+		CHECK(evt_len == sizeof(cs) && memcmp(evt, cs, sizeof(cs)) == 0);
+	}
+	evt_len = 0;
+	ll_hci_evt_chan_sel_algo(0, 0);
+	CHECK(evt_len == 7 && evt[3] == 0x14 && evt[4] == 0 && evt[6] == 0x00);
 }
 
 static void test_event_masks(void)
@@ -234,6 +247,9 @@ static void test_event_masks(void)
 	cmd(0x0C03, NULL, 0);
 	evt_len = 0;
 	ll_hci_evt_conn_complete(0, &ci);
+	CHECK(evt_len == 0);
+	evt_len = 0;
+	ll_hci_evt_chan_sel_algo(0, 1);
 	CHECK(evt_len == 0);
 	evt_len = 0;
 	ll_hci_evt_disconn_complete(0, 0x08);
@@ -258,6 +274,26 @@ static void test_event_masks(void)
 	ll_hci_evt_conn_complete(0, &ci);     /* LE default mask has bit 0 */
 	CHECK(evt_len == 22);
 	evt_len = 0;
+	ll_hci_evt_chan_sel_algo(0, 1);       /* LE default mask 0x1F: bit 19 off */
+	CHECK(evt_len == 0);
+	memset(m, 0, 8);
+	m[0] = 0x1F;
+	m[2] = 0x08;                          /* LE bit 19: Channel Selection Algorithm */
+	cmd(0x2001, m, 8);
+	evt_len = 0;
+	ll_hci_evt_chan_sel_algo(0, 1);
+	CHECK(evt_len == 7);
+	memset(m, 0, 8);
+	m[2] = 0x08;
+	cmd(0x0C01, m, 8);                    /* LE Meta (bit 61) off */
+	evt_len = 0;
+	ll_hci_evt_chan_sel_algo(0, 1);
+	CHECK(evt_len == 0);
+	memset(m, 0, 8);
+	m[7] = 0x20;
+	m[0] = 0x80;
+	cmd(0x0C01, m, 8);                    /* back to the Zephyr-like mask */
+	evt_len = 0;
 	ll_hci_evt_num_completed(0, 1);       /* not maskable */
 	CHECK(evt_len == 8);
 
@@ -270,6 +306,9 @@ static void test_event_masks(void)
 	CHECK(evt_len == 0);
 	evt_len = 0;
 	ll_hci_evt_conn_update(0, &p);
+	CHECK(evt_len == 0);
+	evt_len = 0;
+	ll_hci_evt_chan_sel_algo(0, 1);       /* bit 19 off */
 	CHECK(evt_len == 0);
 	evt_len = 0;
 	ll_hci_evt_ltk_req(0, rnd8, 0);
@@ -537,7 +576,9 @@ int main(void)
 	CHECK(is_cc(0x2003, LL_ST_SUCCESS));
 	CHECK(evt_len == 7 + 8);
 	CHECK(evt[7] == LL_FEATURES_LOW && evt[7] == 0x05);
-	for (int i = 1; i < 8; i++) CHECK(evt[7 + i] == 0);
+	/* byte 1: bit 14 Channel Selection Algorithm #2 (Vol 6 Part B 4.6) */
+	CHECK(evt[8] == LL_FEATURES_BYTE1 && evt[8] == 0x40);
+	for (int i = 2; i < 8; i++) CHECK(evt[7 + i] == 0);
 
 	/* LE Rand */
 	cmd(0x2018, NULL, 0);

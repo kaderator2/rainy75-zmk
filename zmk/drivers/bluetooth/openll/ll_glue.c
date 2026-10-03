@@ -658,6 +658,9 @@ static void handle_connected(uint8_t link)
 		ci.latency, ci.timeout);
 	if (!silent_end[link]) {
 		ll_hci_evt_conn_complete(link, &ci);
+		/* ll_conn uses CSA#2 exactly when the CONNECT_IND has ChSel 1
+		 * (our ADV_IND always has it) */
+		ll_hci_evt_chan_sel_algo(link, ci.chsel ? 0x01 : 0x00);
 	}
 }
 

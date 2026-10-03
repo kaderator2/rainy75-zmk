@@ -10,16 +10,22 @@ int main(void)
 	uint8_t out[LL_ADV_PDU_MAX];
 	const uint8_t ad[3] = {0x02, 0x01, 0x06};
 
-	/* ADV_IND: header type 0, TxAdd 0 (public), ChSel 0; length 6 + 3 */
+	/* ADV_IND: header type 0, TxAdd 0 (public), ChSel 1 (CSA#2,
+	 * Vol 6 Part B 2.3.1); length 6 + 3 */
 	uint8_t n = ll_pdu_build_adv(out, LL_PDU_ADV_IND, adva, ad, 3);
 	CHECK(n == 11);
-	CHECK(out[0] == 0x00 && out[1] == 9);
+	CHECK(out[0] == 0x20 && out[1] == 9);
 	CHECK(memcmp(&out[2], adva, 6) == 0);
 	CHECK(memcmp(&out[8], ad, 3) == 0);
 
 	/* SCAN_RSP with empty data */
 	n = ll_pdu_build_adv(out, LL_PDU_SCAN_RSP, adva, NULL, 0);
 	CHECK(n == 8 && out[0] == 0x04 && out[1] == 6);
+	/* ChSel is RFU (0) in the other advertising PDUs */
+	n = ll_pdu_build_adv(out, LL_PDU_ADV_NONCONN_IND, adva, ad, 3);
+	CHECK(n == 11 && out[0] == 0x02);
+	n = ll_pdu_build_adv(out, LL_PDU_ADV_SCAN_IND, adva, ad, 3);
+	CHECK(n == 11 && out[0] == 0x06);
 
 	/* SCAN_REQ: TxAdd=1 (random scanner), RxAdd=0, ScanA + AdvA */
 	uint8_t req[14] = {0x43, 12, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF};

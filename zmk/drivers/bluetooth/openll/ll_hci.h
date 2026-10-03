@@ -77,6 +77,10 @@ void ll_hci_evt_ltk_req(uint16_t handle, const uint8_t rand[8], uint16_t ediv);
 void ll_hci_evt_enc_change(uint16_t handle, uint8_t status, bool enabled);
 /* LE Connection Update Complete (0x3E/0x03): status 0, new parameters. */
 void ll_hci_evt_conn_update(uint16_t handle, const struct ll_conn_params *p);
+/* LE Channel Selection Algorithm (0x3E/0x14, Vol 4 Part E 7.7.65.20), if LE
+ * event mask bit 19 is set: handle, algo 0x00 = CSA#1, 0x01 = CSA#2. Sent by
+ * the glue right after LE Connection Complete. */
+void ll_hci_evt_chan_sel_algo(uint16_t handle, uint8_t algo);
 
 /* ---- ACL data framing (no H4 type byte on input, H4 type 0x02 on
  * output). LE ACL is never fragmented here: LE Read Buffer Size reports

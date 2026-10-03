@@ -63,11 +63,15 @@ _Static_assert(LL_MAX_CONN >= 1 && LL_MAX_CONN <= 5, "LL_MAX_CONN must be 1..5")
 #define LL_LLID_CTRL      0x3    /* LL control PDU */
 #define LL_OWN_SCA_PPM    50     /* own sleep clock accuracy (crystal) */
 
-/* LL feature set (Vol 6 Part B 4.6), byte 0; bytes 1..7 are 0. Used by
- * LL_FEATURE_RSP and HCI LE Read Local Supported Features. */
+/* LL feature set (Vol 6 Part B 4.6), bytes 0 and 1; bytes 2..7 are 0.
+ * Used by LL_FEATURE_RSP and HCI LE Read Local Supported Features. */
 #define LL_FEAT_LE_ENC        0x01   /* bit 0: LE Encryption */
 #define LL_FEAT_EXT_REJ_IND   0x04   /* bit 2: Extended Reject Indication */
 #define LL_FEATURES_LOW       (LL_FEAT_LE_ENC | LL_FEAT_EXT_REJ_IND)
+/* byte 1 of the feature set (LL_FEATURE_RSP sends our own byte 1, HCI LE
+ * Read Local Supported Features reports it) */
+#define LL_FEAT1_CSA2         0x40   /* bit 14: Channel Selection Algorithm #2 */
+#define LL_FEATURES_BYTE1     (LL_FEAT1_CSA2)
 
 /* Controller identity reported via Read Local Version Information */
 #define LL_HCI_VERSION    0x09   /* Bluetooth Core 5.0 */
