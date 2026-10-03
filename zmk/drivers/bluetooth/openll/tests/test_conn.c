@@ -1621,6 +1621,63 @@ static void test_latency_from_update(void)
 	ll_conn_end(LL_ST_REMOTE_TERM);
 }
 
+/* Review fix: once an instant re-plan applied the instant to the planned
+ * event, nothing may re-plan to an earlier event (it would use the new
+ * timing / the old map, and the instant would never be applied again). */
+static void test_latency_instant_replan_then_kick(void)
+{
+	struct ll_conn_params p24 = {.interval = 24, .latency = 0, .timeout = 400};
+	struct ll_conn_params p12 = {.interval = 12, .latency = 0, .timeout = 400};
+	static const uint8_t no28[5] = {0xFF, 0xFF, 0xFF, 0xEF, 0x1F};
+	struct ll_csa1 ref;
+	uint32_t a0;
+	int cancels;
+
+	/* channel map instant 3 re-planned, then a kick: still event 3, new map */
+	a0 = start_lat(4, 400, &ref, false);
+	CHECK(ll_conn_chmap_at(3, no0to9) == 0);
+	cancels = sch.cancels;
+	ll_conn_kick();
+	CHECK(sch.cancels == cancels);
+	fire_alarm();
+	CHECK(ll_conn_event_counter() == 3);
+	CHECK(rad.open == open_at(a0, 3));
+	(void)ref_skip(&ref, 2);
+	ll_csa1_set_map(&ref, no0to9);
+	CHECK(rad.ch == ll_csa1_next(&ref));
+	done(0);
+	ll_conn_end(LL_ST_REMOTE_TERM);
+
+	/* connection update instant 3 re-planned, then a kick: still the
+	 * transmit window of event 3 (old anchor + 0, 1.25 ms, widening over
+	 * 46.25 ms: 13.875 -> 14 + 16 = 30 us) */
+	a0 = start_lat(4, 400, &ref, false);
+	CHECK(ll_conn_update_at(3, 1, 0, &p24) == 0);
+	ll_conn_kick();
+	fire_alarm();
+	CHECK(ll_conn_event_counter() == 3 && cbs.updated == 1);
+	CHECK(rad.open == a0 + T(45000) - T(30 + LL_CONN_WIN_MARGIN_US));
+	CHECK(rad.fst == 1250 + 2 * (30 + 200) + 40);
+	done(0);
+	ll_conn_end(LL_ST_REMOTE_TERM);
+
+	/* a second instant for the event whose map instant is applied: the
+	 * applied map stays (re-plan restores the state after it) */
+	a0 = start_lat(4, 400, &ref, false);
+	CHECK(ll_conn_chmap_at(3, no28) == 0);
+	CHECK(ll_conn_update_at(3, 1, 0, &p12) == 0);
+	ll_conn_kick();
+	fire_alarm();
+	CHECK(ll_conn_event_counter() == 3);
+	CHECK(rad.open == a0 + T(45000) - T(30 + LL_CONN_WIN_MARGIN_US));
+	(void)ref_skip(&ref, 2);
+	ll_csa1_set_map(&ref, no28);
+	CHECK(rad.ch == ll_csa1_next(&ref));
+	CHECK(rad.ch != 28);   /* event 3's unmapped channel (4 * 7 mod 37) */
+	done(0);
+	ll_conn_end(LL_ST_REMOTE_TERM);
+}
+
 int main(void)
 {
 	test_first_events();
@@ -1657,5 +1714,6 @@ int main(void)
 	test_latency_supervision();
 	test_kick();
 	test_latency_from_update();
+	test_latency_instant_replan_then_kick();
 	DONE();
 }

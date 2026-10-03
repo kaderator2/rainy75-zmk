@@ -179,10 +179,12 @@ struct ll_conn_stats {
 	uint32_t first_outside; /* first delivered packet after the RX window (no re-anchor) */
 	/* Peripheral latency (slice 5). planned: listen alarms armed (a
 	 * re-plan of the same listen counts once); planned - listened = late
-	 * events + plans ended by the link end. listened: events issued to the
-	 * radio (same as events, named for the power counters). skipped: events
-	 * skipped by latency (net of kick / instant re-plans). kicks:
-	 * ll_conn_kick() calls that re-planned. */
+	 * events + plans ended by the link end. listened: alias of events
+	 * (events issued to the radio), named for the power counters. skipped:
+	 * events skipped by latency, net of kick / instant re-plans; counted
+	 * when planned, so it may overstate by up to latency when the link ends
+	 * before the planned event. kicks: ll_conn_kick() calls that
+	 * re-planned. */
 	uint32_t planned;
 	uint32_t listened;
 	uint32_t skipped;

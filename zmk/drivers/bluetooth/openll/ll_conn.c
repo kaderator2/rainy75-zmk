@@ -213,6 +213,10 @@ static void plan_event(void)
 	uint32_t widen, margin;
 
 	apply_instants();
+	if (c.skip_n == 0) {
+		/* re-plan point: the state after this event's instants */
+		c.csa_base = c.csa;
+	}
 	c.ch = ll_csa1_next(&c.csa);
 	c.open_tick = open_of(c.counter, &widen);
 	if (widen > stats.widen_max_us) {
@@ -277,7 +281,12 @@ static void plan(void)
 
 /* Re-plan the planned (not yet issued) listen to event `target` in
  * [skip_base, counter]: restore the state before the skip, advance over
- * the events before target, plan it (applying its instants). */
+ * the events before target, plan it (applying its instants). Afterwards
+ * target is the new skip base with skip_n = 0: the instants applied at it
+ * changed the timing and the map, so no later re-plan may go back to an
+ * earlier event (csa_base is the state after them, see plan_event). This
+ * keeps the invariant that skip_n > 0 only while no instant is applied at
+ * the planned event, which ll_conn_kick() / first_reachable() rely on. */
 static void replan_to(uint16_t target)
 {
 	uint16_t k = (uint16_t)(target - c.skip_base);
@@ -288,14 +297,19 @@ static void replan_to(uint16_t target)
 		(void)ll_csa1_next(&c.csa);
 	}
 	stats.skipped -= (uint32_t)(c.skip_n - k);
-	c.skip_n = k;
+	c.skip_n = 0;
 	c.counter = target;
+	c.skip_base = target;
 	plan_event();
 }
 
 /* Index (from skip_base) of the first event of the planned window whose
  * alarm (LL_CONN_ARM_LEAD_US before its RX opens) is still ahead; skip_n
- * if none before the planned one is. Caller holds the lock, c.planned. */
+ * if none before the planned one is. Caller holds the lock, c.planned.
+ * Only meaningful with skip_n > 0, i.e. on pre-instant timing state: plan()
+ * never skips with an instant pending in the window and replan_to() sets
+ * skip_n = 0 once it applied one, so the timing and map used here are
+ * those of every event in [skip_base, counter]. */
 static uint16_t first_reachable(void)
 {
 	uint32_t now = ll_radio_now();
