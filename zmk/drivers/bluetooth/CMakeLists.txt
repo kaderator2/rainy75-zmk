@@ -20,6 +20,7 @@ if(CONFIG_BT_HCI_B91_CTLR_OPEN)
     openll/ll_txq.c
     openll/ll_rxq.c
     openll/ll_conn.c
+    openll/ll_credit.c
     openll/ll_llcp.c
     ${B91_DRV}/rf.c
   )

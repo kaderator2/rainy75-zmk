@@ -54,7 +54,9 @@ typedef void (*ll_radio_cb_t)(enum ll_radio_evt evt, const uint8_t *pdu,
 int ll_radio_init(ll_radio_cb_t cb);
 uint32_t ll_radio_now(void);
 void ll_radio_set_adv_channel(uint8_t ch);   /* 37..39; adv AA + CRC init */
-/* TX pdu at start_tick, then listen up to rx_window_us for a reply. */
+/* TX pdu at start_tick, then listen up to rx_window_us for a reply. A
+ * guard alarm (ll_sched_guard_at) ends it as LL_RADIO_RX_TIMEOUT after a
+ * baseband restore if no end IRQ comes (also for ll_radio_tx_rsp_at). */
 void ll_radio_tx_then_rx(const uint8_t *pdu, uint8_t len, uint32_t start_tick,
 			 uint32_t rx_window_us);
 /* Pre-load the response buffer (SCAN_RSP), so the IFS path only triggers. */
@@ -166,6 +168,9 @@ struct ll_radio_stats {
 	/* ll_radio_adv_restore(): calls, and the TX FIFO pointers around the
 	 * last baseband reset (rptr << 8 | wptr) */
 	uint32_t restores;
+	/* advertising TX/RX ended by the adv guard (no end IRQ; recovered
+	 * with ll_radio_adv_restore, also counted in restores) */
+	uint32_t adv_guard;
 	uint16_t restore_ptrs_before;
 	uint16_t restore_ptrs_after;
 };

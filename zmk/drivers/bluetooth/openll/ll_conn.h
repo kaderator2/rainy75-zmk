@@ -174,6 +174,10 @@ void ll_conn_terminate(uint8_t link, uint8_t reason);
  * end of the current event if one is on air. Thread or ISR. */
 void ll_conn_end(uint8_t link, uint8_t reason);
 bool ll_conn_active(uint8_t link);
+/* ll_conn_end(link, reason) for every active link (one radio: a wedged
+ * radio ends all links, the glue's guard-streak rule). Returns the number of
+ * links ended (or whose end is pending). Thread or ISR. */
+uint8_t ll_conn_end_all(uint8_t reason);
 /* Links not free (active, or ended and awaiting ll_conn_release()). */
 uint8_t ll_conn_count(void);
 /* Thread: the consumer has reset the link's rxq and llcp after
@@ -234,6 +238,9 @@ struct ll_conn_stats {
 /* Per link, cumulative since boot (not reset per connection). Out-of-range
  * link: all zero. */
 void ll_conn_get_stats(uint8_t link, struct ll_conn_stats *s);
+/* Sum over all links (widen_max_us: the maximum), as reported by the
+ * aggregate group 66 fields and the stats log. */
+void ll_conn_get_stats_total(struct ll_conn_stats *s);
 
 /* ll_arb owner callbacks for the links (the glue's ll_arb_ops dispatch ids
  * < LL_MAX_CONN here). start: issue the BRX of the link's planned event

@@ -2,6 +2,7 @@
  * Copyright (c) 2026 scholzri
  * SPDX-License-Identifier: Apache-2.0
  */
+#include <assert.h>
 #include <errno.h>
 #include <string.h>
 #include "ll_hci.h"
@@ -83,6 +84,9 @@ static void masks_default(void)
 
 void ll_hci_init(const struct ll_hci_ops *ops, ll_hci_sink_t sink)
 {
+	/* required by the connection commands and host ACL: fail loudly at
+	 * init instead of a NULL call on the first Disconnect / ACL packet */
+	assert(ops != NULL && ops->handle_valid != NULL);
 	hci_ops = ops;
 	hci_sink = sink;
 	masks_default();

@@ -273,6 +273,11 @@ static void plan_event(struct ll_link *c)
 	if (apply_instants(c)) {
 		c->inst_evt = true;
 		c->inst_counter = c->counter;
+	} else if (c->inst_evt && c->inst_counter != c->counter) {
+		/* planned past the instant event (re-plans never go back
+		 * before it, see replan_to): forget it, so a counter wrap
+		 * (65536 events later) cannot make a stale counter MUST */
+		c->inst_evt = false;
 	}
 	if (c->skip_n == 0) {
 		/* re-plan point: the state after this event's instants */
@@ -401,11 +406,21 @@ static void rebase(struct ll_link *c)
 
 /* Yield the planned event and the following ones until the arbiter
  * accepts one (each counts as a collision, advances like a skip). Every
- * step applies the instants of the event it plans. */
-static void yield_on(struct ll_link *c)
+ * step applies the instants of the event it plans. commit: the planned
+ * event was refused by the arbiter at its last request (not displaced), so
+ * giving it up is committed to the fairness flags (ll_arb_yield); a
+ * displaced event was committed by the arbiter already. */
+static void yield_on(struct ll_link *c, bool commit)
 {
 	for (int i = 0; i < YIELD_MAX; i++) {
 		ST(c)->collisions++;
+		if (commit) {
+			unsigned int key = ll_plat_lock();
+
+			ll_arb_yield(c->id);
+			ll_plat_unlock(key);
+		}
+		commit = true;
 		c->counter++;
 		c->skip_base = c->counter;
 		c->skip_n = 0;
@@ -421,7 +436,11 @@ static void yield_on(struct ll_link *c)
 /* Request the latest event of [skip_base + lo, skip_base + hi] the arbiter
  * accepts (a dodge inside the latency window), else yield after hi.
  * stats.skipped follows the event taken. On success nothing else is
- * touched afterwards: a nested bump may already have re-planned. */
+ * touched afterwards: a bump of this link (dispatched before the request
+ * returns) may already have re-planned. The probes do not count for
+ * fairness; event hi is requested once more before it is given up, so the
+ * yield commits the refusal of hi itself (with lo < hi the last probe was
+ * lo). */
 static void place_latest(struct ll_link *c, uint16_t lo, uint16_t hi)
 {
 	uint16_t orig = c->skip_n;
@@ -433,9 +452,14 @@ static void place_latest(struct ll_link *c, uint16_t lo, uint16_t hi)
 			return;
 		}
 	}
-	set_window(c, hi);
 	ST(c)->skipped -= (uint32_t)(orig - hi);
-	yield_on(c);
+	if (lo < hi) {
+		set_window(c, hi);
+		if (request(c) == 0) {
+			return;
+		}
+	}
+	yield_on(c, true);
 }
 
 /* Plan the next event, skipping idle events where allowed. */
@@ -538,6 +562,10 @@ static void prepare(struct ll_link *c, uint32_t cap_us)
 	if (ev_owner >= 0 || cap_us < c->fst_us + LL_CONN_GUARD_MIN_TAIL_US) {
 		/* another event is on air (it overran its cap), or no room
 		 * before the next request: yield this event (not a miss) */
+		unsigned int key = ll_plat_lock();
+
+		ll_arb_yield(c->id);
+		ll_plat_unlock(key);
 		ST(c)->collisions++;
 		event_closed(c, now);
 		return;
@@ -600,8 +628,9 @@ void ll_conn_arb_bumped(uint8_t link)
 			}
 		}
 		if (!placed) {
+			/* the bumped event itself was committed by the arbiter */
 			set_window(c, orig);
-			yield_on(c);
+			yield_on(c, false);
 		}
 	}
 	ll_plat_unlock(key);
@@ -867,7 +896,7 @@ static void instant_replan(struct ll_link *c, uint16_t instant)
 
 		replan_to(c, (uint16_t)(c->skip_base + (i < d ? i : d)));
 		if (request(c) != 0) {
-			yield_on(c);
+			yield_on(c, true);
 		}
 	}
 }
@@ -975,6 +1004,21 @@ bool ll_conn_active(uint8_t link)
 	return c && c->active;
 }
 
+uint8_t ll_conn_end_all(uint8_t reason)
+{
+	unsigned int key = ll_plat_lock();
+	uint8_t n = 0;
+
+	for (uint8_t i = 0; i < LL_MAX_CONN; i++) {
+		if (links[i].active) {
+			request_end(&links[i], reason);
+			n++;
+		}
+	}
+	ll_plat_unlock(key);
+	return n;
+}
+
 uint8_t ll_conn_count(void)
 {
 	uint8_t n = 0;
@@ -1045,8 +1089,9 @@ void ll_conn_kick(uint8_t link)
 			}
 		}
 		if (i < orig && !placed) {
+			/* the last probe was orig itself: commit its refusal */
 			set_window(c, orig);
-			yield_on(c);
+			yield_on(c, true);
 		}
 	}
 	ll_plat_unlock(key);
@@ -1062,5 +1107,33 @@ void ll_conn_get_stats(uint8_t link, struct ll_conn_stats *s)
 	}
 	key = ll_plat_lock();
 	*s = stats[link];
+	ll_plat_unlock(key);
+}
+
+void ll_conn_get_stats_total(struct ll_conn_stats *s)
+{
+	unsigned int key = ll_plat_lock();
+
+	memset(s, 0, sizeof(*s));
+	for (uint8_t i = 0; i < LL_MAX_CONN; i++) {
+		const struct ll_conn_stats *t = &stats[i];
+
+		s->events += t->events;
+		s->rx_events += t->rx_events;
+		s->missed += t->missed;
+		s->late += t->late;
+		s->rx_pkts += t->rx_pkts;
+		if (t->widen_max_us > s->widen_max_us) {
+			s->widen_max_us = t->widen_max_us;
+		}
+		s->first_bad += t->first_bad;
+		s->first_nodata += t->first_nodata;
+		s->first_outside += t->first_outside;
+		s->planned += t->planned;
+		s->listened += t->listened;
+		s->skipped += t->skipped;
+		s->kicks += t->kicks;
+		s->collisions += t->collisions;
+	}
 	ll_plat_unlock(key);
 }

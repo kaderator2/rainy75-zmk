@@ -38,11 +38,15 @@ config OPENLL_MGMT
 	bool "Power counters via mcumgr (open BLE controller)"
 	default n
 	depends on MCUMGR && BT_HCI_B91_CTLR_OPEN
+	# reply: root map > per-link list > per-link map (canonical zcbor
+	# needs a backup state per level)
+	select MCUMGR_SMP_CBOR_MIN_ENCODING_LEVEL_3 if ZCBOR_CANONICAL
 	help
 	  Adds a custom mcumgr group (ID 66) with one read command that returns
 	  uptime, connection events planned / listened / skipped, kicks,
-	  controller-thread wakeups and battery mV. Readable over BLE and USB
-	  SMP; see reverse/tools/openll_stats.py.
+	  controller-thread wakeups and battery mV (sums over the links), plus
+	  per-link counters and the advertising arbitration counters. Readable
+	  over BLE and USB SMP; see reverse/tools/openll_stats.py.
 
 config RAINY_RGB
 	bool "Rainy 75 out-of-tree RGB lighting engine"

@@ -1,5 +1,9 @@
+#define _POSIX_C_SOURCE 200809L
 #include <errno.h>
+#include <signal.h>
 #include <string.h>
+#include <sys/wait.h>
+#include <unistd.h>
 #include "test.h"
 #include "../ll_hci.h"
 #include "../ll_defs.h"
@@ -19,7 +23,8 @@ static void rnd(uint8_t *o, uint8_t n) { for (uint8_t i = 0; i < n; i++) o[i] = 
 static void reset(void) { reset_calls++; }
 static uint8_t set_params(const struct ll_adv_params *p) { got_params = *p; return next_status; }
 static uint8_t set_data(const uint8_t *d, uint8_t l) { memcpy(got_data, d, l); got_data_len = l; data_calls++; return 0; }
-static uint8_t enable(bool e) { enable_arg = e; return 0; }
+static uint8_t enable_status;
+static uint8_t enable(bool e) { enable_arg = e; return enable_status; }
 static void unknown(uint16_t op) { unknown_calls++; unknown_op = op; }
 static int disc_calls, ltk_calls, neg_calls;
 static uint8_t disc_reason, got_ltk[16];
@@ -442,8 +447,31 @@ static void test_handles(void)
 	CHECK(ll_get_le16(&out[1]) == (uint16_t)(last | 0x1000));
 }
 
+/* ll_hci_init without handle_valid fails loudly (assert -> abort) */
+static void test_init_requires_handle_valid(void)
+{
+	struct ll_hci_ops bad = ops;
+	pid_t pid;
+	int st = 0;
+
+	bad.handle_valid = NULL;
+	fflush(stdout);
+	pid = fork();
+	if (pid == 0) {
+		/* silence the assert message in the test log */
+		if (freopen("/dev/null", "w", stderr) == NULL) {
+			_exit(1);
+		}
+		ll_hci_init(&bad, sink);
+		_exit(0);
+	}
+	CHECK(pid > 0 && waitpid(pid, &st, 0) == pid);
+	CHECK(WIFSIGNALED(st) && WTERMSIG(st) == SIGABRT);
+}
+
 int main(void)
 {
+	test_init_requires_handle_valid();
 	ll_hci_init(&ops, sink);
 
 	/* Reset */
@@ -557,6 +585,12 @@ int main(void)
 	CHECK(enable_arg == 1);
 	cmd(0x200A, &two, 1);
 	CHECK(is_cc(0x200A, LL_ST_INVALID_PARAM));
+	/* the controller's status reaches the host unchanged: Connection
+	 * Limit Exceeded when every link is taken (slice 6a Task 6) */
+	enable_status = LL_ST_CONN_LIMIT;
+	cmd(0x200A, &one, 1);
+	CHECK(is_cc(0x200A, 0x09) && evt_len == 7);
+	enable_status = LL_ST_SUCCESS;
 
 	/* Unknown opcode: Command Complete with 0x01, hook called */
 	cmd(0x2017, NULL, 0);

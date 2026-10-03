@@ -14,8 +14,9 @@
  *   sends host ACL through ll_llcp_tx() (the single encrypt+push point),
  *   emits LE Connection Complete / Connection Update Complete / Number Of
  *   Completed Packets / Disconnection Complete, and on a disconnect resets
- *   ll_rxq and ll_llcp in thread context, before advertising can be enabled
- *   again (adv enable is refused while that reset is pending).
+ *   the link's ll_rxq and ll_llcp in thread context before it releases the
+ *   link id (ll_conn keeps it taken until then, so no new connection can
+ *   use it earlier).
  * - HCI thread (host TX): HCI commands (ll_hci) and host ACL, which is only
  *   parsed and queued here, so encryption and the TX packet counter run in
  *   one thread for data (LTK reply / Disconnect queue control PDUs from the
@@ -55,6 +56,7 @@
 #include "ll_adv.h"
 #include "ll_arb.h"
 #include "ll_conn.h"
+#include "ll_credit.h"
 #include "ll_crypt.h"
 #include "ll_hci.h"
 #include "ll_llcp.h"
@@ -140,9 +142,9 @@ static atomic_t pend[LL_MAX_CONN];                     /* PEND_* bits set by the
 static struct ll_connect_ind pend_ci[LL_MAX_CONN];     /* written before the bit is set */
 static struct ll_conn_params pend_params[LL_MAX_CONN];
 static uint8_t pend_reason[LL_MAX_CONN];
-static atomic_t nocp_pending[LL_MAX_CONN];             /* acked ACL PDUs not yet reported */
-static atomic_t conn_gen[LL_MAX_CONN];                 /* incremented per handled CONNECTED */
-static volatile bool conn_up[LL_MAX_CONN];   /* Connection Complete sent, no Disconnection Complete yet */
+/* Up for the host (Connection Complete sent, no Disconnection Complete
+ * yet), connection generation and unreported acked ACL PDUs (Number Of
+ * Completed Packets): ll_credit.h, per link. */
 static volatile bool silent_end[LL_MAX_CONN]; /* HCI Reset: end without Disconnection Complete */
 
 /* ---- controller thread state ---- */
@@ -157,20 +159,10 @@ static bool pend_test(uint8_t link, int bit)
 	return atomic_test_bit(&pend[link], bit);
 }
 
-static bool pend_any(int bit)
-{
-	for (uint8_t i = 0; i < LL_MAX_CONN; i++) {
-		if (pend_test(i, bit)) {
-			return true;
-		}
-	}
-	return false;
-}
-
 static bool any_conn_up(void)
 {
 	for (uint8_t i = 0; i < LL_MAX_CONN; i++) {
-		if (conn_up[i]) {
+		if (ll_credit_up(i)) {
 			return true;
 		}
 	}
@@ -386,8 +378,8 @@ static void conn_evt(uint8_t link, enum ll_conn_evt what, const void *arg)
 static void txq_done(uint8_t link, enum ll_txq_kind kind, uint8_t ctrl_opcode)
 {
 	ARG_UNUSED(ctrl_opcode);
-	if (kind == LL_TXQ_ACL && link < LL_MAX_CONN) {
-		atomic_inc(&nocp_pending[link]);
+	if (kind == LL_TXQ_ACL) {
+		ll_credit_acked(link);
 	}
 	if (kind != LL_TXQ_EMPTY) {
 		atomic_inc(&cnt_tx_acked);
@@ -431,17 +423,9 @@ static void radio_evt(enum ll_radio_evt evt, const uint8_t *pdu, uint8_t len, ui
 	}
 	if (ll_radio_conn_guard_streak() >= GUARD_STREAK_MAX && ll_conn_count() != 0) {
 		/* One radio: the streak is counted over all links' events, and
-		 * a wedge ends every active link. The event is closed
-		 * (CONN_DONE handled), so these end now. */
-		bool ended = false;
-
-		for (uint8_t i = 0; i < LL_MAX_CONN; i++) {
-			if (ll_conn_active(i)) {
-				ll_conn_end(i, LL_ST_CONN_TIMEOUT);
-				ended = true;
-			}
-		}
-		if (ended) {
+		 * a wedge ends every active link (ll_conn_end_all, host-tested).
+		 * The event is closed (CONN_DONE handled), so these end now. */
+		if (ll_conn_end_all(LL_ST_CONN_TIMEOUT) != 0) {
 			atomic_inc(&cnt_guard_escalations);
 		}
 	}
@@ -525,7 +509,7 @@ static void unknown_opcode(uint16_t op)
  * event not handled yet). */
 static bool link_busy(uint8_t i)
 {
-	return ll_conn_active(i) || conn_up[i] || pend_test(i, PEND_DISCONNECTED) ||
+	return ll_conn_active(i) || ll_credit_up(i) || pend_test(i, PEND_DISCONNECTED) ||
 	       pend_test(i, PEND_CONNECTED);
 }
 
@@ -566,23 +550,6 @@ static void hci_reset(void)
 	}
 }
 
-/* Advertising may only start again once the controller thread has reset
- * the RX queue and LLCP state of the last connection (ll_rxq_reset() must
- * not race with a new connection's ISR producer). Checked under the lock so
- * a DISCONNECTED raised by the ISR cannot slip in between. */
-static uint8_t adv_enable(bool enable)
-{
-	unsigned int key = ll_plat_lock();
-	uint8_t st;
-
-	if (enable && pend_any(PEND_DISCONNECTED)) {
-		st = LL_ST_DISALLOWED;
-	} else {
-		st = ll_adv_enable(enable);
-	}
-	ll_plat_unlock(key);
-	return st;
-}
 
 /* HCI thread: the negative reply resumes paused host ACL; wake the
  * controller thread, which holds it (nothing else would). */
@@ -617,7 +584,12 @@ static const struct ll_hci_ops hci_ops = {
 	.adv_set_params = ll_adv_set_params,
 	.adv_set_data = ll_adv_set_data,
 	.adv_set_scan_rsp = ll_adv_set_scan_rsp,
-	.adv_enable = adv_enable,
+	/* No glue-side refusal while a disconnect is pending (slice 6a Task
+	 * 6): ll_conn keeps an ended link taken until handle_disconnected()
+	 * has reset its ll_rxq / ll_llcp and released it, so a CONNECT_IND
+	 * during advertising can never reuse that id before the reset, and
+	 * ll_adv_enable() counts it as taken (0x09 when it was the last). */
+	.adv_enable = ll_adv_enable,
 	.unknown = unknown_opcode,
 	.disconnect = hci_disconnect,
 	.ltk_reply = ltk_reply,
@@ -678,15 +650,10 @@ static void handle_connected(uint8_t link)
 	atomic_clear_bit(&pend[link], PEND_CONNECTED);
 	ll_plat_unlock(key);
 
-	atomic_inc(&conn_gen[link]);
 	held_valid[link] = false;
 	mic_failed[link] = false;
-	/* No credit of an earlier connection may reach this one (credit_back()
-	 * and handle_disconnected() already exclude it; this is the backstop). */
-	key = ll_plat_lock();
-	atomic_clear(&nocp_pending[link]);
-	conn_up[link] = true;
-	ll_plat_unlock(key);
+	/* new generation, up, no credit of an earlier connection (ll_credit) */
+	ll_credit_open(link);
 	LOG_INF("connected (handle %u): interval %u latency %u timeout %u", link, ci.interval,
 		ci.latency, ci.timeout);
 	if (!silent_end[link]) {
@@ -704,7 +671,7 @@ static void handle_updated(uint8_t link)
 	ll_plat_unlock(key);
 	LOG_INF("connection update (handle %u): interval %u latency %u timeout %u", link,
 		p.interval, p.latency, p.timeout);
-	if (conn_up[link] && !pend_test(link, PEND_DISCONNECTED)) {
+	if (ll_credit_up(link) && !pend_test(link, PEND_DISCONNECTED)) {
 		ll_hci_evt_conn_update(link, &p);
 	}
 }
@@ -713,10 +680,10 @@ static void handle_updated(uint8_t link)
  * (never after the Disconnection Complete of the connection). */
 static void flush_nocp(uint8_t link)
 {
-	uint32_t n = (uint32_t)atomic_clear(&nocp_pending[link]);
+	uint16_t n = ll_credit_take(link);   /* 0 while the link is down */
 
-	if (n != 0 && conn_up[link]) {
-		ll_hci_evt_num_completed(link, (uint16_t)n);
+	if (n != 0) {
+		ll_hci_evt_num_completed(link, n);
 	}
 }
 
@@ -726,7 +693,7 @@ static void handle_rx(uint8_t link)
 	struct ll_rx_pdu pdu;
 	uint8_t h4[LL_HCI_ACL_MAX];
 
-	if (!conn_up[link]) {
+	if (!ll_credit_up(link)) {
 		return;
 	}
 	for (int i = 0; i < RX_BUDGET; i++) {
@@ -772,12 +739,12 @@ static void handle_acl_tx(uint8_t link)
 {
 	struct acl_item *h = &held[link];
 
-	while (conn_up[link] && !pend_test(link, PEND_DISCONNECTED)) {
+	while (ll_credit_up(link) && !pend_test(link, PEND_DISCONNECTED)) {
 		if (!held_valid[link]) {
 			if (k_msgq_get(&acl_q[link], h, K_NO_WAIT) != 0) {
 				return;
 			}
-			if (h->gen != (uint32_t)atomic_get(&conn_gen[link])) {
+			if (h->gen != ll_credit_gen(link)) {
 				atomic_inc(&cnt_acl_drop);   /* queued for a previous connection */
 				continue;
 			}
@@ -796,7 +763,7 @@ static void handle_acl_tx(uint8_t link)
 		}
 		LOG_WRN("host ACL dropped (handle %u, %d)", link, r);
 		atomic_inc(&cnt_acl_drop);
-		atomic_inc(&nocp_pending[link]);   /* the host's buffer credit comes back */
+		(void)ll_credit_back(link);   /* the host's buffer credit comes back */
 		held_valid[link] = false;
 	}
 }
@@ -831,19 +798,19 @@ static void handle_disconnected(uint8_t link)
 	k_msgq_purge(&acl_q[link]);
 	held_valid[link] = false;
 	atomic_clear_bit(&pend[link], PEND_UPDATED);
-	/* Under the lock, paired with credit_back(): an HCI-thread credit is
-	 * either counted before this clear or sees conn_up false. */
-	key = ll_plat_lock();
-	atomic_clear(&nocp_pending[link]);
-	was_up = conn_up[link];
-	conn_up[link] = false;
-	ll_plat_unlock(key);
+	/* credits and "up" end together (ll_credit: an HCI-thread credit is
+	 * either counted before this or sees the link down) */
+	was_up = ll_credit_close(link);
 
-	ll_conn_release(link);   /* the id may be reused from now on */
+	/* One lock section: this connection's silent_end and DISCONNECTED are
+	 * consumed before the id is released, so a new connection on the
+	 * reused id (CONNECT_IND ISR right after the release) can neither
+	 * lose its own DISCONNECTED nor inherit silent_end. */
 	key = ll_plat_lock();
 	silent = silent_end[link];
 	silent_end[link] = false;
-	atomic_clear_bit(&pend[link], PEND_DISCONNECTED);   /* advertising may start again */
+	atomic_clear_bit(&pend[link], PEND_DISCONNECTED);
+	ll_conn_release(link);   /* the id may be reused from now on */
 	ll_plat_unlock(key);
 
 	LOG_INF("disconnected (handle %u), reason 0x%02x%s", link, reason,
@@ -863,15 +830,22 @@ static uint32_t ticks_to_us(uint32_t t)
  * 2 s while there is anything to report, plus a stall warning if
  * advertising is enabled but tx2rx is not advancing. Connection counters
  * are logged while connected or changed; the ll_conn counters and the
- * ll_rxq overflow count are those of link 0 (per-link stats: group 66,
- * slice 6a Task 6). */
+ * ll_rxq overflow count are sums over all links (per-link counters: group
+ * 66). */
 static void report_stats(struct ll_radio_stats *last, struct ll_conn_stats *last_c)
 {
 	struct ll_radio_stats st;
 	struct ll_conn_stats cs;
 
+	uint32_t rxq_of = 0;
+	struct ll_adv_stats as;
+
 	ll_radio_get_stats(&st);
-	ll_conn_get_stats(0, &cs);
+	ll_conn_get_stats_total(&cs);
+	ll_adv_get_stats(&as);
+	for (uint8_t i = 0; i < LL_MAX_CONN; i++) {
+		rxq_of += ll_rxq_overflow_count(i);
+	}
 	if (st.tx2rx != last->tx2rx || st.rx_ok != last->rx_ok || st.rx_timeout != last->rx_timeout ||
 	    st.rsp_tx != last->rsp_tx || st.rsp_late != last->rsp_late || ll_adv_is_enabled()) {
 		LOG_INF("radio: tx2rx %u rx_ok %u crc %u timeout %u rsp %u rsp_late %u",
@@ -892,13 +866,16 @@ static void report_stats(struct ll_radio_stats *last, struct ll_conn_stats *last
 			st.conn_fto, st.conn_guard, cs.widen_max_us);
 		LOG_INF("conn: tx %u acked %u tifs<=150 %u 151-152 %u >152 %u rxq_of %u ptr_odd %u",
 			st.conn_tx, (uint32_t)atomic_get(&cnt_tx_acked), st.tifs_le150,
-			st.tifs_151_152, st.tifs_gt152, ll_rxq_overflow_count(0), st.rx_ptr_odd);
+			st.tifs_151_152, st.tifs_gt152, rxq_of, st.rx_ptr_odd);
 		LOG_INF("conn: first_bad %u nodata %u outside %u ptr_skip %u wptr_max %u fst_capped %u guard_esc %u",
 			cs.first_bad, cs.first_nodata, cs.first_outside, st.rx_ptr_skip,
 			st.rx_wptr_max, st.fst_capped,
 			(uint32_t)atomic_get(&cnt_guard_escalations));
-		LOG_INF("conn: latency planned %u listened %u skipped %u kicks %u",
-			cs.planned, cs.listened, cs.skipped, cs.kicks);
+		LOG_INF("conn: latency planned %u listened %u skipped %u kicks %u coll %u links %u",
+			cs.planned, cs.listened, cs.skipped, cs.kicks, cs.collisions,
+			ll_conn_count());
+		LOG_INF("adv: events %u slid %u dropped %u cut %u stuck %u adv_guard %u",
+			as.events, as.slid, as.dropped, as.cut, as.stuck, st.adv_guard);
 		LOG_INF("conn: acl in %u out %u drop %u evt_drop %u lock max %u us acl_tx %u us aes %u us",
 			(uint32_t)atomic_get(&cnt_acl_in), (uint32_t)atomic_get(&cnt_acl_out),
 			(uint32_t)atomic_get(&cnt_acl_drop), (uint32_t)atomic_get(&cnt_evt_drop),
@@ -1010,6 +987,7 @@ int b91_bt_controller_init(void)
 	ll_arb_init(&arb_ops);
 	ll_conn_init(&conn_ops);
 	ll_llcp_init(&llcp_ops);   /* resets every link's LLCP state */
+	ll_credit_init();
 	for (uint8_t i = 0; i < LL_MAX_CONN; i++) {
 		ll_rxq_reset(i);
 		k_msgq_init(&acl_q[i], acl_q_buf[i], sizeof(struct acl_item), ACL_Q_DEPTH);
@@ -1031,23 +1009,16 @@ int b91_bt_controller_init(void)
 
 /* HCI thread: give the host's LE ACL buffer credit back for a packet that
  * will never be sent, on the handle it was sent to (NOCP is per handle; a
- * handle that is no link cannot get one). The conn_up test and the
- * increment are one step under ll_plat_lock(), so a credit of an ended
- * connection cannot leak into the next one on that link
- * (handle_disconnected() clears the count and conn_up under the same
- * lock). */
+ * handle that is no link cannot get one). ll_credit_back() tests "up" and
+ * counts in one lock section, so a credit of an ended connection cannot
+ * leak into the next one on that link (ll_credit_close() clears the count
+ * and "up" together). */
 static void credit_back(uint16_t handle)
 {
-	unsigned int key;
-
 	if (handle >= LL_MAX_CONN) {
 		return;
 	}
-	key = ll_plat_lock();
-	if (conn_up[handle]) {
-		atomic_inc(&nocp_pending[handle]);
-	}
-	ll_plat_unlock(key);
+	(void)ll_credit_back((uint8_t)handle);
 	k_sem_give(&wake);
 }
 
@@ -1076,12 +1047,14 @@ void b91_bt_host_send_packet(uint8_t type, uint8_t *data, uint16_t len)
 			}
 			break;
 		}
-		/* handle_valid() passed: the handle is a link id */
-		if (!conn_up[it.pdu.handle]) {
+		/* handle_valid() passed: the handle is a link id. Up and
+		 * generation in one lock section (ll_credit_up_gen): a packet
+		 * is never tagged with a newer connection's generation after
+		 * its own one ended on that id. */
+		if (!ll_credit_up_gen((uint8_t)it.pdu.handle, &it.gen)) {
 			atomic_inc(&cnt_acl_drop);   /* not reported yet (or it just ended) */
 			break;
 		}
-		it.gen = (uint32_t)atomic_get(&conn_gen[it.pdu.handle]);
 		if (k_msgq_put(&acl_q[it.pdu.handle], &it, K_NO_WAIT) != 0) {
 			LOG_ERR("host ACL queue full (host exceeded LE ACL buffers)");
 			atomic_inc(&cnt_acl_drop);

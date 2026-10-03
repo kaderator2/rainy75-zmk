@@ -45,13 +45,15 @@ config BT_HCI_B91_OPENLL_MAX_CONN
 	int "Open link layer: maximum number of peripheral connections"
 	depends on BT_HCI_B91_CTLR_OPEN
 	range 1 5
-	default 1
+	default 3
 	help
 	  Number of simultaneous peripheral links the open link layer keeps
-	  (link ids and HCI connection handles 0..N-1). Multilink is being
-	  built up in slice 6a: ll_conn, HCI and the glue are per link, but
-	  the links share the main alarm without an arbiter and advertising
-	  stays off while any link exists, so use 1 until slice 6a is done.
+	  (link ids and HCI connection handles 0..N-1, one per ZMK profile
+	  that stays connected). The event arbiter (ll_arb) shares the radio
+	  between the links and advertising; advertising is allowed while a
+	  link is free (connectable advertising with all links taken is
+	  refused with Connection Limit Exceeded, 0x09). Each link costs about
+	  1-2 KB of RAM. 1 behaves as the single-link controller of slice 5.
 
 config BT_HCI_B91_OPENLL_STATS_LOG
 	bool "Open link layer: periodic radio/connection stats log"

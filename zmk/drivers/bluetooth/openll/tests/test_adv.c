@@ -36,18 +36,24 @@ static void on_conn(const struct ll_connect_ind *ci) { conn = *ci; conn_calls++;
 static int start_ret = -EINVAL, start_calls, restores; static bool conn_is_active;
 static struct ll_connect_ind start_ci; static uint32_t start_tick;
 static bool start_saw_enabled = true, start_saw_sched = true; static int start_saw_stops;
+/* links taken (active or awaiting release): 0..LL_MAX_CONN */
+static uint8_t taken;
 int ll_conn_start(const struct ll_connect_ind *ci, uint32_t t)
 {
 	start_calls++; start_ci = *ci; start_tick = t;
 	/* advertising must already be stopped when the connection starts */
 	start_saw_enabled = ll_adv_is_enabled(); start_saw_sched = sched_cb != NULL;
 	start_saw_stops = radio_stops;
-	if (start_ret >= 0) conn_is_active = true;
+	if (start_ret >= 0) {
+		conn_is_active = true;
+		taken++;
+	}
 	return start_ret;
 }
-/* links taken (active or awaiting release) */
-uint8_t ll_conn_count(void) { return conn_is_active ? 1 : 0; }
+uint8_t ll_conn_count(void) { return taken; }
 void ll_radio_adv_restore(void) { restores++; }
+static int adv_enters;
+void ll_radio_adv_enter(void) { adv_enters++; }
 
 static const uint8_t adva[6] = {0x01, 0x02, 0x03, 0x38, 0xC1, 0xA4};
 
@@ -58,12 +64,257 @@ static struct ll_adv_params params(uint8_t type, uint8_t map)
 	return p;
 }
 
-/* the real ll_arb with advertising as its only owner */
-static void arb_start(uint8_t id, uint32_t cap_us) { CHECK(id == LL_ARB_ADV); ll_adv_arb_start(cap_us); }
-static void arb_bumped(uint8_t id) { CHECK(id == LL_ARB_ADV); ll_adv_arb_bumped(); }
+/* the real ll_arb; advertising is its only real owner, id 0 is a foreign
+ * requester driven by the test (starts and bumps recorded) */
+static int foreign_starts, foreign_bumps;
+static void arb_start(uint8_t id, uint32_t cap_us)
+{
+	if (id == LL_ARB_ADV) ll_adv_arb_start(cap_us); else foreign_starts++;
+}
+static void arb_bumped(uint8_t id)
+{
+	if (id == LL_ARB_ADV) ll_adv_arb_bumped(); else foreign_bumps++;
+}
 static const struct ll_arb_ops arb_ops = {.start = arb_start, .bumped = arb_bumped};
 
 static void fire_sched(void) { ll_sched_cb_t cb = sched_cb; sched_cb = NULL; CHECK(cb != NULL); if (cb) cb(); }
+
+static void put_ci_pdu(uint8_t *ci_pdu)
+{
+	static const uint8_t base[8] = {0x05, 34, 0x11, 0x12, 0x13, 0x14, 0x15, 0xD6};
+
+	memset(ci_pdu, 0, 36);
+	memcpy(ci_pdu, base, 8);
+	memcpy(&ci_pdu[8], adva, 6);
+	ci_pdu[2 + 22] = 24;  /* interval */
+}
+
+/* Slice 6a Task 6: enable while links are up. */
+static void test_while_connected(void)
+{
+	struct ll_adv_params p;
+	uint8_t ci_pdu[36];
+
+	ll_adv_reset();
+	/* counts 0..N: connectable allowed below N, 0x09 at N */
+	for (uint8_t n = 0; n <= LL_MAX_CONN; n++) {
+		taken = n;
+		for (uint8_t type = 0; type <= 3; type++) {
+			uint8_t want;
+
+			if (type == 1) {
+				continue;   /* directed: unsupported */
+			}
+			p = params(type, 7);
+			CHECK(ll_adv_set_params(&p) == LL_ST_SUCCESS);
+			/* only connectable (ADV_IND) is limited */
+			want = (type == 0 && n >= LL_MAX_CONN) ? LL_ST_CONN_LIMIT : LL_ST_SUCCESS;
+			CHECK(ll_adv_enable(true) == want);
+			CHECK(ll_adv_is_enabled() == (want == LL_ST_SUCCESS));
+			CHECK((sched_cb != NULL) == (want == LL_ST_SUCCESS));
+			CHECK(ll_adv_enable(false) == LL_ST_SUCCESS);
+		}
+	}
+	/* after a handover with links left: no restore, ll_radio_adv_enter
+	 * before every channel start that follows a gap */
+	if (LL_MAX_CONN >= 2) {
+		int r0 = restores, e0;
+
+		taken = 0;
+		p = params(0, 7);
+		CHECK(ll_adv_set_params(&p) == LL_ST_SUCCESS);
+		CHECK(ll_adv_enable(true) == LL_ST_SUCCESS);
+		fire_sched();
+		put_ci_pdu(ci_pdu);
+		start_ret = 0;
+		ll_adv_radio_evt(LL_RADIO_RX_OK, ci_pdu, 36, now_tick);
+		CHECK(!ll_adv_is_enabled() && taken == 1);
+		e0 = adv_enters;
+		CHECK(ll_adv_enable(true) == LL_ST_SUCCESS);
+		CHECK(restores == r0);
+		fire_sched();
+		CHECK(adv_enters == e0 + 1 && radio_ch == 37);
+		/* the whole event is one request: no further enter */
+		ll_adv_radio_evt(LL_RADIO_RX_TIMEOUT, NULL, 0, 0);
+		ll_adv_radio_evt(LL_RADIO_RX_TIMEOUT, NULL, 0, 0);
+		CHECK(radio_ch == 39 && adv_enters == e0 + 1);
+		ll_adv_radio_evt(LL_RADIO_RX_TIMEOUT, NULL, 0, 0);
+		/* connection radio events between adv events are ignored */
+		{
+			int tx0 = txrx_calls, sc0 = sched_calls;
+
+			ll_adv_radio_evt(LL_RADIO_CONN_DONE, NULL, 0, 0);
+			ll_adv_radio_evt(LL_RADIO_CONN_RX, ci_pdu, 2, 0);
+			CHECK(txrx_calls == tx0 && sched_calls == sc0);
+		}
+		fire_sched();
+		CHECK(adv_enters == e0 + 2);
+		CHECK(ll_adv_enable(false) == LL_ST_SUCCESS);
+		/* the last link gone: the next enable restores once, no enters */
+		taken = 0;
+		CHECK(ll_adv_enable(true) == LL_ST_SUCCESS);
+		CHECK(restores == r0 + 1);
+		e0 = adv_enters;
+		fire_sched();
+		CHECK(adv_enters == e0);
+		CHECK(ll_adv_enable(false) == LL_ST_SUCCESS);
+	}
+	taken = 0;
+	conn_is_active = false;
+}
+
+static int foreign_req(uint32_t t, uint32_t len_us, uint8_t prio)
+{
+	struct ll_arb_req r = {.alarm_tick = t, .open_tick = t, .min_len_us = len_us,
+			       .max_len_us = len_us, .prio = prio};
+
+	return ll_arb_request(0, &r);
+}
+
+/* A displaced adv event goes straight to the next gap: it never asks for
+ * the displaced placement again (which, at a tie it would win as the one
+ * that yielded last, would displace the displacer back). */
+static void test_bumped_goes_to_gap(void)
+{
+	struct ll_adv_params p = params(0, 7);
+	uint32_t ev0;
+
+	ll_adv_reset();
+	foreign_starts = foreign_bumps = 0;
+	CHECK(ll_adv_set_params(&p) == LL_ST_SUCCESS);
+	CHECK(ll_adv_enable(true) == LL_ST_SUCCESS);
+	ev0 = sched_tick;
+	/* the foreign requester loses once and gives up (yield), so it wins
+	 * the next tie against advertising and displaces it */
+	CHECK(foreign_req(ev0 + 1000 * LL_TICKS_PER_US, 1000, LL_ARB_PRIO_ADV) == -EBUSY);
+	ll_arb_yield(0);
+	CHECK(foreign_req(ev0 + 1000 * LL_TICKS_PER_US, 1000, LL_ARB_PRIO_ADV) == 0);
+	CHECK(foreign_bumps == 0);   /* advertising did not take it back */
+	CHECK(sched_tick == ev0 + 1000 * LL_TICKS_PER_US);
+	fire_sched();
+	CHECK(foreign_starts == 1);
+	ll_arb_cancel(0);
+	/* advertising after the foreign span */
+	CHECK(sched_cb != NULL && (int32_t)(sched_tick - (ev0 + 2000 * LL_TICKS_PER_US)) > 0);
+	fire_sched();
+	CHECK(radio_ch == 37);
+	CHECK(ll_adv_enable(false) == LL_ST_SUCCESS);
+}
+
+static int foreign_req_id(uint8_t id, uint32_t t, uint32_t len_us, uint8_t prio)
+{
+	struct ll_arb_req r = {.alarm_tick = t, .open_tick = t, .min_len_us = len_us,
+			       .max_len_us = len_us, .prio = prio};
+
+	return ll_arb_request(id, &r);
+}
+
+#define TU(us) ((uint32_t)(us) * LL_TICKS_PER_US)
+
+/* Run one adv channel at the pending alarm: fire, 700 us of air. */
+static void adv_channel(void)
+{
+	now_tick = sched_tick;
+	fire_sched();
+	now_tick += TU(700);
+	ll_adv_radio_evt(LL_RADIO_RX_TIMEOUT, NULL, 0, 0);
+}
+
+/* Slicing: the whole event is moved behind a short block when it fits
+ * there within 10 ms; else only the first channel goes in front of it,
+ * and the next channels into later gaps, each within 10 ms of the last
+ * PDU (Vol 6 Part B 4.4.2.3), or the event is cut. */
+static void test_sliced(void)
+{
+	struct ll_adv_params p = params(3, 7);
+	struct ll_adv_stats a0, a1;
+	uint32_t ev0;
+
+	ll_adv_reset();
+	foreign_starts = foreign_bumps = 0;
+	CHECK(ll_adv_set_params(&p) == LL_ST_SUCCESS);
+	ll_adv_get_stats(&a0);
+	CHECK(ll_adv_enable(true) == LL_ST_SUCCESS);
+	ev0 = sched_tick;
+	/* A: a 3 ms MUST block 2.5 ms after the start: the whole event moves
+	 * behind it (5.5 ms later) and runs its 3 channels back to back */
+	CHECK(foreign_req(ev0 + TU(2500), 3000, LL_ARB_PRIO_MUST) == 0);
+	CHECK(sched_tick == ev0 + TU(2500));
+	now_tick = sched_tick;
+	fire_sched();
+	CHECK(foreign_starts == 1);
+	ll_arb_cancel(0);
+	CHECK(sched_tick == ev0 + TU(5500) + 1);
+	now_tick = sched_tick;
+	fire_sched();
+	CHECK(radio_ch == 37);
+	ll_adv_radio_evt(LL_RADIO_RX_TIMEOUT, NULL, 0, 0);
+	CHECK(radio_ch == 38);
+	ll_adv_radio_evt(LL_RADIO_RX_TIMEOUT, NULL, 0, 0);
+	CHECK(radio_ch == 39);
+	ll_adv_radio_evt(LL_RADIO_RX_TIMEOUT, NULL, 0, 0);
+	ll_adv_get_stats(&a1);
+	CHECK(a1.events == a0.events + 1 && a1.slid == a0.slid + 1 && a1.cut == a0.cut);
+
+	/* B: a 12 ms block: only channel 37 fits in front of it; channel 38
+	 * would start more than 10 ms after it: the event is cut */
+	ev0 = sched_tick;
+	CHECK(foreign_req(ev0 + TU(2500), 12000, LL_ARB_PRIO_MUST) == 0);
+	CHECK(sched_tick == ev0);
+	adv_channel();
+	CHECK(radio_ch == 37);
+	ll_adv_get_stats(&a1);
+	CHECK(a1.cut == a0.cut + 1 && a1.events == a0.events + 2);
+	CHECK(sched_tick == ev0 + TU(2500));   /* the block, then the next event */
+	now_tick = sched_tick;
+	fire_sched();
+	ll_arb_cancel(0);
+	CHECK(sched_cb != NULL && (int32_t)(sched_tick - (ev0 + TU(100000))) > 0);
+
+	/* C (two foreign requesters, N >= 2): blocks [2.5, 5.5] and [10, 20]
+	 * ms: sliced, 37 at the start, 38 after the first block, 39 right
+	 * behind it, all within 10 ms of each other */
+	if (LL_MAX_CONN >= 2) {
+		uint32_t t37, t38;
+
+		ev0 = sched_tick;
+		CHECK(foreign_req_id(1, ev0 + TU(10000), 10000, LL_ARB_PRIO_MUST) == 0);
+		CHECK(foreign_req_id(0, ev0 + TU(2500), 3000, LL_ARB_PRIO_MUST) == 0);
+		CHECK(sched_tick == ev0);
+		t37 = ev0;
+		adv_channel();
+		CHECK(radio_ch == 37);
+		CHECK(sched_tick == ev0 + TU(2500));
+		/* waiting for channel 38: radio events of other users (a link's
+		 * connection event in the gap, a stray timeout) are ignored */
+		{
+			int tx0 = txrx_calls, sc0 = sched_calls;
+
+			ll_adv_radio_evt(LL_RADIO_CONN_DONE, NULL, 0, 0);
+			ll_adv_radio_evt(LL_RADIO_RX_TIMEOUT, NULL, 0, 0);
+			ll_adv_radio_evt(LL_RADIO_TX_DONE, NULL, 0, 0);
+			CHECK(txrx_calls == tx0 && sched_calls == sc0 && radio_ch == 37);
+		}
+		now_tick = sched_tick;
+		fire_sched();               /* block 1 */
+		ll_arb_cancel(0);
+		t38 = sched_tick;
+		CHECK(t38 == ev0 + TU(5500) + 1);
+		adv_channel();
+		CHECK(radio_ch == 38);
+		CHECK((int32_t)(sched_tick - t38) > 0 &&
+		      (int32_t)(sched_tick - (ev0 + TU(10000))) < 0);
+		CHECK((int32_t)(t38 - t37) <= (int32_t)TU(10000));
+		adv_channel();
+		CHECK(radio_ch == 39);
+		ll_adv_get_stats(&a1);
+		CHECK(a1.cut == a0.cut + 1 && a1.events == a0.events + 3);
+		now_tick = sched_tick;
+		fire_sched();               /* block 2 */
+		ll_arb_cancel(1);
+	}
+	CHECK(ll_adv_enable(false) == LL_ST_SUCCESS);
+}
 
 int main(void)
 {
@@ -232,10 +483,17 @@ int main(void)
 	ll_adv_radio_evt(LL_RADIO_RX_TIMEOUT, NULL, 0, 0);
 	ll_adv_radio_evt(LL_RADIO_TX_DONE, NULL, 0, 0);
 	CHECK(sched_calls == sc_before && txrx_calls == txrx_before);
-	/* the host may not re-enable advertising during the connection;
-	 * disable is a harmless no-op */
-	CHECK(ll_adv_enable(true) == LL_ST_DISALLOWED);
-	CHECK(!ll_adv_is_enabled() && sched_cb == NULL && restores == 0);
+	/* with one link only, connectable advertising cannot be re-enabled
+	 * during the connection (0x09); with more links it can, without a
+	 * baseband restore. Disable is a harmless no-op. */
+	if (LL_MAX_CONN == 1) {
+		CHECK(ll_adv_enable(true) == LL_ST_CONN_LIMIT);
+		CHECK(!ll_adv_is_enabled() && sched_cb == NULL && restores == 0);
+	} else {
+		CHECK(ll_adv_enable(true) == LL_ST_SUCCESS);
+		CHECK(ll_adv_is_enabled() && restores == 0);
+		CHECK(ll_adv_enable(false) == LL_ST_SUCCESS);
+	}
 	CHECK(ll_adv_enable(false) == LL_ST_SUCCESS);
 	/* parameters and data may still be changed (host prepares resume) */
 	p = params(0, 7);
@@ -243,6 +501,7 @@ int main(void)
 	/* after the disconnect the host re-enables advertising via HCI: the
 	 * radio is restored once (baseband left connection mode), then events run */
 	conn_is_active = false;
+	taken = 0;
 	CHECK(ll_adv_enable(true) == LL_ST_SUCCESS);
 	CHECK(restores == 1 && ll_adv_is_enabled() && sched_cb != NULL);
 	fire_sched();
@@ -281,5 +540,8 @@ int main(void)
 	CHECK(sched_calls == sc_before + 1 && sched_cb != NULL);
 	CHECK(ll_adv_enable(false) == LL_ST_SUCCESS);
 
+	test_while_connected();
+	test_bumped_goes_to_gap();
+	test_sliced();
 	DONE();
 }

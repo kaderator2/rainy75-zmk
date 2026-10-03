@@ -30,6 +30,7 @@ _Static_assert(LL_MAX_CONN >= 1 && LL_MAX_CONN <= 5, "LL_MAX_CONN must be 1..5")
 #define LL_ST_UNSUPPORTED    0x11
 #define LL_ST_INVALID_PARAM  0x12
 #define LL_ST_PIN_KEY_MISSING 0x06
+#define LL_ST_CONN_LIMIT      0x09   /* Connection Limit Exceeded */
 #define LL_ST_CONN_TIMEOUT    0x08
 #define LL_ST_REMOTE_TERM     0x13
 #define LL_ST_LOCAL_TERM      0x16

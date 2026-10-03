@@ -123,6 +123,17 @@ static uint8_t rx_buf[RX_AREA_SIZE] __aligned(4);
 static uint8_t conn_tx_buf[(1 + RING_N) * DMA_BUF_SIZE] __aligned(4);
 static ll_radio_cb_t radio_cb;
 static volatile bool rsp_in_flight;
+/* An advertising TX/RX (tx_then_rx, or a SCAN_RSP) whose end IRQ is
+ * pending; the adv guard recovers if it never comes. */
+static volatile bool adv_open;
+/* Adv guard: an stx2rx ends within about 0.8 ms (TX + 300 us RX window),
+ * a SCAN_RSP within 0.5 ms of its trigger. ml-spike S3 saw one stall in
+ * 3791 adv events between connection events (FSM idle, TX seen, no end
+ * IRQ); without recovery advertising would stay "in event" forever, and the
+ * arbiter would keep its request running and starve every link. */
+#define ADV_GUARD_US           2000
+#define ADV_RSP_GUARD_US       1500
+static atomic_t cnt_adv_guard;
 
 static enum { MODE_ADV, MODE_CONN } mode;
 
@@ -183,6 +194,10 @@ static uint8_t *rx_entry(uint8_t idx)
 
 static void adv_isr(uint16_t st)
 {
+	if (st & (FLD_RF_IRQ_RX | FLD_RF_IRQ_RX_TIMEOUT | FLD_RF_IRQ_FIRST_TIMEOUT) ||
+	    ((st & FLD_RF_IRQ_TX) && rsp_in_flight)) {
+		adv_open = false;   /* ended (a SCAN_RSP re-opens it below) */
+	}
 	if (st & FLD_RF_IRQ_RX) {
 		/* The DMA wrote entry (wptr & 3) and advanced the wptr; the
 		 * advertising RX window ends with this packet, so the newest
@@ -426,6 +441,21 @@ void ll_radio_set_adv_channel(uint8_t ch)
 	rf_set_ble_crc_adv();
 }
 
+/* Adv guard (stimer ISR): the advertising TX/RX produced no end IRQ.
+ * Recover as ml-spike S3 did: baseband reset + adv init (the restore; the
+ * next connection event re-selects its link, a new connection redoes the
+ * connection setup), then end the channel for ll_adv like an RX timeout. */
+static void adv_guard(void)
+{
+	if (!adv_open || mode != MODE_ADV) {
+		return;
+	}
+	adv_open = false;
+	atomic_inc(&cnt_adv_guard);
+	ll_radio_adv_restore();
+	radio_cb(LL_RADIO_RX_TIMEOUT, NULL, 0, 0);
+}
+
 void ll_radio_tx_then_rx(const uint8_t *pdu, uint8_t len, uint32_t start_tick,
 			 uint32_t rx_window_us)
 {
@@ -434,7 +464,9 @@ void ll_radio_tx_then_rx(const uint8_t *pdu, uint8_t len, uint32_t start_tick,
 	rf_tx_settle_us(TX_SETTLE_ADV_US);
 	rf_ble_set_rx_timeout(rx_window_us);
 	atomic_inc(&cnt_tx2rx);
+	adv_open = true;
 	rf_start_stx2rx(tx_buf, start_tick);
+	ll_sched_guard_at(start_tick + ADV_GUARD_US * LL_TICKS_PER_US, adv_guard);
 }
 
 void ll_radio_prepare_rsp(const uint8_t *pdu, uint8_t len)
@@ -455,7 +487,9 @@ bool ll_radio_tx_rsp_at(uint32_t tick)
 	rsp_in_flight = true;
 	rf_tx_settle_us(TX_SETTLE_RSP_US);
 	atomic_inc(&cnt_rsp_tx);
+	adv_open = true;
 	rf_start_stx(rsp_buf, trigger_tick);
+	ll_sched_guard_at(trigger_tick + ADV_RSP_GUARD_US * LL_TICKS_PER_US, adv_guard);
 	return true;
 }
 
@@ -477,6 +511,7 @@ void ll_radio_get_stats(struct ll_radio_stats *s)
 	s->tifs_151_152 = (uint32_t)atomic_get(&cnt_tifs_151_152);
 	s->tifs_gt152 = (uint32_t)atomic_get(&cnt_tifs_gt152);
 	s->restores = (uint32_t)atomic_get(&cnt_restores);
+	s->adv_guard = (uint32_t)atomic_get(&cnt_adv_guard);
 	s->rx_ptr_skip = (uint32_t)atomic_get(&cnt_rx_ptr_skip);
 	s->fst_capped = (uint32_t)atomic_get(&cnt_fst_capped);
 	s->rx_wptr_max = rx_wptr_max;
@@ -487,6 +522,7 @@ void ll_radio_get_stats(struct ll_radio_stats *s)
 void ll_radio_stop(void)
 {
 	rsp_in_flight = false;
+	adv_open = false;
 	rf_set_tx_rx_off_auto_mode();
 }
 
@@ -563,6 +599,7 @@ void ll_radio_conn_init(void)
 void ll_radio_conn_select(uint32_t aa, uint32_t crc_init)
 {
 	rf_set_tx_rx_off_auto_mode();
+	adv_open = false;
 	/* brx spike round 1: AA byte-swapped, CRC init as parsed; written to
 	 * the hardware by ll_radio_conn_event() */
 	cn.aa_reg = __builtin_bswap32(aa);
@@ -577,6 +614,7 @@ void ll_radio_adv_enter(void)
 	rf_set_tx_rx_off_auto_mode();
 	cn.evt_open = false;
 	rsp_in_flight = false;
+	adv_open = false;
 	/* S3 round 1: an stx2rx with a non-empty TX FIFO wedges the FSM in
 	 * 0x03 and the following BRX commands never end. The next connection
 	 * event rebuilds its link's ring. */
@@ -714,6 +752,7 @@ void ll_radio_adv_restore(void)
 	rf_set_tx_wptr(0, rf_get_tx_rptr(0));
 	restore_ptrs_after = tx_ptrs();
 	rsp_in_flight = false;
+	adv_open = false;
 	mode = MODE_ADV;
 	atomic_inc(&cnt_restores);
 	irq_unlock(key);

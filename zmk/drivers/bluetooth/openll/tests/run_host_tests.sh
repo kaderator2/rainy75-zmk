@@ -16,13 +16,14 @@ build_run_as() {
     "/tmp/openll_$n"
 }
 build_run test_pdu ../ll_pdu.c
-build_run test_adv ../ll_adv.c ../ll_pdu.c ../ll_arb.c
 build_run test_csa1 ../ll_csa1.c
 build_run test_crypt ../ll_crypt.c aes_ref.c
 # Suites with per-link state run for LL_MAX_CONN 1, 3 and 5 (slice 6a):
 # binaries <test>_n<N>.
 for n in 1 3 5; do
+    build_run_as test_adv_n$n test_adv -DLL_MAX_CONN=$n ../ll_adv.c ../ll_pdu.c ../ll_arb.c
     build_run_as test_hci_n$n test_hci -DLL_MAX_CONN=$n ../ll_hci.c
+    build_run_as test_credit_n$n test_credit -DLL_MAX_CONN=$n ../ll_credit.c
     build_run_as test_txq_n$n test_txq -DLL_MAX_CONN=$n ../ll_txq.c
     build_run_as test_txq_safe_n$n test_txq -DLL_MAX_CONN=$n -DLL_TXQ_SAFE_MODE ../ll_txq.c
     build_run_as test_conn_n$n test_conn -DLL_MAX_CONN=$n \

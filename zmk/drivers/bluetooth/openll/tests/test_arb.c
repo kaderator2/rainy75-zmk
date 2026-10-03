@@ -54,6 +54,7 @@ static struct {
 	int txrx;
 	uint8_t adv_ch;
 	int stops;
+	int adv_enters;
 } rad;
 
 static struct {
@@ -104,6 +105,7 @@ void ll_radio_prepare_rsp(const uint8_t *pdu, uint8_t len) { (void)pdu; (void)le
 bool ll_radio_tx_rsp_at(uint32_t tick) { (void)tick; return true; }
 void ll_radio_stop(void) { rad.stops++; }
 void ll_radio_adv_restore(void) {}
+void ll_radio_adv_enter(void) { rad.adv_enters++; }
 void ll_sched_init(void) {}
 void ll_sched_at(uint32_t tick, ll_sched_cb_t cb)
 {
@@ -157,12 +159,31 @@ static void rec_start(uint8_t id, uint32_t cap_us)
 	rec.start_cap = cap_us;
 }
 
+/* chain test: a bumped owner requests chain_req[id] again (if set) */
+static struct ll_arb_req chain_req[LL_ARB_IDS];
+static bool chain_on[LL_ARB_IDS];
+static int bump_depth, bump_depth_max;
+static uint8_t bump_order[16];
+static int bump_order_n;
+
 static void rec_bumped(uint8_t id)
 {
 	CHECK(locks > 0);   /* same context as the displacing request */
+	bump_depth++;
+	if (bump_depth > bump_depth_max) {
+		bump_depth_max = bump_depth;
+	}
 	rec.bumps++;
 	rec.bump_id = id;
 	rec.bumped_mask |= 1u << id;
+	if (bump_order_n < 16) {
+		bump_order[bump_order_n++] = id;
+	}
+	if (chain_on[id]) {
+		chain_on[id] = false;
+		CHECK(ll_arb_request(id, &chain_req[id]) == 0);
+	}
+	bump_depth--;
 }
 
 static const struct ll_arb_ops rec_ops = {.start = rec_start, .bumped = rec_bumped};
@@ -172,6 +193,8 @@ static void arb_reset(void)
 	now = 1000000;
 	memset(&sch, 0, sizeof(sch));
 	memset(&rec, 0, sizeof(rec));
+	memset(chain_on, 0, sizeof(chain_on));
+	bump_depth = bump_depth_max = bump_order_n = 0;
 	ll_arb_init(&rec_ops);
 }
 
@@ -199,6 +222,14 @@ static int req(uint8_t id, struct ll_arb_req r)
 }
 
 static const uint8_t A = 0, B = LL_ARB_ADV;
+
+static void yield(uint8_t id)
+{
+	unsigned int k = ll_plat_lock();
+
+	ll_arb_yield(id);
+	ll_plat_unlock(k);
+}
 
 static void test_accept_refuse_prio(void)
 {
@@ -264,15 +295,48 @@ static void test_bump(void)
 	}
 }
 
+/* A displaced owner's request that displaces another one does not nest:
+ * the second bumped callback runs after the first returned (depth 1). */
+static void test_bump_chain(void)
+{
+	const uint32_t t = 2000000;
+	const uint8_t C = 1;
+
+	if (LL_ARB_IDS < 3) {
+		return;
+	}
+	arb_reset();
+	CHECK(req(A, mk(t, 0, 1000, 1000, LL_ARB_PRIO_ACTIVE)) == 0);
+	CHECK(req(C, mk(t + T(5000), 0, 1000, 1000, LL_ARB_PRIO_IDLE)) == 0);
+	/* A, once bumped, moves onto C (ACTIVE beats IDLE) */
+	chain_req[A] = mk(t + T(5000), 0, 1000, 1000, LL_ARB_PRIO_ACTIVE);
+	chain_on[A] = true;
+	CHECK(req(B, mk(t, 0, 1000, 1000, LL_ARB_PRIO_MUST)) == 0);
+	CHECK(rec.bumps == 2 && bump_order_n == 2);
+	CHECK(bump_order[0] == A && bump_order[1] == C);
+	CHECK(bump_depth_max == 1);
+	CHECK(sch.tick == t);
+	fire_alarm();
+	CHECK(rec.start_id == B);
+	CHECK(sch.tick == t + T(5000));
+	ll_arb_cancel(B);   /* B's event is over */
+	fire_alarm();
+	CHECK(rec.start_id == A);
+}
+
 static void test_round_robin(void)
 {
 	const uint32_t t = 2000000;
 
 	arb_reset();
 	CHECK(req(A, mk(t, 500, 2000, 10000, LL_ARB_PRIO_IDLE)) == 0);
-	/* tie, B never yielded: refused (B yields) */
+	/* tie, B never yielded: refused */
 	CHECK(req(B, mk(t + T(100), 500, 2000, 10000, LL_ARB_PRIO_IDLE)) == -EBUSY);
-	/* B yielded last: it wins the next tie, A is bumped (A yields) */
+	/* a refusal alone is a probe: no flag changes, B still loses */
+	CHECK(req(B, mk(t + T(150), 500, 2000, 10000, LL_ARB_PRIO_IDLE)) == -EBUSY);
+	/* B gives the event up (a yield): now B yielded last, it wins the next
+	 * tie, A is bumped (A yields) */
+	yield(B);
 	CHECK(req(B, mk(t + T(200), 500, 2000, 10000, LL_ARB_PRIO_IDLE)) == 0);
 	CHECK(rec.bumps == 1 && rec.bump_id == A);
 	/* now A yielded last: A wins */
@@ -285,14 +349,39 @@ static void test_round_robin(void)
 		CHECK(req(req_id, mk(t + T(400 + 10 * i), 500, 2000, 10000, LL_ARB_PRIO_IDLE)) == 0);
 		CHECK(rec.bump_id == ((i & 1) ? B : A));
 	}
-	/* a loss at a priority collision counts as a yield too: A refused by
-	 * a higher B wins the next tie */
+	/* a loss at a priority collision counts as a yield too once given up:
+	 * A refused by a higher B, A yields, A wins the next tie */
 	arb_reset();
 	CHECK(req(B, mk(t, 500, 2000, 10000, LL_ARB_PRIO_ACTIVE)) == 0);
 	CHECK(req(A, mk(t, 500, 2000, 10000, LL_ARB_PRIO_IDLE)) == -EBUSY);
+	yield(A);
 	CHECK(req(B, mk(t, 500, 2000, 10000, LL_ARB_PRIO_IDLE)) == 0);   /* replaces itself */
 	CHECK(req(A, mk(t, 500, 2000, 10000, LL_ARB_PRIO_IDLE)) == 0);
 	CHECK(rec.bumps == 1 && rec.bump_id == B);
+	/* refused probes (dodge loop, kick probes) without a yield change no
+	 * flag: A keeps losing ties against B, however often it probes */
+	arb_reset();
+	CHECK(req(B, mk(t, 500, 2000, 10000, LL_ARB_PRIO_IDLE)) == 0);
+	for (int i = 0; i < 5; i++) {
+		CHECK(req(A, mk(t + T(100 * i), 500, 2000, 10000, LL_ARB_PRIO_IDLE)) == -EBUSY);
+	}
+	CHECK(rec.bumps == 0);
+	/* the yield marks only the request that refused A's LAST probe as
+	 * not yielded: B (refused A) is reset, a third request is untouched */
+	if (LL_ARB_IDS >= 3) {
+		const uint8_t C = 1;
+
+		CHECK(req(C, mk(t + T(20000), 500, 2000, 10000, LL_ARB_PRIO_IDLE)) == 0);
+		yield(C);   /* C has no recorded refusal: only C is marked */
+		yield(A);   /* A's last refusal was by B */
+		/* A now wins a tie against B (A yielded, B not) ... */
+		CHECK(req(A, mk(t + T(100), 500, 2000, 10000, LL_ARB_PRIO_IDLE)) == 0);
+		CHECK(rec.bumps == 1 && rec.bump_id == B);
+		/* ... and C (yielded, never reset) wins a tie against A, which
+		 * just won and is not yielded */
+		CHECK(req(C, mk(t + T(200), 500, 2000, 10000, LL_ARB_PRIO_IDLE)) == 0);
+		CHECK(rec.bumps == 2 && rec.bump_id == A);
+	}
 }
 
 /* A started request is running until its owner requests again or
@@ -300,17 +389,21 @@ static void test_round_robin(void)
 static void test_running(void)
 {
 	const uint32_t t = 2000000;
+	const uint32_t reserve = LL_CONN_EVENT_SAFETY_US + LL_CONN_ARM_LEAD_US;
 
 	arb_reset();
 	CHECK(req(A, mk(t, 500, 2000, 12000, LL_ARB_PRIO_IDLE)) == 0);
 	fire_alarm();
 	CHECK(rec.starts == 1 && rec.start_id == A && rec.start_cap == 12000);
-	/* MUST cannot displace a running event, also past min_len (cap) */
+	/* MUST cannot displace a running event, also past min_len, up to
+	 * the cap plus the clipping reserve (a request accepted while it runs
+	 * keeps SAFETY + LEAD between the cap and its own span) */
 	CHECK(req(B, mk(t + T(1000), 0, 1000, 1000, LL_ARB_PRIO_MUST)) == -EBUSY);
 	CHECK(req(B, mk(t + T(11000), 0, 1000, 1000, LL_ARB_PRIO_MUST)) == -EBUSY);
+	CHECK(req(B, mk(t + T(12000 + reserve), 0, 1000, 1000, LL_ARB_PRIO_MUST)) == -EBUSY);
 	CHECK(rec.bumps == 0);
-	CHECK(req(B, mk(t + T(12000) + 1, 0, 1000, 1000, LL_ARB_PRIO_MUST)) == 0);
-	CHECK(ll_arb_gap(t, 0, 100) == t + T(13000) + 2);
+	CHECK(req(B, mk(t + T(12000 + reserve) + 1, 0, 1000, 1000, LL_ARB_PRIO_MUST)) == 0);
+	CHECK(ll_arb_gap(t, 0, 100) == t + T(13000 + reserve) + 2);
 	/* A's next request ends the running state */
 	CHECK(req(A, mk(t + T(30000), 500, 2000, 12000, LL_ARB_PRIO_IDLE)) == 0);
 	CHECK(ll_arb_gap(t, 0, 100) == t);
@@ -346,8 +439,9 @@ static void test_cap_clip(void)
 	CHECK(req(B, mk(t + T(9000), 500, 2000, 14000, LL_ARB_PRIO_IDLE)) == 0);
 	fire_alarm();
 	CHECK(rec.start_id == A && rec.start_cap == 9000 - reserve);
-	/* the running span follows the clipped cap */
-	CHECK(ll_arb_gap(t, 0, 1) == t + T(9000 - reserve) + 1);
+	/* the running span follows the clipped cap plus the reserve: it ends
+	 * exactly where B's open is (B's own span starts with its lead) */
+	CHECK(ll_arb_gap(t, 0, 1) == t + T(9000 + 2000) + 1);
 	/* far after: max stays */
 	arb_reset();
 	CHECK(req(A, mk(t, 500, 2000, 14000, LL_ARB_PRIO_IDLE)) == 0);
@@ -534,8 +628,12 @@ static struct {
 	int last_ev[LL_MAX_CONN];   /* counter of the last listened event, -1 none */
 	int max_gap[LL_MAX_CONN];
 	int adv_events;
+	int adv_pdus;
 	uint32_t adv_last, adv_max_gap;
 	int overlaps, over_cap;
+	/* the next adv channel receives this CONNECT_IND instead of nothing */
+	const uint8_t *connect_pdu;
+	uint32_t connect_end;
 } sim;
 
 static const uint8_t all37[5] = {0xFF, 0xFF, 0xFF, 0xFF, 0x1F};
@@ -627,6 +725,7 @@ static int link_of_aa(uint32_t aa)
 static void sim_step(void)
 {
 	int ev = rad.events, tx = rad.txrx;
+	struct ll_adv_stats as0, as1;
 
 	if (!sch.cb) {
 		CHECK(sch.cb != NULL);
@@ -639,7 +738,9 @@ static void sim_step(void)
 			       (unsigned)sim.busy_until);
 		}
 	}
+	ll_adv_get_stats(&as0);
 	fire_alarm();
+	ll_adv_get_stats(&as1);
 	if (rad.events != ev) {
 		int k = link_of_aa(rad.aa);
 		int e;
@@ -677,14 +778,32 @@ static void sim_step(void)
 	} else if (rad.txrx != tx) {
 		uint32_t start = now;
 
-		if (sim.adv_events > 0 && start - sim.adv_last > sim.adv_max_gap) {
-			sim.adv_max_gap = start - sim.adv_last;
+		if (as1.events != as0.events) {   /* an event's first channel */
+			if (sim.adv_events > 0 && start - sim.adv_last > sim.adv_max_gap) {
+				sim.adv_max_gap = start - sim.adv_last;
+			}
+			sim.adv_last = start;
+			sim.adv_events++;
 		}
-		sim.adv_last = start;
-		sim.adv_events++;
-		for (int i = 0; i < 3; i++) {
+		/* the channels the running request covers follow back to back
+		 * (700 us each); a sliced event continues at a later alarm */
+		for (;;) {
+			int t0 = rad.txrx;
+
+			sim.adv_pdus++;
 			now += T(700);
+			if (sim.connect_pdu) {
+				const uint8_t *pdu = sim.connect_pdu;
+
+				sim.connect_pdu = NULL;
+				sim.connect_end = now;
+				ll_adv_radio_evt(LL_RADIO_RX_OK, pdu, 36, now);
+				break;
+			}
 			ll_adv_radio_evt(LL_RADIO_RX_TIMEOUT, NULL, 0, now);
+			if (rad.txrx == t0) {
+				break;
+			}
 		}
 		sim.busy_until = now;
 	}
@@ -935,7 +1054,7 @@ static void test_adv_dropped(void)
 				  .type = 0, .chan_map = 7};
 	struct ll_adv_stats a0, a1;
 	struct ll_arb_req r = {.alarm_tick = t0, .open_tick = t0, .min_len_us = 100000,
-			       .max_len_us = 100000, .prio = LL_ARB_PRIO_IDLE};
+			       .max_len_us = 100000, .prio = LL_ARB_PRIO_SUPERVISION};
 	int txrx;
 
 	sim_reset();
@@ -974,6 +1093,186 @@ static void test_adv_dropped(void)
 	CHECK(sch.cb == NULL);
 }
 
+/* A starving advertiser asks at ACTIVE after ADV_STARVE_DROPS dropped
+ * events: an idle (or active) block is displaced then, so advertising
+ * resumes within a few intervals instead of waiting for the block. */
+static void test_adv_starve_boost(void)
+{
+	const uint32_t t0 = 2000000;
+	struct ll_adv_params p = {.interval_min = 0x0020, .interval_max = 0x0020,   /* 20 ms */
+				  .type = 0, .chan_map = 7};
+	struct ll_adv_stats a0, a1;
+	struct ll_arb_req r = {.alarm_tick = t0, .open_tick = t0, .min_len_us = 200000,
+			       .max_len_us = 200000, .prio = LL_ARB_PRIO_IDLE};
+	int txrx;
+
+	sim_reset();
+	ll_adv_get_stats(&a0);
+	CHECK(ll_adv_set_params(&p) == LL_ST_SUCCESS);
+	now = t0 - T(1000) - T(500);
+	CHECK(ll_adv_enable(true) == LL_ST_SUCCESS);
+	{
+		unsigned int k = ll_plat_lock();
+
+		CHECK(ll_arb_request(0, &r) == 0);   /* a foreign 200 ms idle block */
+		ll_plat_unlock(k);
+	}
+	txrx = rad.txrx;
+	/* the block's own alarm comes first; nothing transmits before an
+	 * advertising event displaced it (alarm ~ the block's) */
+	for (int i = 0; i < 50 && rad.txrx == txrx && sch.cb; i++) {
+		if ((int32_t)(sch.tick - t0) >= 0 && (int32_t)(sch.tick - (t0 + T(1000))) < 0) {
+			break;   /* the block's alarm: it was not displaced */
+		}
+		sim_step();
+	}
+	ll_adv_get_stats(&a1);
+	printf("  adv_starve_boost n%d: dropped %u then adv tx %d at +%d us\n", LL_MAX_CONN,
+	       (unsigned)(a1.dropped - a0.dropped), rad.txrx - txrx,
+	       (int)((int32_t)(now - t0) / (int32_t)LL_TICKS_PER_US));
+	CHECK(rad.txrx > txrx);
+	CHECK(a1.dropped - a0.dropped >= 1 && a1.dropped - a0.dropped <= 4);
+	CHECK((int32_t)(now - (t0 + T(100000))) < 0);   /* long before the block ends */
+	CHECK(ll_adv_enable(false) == LL_ST_SUCCESS);
+}
+
+/* Three busy links at 7.5 ms (the air is full with their own events) plus
+ * advertising every 100 ms: the links stay up and keep listening, and
+ * advertising still gets out every few intervals (sliced channels and the
+ * starvation boost), never overlapping a link's event. */
+static void test_busy_links_adv(void)
+{
+	const uint32_t t0 = 2000000;
+	/* non-connectable: with 3 of 3 links taken connectable advertising
+	 * is refused (0x09); the air time is the same */
+	struct ll_adv_params p = {.interval_min = 0x00A0, .interval_max = 0x00A0,
+				  .type = 3, .chan_map = 7};
+	struct ll_adv_stats a0, a1;
+	const uint32_t ival = T(100000 + 10000);
+	uint8_t links = LL_MAX_CONN < 3 ? LL_MAX_CONN : 3;
+	int max_gap = 0;
+
+	if (LL_MAX_CONN < 3) {
+		return;
+	}
+	sim_reset();
+	ll_adv_get_stats(&a0);
+	for (uint8_t k = 0; k < links; k++) {
+		busy[k] = true;
+		CHECK(sim_connect(k, t0 + T(2500) * k, 6, 0, 100, 0) == k);
+	}
+	CHECK(ll_adv_set_params(&p) == LL_ST_SUCCESS);
+	CHECK(ll_adv_enable(true) == LL_ST_SUCCESS);
+	sim_run_until(t0 + T(10000000));
+	ll_adv_get_stats(&a1);
+	for (uint8_t k = 0; k < links; k++) {
+		if (sim.max_gap[k] > max_gap) {
+			max_gap = sim.max_gap[k];
+		}
+	}
+	printf("  busy_links_adv n%d: adv events %d pdus %d (slid %u dropped %u cut %u), "
+	       "max adv gap %u us; links listened %d/%d/%d coll %u/%u/%u max gap %d\n",
+	       LL_MAX_CONN, sim.adv_events, sim.adv_pdus, (unsigned)(a1.slid - a0.slid),
+	       (unsigned)(a1.dropped - a0.dropped), (unsigned)(a1.cut - a0.cut),
+	       (unsigned)(sim.adv_max_gap / LL_TICKS_PER_US), sim.listened[0], sim.listened[1],
+	       sim.listened[2], (unsigned)coll(0), (unsigned)coll(1), (unsigned)coll(2), max_gap);
+	CHECK(sim.overlaps == 0 && sim.over_cap == 0);
+	for (uint8_t k = 0; k < links; k++) {
+		CHECK(ll_conn_active(k) && disconnects[k] == 0);
+		CHECK(sim.listened[k] > 10000 / 7.5 / 4);
+	}
+	CHECK(sim.adv_events >= 10000 / 110 / 4);
+	CHECK(sim.adv_max_gap <= 4 * ival);
+	CHECK(a1.stuck == a0.stuck);
+	CHECK(ll_adv_enable(false) == LL_ST_SUCCESS);
+}
+
+/* Advertising while connected: enabling is allowed while a link is free,
+ * connectable advertising is refused with 0x09 once every link is taken
+ * (non-connectable still allowed); a CONNECT_IND during advertising while
+ * connected creates the next link and stops advertising. */
+static void test_adv_while_connected(void)
+{
+	const uint32_t t0 = 2000000;
+	struct ll_adv_params p = {.interval_min = 0x00A0, .interval_max = 0x00A0,
+				  .type = 0, .chan_map = 7};
+	uint8_t ci_pdu[36] = {0x05, 34, 0x11, 0x12, 0x13, 0x14, 0x15, 0xD6};
+	int ev;
+
+	sim_reset();
+	CHECK(ll_adv_set_params(&p) == LL_ST_SUCCESS);
+	CHECK(sim_connect(0, t0, 12, 0, 400, 0) == 0);
+	sim_run_link(0, 3);
+	if (LL_MAX_CONN == 1) {
+		CHECK(ll_adv_enable(true) == LL_ST_CONN_LIMIT);
+		CHECK(!ll_adv_is_enabled());
+		p.type = 3;   /* non-connectable: allowed */
+		CHECK(ll_adv_set_params(&p) == LL_ST_SUCCESS);
+		CHECK(ll_adv_enable(true) == LL_ST_SUCCESS);
+		CHECK(ll_adv_enable(false) == LL_ST_SUCCESS);
+		ll_conn_end(0, 0x13);
+		return;
+	}
+	CHECK(ll_adv_enable(true) == LL_ST_SUCCESS);
+	/* CONNECT_IND for us on the first adv channel */
+	memcpy(&ci_pdu[8], adva, 6);
+	ci_pdu[14] = 0x22; ci_pdu[15] = 0x22; ci_pdu[16] = 0x00; ci_pdu[17] = 0x50;   /* AA */
+	ci_pdu[18] = 0x56; ci_pdu[19] = 0x55; ci_pdu[20] = 0x55;   /* CRCInit */
+	ci_pdu[21] = 1;                       /* WinSize */
+	ci_pdu[24] = 12;                      /* Interval */
+	ci_pdu[28] = (uint8_t)(400 & 0xFF); ci_pdu[29] = (uint8_t)(400 >> 8);
+	memcpy(&ci_pdu[30], all37, 5);
+	ci_pdu[35] = 7 | (1 << 5);
+	sim.connect_pdu = ci_pdu;
+	for (int i = 0; i < 1000 && sim.connect_pdu; i++) {
+		sim_step();
+	}
+	CHECK(sim.connect_pdu == NULL);
+	CHECK(ll_conn_active(1) && ll_conn_count() == 2);
+	CHECK(!ll_adv_is_enabled());
+	cen[1].present = true;
+	cen[1].aa = 0x50002222u;
+	cen[1].base = sim.connect_end + T(1250 + 100);
+	cen[1].ival = T(1250u * 12);
+	ev = sim.rx[1];
+	sim_run_link(1, 20);
+	CHECK(sim.rx[1] > ev + 10);           /* link 1 follows its central */
+	CHECK(ll_conn_active(0) && disconnects[0] == 0 && disconnects[1] == 0);
+	CHECK(sim.overlaps == 0 && sim.over_cap == 0);
+	/* fill the remaining links: connectable advertising is refused with
+	 * 0x09, non-connectable and scannable ones are allowed */
+	for (uint8_t k = 2; k < LL_MAX_CONN; k++) {
+		CHECK(ll_adv_enable(true) == LL_ST_SUCCESS);
+		CHECK(ll_adv_enable(false) == LL_ST_SUCCESS);
+		CHECK(sim_connect(k, now + T(3000), 12, 0, 400, 0) == k);
+	}
+	CHECK(ll_conn_count() == LL_MAX_CONN);
+	CHECK(ll_adv_enable(true) == LL_ST_CONN_LIMIT);
+	CHECK(!ll_adv_is_enabled());
+	p.type = 3;
+	CHECK(ll_adv_set_params(&p) == LL_ST_SUCCESS);
+	CHECK(ll_adv_enable(true) == LL_ST_SUCCESS);
+	CHECK(ll_adv_enable(false) == LL_ST_SUCCESS);
+	p.type = 2;
+	CHECK(ll_adv_set_params(&p) == LL_ST_SUCCESS);
+	CHECK(ll_adv_enable(true) == LL_ST_SUCCESS);
+	CHECK(ll_adv_enable(false) == LL_ST_SUCCESS);
+	/* an ended link awaiting release is still taken */
+	auto_release = false;
+	ll_conn_end(1, 0x13);
+	p.type = 0;
+	CHECK(ll_adv_set_params(&p) == LL_ST_SUCCESS);
+	CHECK(ll_adv_enable(true) == LL_ST_CONN_LIMIT);
+	ll_rxq_reset(1);
+	ll_conn_release(1);
+	CHECK(ll_adv_enable(true) == LL_ST_SUCCESS);
+	CHECK(ll_adv_enable(false) == LL_ST_SUCCESS);
+	auto_release = true;
+	for (uint8_t k = 0; k < LL_MAX_CONN; k++) {
+		ll_conn_end(k, 0x13);
+	}
+}
+
 /* ll_conn_init / ll_adv_reset leave the arbiter consistent: no request,
  * no alarm left behind. */
 static void test_reset_consistent(void)
@@ -998,6 +1297,7 @@ int main(void)
 {
 	test_accept_refuse_prio();
 	test_bump();
+	test_bump_chain();
 	test_round_robin();
 	test_running();
 	test_cap_clip();
@@ -1009,6 +1309,9 @@ int main(void)
 	test_supervision_rescue();
 	test_adv_gaps();
 	test_adv_dropped();
+	test_adv_starve_boost();
+	test_busy_links_adv();
+	test_adv_while_connected();
 	test_reset_consistent();
 	CHECK(locks == 0);
 	DONE();

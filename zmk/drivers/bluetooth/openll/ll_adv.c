@@ -8,22 +8,45 @@
  * Radio callbacks run in ISR context; HCI-facing calls take ll_plat_lock().
  *
  * Connection handover: a CONNECT_IND for us stops advertising and hands the
- * connection to ll_conn_start(). If ll_conn accepts it, advertising stays
- * disabled, as the controller must do when a connection is created
- * (Vol 4 Part E 7.8.9, Vol 6 Part B 4.4.2.2); the host re-enables it with
- * LE Set Advertising Enable after Disconnection Complete (Zephyr:
- * bt_le_adv_resume() when the peripheral connection object is released).
- * There is therefore no controller-side resume. Enabling is refused while
- * the connection is active (we support no advertising + connection state
- * combination), and the first enable after a connection calls
- * ll_radio_adv_restore() to bring the baseband back from connection mode.
- * If ll_conn refuses the CONNECT_IND, advertising continues as before.
+ * connection to ll_conn_start(), which takes the lowest free link. If
+ * ll_conn accepts it, advertising stays disabled, as the controller must do
+ * when a connection is created (Vol 4 Part E 7.8.9, Vol 6 Part B 4.4.2.2);
+ * the host re-enables it with LE Set Advertising Enable (Zephyr / ZMK:
+ * whenever the active profile is open or not connected). There is no
+ * controller-side resume. If ll_conn refuses the CONNECT_IND, advertising
+ * continues as before.
  *
- * Arbitration (slice 6a): every adv event is a request to ll_arb (id
- * LL_ARB_ADV, lowest priority, span ADV_EVENT_US from its start). When it
- * is refused or displaced, the event slides to the next gap
- * (ll_arb_gap()), or is dropped when that gap lies beyond the next adv
- * interval (the next event is then planned as usual, with a new advDelay).
+ * Advertising while connected (slice 6a Task 6): enabling is allowed while a
+ * link is free (ll_conn_count() < LL_MAX_CONN); connectable advertising
+ * with every link taken is refused with Connection Limit Exceeded (0x09),
+ * non-connectable advertising is always allowed. Vol 4 Part E 7.8.9 names
+ * no error code for this case; 0x09 is the one whose definition fits (Vol 1
+ * Part F 2.9: "an attempt to create another connection failed because the
+ * Controller is already at its limit of the number of connections it can
+ * support"). Radio: the first enable with no link left after a connection
+ * restores the baseband (ll_radio_adv_restore); while links exist, every
+ * adv channel that follows connection events starts with
+ * ll_radio_adv_enter() (empty TX FIFO + adv registers, ml-spike S3), never
+ * with a baseband reset.
+ *
+ * Arbitration (slice 6a): advertising is the requester LL_ARB_ADV with the
+ * lowest priority. A request covers whole channels of ADV_CHAN_US each: the
+ * whole event when it fits, else only the next channel (slicing; the
+ * channels of one event then take separate requests, at most
+ * ADV_PDU_GAP_MAX_US apart, Vol 6 Part B 4.4.2.3: "The time between the
+ * beginning of two consecutive ADV_IND PDUs within an advertising event
+ * shall be less than or equal to 10 ms"). A refused or displaced first
+ * channel slides into the next gap (ll_arb_gap) before the next adv
+ * interval, else the event is dropped; a continuation channel that finds
+ * no gap within the 10 ms ends the event early (stats.cut). When no event
+ * has started for ADV_STARVE_INTERVALS intervals, or that many were dropped
+ * in a row (no gap before the next interval, or displaced again and again
+ * by links that keep the air full), the first channel asks
+ * at LL_ARB_PRIO_ACTIVE: it then takes part in the round-robin of the
+ * links' ties and may displace an idle or active link's event (that link
+ * yields one event), never a supervision-critical or transmit-window /
+ * instant event. So advertising cannot starve for more than a few
+ * intervals.
  */
 #include <string.h>
 #include "ll_adv.h"
@@ -36,9 +59,34 @@
 #define ADV_START_LEAD_TICKS (1000 * LL_TICKS_PER_US)   /* first event 1 ms after enable */
 #define ADV_TX_LEAD_TICKS    (100 * LL_TICKS_PER_US)    /* radio programming headroom */
 #define ADV_DELAY_MAX_TICKS  (10000 * LL_TICKS_PER_US)
-/* Air time reserved per adv event: 3 channels with TX, RX window, a
- * possible SCAN_RSP or CONNECT_IND, and the radio programming. */
-#define ADV_EVENT_US         4000
+/* Air time reserved per adv channel, from the arbiter's start (alarm =
+ * open) to the end of the channel's last packet, worst case:
+ *   stimer ISR latency under USB load (up to about 270 us, see
+ *   LL_CONN_ARM_LEAD_US)                                          300
+ *   ll_radio_adv_enter() after connection events (S3: max 70 us)   70
+ *   ADV_TX_LEAD (programming headroom)                            100
+ *   TX settle (TX_SETTLE_ADV_US)                                   84
+ *   ADV_IND, 37-byte payload: (1 + 4 + 2 + 37 + 3) * 8 us         376
+ *   T_IFS + SCAN_REQ (12-byte payload, 176 us) or CONNECT_IND
+ *   (34-byte payload, 352 us)                               150 + 352
+ *   SCAN_RSP: measured 209 us after the request ends + 376 us     585
+ *   sum 2017 (SCAN_REQ: 1841; RX window only, no request: 1230)
+ * A CONNECT_IND ends the event (the link's first event lies at least
+ * 1.25 ms later), so the SCAN_RSP case bounds the span: 2000 us
+ * (ADV_RX_WINDOW_US 300 > T_IFS + the 40 us until a request's access
+ * address is in, so a channel without any request also fits). */
+#define ADV_CHAN_US          2000
+/* Rule of Vol 6 Part B 4.4.2.3 (start of consecutive PDUs <= 10 ms) */
+#define ADV_PDU_GAP_MAX_TICKS (10000 * LL_TICKS_PER_US)
+/* The next channel of a sliced event is asked for this long after now */
+#define ADV_CHAN_LEAD_US     200
+/* A whole-event gap is taken instead of a sliced start when it begins at
+ * most this long after the earliest single-channel gap */
+#define ADV_WHOLE_WAIT_TICKS (10000 * LL_TICKS_PER_US)
+/* Starving: no event started for this many adv intervals (each with the
+ * maximum advDelay), or this many events dropped in a row; the first
+ * channel then asks at ACTIVE */
+#define ADV_STARVE_INTERVALS 2
 /* slide / drop rounds per planned event (each drop moves one interval) */
 #define ADV_PLAN_TRIES       8
 
@@ -61,10 +109,19 @@ static struct {
 	uint8_t rsp_pdu[LL_ADV_PDU_MAX];
 	uint8_t rsp_pdu_len;
 	volatile bool enabled;
-	volatile bool in_event; /* true from the first tx_current() until the event ends */
-	volatile bool radio_dirty; /* a connection used the radio since advertising ran */
+	volatile bool in_event; /* true from the first channel's start until the event ends */
+	volatile bool on_air;   /* a channel's TX / RX (or SCAN_RSP) is running */
+	/* a connection used the radio since the last baseband restore: every
+	 * channel start after a gap enters adv mode (ll_radio_adv_enter) */
+	volatile bool radio_dirty;
 	uint8_t ch_idx;       /* 0..2 = channel 37..39 */
+	uint8_t req_chans;    /* channels covered by the accepted request */
+	uint8_t chans_left;   /* further channels of the running request */
+	uint32_t last_start;  /* start of the last event (or the enable) */
+	uint8_t drops_in_row; /* events dropped since then */
 	uint32_t event_tick;  /* start of the current advertising event */
+	uint32_t req_tick;    /* start of the accepted request */
+	uint32_t pdu_tick;    /* start of the last channel's PDU (10 ms rule) */
 	struct ll_adv_stats stats;
 } adv;
 
@@ -105,8 +162,17 @@ static void defaults(void)
 	build_pdus();
 }
 
+static uint8_t nchan(void)
+{
+	uint8_t m = adv.prm.chan_map & 0x07;
+
+	return (uint8_t)((m & 1) + ((m >> 1) & 1) + ((m >> 2) & 1));
+}
+
 static void tx_current(void)
 {
+	adv.on_air = true;
+	adv.pdu_tick = ll_radio_now();
 	ll_radio_set_adv_channel(37 + adv.ch_idx);
 	ll_radio_tx_then_rx(adv.pdu, adv.pdu_len, ll_radio_now() + ADV_TX_LEAD_TICKS,
 			    ADV_RX_WINDOW_US);
@@ -117,19 +183,37 @@ static uint32_t interval_ticks(void)
 	return (uint32_t)adv.prm.interval_min * 625u * LL_TICKS_PER_US;
 }
 
-static int adv_request(uint32_t t)
+static bool before(uint32_t a, uint32_t b)
+{
+	return (int32_t)(a - b) < 0;
+}
+
+/* Priority of the first channel: ACTIVE while starving (file header). */
+static uint8_t first_prio(void)
+{
+	uint32_t limit = ADV_STARVE_INTERVALS * (interval_ticks() + ADV_DELAY_MAX_TICKS);
+
+	return adv.drops_in_row >= ADV_STARVE_INTERVALS ||
+		       (uint32_t)(ll_radio_now() - adv.last_start) > limit
+		       ? LL_ARB_PRIO_ACTIVE : LL_ARB_PRIO_ADV;
+}
+
+/* Request nch channels from t (alarm = open = t). Caller holds the lock. */
+static int adv_request(uint32_t t, uint8_t nch, uint8_t prio)
 {
 	struct ll_arb_req r = {
 		.alarm_tick = t,
 		.open_tick = t,
-		.min_len_us = ADV_EVENT_US,
-		.max_len_us = ADV_EVENT_US,
-		.prio = LL_ARB_PRIO_ADV,
+		.min_len_us = (uint32_t)nch * ADV_CHAN_US,
+		.max_len_us = (uint32_t)nch * ADV_CHAN_US,
+		.prio = prio,
 	};
-	unsigned int key = ll_plat_lock();
 	int ret = ll_arb_request(LL_ARB_ADV, &r);
 
-	ll_plat_unlock(key);
+	if (ret == 0) {
+		adv.req_tick = t;
+		adv.req_chans = nch;
+	}
 	return ret;
 }
 
@@ -138,35 +222,80 @@ static void advance_event(void)
 	adv.event_tick += interval_ticks() + ll_plat_rand32() % (ADV_DELAY_MAX_TICKS + 1);
 }
 
-/* Request the event at event_tick; refused: slide into the next gap, or
- * drop it when that gap lies beyond the next interval. */
-static void plan_event(void)
+/* First channel of the event: at event_tick (direct: a fresh plan; never
+ * after a bump, which must not ask for the displaced placement again),
+ * whole event first, else only its first channel; refused: slide into the
+ * earliest gap before the next interval, the whole event if that gap is
+ * not much later than a single channel's. Caller holds the lock. */
+static bool place_first(bool direct)
 {
-	for (int i = 0; i < ADV_PLAN_TRIES; i++) {
-		uint32_t t;
+	uint8_t n = nchan();
+	uint8_t prio = first_prio();
+	uint32_t limit = adv.event_tick + interval_ticks();
+	uint32_t tf, t1;
 
-		if (adv_request(adv.event_tick) == 0) {
-			return;
+	if (direct) {
+		if (adv_request(adv.event_tick, n, prio) == 0 ||
+		    (n > 1 && adv_request(adv.event_tick, 1, prio) == 0)) {
+			return true;
 		}
-		t = ll_arb_gap(adv.event_tick, 0, ADV_EVENT_US);
-		if ((int32_t)(t - (adv.event_tick + interval_ticks())) < 0) {
-			adv.stats.slid++;
-			adv.event_tick = t;
-			if (adv_request(t) == 0) {
-				return;
-			}
-		}
-		adv.stats.dropped++;
-		advance_event();
 	}
-	/* not expected (a gap always follows the few requests): try again
-	 * after the gap, whatever its distance */
-	adv.event_tick = ll_arb_gap(adv.event_tick, 0, ADV_EVENT_US);
-	(void)adv_request(adv.event_tick);
+	tf = ll_arb_gap(adv.event_tick, 0, (uint32_t)n * ADV_CHAN_US);
+	t1 = ll_arb_gap(adv.event_tick, 0, ADV_CHAN_US);
+	if (before(tf, limit) && (uint32_t)(tf - t1) <= ADV_WHOLE_WAIT_TICKS &&
+	    adv_request(tf, n, prio) == 0) {
+		adv.stats.slid++;
+		adv.event_tick = tf;
+		return true;
+	}
+	if (before(t1, limit) && adv_request(t1, 1, prio) == 0) {
+		adv.stats.slid++;
+		adv.event_tick = t1;
+		return true;
+	}
+	return false;
 }
 
+/* Plan the event at event_tick (see place_first), dropping events that
+ * find no room before their next interval. Caller holds the lock. */
+static void plan_event(bool direct)
+{
+	for (int i = 0; i < ADV_PLAN_TRIES; i++) {
+		if (place_first(direct)) {
+			return;
+		}
+		adv.stats.dropped++;
+		if (adv.drops_in_row < UINT8_MAX) {
+			adv.drops_in_row++;
+		}
+		ll_arb_yield(LL_ARB_ADV);   /* gave the event up (fairness) */
+		advance_event();
+		direct = true;
+	}
+	/* Not expected (a gap always follows the few requests): the first
+	 * channel after the gap, whatever its distance. ll_arb_gap() avoids
+	 * every accepted span, so the request cannot be refused; if it still
+	 * is, advertising is disabled rather than left enabled with no
+	 * request and no alarm (counted in stats.stuck; the host enables it
+	 * again on its next advertising update). */
+	adv.event_tick = ll_arb_gap(adv.event_tick, 0, ADV_CHAN_US);
+	if (adv_request(adv.event_tick, 1, LL_ARB_PRIO_ADV) != 0) {
+		adv.stats.stuck++;
+		adv.enabled = false;
+		adv.in_event = false;
+		adv.on_air = false;
+		ll_arb_cancel(LL_ARB_ADV);
+	}
+}
+
+/* Event over (or abandoned): plan the next one. Any context. */
 static void schedule_next_event(void)
 {
+	unsigned int key = ll_plat_lock();
+
+	adv.in_event = false;
+	adv.on_air = false;
+	ll_arb_cancel(LL_ARB_ADV);   /* the event is over (no own span in the gap search) */
 	advance_event();
 	if ((int32_t)(adv.event_tick - ll_radio_now()) < 0) {
 		/* missed the window for a long time (e.g. stalled radio); re-base
@@ -174,24 +303,56 @@ static void schedule_next_event(void)
 		adv.event_tick = ll_radio_now() + interval_ticks() +
 				 ll_plat_rand32() % (ADV_DELAY_MAX_TICKS + 1);
 	}
-	plan_event();
+	plan_event(true);
+	ll_plat_unlock(key);
+}
+
+/* The next channel of a sliced event, in the first gap from `from`, or the
+ * event ends early when that lies beyond the 10 ms PDU spacing. Caller
+ * holds the lock. */
+static void place_next_channel(uint32_t from)
+{
+	uint32_t t;
+
+	/* the channel just ended: its own (running) span must not push the
+	 * gap search */
+	ll_arb_cancel(LL_ARB_ADV);
+	t = ll_arb_gap(from, 0, ADV_CHAN_US);
+
+	if ((int32_t)(t + ADV_TX_LEAD_TICKS - adv.pdu_tick) <= (int32_t)ADV_PDU_GAP_MAX_TICKS &&
+	    adv_request(t, 1, LL_ARB_PRIO_ADV) == 0) {
+		return;
+	}
+	adv.stats.cut++;
+	schedule_next_event();
 }
 
 /* Advance to the next enabled channel; end the event after channel 39. */
 static void next_channel(void)
 {
+	adv.on_air = false;
 	while (++adv.ch_idx < 3) {
 		if (adv.prm.chan_map & (1 << adv.ch_idx)) {
-			tx_current();
+			if (adv.chans_left > 0) {
+				adv.chans_left--;
+				tx_current();
+			} else {
+				unsigned int key = ll_plat_lock();
+
+				place_next_channel(ll_radio_now() + ADV_CHAN_LEAD_US * LL_TICKS_PER_US);
+				ll_plat_unlock(key);
+			}
 			return;
 		}
 	}
-	adv.in_event = false;
 	schedule_next_event();
 }
 
-static void start_event(void)
+/* Arbiter start: the event's first channel, or the next channel of a
+ * sliced event. */
+void ll_adv_arb_start(uint32_t cap_us)
 {
+	(void)cap_us;   /* fixed length, the span already covers it */
 	if (!adv.enabled) {
 		unsigned int key = ll_plat_lock();
 
@@ -199,28 +360,39 @@ static void start_event(void)
 		ll_plat_unlock(key);
 		return;
 	}
-	adv.stats.events++;
-	if (scannable()) {
-		ll_radio_prepare_rsp(adv.rsp_pdu, adv.rsp_pdu_len);
+	if (!adv.in_event) {
+		adv.stats.events++;
+		adv.last_start = ll_radio_now();
+		adv.drops_in_row = 0;
+		if (scannable()) {
+			ll_radio_prepare_rsp(adv.rsp_pdu, adv.rsp_pdu_len);
+		}
+		adv.ch_idx = 0;
+		while (!(adv.prm.chan_map & (1 << adv.ch_idx))) {
+			adv.ch_idx++;
+		}
+		adv.in_event = true;
 	}
-	adv.ch_idx = 0;
-	while (!(adv.prm.chan_map & (1 << adv.ch_idx))) {
-		adv.ch_idx++;
+	adv.chans_left = adv.req_chans > 0 ? (uint8_t)(adv.req_chans - 1) : 0;
+	if (adv.radio_dirty) {
+		/* connection events may have used the radio since the last
+		 * channel: empty TX FIFO + adv registers (S3) */
+		ll_radio_adv_enter();
 	}
-	adv.in_event = true;
 	tx_current();
 }
 
-void ll_adv_arb_start(uint32_t cap_us)
-{
-	(void)cap_us;   /* fixed length, the span already covers it */
-	start_event();
-}
-
+/* Displaced (lock held by the arbiter): the first gap from the displaced
+ * placement, never that placement again. */
 void ll_adv_arb_bumped(void)
 {
-	if (adv.enabled && !adv.in_event) {
-		plan_event();
+	if (!adv.enabled || adv.on_air) {
+		return;
+	}
+	if (adv.in_event) {
+		place_next_channel(adv.req_tick);
+	} else {
+		plan_event(false);
 	}
 }
 
@@ -246,32 +418,40 @@ void ll_adv_init(const uint8_t adva[6], ll_adv_connect_cb_t on_connect)
 uint8_t ll_adv_enable(bool enable)
 {
 	unsigned int key = ll_plat_lock();
+	uint8_t st = LL_ST_SUCCESS;
 
 	if (enable && !adv.enabled) {
-		/* any link taken (active or awaiting release): no
-		 * advertising + connection combination yet (slice 6a Task 6
-		 * allows it while a link is free) */
-		if (ll_conn_count() != 0) {
-			ll_plat_unlock(key);
-			return LL_ST_DISALLOWED;
+		uint8_t taken = ll_conn_count();
+
+		if (connectable() && taken >= LL_MAX_CONN) {
+			/* every link taken (active or awaiting release): see
+			 * the file header for the code */
+			st = LL_ST_CONN_LIMIT;
+		} else {
+			if (adv.radio_dirty && taken == 0) {
+				/* back from connection mode, no link left:
+				 * baseband restore once */
+				adv.radio_dirty = false;
+				ll_radio_adv_restore();
+			}
+			adv.enabled = true;
+			adv.in_event = false;
+			adv.on_air = false;
+			adv.last_start = ll_radio_now();
+			adv.drops_in_row = 0;
+			adv.event_tick = ll_radio_now() + ADV_START_LEAD_TICKS;
+			plan_event(true);
 		}
-		if (adv.radio_dirty) {
-			adv.radio_dirty = false;
-			ll_radio_adv_restore();
-		}
-		adv.enabled = true;
-		adv.event_tick = ll_radio_now() + ADV_START_LEAD_TICKS;
-		plan_event();
 	} else if (!enable && adv.enabled) {
 		adv.enabled = false;
 		adv.in_event = false;
+		adv.on_air = false;
 		ll_arb_cancel(LL_ARB_ADV);
 		ll_radio_stop();
 	}
 	ll_plat_unlock(key);
-	return LL_ST_SUCCESS;
+	return st;
 }
-
 bool ll_adv_is_enabled(void)
 {
 	return adv.enabled;
@@ -340,7 +520,11 @@ void ll_adv_radio_evt(enum ll_radio_evt evt, const uint8_t *pdu, uint8_t len,
 {
 	struct ll_connect_ind ci;
 
-	if (!adv.enabled || !adv.in_event) {
+	/* only the advertising radio events of a channel on air (connection
+	 * events between sliced channels reach this dispatcher too) */
+	if (!adv.enabled || !adv.in_event || !adv.on_air ||
+	    (evt != LL_RADIO_RX_OK && evt != LL_RADIO_RX_TIMEOUT && evt != LL_RADIO_RX_CRC_ERR &&
+	     evt != LL_RADIO_TX_DONE)) {
 		return;
 	}
 	if (evt == LL_RADIO_RX_OK) {
@@ -358,6 +542,7 @@ void ll_adv_radio_evt(enum ll_radio_evt evt, const uint8_t *pdu, uint8_t len,
 			 * radio and may report CONNECTED synchronously. No
 			 * advertising alarm is pending inside an event. */
 			adv.in_event = false;
+			adv.on_air = false;
 			adv.enabled = false;
 			{
 				unsigned int key = ll_plat_lock();

@@ -12,17 +12,25 @@
  * Span of a request: [alarm_tick, open_tick + min_len_us]. Once started,
  * the request is "running" until its owner requests again or cancels
  * (ll_conn: at CONN_DONE; ll_adv: at the end of the adv event); a running
- * span ends at open_tick + max(min_len_us, cap_us), and it can neither be
- * displaced nor overlapped. If the alarm of a request fires while another
+ * span ends at open_tick + max(min_len_us, cap_us + LL_CONN_EVENT_SAFETY_US
+ * + LL_CONN_ARM_LEAD_US) (the clipping reserve, so a request accepted while
+ * it runs still opens its RX that long after the event's cap), and it can
+ * neither be displaced nor overlapped. If the alarm of a request fires while another
  * request is still running (an event overran its cap), that request is
  * displaced (bumped) instead of started.
  *
  * Collisions: a new request that overlaps accepted ones is refused if any
  * of them is running or has a higher priority, or has the same priority
- * while the requester did not yield at its last collision or the other one
- * did (round-robin: the one that yielded last wins ties). Otherwise all
- * the overlapped requests are displaced. At every collision the loser is
- * marked as having yielded, the winner as not.
+ * unless the requester yielded at its last collision and the other one did
+ * not (round-robin: the one that yielded last wins ties). Otherwise all the
+ * overlapped requests are displaced.
+ *
+ * Fairness flags ("yielded"): a displaced request's owner is marked as
+ * having yielded and the displacing requester as not. A refusal changes no
+ * flag by itself: the owner may still find another event (dodge, kick
+ * probes). Only when it actually gives up the event it was refused for does
+ * it call ll_arb_yield(), which marks it yielded and the requests that
+ * refused it (at its last refusal) as not.
  *
  * Context: ll_arb_request / ll_arb_cancel run with ll_plat_lock() held
  * (nesting ok, the callers may be in ISR context); the start callback runs
@@ -68,11 +76,17 @@ struct ll_arb_ops {
 /* ops is copied. Drops every request and the main alarm. */
 void ll_arb_init(const struct ll_arb_ops *ops);
 /* Accept (0) or refuse (-EBUSY) id's next event. Overlap = [alarm_tick, open_tick + min_len_us]
- * intersects another accepted request's span. Refused if the other one has higher priority, or equal
- * priority and it did NOT yield at its last collision (round-robin: the one that yielded last wins
- * ties). Otherwise the other one is displaced (bumped). Replaces id's previous request. Arms the main
- * alarm (ll_sched_at) for the earliest accepted request. Caller holds ll_plat_lock. */
+ * intersects another accepted request's span. Refused if the other one is running or has a higher
+ * priority, or has the same priority unless id yielded at its last collision and the other one did
+ * not (round-robin: the one that yielded last wins ties). Otherwise the other one is displaced
+ * (bumped, marked yielded; id is marked not yielded). A refusal only records the refusing requests
+ * for ll_arb_yield(). Replaces id's previous request (also when refused: id then has none). Arms the
+ * main alarm (ll_sched_at) for the earliest accepted request. Caller holds ll_plat_lock. */
 int ll_arb_request(uint8_t id, const struct ll_arb_req *r);
+/* id gives up the event of its last refused request (a yield, not a probe): id is marked yielded,
+ * the requests that refused it are marked not yielded (fairness, see the file header). Without a
+ * recorded refusal only id is marked. Caller holds ll_plat_lock. */
+void ll_arb_yield(uint8_t id);
 void ll_arb_cancel(uint8_t id);
 /* Earliest tick >= from_tick at which a span [t - lead_us, t + len_us] overlaps no accepted request
  * (advertising uses it to slide into a gap). */

@@ -16,8 +16,11 @@ Usage:
 
 Fields: up (ms), idle (CPU idle ms, if built in), plan/listen/skip (connection events planned / listened /
 skipped by peripheral latency), kick, ev, miss, wake (controller thread
-wakeups), mv (battery, 0 = unavailable). Counters are uint32, cumulative
-since boot; deltas are computed modulo 2**32.
+wakeups), mv (battery, 0 = unavailable). With multilink firmware (slice 6a)
+the connection counters are sums over the links, and the reply adds links
+(links up), link (per link id: up, listen, skip, coll = events yielded to
+the arbiter, miss) and adv (advertising events, slid, drop, cut, stuck).
+Counters are uint32, cumulative since boot; deltas are computed modulo 2**32.
 """
 
 import argparse
@@ -34,6 +37,8 @@ CMD_STATS = 0
 SMP_OP_READ = 0
 FIELDS = ("up", "idle", "plan", "listen", "skip", "kick", "ev", "miss", "wake", "mv")
 COUNTERS = ("idle", "plan", "listen", "skip", "kick", "ev", "miss", "wake")
+LINK_COUNTERS = ("listen", "skip", "coll", "miss")
+ADV_COUNTERS = ("ev", "slid", "drop", "cut", "stuck")
 
 
 # --- pure helpers (unit tested) --------------------------------------------
@@ -57,10 +62,19 @@ def parse_response(frame):
     return body
 
 
+def _sub(new, old, keys):
+    return {k: (new[k] - old[k]) & 0xFFFFFFFF for k in keys if k in new and k in old}
+
+
 def delta(new, old):
-    """Per-field difference of two stats dicts; counters wrap at 2**32."""
-    return {k: (new[k] - old[k]) & 0xFFFFFFFF for k in ("up",) + COUNTERS
-            if k in new and k in old}
+    """Per-field difference of two stats dicts; counters wrap at 2**32.
+    Per-link ("link") and advertising ("adv") counters are differenced too."""
+    d = _sub(new, old, ("up",) + COUNTERS)
+    if isinstance(new.get("link"), list) and isinstance(old.get("link"), list):
+        d["link"] = [_sub(n, p, LINK_COUNTERS) for n, p in zip(new["link"], old["link"])]
+    if isinstance(new.get("adv"), dict) and isinstance(old.get("adv"), dict):
+        d["adv"] = _sub(new["adv"], old["adv"], ADV_COUNTERS)
+    return d
 
 
 def format_stats(s, d=None):
@@ -69,6 +83,17 @@ def format_stats(s, d=None):
     line = (f"up {s['up'] / 1000:.1f}s  {idle}plan {s['plan']}  listen {s['listen']}  "
             f"skip {s['skip']}  kick {s['kick']}  ev {s['ev']}  miss {s['miss']}  "
             f"wake {s['wake']}  batt {s['mv']} mV")
+    if "links" in s:
+        line += f"  links {s['links']}"
+    for i, lk in enumerate(s.get("link") or []):
+        if lk.get("up"):
+            line += (f"\n  link {i}: up listen {lk.get('listen', 0)} skip {lk.get('skip', 0)} "
+                     f"coll {lk.get('coll', 0)} miss {lk.get('miss', 0)}")
+        else:
+            line += f"\n  link {i}: down"
+    if isinstance(s.get("adv"), dict):
+        a = s["adv"]
+        line += "\n  adv: " + " ".join(f"{k} {a.get(k, 0)}" for k in ADV_COUNTERS)
     if d and d.get("up"):
         secs = d["up"] / 1000.0
         tot = d.get("listen", 0) + d.get("skip", 0)
@@ -78,6 +103,12 @@ def format_stats(s, d=None):
         line += (f"\n  delta {secs:.1f}s: listen {d.get('listen', 0)} "
                  f"skip {d.get('skip', 0)} ({ratio}) wake {d.get('wake', 0)} "
                  f"({d.get('wake', 0) / secs:.1f}/s) miss {d.get('miss', 0)}")
+        for i, lk in enumerate(d.get("link") or []):
+            line += f"\n  delta link {i}: " + " ".join(
+                f"{k} {lk.get(k, 0)}" for k in LINK_COUNTERS)
+        if "adv" in d:
+            line += "\n  delta adv: " + " ".join(f"{k} {d['adv'].get(k, 0)}"
+                                                 for k in ADV_COUNTERS)
     return line
 
 

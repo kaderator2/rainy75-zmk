@@ -2093,6 +2093,77 @@ static void test_last_link_alone(void)
 	CHECK(ll_conn_count() == 0);
 }
 
+/* ll_conn_end_all: every active link ends with the reason (the glue's
+ * radio-wedge rule); a link with its event on air ends at CONN_DONE. */
+static void test_end_all(void)
+{
+	struct ll_connect_ind ci = mk_ci_link(0);
+	const uint32_t t0 = 1000000;
+
+	reset_all(false);
+	CHECK(ll_conn_end_all(LL_ST_CONN_TIMEOUT) == 0);
+	for (uint8_t k = 0; k < LL_MAX_CONN; k++) {
+		CHECK(ll_conn_start(&ci, t0 + T(5000) * k) == k);
+	}
+	fire_alarm();   /* link 0's window event on air */
+	CHECK(rad.aa == ci.aa);
+	cbs.disconnected = 0;
+	CHECK(ll_conn_end_all(LL_ST_CONN_TIMEOUT) == LL_MAX_CONN);
+	/* the others ended at once, link 0 at the end of its event */
+	CHECK(cbs.disconnected == LL_MAX_CONN - 1);
+	CHECK(ll_conn_active(0));   /* its end is pending until CONN_DONE */
+	done(0);
+	CHECK(cbs.disconnected == LL_MAX_CONN && cbs.reason == LL_ST_CONN_TIMEOUT);
+	for (uint8_t k = 0; k < LL_MAX_CONN; k++) {
+		CHECK(!ll_conn_active(k));
+	}
+	CHECK(ll_conn_count() == 0 && sch.cb == NULL);
+	CHECK(ll_conn_end_all(LL_ST_CONN_TIMEOUT) == 0);
+}
+
+/* The MUST priority of an instant event is forgotten once the link has
+ * planned past it: 65536 events later the same counter is an ordinary
+ * (idle) event that an ACTIVE request can displace. */
+static void test_instant_prio_after_wrap(void)
+{
+	struct ll_connect_ind ci = mk_ci(6, 3200, 7, 1, 0);
+	uint32_t a = 7000000 + T(1250 + 100);
+	const uint16_t x = 10;
+	struct ll_arb_req r;
+	unsigned int key;
+	int ret;
+
+	reset_all(false);
+	CHECK(ll_conn_start(&ci, 7000000) == 0);
+	CHECK(ll_conn_chmap_at(0, x, no0to9) == 0);
+	for (uint32_t k = 0; k < 65536u + x; k++) {
+		fire_alarm();
+		rx(a, 0x01, 0);
+		done(1);
+		a += T(7500);
+	}
+	CHECK(ll_conn_event_counter(0) == x && sch.cb != NULL);
+	/* an ACTIVE request over link 0's planned (idle) event */
+	r.alarm_tick = sch.tick + T(600);
+	r.open_tick = r.alarm_tick;
+	r.min_len_us = 500;
+	r.max_len_us = 500;
+	r.prio = LL_ARB_PRIO_ACTIVE;
+	key = ll_plat_lock();
+	ret = ll_arb_request(LL_ARB_ADV, &r);
+	ll_arb_cancel(LL_ARB_ADV);
+	ll_plat_unlock(key);
+	CHECK(ret == 0);
+	{
+		struct ll_conn_stats st;
+
+		ll_conn_get_stats(0, &st);
+		CHECK(st.collisions >= 1);   /* link 0 yielded that event */
+	}
+	CHECK(ll_conn_active(0));
+	ll_conn_end(0, LL_ST_REMOTE_TERM);
+}
+
 int main(void)
 {
 	test_first_events();
@@ -2135,5 +2206,7 @@ int main(void)
 	test_links_interleaved();
 	test_collision_skips();
 	test_last_link_alone();
+	test_end_all();
+	test_instant_prio_after_wrap();
 	DONE();
 }

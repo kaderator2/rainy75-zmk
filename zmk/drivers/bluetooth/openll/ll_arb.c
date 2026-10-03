@@ -25,14 +25,20 @@
 struct slot {
 	bool used;       /* accepted request */
 	bool running;    /* started, the owner has not requested again yet */
-	bool yielded;    /* lost its last collision */
+	bool yielded;    /* lost its last collision (displaced, or ll_arb_yield) */
+	uint32_t refused_by; /* ids that refused its last request (for ll_arb_yield) */
 	struct ll_arb_req r;
-	uint32_t run_end; /* running: open_tick + max(min_len_us, cap_us) */
+	/* running: open_tick + max(min_len_us, cap_us + CLIP_RESERVE_US) */
+	uint32_t run_end;
 };
 
 static struct slot slots[LL_ARB_IDS];
 static struct ll_arb_ops ops;
 static bool armed;
+/* Displaced ids whose bumped callback is still due, and whether a dispatch
+ * loop is running (see dispatch_bumps). */
+static uint32_t pending_bumps;
+static bool dispatching;
 
 static void alarm_fired(void);
 
@@ -113,6 +119,32 @@ static uint32_t clip_cap(int id)
 	return cap;
 }
 
+/* Call bumped for every displaced id. The owners re-plan and request
+ * again from inside the callback, and such a nested request may displace
+ * others: it only adds them to pending_bumps, the outermost call's loop
+ * calls them. So there is no recursion through the arbiter (the stack
+ * depth is one owner callback, whatever the chain), and the chain is
+ * finite because a displaced owner never requests the event it was bumped
+ * from again and every owner's re-plan is bounded (ll_conn: latency window,
+ * then at most YIELD_MAX yields; ll_adv: ADV_PLAN_TRIES rounds). Caller
+ * holds ll_plat_lock. */
+static void dispatch_bumps(void)
+{
+	if (dispatching) {
+		return;
+	}
+	dispatching = true;
+	while (pending_bumps != 0) {
+		int i = __builtin_ctz(pending_bumps);
+
+		pending_bumps &= ~(1u << i);
+		if (ops.bumped) {
+			ops.bumped((uint8_t)i);
+		}
+	}
+	dispatching = false;
+}
+
 /* stimer ISR (ll_sched main slot) */
 static void alarm_fired(void)
 {
@@ -132,15 +164,18 @@ static void alarm_fired(void)
 		s->used = false;
 		s->yielded = true;
 		arm();
-		if (ops.bumped) {
-			ops.bumped((uint8_t)id);
-		}
+		pending_bumps |= 1u << id;
+		dispatch_bumps();
 		ll_plat_unlock(key);
 		return;
 	}
 	cap = clip_cap(id);
 	s->running = true;
-	s->run_end = s->r.open_tick + US(cap > s->r.min_len_us ? cap : s->r.min_len_us);
+	/* The event may use the cap; a request accepted while it runs must
+	 * still open its RX the clipping reserve after it (the same distance
+	 * clip_cap() keeps before an accepted request). */
+	s->run_end = s->r.open_tick + US(cap + CLIP_RESERVE_US > s->r.min_len_us ?
+					 cap + CLIP_RESERVE_US : s->r.min_len_us);
 	arm();
 	ll_plat_unlock(key);
 	if (ops.start) {
@@ -154,6 +189,8 @@ void ll_arb_init(const struct ll_arb_ops *o)
 
 	memset(slots, 0, sizeof(slots));
 	memset(&ops, 0, sizeof(ops));
+	pending_bumps = 0;
+	dispatching = false;
 	if (o) {
 		ops = *o;
 	}
@@ -197,8 +234,9 @@ int ll_arb_request(uint8_t id, const struct ll_arb_req *r)
 			win = me->yielded && !o->yielded;
 		}
 		if (!win) {
-			me->yielded = true;
-			o->yielded = false;
+			/* no flag changes here: the owner may still find another
+			 * event (a probe); ll_arb_yield() commits the loss */
+			me->refused_by = 1u << i;
 			arm();
 			return -EBUSY;
 		}
@@ -206,6 +244,7 @@ int ll_arb_request(uint8_t id, const struct ll_arb_req *r)
 	}
 	me->used = true;
 	me->r = *r;
+	me->refused_by = 0;
 	if (collided) {
 		me->yielded = false;
 	}
@@ -216,14 +255,23 @@ int ll_arb_request(uint8_t id, const struct ll_arb_req *r)
 		}
 	}
 	arm();
-	/* The displaced owners re-plan (and may request again) now; a
-	 * nested request re-arms by itself. */
+	pending_bumps |= victims;
+	dispatch_bumps();
+	return 0;
+}
+
+void ll_arb_yield(uint8_t id)
+{
+	if (id >= LL_ARB_IDS) {
+		return;
+	}
+	slots[id].yielded = true;
 	for (int i = 0; i < LL_ARB_IDS; i++) {
-		if ((victims & (1u << i)) && ops.bumped) {
-			ops.bumped((uint8_t)i);
+		if (slots[id].refused_by & (1u << i)) {
+			slots[i].yielded = false;
 		}
 	}
-	return 0;
+	slots[id].refused_by = 0;
 }
 
 void ll_arb_cancel(uint8_t id)

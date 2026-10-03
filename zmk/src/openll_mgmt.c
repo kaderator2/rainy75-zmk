@@ -5,12 +5,20 @@
  *   0: stats (read) -> {"rc":0, "up": uptime ms, "idle": idle-thread ms,
  *                       "plan": uint, "listen": uint,
  *                       "skip": uint, "kick": uint, "ev": uint, "miss": uint,
- *                       "wake": uint, "mv": uint (battery, 0 if unavailable)}
+ *                       "wake": uint, "mv": uint (battery, 0 if unavailable),
+ *                       "links": uint (links up),
+ *                       "link": [{"up": 0/1, "listen": uint, "skip": uint,
+ *                                 "coll": uint, "miss": uint}, ...] (per link id),
+ *                       "adv": {"ev": uint, "slid": uint, "drop": uint,
+ *                               "cut": uint, "stuck": uint}}
  *   All counters are cumulative since boot and uint32 (wrap after 49 days).
- *   plan/listen/skip/kick/ev/miss come from ll_conn_get_stats of link 0 (ev = events
- *   issued to the radio, miss = events without any CRC-valid packet plus
- *   late alarms), wake counts controller-thread passes. With peripheral
- *   latency active and idle, skip grows much faster than listen.
+ *   plan/listen/skip/kick/ev/miss are sums over all links of ll_conn_get_stats
+ *   (ev = events issued to the radio, miss = events without any CRC-valid
+ *   packet plus late alarms), wake counts controller-thread passes. With
+ *   peripheral latency active and idle, skip grows much faster than listen.
+ *   "link" has one map per link id 0..CONFIG_BT_HCI_B91_OPENLL_MAX_CONN-1
+ *   (coll: events yielded to the arbiter); "adv" are the advertising
+ *   arbitration counters (ll_adv_get_stats).
  *
  * "idle" is the CPU idle time (k_thread_runtime_stats_all_get); needs
  * CONFIG_THREAD_RUNTIME_STATS (about +290 B ROM, +240 B RAM, set in
@@ -31,7 +39,9 @@
 #include <zephyr/logging/log.h>
 
 #include "b91_bt.h"
+#include "ll_adv.h"
 #include "ll_conn.h"
+#include "ll_defs.h"
 
 LOG_MODULE_REGISTER(openll_mgmt, LOG_LEVEL_INF);
 
@@ -83,8 +93,14 @@ static int openll_mgmt_stats(struct smp_streamer *ctxt)
 {
 	zcbor_state_t *zse = ctxt->writer->zs;
 	struct ll_conn_stats s;
+	struct ll_adv_stats as;
+	uint32_t up = 0;
 
-	ll_conn_get_stats(0, &s);   /* link 0 (per-link fields: slice 6a Task 6) */
+	ll_conn_get_stats_total(&s);   /* aggregates: sums over the links */
+	ll_adv_get_stats(&as);
+	for (uint8_t i = 0; i < LL_MAX_CONN; i++) {
+		up += ll_conn_active(i) ? 1 : 0;
+	}
 
 	bool ok = zcbor_tstr_put_lit(zse, "rc") && zcbor_int32_put(zse, 0) &&
 		  zcbor_tstr_put_lit(zse, "up") &&
@@ -100,7 +116,30 @@ static int openll_mgmt_stats(struct smp_streamer *ctxt)
 		  zcbor_tstr_put_lit(zse, "miss") && zcbor_uint32_put(zse, s.missed) &&
 		  zcbor_tstr_put_lit(zse, "wake") &&
 		  zcbor_uint32_put(zse, b91_bt_controller_wakeups()) &&
-		  zcbor_tstr_put_lit(zse, "mv") && zcbor_uint32_put(zse, battery_mv());
+		  zcbor_tstr_put_lit(zse, "mv") && zcbor_uint32_put(zse, battery_mv()) &&
+		  zcbor_tstr_put_lit(zse, "links") && zcbor_uint32_put(zse, up) &&
+		  zcbor_tstr_put_lit(zse, "link") && zcbor_list_start_encode(zse, LL_MAX_CONN);
+	for (uint8_t i = 0; ok && i < LL_MAX_CONN; i++) {
+		struct ll_conn_stats l;
+
+		ll_conn_get_stats(i, &l);
+		ok = zcbor_map_start_encode(zse, 5) &&
+		     zcbor_tstr_put_lit(zse, "up") &&
+		     zcbor_uint32_put(zse, ll_conn_active(i) ? 1 : 0) &&
+		     zcbor_tstr_put_lit(zse, "listen") && zcbor_uint32_put(zse, l.listened) &&
+		     zcbor_tstr_put_lit(zse, "skip") && zcbor_uint32_put(zse, l.skipped) &&
+		     zcbor_tstr_put_lit(zse, "coll") && zcbor_uint32_put(zse, l.collisions) &&
+		     zcbor_tstr_put_lit(zse, "miss") && zcbor_uint32_put(zse, l.missed) &&
+		     zcbor_map_end_encode(zse, 5);
+	}
+	ok = ok && zcbor_list_end_encode(zse, LL_MAX_CONN) &&
+	     zcbor_tstr_put_lit(zse, "adv") && zcbor_map_start_encode(zse, 5) &&
+	     zcbor_tstr_put_lit(zse, "ev") && zcbor_uint32_put(zse, as.events) &&
+	     zcbor_tstr_put_lit(zse, "slid") && zcbor_uint32_put(zse, as.slid) &&
+	     zcbor_tstr_put_lit(zse, "drop") && zcbor_uint32_put(zse, as.dropped) &&
+	     zcbor_tstr_put_lit(zse, "cut") && zcbor_uint32_put(zse, as.cut) &&
+	     zcbor_tstr_put_lit(zse, "stuck") && zcbor_uint32_put(zse, as.stuck) &&
+	     zcbor_map_end_encode(zse, 5);
 	return ok ? MGMT_ERR_EOK : MGMT_ERR_EMSGSIZE;
 }
 

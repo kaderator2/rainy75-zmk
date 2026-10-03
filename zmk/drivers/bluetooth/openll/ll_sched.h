@@ -7,8 +7,9 @@
  * Two independent slots share the one stimer compare: the main alarm
  * (ll_sched_at, used only by ll_arb, which starts the events of ll_adv and
  * ll_conn) and the guard
- * alarm (ll_sched_guard_at, used by ll_radio to end a connection event whose
- * completion IRQ never arrived). The compare is programmed with the earlier
+ * alarm (ll_sched_guard_at, used by ll_radio to end a connection event or
+ * an advertising TX/RX whose completion IRQ never arrived; the two never
+ * overlap, the last one armed wins). The compare is programmed with the earlier
  * of the two; a slot whose tick is already due when the other fires runs in
  * the same interrupt.
  */
