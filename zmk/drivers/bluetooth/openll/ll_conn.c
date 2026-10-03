@@ -74,9 +74,14 @@ static struct {
 	uint16_t ppm;         /* central SCA + own */
 	uint32_t widen_max_us; /* interval / 2 - T_IFS (exceeds 16 bits) */
 	struct ll_csa1 csa;
-	struct ll_csa1 csa_base; /* before the skipped events and the planned one */
+	/* CSA#1 state before the skipped events and the planned one; with
+	 * skip_n == 0 after a re-plan (replan_to): the state after the
+	 * instants applied at the planned event */
+	struct ll_csa1 csa_base;
 	uint16_t counter;     /* next event not yet completed (planned: the listened one) */
-	uint16_t skip_base;   /* first event after the last closed one */
+	/* first event after the last closed one; with skip_n == 0 after a
+	 * re-plan: the planned (target) event itself */
+	uint16_t skip_base;
 	uint16_t skip_n;      /* events skipped before the planned one */
 	uint32_t ref_tick;
 	uint16_t ref_counter;

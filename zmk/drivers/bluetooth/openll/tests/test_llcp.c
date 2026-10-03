@@ -67,8 +67,8 @@ unsigned int ll_plat_lock(void) { locks++; return 0; }
 void ll_plat_unlock(unsigned int k) { (void)k; locks--; }
 
 /* TX producer serialization (thread mutex on the device) */
-static int tx_locks;
-void ll_plat_tx_lock(void) { tx_locks++; }
+static int tx_locks, tx_lock_calls;
+void ll_plat_tx_lock(void) { tx_locks++; tx_lock_calls++; }
 void ll_plat_tx_unlock(void) { tx_locks--; }
 
 /* AES never runs with interrupts locked by the caller (Task 10: the IRQ
@@ -166,6 +166,22 @@ void ll_conn_end(uint8_t reason)
 }
 bool ll_conn_active(void) { return cn.active; }
 
+/* Kick after every successful push (slice 5): outside the IRQ lock, after
+ * the PDU is in the queue. n_at_kick: pushes seen at the last kick. */
+static struct {
+	int calls;
+	int n_at_kick;
+	int bad;   /* kicks with the IRQ lock held or before a new push */
+} kk;
+void ll_conn_kick(void)
+{
+	if (locks != 0 || tx.n <= kk.n_at_kick) {
+		kk.bad++;
+	}
+	kk.calls++;
+	kk.n_at_kick = tx.n;
+}
+
 /* ---------------- HCI ops ---------------- */
 
 static struct {
@@ -202,6 +218,7 @@ static void fresh(void)
 	memset(&tx, 0, sizeof(tx));
 	memset(&cn, 0, sizeof(cn));
 	memset(&hci, 0, sizeof(hci));
+	memset(&kk, 0, sizeof(kk));
 	rxq_crypt = NULL;
 	rxq_set_calls = 0;
 	rand_n = rand_i = 0;
@@ -744,6 +761,135 @@ int main(void)
 		ll_llcp_tick(now + T(TIMEOUT_US));
 		CHECK(cn.end_calls == 1);
 	}
+
+	/* ---- ll_conn_kick after every successful push (slice 5) ---- */
+	fresh();
+	features(0xFF);                       /* LLCP response */
+	CHECK(kk.calls == 1 && kk.bad == 0);
+	CHECK(ll_llcp_tx(LL_TXQ_ACL, LL_LLID_START, data2_clear, 27) == 0);
+	CHECK(kk.calls == 2 && kk.bad == 0);
+	CHECK(ll_llcp_ctrl_tx((const uint8_t[]){0x02, 0x13}, 2) == 0);   /* ops.ctrl_tx path */
+	CHECK(kk.calls == 3 && kk.bad == 0);
+	/* nothing queued: no kick */
+	tx.fail = 1;
+	CHECK(ll_llcp_tx(LL_TXQ_ACL, LL_LLID_START, data2_clear, 27) == -ENOMEM);
+	CHECK(ll_llcp_tx(LL_TXQ_ACL, LL_LLID_START, data2_clear, 0) == -EINVAL);
+	CHECK(kk.calls == 3);
+	/* encryption start: LL_ENC_RSP, LL_START_ENC_REQ (HCI thread),
+	 * LL_START_ENC_RSP each kick; paused ACL does not */
+	fresh();
+	{
+		uint8_t req[23];
+
+		sample_rand();
+		build_enc_req(req);
+		rx(req, sizeof(req));
+		CHECK(kk.calls == 1);
+		CHECK(ll_llcp_tx(LL_TXQ_ACL, LL_LLID_START, data2_clear, 27) == -EAGAIN);
+		CHECK(kk.calls == 1);
+	}
+	fresh();
+	start_encryption();
+	CHECK(kk.calls == 3 && kk.bad == 0);
+	/* encrypted ACL kicks too */
+	CHECK(ll_llcp_tx(LL_TXQ_ACL, LL_LLID_START, data2_clear, 27) == 0);
+	CHECK(kk.calls == 4 && kk.bad == 0);
+	/* negative LTK reply: the reject kicks */
+	fresh();
+	{
+		uint8_t req[23];
+
+		sample_rand();
+		build_enc_req(req);
+		rx(req, sizeof(req));
+		CHECK(ll_llcp_ltk_neg_reply() == LL_ST_SUCCESS);
+		CHECK(kk.calls == 2 && kk.bad == 0);
+	}
+
+	/* ---- ll_llcp_busy: a procedure waits (slice 5 latency hook) ---- */
+	fresh();
+	CHECK(!ll_llcp_busy());
+	features(0xFF);
+	CHECK(!ll_llcp_busy());               /* answered at once: not a waiting procedure */
+	{
+		uint8_t req[23], buf[8];
+		int calls;
+
+		sample_rand();
+		build_enc_req(req);
+		rx(req, sizeof(req));
+		/* ISR-called: never takes the TX mutex */
+		calls = tx_lock_calls;
+		CHECK(ll_llcp_busy());            /* waiting for the host's LTK */
+		CHECK(tx_lock_calls == calls && locks == 0);
+		CHECK(ll_llcp_ltk_reply(ltk) == LL_ST_SUCCESS);
+		CHECK(ll_llcp_busy());            /* waiting for LL_START_ENC_RSP */
+		memcpy(buf, rsp1_air, 5);
+		CHECK(ll_crypt_decrypt(rxq_crypt, 0x0F, buf, 5) == 1);
+		rx(buf, 1);
+		CHECK(hci.enc_change == 1);
+		CHECK(!ll_llcp_busy());           /* done */
+	}
+	/* negative reply, timeout and reset end it */
+	fresh();
+	{
+		uint8_t req[23];
+
+		sample_rand();
+		build_enc_req(req);
+		rx(req, sizeof(req));
+		CHECK(ll_llcp_busy());
+		CHECK(ll_llcp_ltk_neg_reply() == LL_ST_SUCCESS);
+		CHECK(!ll_llcp_busy());
+		sample_rand();
+		rx(req, sizeof(req));
+		CHECK(ll_llcp_busy());
+		ll_llcp_tick(now + T(TIMEOUT_US));
+		CHECK(!ll_llcp_busy());
+		sample_rand();
+		rx(req, sizeof(req));
+		CHECK(ll_llcp_busy());
+		ll_llcp_reset();
+		CHECK(!ll_llcp_busy());
+	}
+
+	/* ---- ll_llcp_timeout_ticks: arm the 40 s timer only while running ---- */
+	fresh();
+	CHECK(ll_llcp_timeout_ticks(now) == -1);
+	features(0xFF);
+	CHECK(ll_llcp_timeout_ticks(now) == -1);
+	{
+		uint8_t req[23];
+		uint32_t t0 = now;
+
+		sample_rand();
+		build_enc_req(req);
+		rx(req, sizeof(req));
+		CHECK(ll_llcp_timeout_ticks(t0) == (int32_t)T(TIMEOUT_US));
+		CHECK(ll_llcp_timeout_ticks(t0 + 5) == (int32_t)T(TIMEOUT_US) - 5);
+		CHECK(ll_llcp_timeout_ticks(t0 + T(TIMEOUT_US)) == 0);
+		CHECK(ll_llcp_timeout_ticks(t0 + T(TIMEOUT_US) + 100) == 0);
+		/* restarted by LL_START_ENC_REQ */
+		now = t0 + T(10000000);
+		CHECK(ll_llcp_ltk_reply(ltk) == LL_ST_SUCCESS);
+		CHECK(ll_llcp_timeout_ticks(t0 + T(TIMEOUT_US)) == (int32_t)T(10000000));
+		ll_llcp_reset();
+		CHECK(ll_llcp_timeout_ticks(now) == -1);
+	}
+	/* across the 32-bit tick wrap */
+	fresh();
+	{
+		uint8_t req[23];
+
+		now = 0xFFFFFF00u;
+		sample_rand();
+		build_enc_req(req);
+		rx(req, sizeof(req));
+		CHECK(ll_llcp_timeout_ticks(now + 0x200) == (int32_t)T(TIMEOUT_US) - 0x200);
+		CHECK(ll_llcp_ltk_neg_reply() == LL_ST_SUCCESS);
+		CHECK(ll_llcp_timeout_ticks(now) == -1);
+	}
+	CHECK(tx_locks == 0);
 
 	CHECK(locks == 0);
 	DONE();

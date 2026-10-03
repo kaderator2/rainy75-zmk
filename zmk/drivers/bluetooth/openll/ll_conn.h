@@ -157,14 +157,21 @@ bool ll_conn_active(void);
  * if any). Instants are relative to this. While a latency skip is planned
  * this is the first skipped event (conservative: an instant for a skipped
  * event re-plans the listen to it, or is passed if that event is no
- * longer reachable). */
+ * longer reachable). After a re-plan (kick or instant) it is the planned
+ * event, so an instant for an earlier event is treated as passed (0x28); a
+ * conforming central never sends one (the instant is >= 6 events after the
+ * PDU, which arrives in a listened event). */
 uint16_t ll_conn_event_counter(void);
 /* New TX data was queued (call after a successful ll_txq_push; the
- * ll_plat_lock() it takes nests, so the caller may hold it): if the planned event lies beyond the next regular
- * event that can still be prepared (alarm LL_CONN_ARM_LEAD_US before its
- * RX opens), re-plan to that event. No-op without a connection, during an
- * event (the next plan sees the backlog) or when that event is already the
- * planned one. ISR-safe; takes ll_plat_lock(). */
+ * ll_plat_lock() it takes nests, so the caller may hold it): if the planned
+ * event lies beyond the next regular event that can still be prepared
+ * (alarm LL_CONN_ARM_LEAD_US before its RX opens), re-plan to that event.
+ * No-op without a connection, during an event (the next plan sees the
+ * backlog) or when that event is already the planned one. Once an instant
+ * is applied at the planned event (it was re-planned to an instant), a kick
+ * cannot pull the listen earlier: TX may then wait up to latency x interval
+ * until the instant event (accepted trade-off, instants are rare).
+ * ISR-safe; takes ll_plat_lock(). */
 void ll_conn_kick(void);
 
 struct ll_conn_stats {

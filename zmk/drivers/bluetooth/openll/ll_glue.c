@@ -21,6 +21,15 @@
  *   one thread for data (LTK reply / Disconnect queue control PDUs from the
  *   HCI thread under ll_plat_tx_lock(), see ll_llcp.h).
  *
+ * The controller thread sleeps until something happens (K_FOREVER): the
+ * radio/stimer ISRs, the HCI thread and two timers wake it. The LLCP
+ * response timer (llcp_tmr) runs only while an LL control procedure is
+ * pending; the stats timer only with CONFIG_BT_HCI_B91_OPENLL_STATS_LOG.
+ * Host ACL held back (-ENOMEM: TX backlog full; -EAGAIN: encryption start
+ * pauses data) is retried on the wakeup that frees it: an ll_txq ack
+ * (txq_done), the end of the procedure (LL_START_ENC_RSP received here,
+ * the host's LTK negative reply, which wakes it) or the disconnect.
+ *
  * Toward the host, the controller thread delivers directly (after draining
  * the event queue first, so the order of everything it produced is kept);
  * only events produced in other contexts (HCI command completions from the
@@ -48,9 +57,7 @@
 
 LOG_MODULE_REGISTER(openll, CONFIG_BT_HCI_DRIVER_LOG_LEVEL);
 
-#define WAKE_IDLE_MS     100   /* also the ll_llcp_tick period when idle */
-#define WAKE_HELD_MS     5     /* host ACL waiting for TX room / encryption */
-#define STATS_PERIOD_MS  2000
+#define STATS_PERIOD_MS  2000  /* CONFIG_BT_HCI_B91_OPENLL_STATS_LOG */
 #define RX_BUDGET        16    /* PDUs per wakeup (= ll_rxq ring depth) */
 #define RESET_WAIT_MS    200   /* HCI Reset: wait for the connection to end */
 /* Consecutive guard-ended events without any CRC-valid packet after which
@@ -84,6 +91,27 @@ struct acl_item {
 K_MSGQ_DEFINE(acl_q, sizeof(struct acl_item), LL_ACL_NUM + 1, 4);
 
 static K_SEM_DEFINE(wake, 0, 1);
+
+/* LLCP procedure response timeout (40 s, ll_llcp_tick): armed by the
+ * controller thread from ll_llcp_timeout_ticks() only while a procedure is
+ * pending; the expiry only wakes the controller thread. */
+static void llcp_tmr_fn(struct k_work *work)
+{
+	ARG_UNUSED(work);
+	k_sem_give(&wake);
+}
+static K_WORK_DELAYABLE_DEFINE(llcp_tmr, llcp_tmr_fn);
+static bool llcp_tmr_armed;   /* controller thread only */
+
+/* Periodic stats line (CONFIG_BT_HCI_B91_OPENLL_STATS_LOG only). */
+static atomic_t stats_due;
+static void stats_tmr_fn(struct k_timer *t)
+{
+	ARG_UNUSED(t);
+	atomic_set(&stats_due, 1);
+	k_sem_give(&wake);
+}
+static K_TIMER_DEFINE(stats_tmr, stats_tmr_fn, NULL);
 static K_SEM_DEFINE(reset_done, 0, 1);
 
 static K_THREAD_STACK_DEFINE(ctrl_stack, CONFIG_BT_HCI_B91_RX_STACK_SIZE);
@@ -347,6 +375,7 @@ static const struct ll_conn_ops conn_ops = {
 	.evt = conn_evt,
 	.txq_done = txq_done,
 	.ctrl_tx = ll_llcp_ctrl_tx,
+	.busy = ll_llcp_busy,
 };
 
 static const struct ll_llcp_ops llcp_ops = {
@@ -437,6 +466,16 @@ static uint8_t adv_enable(bool enable)
 	return st;
 }
 
+/* HCI thread: the negative reply resumes paused host ACL; wake the
+ * controller thread, which holds it (nothing else would). */
+static uint8_t ltk_neg_reply(void)
+{
+	uint8_t st = ll_llcp_ltk_neg_reply();
+
+	k_sem_give(&wake);
+	return st;
+}
+
 static const struct ll_hci_ops hci_ops = {
 	.get_bd_addr = get_bd_addr,
 	.rand = rand_bytes,
@@ -448,7 +487,7 @@ static const struct ll_hci_ops hci_ops = {
 	.unknown = unknown_opcode,
 	.disconnect = ll_llcp_terminate,
 	.ltk_reply = ll_llcp_ltk_reply,
-	.ltk_neg_reply = ll_llcp_ltk_neg_reply,
+	.ltk_neg_reply = ltk_neg_reply,
 };
 
 /* ---- controller thread ---- */
@@ -679,8 +718,8 @@ static uint32_t ticks_to_us(uint32_t t)
 	return t / LL_TICKS_PER_US;
 }
 
-/* Periodic health log: one line every 2 s while there is anything to
- * report, plus a stall warning if advertising is enabled but tx2rx is not
+/* Periodic health log (CONFIG_BT_HCI_B91_OPENLL_STATS_LOG): one line every
+ * 2 s while there is anything to report, plus a stall warning if advertising is enabled but tx2rx is not
  * advancing. Connection counters are logged while connected or changed. */
 static void report_stats(struct ll_radio_stats *last, struct ll_conn_stats *last_c)
 {
@@ -714,6 +753,8 @@ static void report_stats(struct ll_radio_stats *last, struct ll_conn_stats *last
 			cs.first_bad, cs.first_nodata, cs.first_outside, st.rx_ptr_skip,
 			st.rx_wptr_max, st.fst_capped,
 			(uint32_t)atomic_get(&cnt_guard_escalations));
+		LOG_INF("conn: latency planned %u listened %u skipped %u kicks %u",
+			cs.planned, cs.listened, cs.skipped, cs.kicks);
 		LOG_INF("conn: acl in %u out %u drop %u evt_drop %u lock max %u us acl_tx %u us aes %u us",
 			(uint32_t)atomic_get(&cnt_acl_in), (uint32_t)atomic_get(&cnt_acl_out),
 			(uint32_t)atomic_get(&cnt_acl_drop), (uint32_t)atomic_get(&cnt_evt_drop),
@@ -725,18 +766,30 @@ static void report_stats(struct ll_radio_stats *last, struct ll_conn_stats *last
 	}
 	*last = st;
 	*last_c = cs;
+}
 
-	uint32_t drops = (uint32_t)atomic_clear(&conn_drops);
+/* Arm llcp_tmr for the LLCP response timeout while a procedure is pending,
+ * cancel it otherwise (stimer ticks -> kernel ms, rounded up; firing early
+ * only costs a wakeup that re-arms it). */
+static void llcp_tmr_update(void)
+{
+	int32_t left = conn_up ? ll_llcp_timeout_ticks(ll_radio_now()) : -1;
 
-	if (drops != 0) {
-		LOG_WRN("dropped %u CONNECT_IND event(s) (queue full)", drops);
+	if (left < 0) {
+		if (llcp_tmr_armed) {
+			(void)k_work_cancel_delayable(&llcp_tmr);
+			llcp_tmr_armed = false;
+		}
+		return;
 	}
+	(void)k_work_reschedule(&llcp_tmr,
+				K_MSEC((uint32_t)left / (LL_TICKS_PER_US * 1000u) + 1u));
+	llcp_tmr_armed = true;
 }
 
 static void ctrl_thread_fn(void *p1, void *p2, void *p3)
 {
 	struct ll_connect_ind ci;
-	int64_t next_stats = 0;
 	struct ll_radio_stats last_stats = {0};
 	struct ll_conn_stats last_conn = {0};
 
@@ -745,7 +798,7 @@ static void ctrl_thread_fn(void *p1, void *p2, void *p3)
 	ARG_UNUSED(p3);
 
 	while (1) {
-		(void)k_sem_take(&wake, K_MSEC(held_valid ? WAKE_HELD_MS : WAKE_IDLE_MS));
+		(void)k_sem_take(&wake, K_FOREVER);
 
 		if (atomic_test_bit(&pend, PEND_CONNECTED)) {
 			handle_connected();
@@ -762,15 +815,18 @@ static void ctrl_thread_fn(void *p1, void *p2, void *p3)
 		if (conn_up) {
 			ll_llcp_tick(ll_radio_now());
 		}
+		llcp_tmr_update();
 		drain_evt_q();
 		while (k_msgq_get(&conn_q, &ci, K_NO_WAIT) == 0) {
 			log_connect_ind(&ci);
 		}
 
-		int64_t now = k_uptime_get();
+		uint32_t drops = (uint32_t)atomic_clear(&conn_drops);
 
-		if (now >= next_stats) {
-			next_stats = now + STATS_PERIOD_MS;
+		if (drops != 0) {
+			LOG_WRN("dropped %u CONNECT_IND event(s) (queue full)", drops);
+		}
+		if (IS_ENABLED(CONFIG_BT_HCI_B91_OPENLL_STATS_LOG) && atomic_clear(&stats_due)) {
 			report_stats(&last_stats, &last_conn);
 		}
 	}
@@ -796,6 +852,9 @@ int b91_bt_controller_init(void)
 			ctrl_thread_fn, NULL, NULL, NULL,
 			CONFIG_BT_HCI_B91_RX_PRIO, 0, K_NO_WAIT);
 	k_thread_name_set(&ctrl_thread, "openll");
+	if (IS_ENABLED(CONFIG_BT_HCI_B91_OPENLL_STATS_LOG)) {
+		k_timer_start(&stats_tmr, K_MSEC(STATS_PERIOD_MS), K_MSEC(STATS_PERIOD_MS));
+	}
 	LOG_INF("open link layer up, BD_ADDR %02x:%02x:%02x:%02x:%02x:%02x",
 		bd_addr[5], bd_addr[4], bd_addr[3], bd_addr[2], bd_addr[1], bd_addr[0]);
 	return 0;

@@ -116,10 +116,18 @@ static int tx_locked(enum ll_txq_kind kind, uint8_t llid, const uint8_t *payload
 	key = ll_plat_lock();
 	ret = ll_txq_push(kind, llid, buf, n, kind == LL_TXQ_CTRL ? payload[0] : 0);
 	ll_plat_unlock(key);
-	if (ret != 0 && s.crypt.enc_tx) {
-		s.crypt.tx_ctr--;   /* not queued: the counter value is reused */
+	if (ret != 0) {
+		if (s.crypt.enc_tx) {
+			s.crypt.tx_ctr--;   /* not queued: the counter value is reused */
+		}
+		return ret;
 	}
-	return ret;
+	/* Peripheral latency: listen at the next regular event instead of
+	 * the planned (skipped-ahead) one. Outside the IRQ lock (it takes
+	 * ll_plat_lock() itself), after the push, so a plan racing with it
+	 * either sees the backlog or is re-planned here. */
+	ll_conn_kick();
+	return 0;
 }
 
 int ll_llcp_tx(enum ll_txq_kind kind, uint8_t llid, const uint8_t *payload, uint8_t len)
@@ -497,6 +505,30 @@ void ll_llcp_tick(uint32_t now_tick)
 	if (expired) {
 		ll_conn_end(LL_ST_LMP_TIMEOUT);
 	}
+}
+
+int32_t ll_llcp_timeout_ticks(uint32_t now_tick)
+{
+	int32_t left = -1;
+
+	ll_plat_tx_lock();
+	if (s.tmr_on) {
+		left = (int32_t)RSP_TIMEOUT_TICKS - (int32_t)(now_tick - s.tmr_start);
+		if (left < 0) {
+			left = 0;
+		}
+	}
+	ll_plat_tx_unlock();
+	return left;
+}
+
+/* ISR context, no lock: each field is one aligned word or byte (a single
+ * load), written by threads under ll_plat_tx_lock(). volatile so the
+ * compiler reads the current values. */
+bool ll_llcp_busy(void)
+{
+	return *(volatile enum enc_state *)&s.enc != ENC_IDLE ||
+	       *(volatile bool *)&s.paused || *(volatile bool *)&s.tmr_on;
 }
 
 void ll_llcp_init(const struct ll_llcp_ops *o)
