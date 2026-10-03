@@ -312,7 +312,47 @@ static void test_sliced(void)
 		now_tick = sched_tick;
 		fire_sched();               /* block 2 */
 		ll_arb_cancel(1);
+
+		/* D: the next channel's gap would start 9.7 ms after the last
+		 * PDU: with the start slack (stimer ISR latency + adv_enter,
+		 * 370 us) it could begin after 10 ms, so the event is cut */
+		ll_adv_get_stats(&a0);
+		ev0 = sched_tick;
+		CHECK(foreign_req_id(1, ev0 + TU(12000), 10000, LL_ARB_PRIO_MUST) == 0);
+		CHECK(foreign_req_id(0, ev0 + TU(2500), 7200, LL_ARB_PRIO_MUST) == 0);
+		CHECK(sched_tick == ev0);
+		adv_channel();
+		CHECK(radio_ch == 37);
+		ll_adv_get_stats(&a1);
+		CHECK(a1.cut == a0.cut + 1);
+		now_tick = sched_tick;
+		fire_sched();               /* block 1 */
+		ll_arb_cancel(0);
+		now_tick = sched_tick;
+		fire_sched();               /* block 2 */
+		ll_arb_cancel(1);
 	}
+
+	/* E: a complete event, then two events cut after their first
+	 * channel: advertising is starving, its next event is requested at
+	 * ACTIVE, so an idle request over it is refused */
+	adv_channel();              /* a whole event: 38 and 39 follow at once */
+	ll_adv_radio_evt(LL_RADIO_RX_TIMEOUT, NULL, 0, 0);
+	CHECK(radio_ch == 39);
+	ll_adv_radio_evt(LL_RADIO_RX_TIMEOUT, NULL, 0, 0);
+	for (int i = 0; i < 2; i++) {
+		ev0 = sched_tick;
+		CHECK(foreign_req(ev0 + TU(2500), 12000, LL_ARB_PRIO_MUST) == 0);
+		CHECK(sched_tick == ev0);
+		adv_channel();
+		now_tick = sched_tick;
+		fire_sched();               /* the block */
+		ll_arb_cancel(0);
+	}
+	ev0 = sched_tick;
+	CHECK(foreign_req(ev0 + TU(500), 1000, LL_ARB_PRIO_IDLE) == -EBUSY);
+	CHECK(foreign_req(ev0 + TU(500), 1000, LL_ARB_PRIO_SUPERVISION) == 0);
+	ll_arb_cancel(0);
 	CHECK(ll_adv_enable(false) == LL_ST_SUCCESS);
 }
 

@@ -47,6 +47,7 @@
 #include "ext_driver/ext_rf.h"
 #include "ll_defs.h"
 #include "ll_radio.h"
+#include "ll_radio_mode.h"
 #include "ll_sched.h"
 
 LOG_MODULE_DECLARE(openll, CONFIG_BT_HCI_DRIVER_LOG_LEVEL);
@@ -156,10 +157,10 @@ static struct {
 	uint32_t first_ts;
 	uint8_t first_len;
 	bool tx_seen;           /* first TX IRQ of the event handled */
-	bool saved;             /* adv-mode register values below are saved */
-	uint8_t saved_ctrl1;
-	uint8_t saved_rxtcrc;
 } cn;
+/* Adv snapshot of ll_ctrl_1 / rxtcrcpkt and "connection setup done"
+ * (ll_radio_mode.h, host-tested). */
+static struct ll_radio_mode rm;
 
 static atomic_t cnt_tx2rx, cnt_rx_ok, cnt_rx_crc, cnt_rx_timeout, cnt_rsp_tx, cnt_rsp_late;
 static atomic_t cnt_conn_events, cnt_conn_rx, cnt_conn_tx, cnt_conn_fto, cnt_conn_guard;
@@ -194,9 +195,16 @@ static uint8_t *rx_entry(uint8_t idx)
 
 static void adv_isr(uint16_t st)
 {
-	if (st & (FLD_RF_IRQ_RX | FLD_RF_IRQ_RX_TIMEOUT | FLD_RF_IRQ_FIRST_TIMEOUT) ||
-	    ((st & FLD_RF_IRQ_TX) && rsp_in_flight)) {
-		adv_open = false;   /* ended (a SCAN_RSP re-opens it below) */
+	if (adv_open && ((st & (FLD_RF_IRQ_RX | FLD_RF_IRQ_RX_TIMEOUT | FLD_RF_IRQ_FIRST_TIMEOUT)) ||
+			 ((st & FLD_RF_IRQ_TX) && rsp_in_flight))) {
+		/* ended (a SCAN_RSP re-opens it from the callback below): drop
+		 * the adv guard, so no stimer IRQ per adv channel. In adv mode
+		 * the guard slot can only hold the adv guard (a connection
+		 * event arms its own guard when it is issued). */
+		adv_open = false;
+		if (!cn.evt_open) {
+			ll_sched_guard_cancel();
+		}
 	}
 	if (st & FLD_RF_IRQ_RX) {
 		/* The DMA wrote entry (wptr & 3) and advanced the wptr; the
@@ -421,6 +429,7 @@ int ll_radio_init(ll_radio_cb_t cb)
 {
 	radio_cb = cb;
 	mode = MODE_ADV;
+	ll_radio_mode_reset(&rm);
 	hw_init_adv(true);
 	cn.rx_sw = rf_get_rx_wptr() & RX_WPTR_MASK;
 	IRQ_CONNECT(RF_IRQ, 1, rf_isr, NULL, 0);
@@ -441,10 +450,14 @@ void ll_radio_set_adv_channel(uint8_t ch)
 	rf_set_ble_crc_adv();
 }
 
+static void baseband_restore(bool keep_conn);
+
 /* Adv guard (stimer ISR): the advertising TX/RX produced no end IRQ.
- * Recover as ml-spike S3 did: baseband reset + adv init (the restore; the
- * next connection event re-selects its link, a new connection redoes the
- * connection setup), then end the channel for ll_adv like an RX timeout. */
+ * Recover as ml-spike S3 did: baseband reset + adv init. Live links keep
+ * their connection setup (keep_conn: no new snapshot, ll_radio_conn_init
+ * stays a no-op; each connection event re-selects its registers), and the
+ * adv snapshot is written back. Then the channel ends for ll_adv like an
+ * RX timeout. */
 static void adv_guard(void)
 {
 	if (!adv_open || mode != MODE_ADV) {
@@ -452,7 +465,7 @@ static void adv_guard(void)
 	}
 	adv_open = false;
 	atomic_inc(&cnt_adv_guard);
-	ll_radio_adv_restore();
+	baseband_restore(true);
 	radio_cb(LL_RADIO_RX_TIMEOUT, NULL, 0, 0);
 }
 
@@ -546,8 +559,8 @@ static uint8_t *ring_entry(uint8_t idx)
  * kept: ll_txq programs them per event for the link (before or after this). */
 static void conn_regs(void)
 {
-	reg_rf_rxtcrcpkt = cn.saved_rxtcrc | FLD_RF_EN_TS_TX;   /* T_IFS monitor */
-	reg_rf_ll_ctrl_1 = (cn.saved_ctrl1 & ~(FLD_RF_BRX_SN_INIT | FLD_RF_BRX_NESN_INIT)) |
+	reg_rf_rxtcrcpkt = rm.adv_rxtcrc | FLD_RF_EN_TS_TX;   /* T_IFS monitor */
+	reg_rf_ll_ctrl_1 = (rm.adv_ctrl1 & ~(FLD_RF_BRX_SN_INIT | FLD_RF_BRX_NESN_INIT)) |
 			   (reg_rf_ll_ctrl_1 & (FLD_RF_BRX_SN_INIT | FLD_RF_BRX_NESN_INIT)) |
 			   FLD_RF_RX_FIRST_TIMEOUT_EN;
 	/* TX: base = empty PDU, sent while the FIFO is empty (md-spike round
@@ -564,28 +577,24 @@ void ll_radio_conn_init(void)
 	static const uint8_t empty_pdu[2] = {LL_LLID_CONT, 0};
 	unsigned int key = irq_lock();
 
-	/* Done since the last ll_radio_adv_restore() (which clears
-	 * cn.saved): other links may be live, possibly with an event on air,
+	/* Done since the last ll_radio_adv_restore() (an adv-guard restore
+	 * keeps it): other links may be live, possibly with an event on air,
 	 * so nothing here may touch the FSM, the SN/NESN state, the guard
 	 * streak or the RX ring position. Per event, ll_radio_conn_select()
 	 * and ll_txq_event_start() set everything a link needs. With one link
 	 * every connection follows an adv restore, so the full setup below
-	 * runs at every connection start, as in slice 5. */
-	if (cn.saved) {
+	 * runs at every connection start, as in slice 5. The adv snapshot is
+	 * taken at the first setup only (ll_radio_mode.h). */
+	if (!ll_radio_mode_conn_init(&rm, reg_rf_ll_ctrl_1, reg_rf_rxtcrcpkt)) {
 		irq_unlock(key);
 		return;
 	}
 	rf_set_tx_rx_off_auto_mode();
 	rsp_in_flight = false;
 	cn.evt_open = false;
-	if (!cn.saved) {
-		cn.saved_ctrl1 = reg_rf_ll_ctrl_1;
-		cn.saved_rxtcrc = reg_rf_rxtcrcpkt;
-		cn.saved = true;
-	}
 	/* BRX SN/NESN start values 0, then load them into the live SN/NESN
 	 * state. Per event the SN/NESN init bits come from ll_txq. */
-	reg_rf_ll_ctrl_1 = (cn.saved_ctrl1 & ~(FLD_RF_BRX_SN_INIT | FLD_RF_BRX_NESN_INIT)) |
+	reg_rf_ll_ctrl_1 = (rm.adv_ctrl1 & ~(FLD_RF_BRX_SN_INIT | FLD_RF_BRX_NESN_INIT)) |
 			   FLD_RF_RX_FIRST_TIMEOUT_EN;
 	reset_sn_nesn();
 	load(conn_tx_buf, empty_pdu, sizeof(empty_pdu));
@@ -619,11 +628,16 @@ void ll_radio_adv_enter(void)
 	 * 0x03 and the following BRX commands never end. The next connection
 	 * event rebuilds its link's ring. */
 	rf_set_tx_wptr(0, rf_get_tx_rptr(0));
-	if (cn.saved) {
+	{
+		uint8_t c1, rx;
+
 		/* advertising value: no first-RX timeout (it would bound the
 		 * stx2rx RX by a connection's window), SN/NESN init 0; the TX
-		 * timestamp bit of rxtcrcpkt may stay on */
-		reg_rf_ll_ctrl_1 = cn.saved_ctrl1;
+		 * timestamp bit of rxtcrcpkt may stay on. Without a snapshot no
+		 * connection ever set up, the register holds the adv value. */
+		if (ll_radio_mode_adv_regs(&rm, &c1, &rx)) {
+			reg_rf_ll_ctrl_1 = c1;
+		}
 	}
 	rf_set_ble_access_code_adv();
 	rf_set_ble_crc_adv();
@@ -734,17 +748,25 @@ void ll_radio_fifo_set_wptr(uint8_t wptr)
  * by ll_adv_enable() under ll_plat_lock(). */
 void ll_radio_adv_restore(void)
 {
+	baseband_restore(false);
+}
+
+/* keep_conn: stall recovery while links may be live (the connection setup
+ * stays done); false: the return to advertising after the last link (the
+ * next connection sets up again). */
+static void baseband_restore(bool keep_conn)
+{
 	unsigned int key = irq_lock();
+	uint8_t c1, rx;
 
 	ll_sched_guard_cancel();
 	cn.evt_open = false;
 	rf_set_tx_rx_off_auto_mode();
 	restore_ptrs_before = tx_ptrs();
 	rf_baseband_reset();
-	if (cn.saved) {
-		reg_rf_ll_ctrl_1 = cn.saved_ctrl1;
-		reg_rf_rxtcrcpkt = cn.saved_rxtcrc;
-		cn.saved = false;
+	if (ll_radio_mode_restore(&rm, keep_conn, &c1, &rx)) {
+		reg_rf_ll_ctrl_1 = c1;
+		reg_rf_rxtcrcpkt = rx;
 	}
 	hw_init_adv(false);
 	cn.rx_sw = rf_get_rx_wptr() & RX_WPTR_MASK;

@@ -39,21 +39,31 @@
  * channel slides into the next gap (ll_arb_gap) before the next adv
  * interval, else the event is dropped; a continuation channel that finds
  * no gap within the 10 ms ends the event early (stats.cut). When no event
- * has started for ADV_STARVE_INTERVALS intervals, or that many were dropped
- * in a row (no gap before the next interval, or displaced again and again
- * by links that keep the air full), the first channel asks
- * at LL_ARB_PRIO_ACTIVE: it then takes part in the round-robin of the
- * links' ties and may displace an idle or active link's event (that link
- * yields one event), never a supervision-critical or transmit-window /
- * instant event. So advertising cannot starve for more than a few
- * intervals.
+ * has completed all its channels for ADV_STARVE_INTERVALS intervals, or
+ * that many events were dropped or cut in a row (no gap before the next
+ * interval or within 10 ms, or displaced again and again by links that
+ * keep the air full), advertising is starving: its channel requests (the
+ * first and the continuation ones) ask at LL_ARB_PRIO_ACTIVE. They then
+ * take part in the round-robin of the links' ties and may displace idle or
+ * active link events: every link whose single planned event overlaps the
+ * requested span, so up to one event per link for a whole-event request
+ * (6 ms), and again for a continuation channel; never a
+ * supervision-critical or transmit-window / instant event. So advertising
+ * cannot starve for more than a few intervals.
  */
 #include <string.h>
+#ifdef __ZEPHYR__
+#include <zephyr/logging/log.h>
+#endif
 #include "ll_adv.h"
 #include "ll_arb.h"
 #include "ll_conn.h"
 #include "ll_defs.h"
 #include "ll_plat.h"
+
+#ifdef __ZEPHYR__
+LOG_MODULE_DECLARE(openll, CONFIG_BT_HCI_DRIVER_LOG_LEVEL);
+#endif
 
 #define ADV_RX_WINDOW_US     300                         /* SCAN_REQ/CONNECT_IND start within T_IFS */
 #define ADV_START_LEAD_TICKS (1000 * LL_TICKS_PER_US)   /* first event 1 ms after enable */
@@ -78,6 +88,10 @@
 #define ADV_CHAN_US          2000
 /* Rule of Vol 6 Part B 4.4.2.3 (start of consecutive PDUs <= 10 ms) */
 #define ADV_PDU_GAP_MAX_TICKS (10000 * LL_TICKS_PER_US)
+/* A channel's PDU starts ADV_TX_LEAD after its start callback, which may
+ * run this late after the request's tick: the stimer ISR latency and
+ * ll_radio_adv_enter() of the ADV_CHAN_US budget (300 + 70 us). */
+#define ADV_START_SLACK_TICKS ((300 + 70) * LL_TICKS_PER_US)
 /* The next channel of a sliced event is asked for this long after now */
 #define ADV_CHAN_LEAD_US     200
 /* A whole-event gap is taken instead of a sliced start when it begins at
@@ -117,8 +131,8 @@ static struct {
 	uint8_t ch_idx;       /* 0..2 = channel 37..39 */
 	uint8_t req_chans;    /* channels covered by the accepted request */
 	uint8_t chans_left;   /* further channels of the running request */
-	uint32_t last_start;  /* start of the last event (or the enable) */
-	uint8_t drops_in_row; /* events dropped since then */
+	uint32_t last_full;   /* end of the last event with all its channels (or the enable) */
+	uint8_t drops_in_row; /* events dropped or cut since then */
 	uint32_t event_tick;  /* start of the current advertising event */
 	uint32_t req_tick;    /* start of the accepted request */
 	uint32_t pdu_tick;    /* start of the last channel's PDU (10 ms rule) */
@@ -188,13 +202,13 @@ static bool before(uint32_t a, uint32_t b)
 	return (int32_t)(a - b) < 0;
 }
 
-/* Priority of the first channel: ACTIVE while starving (file header). */
+/* Priority of the channel requests: ACTIVE while starving (file header). */
 static uint8_t first_prio(void)
 {
 	uint32_t limit = ADV_STARVE_INTERVALS * (interval_ticks() + ADV_DELAY_MAX_TICKS);
 
 	return adv.drops_in_row >= ADV_STARVE_INTERVALS ||
-		       (uint32_t)(ll_radio_now() - adv.last_start) > limit
+		       (uint32_t)(ll_radio_now() - adv.last_full) > limit
 		       ? LL_ARB_PRIO_ACTIVE : LL_ARB_PRIO_ADV;
 }
 
@@ -280,6 +294,9 @@ static void plan_event(bool direct)
 	 * again on its next advertising update). */
 	adv.event_tick = ll_arb_gap(adv.event_tick, 0, ADV_CHAN_US);
 	if (adv_request(adv.event_tick, 1, LL_ARB_PRIO_ADV) != 0) {
+#ifdef __ZEPHYR__
+		LOG_ERR("advertising stuck: no arbiter request possible, disabled");
+#endif
 		adv.stats.stuck++;
 		adv.enabled = false;
 		adv.in_event = false;
@@ -319,11 +336,16 @@ static void place_next_channel(uint32_t from)
 	ll_arb_cancel(LL_ARB_ADV);
 	t = ll_arb_gap(from, 0, ADV_CHAN_US);
 
-	if ((int32_t)(t + ADV_TX_LEAD_TICKS - adv.pdu_tick) <= (int32_t)ADV_PDU_GAP_MAX_TICKS &&
-	    adv_request(t, 1, LL_ARB_PRIO_ADV) == 0) {
+	/* pdu_tick + ADV_TX_LEAD was this channel's PDU start; the next
+	 * one starts at the latest at t + slack + ADV_TX_LEAD */
+	if ((int32_t)(t + ADV_START_SLACK_TICKS - adv.pdu_tick) <= (int32_t)ADV_PDU_GAP_MAX_TICKS &&
+	    adv_request(t, 1, first_prio()) == 0) {
 		return;
 	}
 	adv.stats.cut++;
+	if (adv.drops_in_row < UINT8_MAX) {
+		adv.drops_in_row++;   /* a cut event counts toward starvation */
+	}
 	schedule_next_event();
 }
 
@@ -345,6 +367,9 @@ static void next_channel(void)
 			return;
 		}
 	}
+	/* all channels sent: advertising is served */
+	adv.last_full = ll_radio_now();
+	adv.drops_in_row = 0;
 	schedule_next_event();
 }
 
@@ -362,8 +387,6 @@ void ll_adv_arb_start(uint32_t cap_us)
 	}
 	if (!adv.in_event) {
 		adv.stats.events++;
-		adv.last_start = ll_radio_now();
-		adv.drops_in_row = 0;
 		if (scannable()) {
 			ll_radio_prepare_rsp(adv.rsp_pdu, adv.rsp_pdu_len);
 		}
@@ -437,7 +460,7 @@ uint8_t ll_adv_enable(bool enable)
 			adv.enabled = true;
 			adv.in_event = false;
 			adv.on_air = false;
-			adv.last_start = ll_radio_now();
+			adv.last_full = ll_radio_now();
 			adv.drops_in_row = 0;
 			adv.event_tick = ll_radio_now() + ADV_START_LEAD_TICKS;
 			plan_event(true);

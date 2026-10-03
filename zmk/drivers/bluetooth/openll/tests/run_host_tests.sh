@@ -18,6 +18,7 @@ build_run_as() {
 build_run test_pdu ../ll_pdu.c
 build_run test_csa1 ../ll_csa1.c
 build_run test_crypt ../ll_crypt.c aes_ref.c
+build_run test_radio_mode ../ll_radio_mode.c
 # Suites with per-link state run for LL_MAX_CONN 1, 3 and 5 (slice 6a):
 # binaries <test>_n<N>.
 for n in 1 3 5; do
