@@ -26,9 +26,9 @@ enum ll_rxq_result {
 	LL_RXQ_OK,        /* out filled with a new, non-empty, decrypted PDU */
 	LL_RXQ_MIC_FAIL,  /* decrypt of the next PDU failed its MIC;
 			   * caller terminates the connection (LL_ST_MIC_FAILURE).
-			   * The failing PDU is not retried; ll_rxq_get may be
-			   * called again to continue draining the ring, but
-			   * the connection is expected to go away instead. */
+			   * Sticky: every later ll_rxq_get() returns MIC_FAIL
+			   * (nothing is delivered, out untouched) until
+			   * ll_rxq_reset(). */
 };
 
 void ll_rxq_reset(void);

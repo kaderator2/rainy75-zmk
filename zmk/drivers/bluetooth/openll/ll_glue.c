@@ -106,6 +106,7 @@ static volatile bool silent_end;         /* HCI Reset: end without Disconnection
 
 static struct acl_item held;             /* host ACL waiting for ll_llcp_tx() */
 static bool held_valid;
+static bool mic_failed;                  /* MIC failure logged for this connection */
 
 /* ---- counters ---- */
 
@@ -498,6 +499,7 @@ static void handle_connected(void)
 
 	atomic_inc(&conn_gen);
 	held_valid = false;
+	mic_failed = false;
 	conn_up = true;
 	LOG_INF("connected: interval %u latency %u timeout %u", ci.interval, ci.latency,
 		ci.timeout);
@@ -551,7 +553,12 @@ static void handle_rx(void)
 			return;
 		}
 		if (r == LL_RXQ_MIC_FAIL) {
-			LOG_WRN("MIC failure, ending the connection");
+			/* sticky in ll_rxq until the reset at the disconnect:
+			 * log once, ll_conn_end() is idempotent */
+			if (!mic_failed) {
+				mic_failed = true;
+				LOG_WRN("MIC failure, ending the connection");
+			}
 			ll_conn_end(LL_ST_MIC_FAILURE);
 			return;
 		}

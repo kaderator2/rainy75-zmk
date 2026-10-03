@@ -215,6 +215,18 @@ int main(void)
 		CHECK(ll_rxq_get(&out) == LL_RXQ_MIC_FAIL);
 		CHECK(c.rx_ctr == 0);
 
+		/* Sticky until ll_rxq_reset(): no later PDU of this link is
+		 * delivered, even one that would decrypt (the stream has a hole
+		 * and the link is going away), and an empty ring still reports
+		 * the failure rather than EMPTY. */
+		CHECK(ll_rxq_get(&out) == LL_RXQ_MIC_FAIL);
+		put(0x0F, rsp1_air, sizeof(rsp1_air));
+		out.len = 0xEE;
+		CHECK(ll_rxq_get(&out) == LL_RXQ_MIC_FAIL);
+		CHECK(out.len == 0xEE);
+		CHECK(c.rx_ctr == 0);
+		CHECK(ll_rxq_get(&out) == LL_RXQ_MIC_FAIL);
+
 		/* Next connection: fresh crypt state. */
 		ll_rxq_reset();
 		ll_rxq_set_crypt(&c);

@@ -40,7 +40,10 @@
  *
  * Decryption happens in the consumer, in RX order. On LL_RXQ_MIC_FAIL the
  * caller is expected to terminate the connection (Core Spec Vol 6 Part B
- * 5.1.3.1), so there is no in-connection retry.
+ * 5.1.3.1), so there is no in-connection retry. The failure is sticky:
+ * every later ll_rxq_get() returns LL_RXQ_MIC_FAIL until ll_rxq_reset(), so
+ * no PDU after the hole in the stream reaches the host, whatever the caller
+ * does while the link goes down.
  */
 #include <string.h>
 
@@ -65,6 +68,7 @@ static struct {
 	volatile uint8_t tail;   /* next slot to consume, advanced by the consumer (thread) */
 	uint32_t overflow;
 	struct ll_crypt *crypt;
+	bool mic_failed;         /* sticky until ll_rxq_reset() (consumer only) */
 } q;
 
 void ll_rxq_reset(void)
@@ -112,6 +116,9 @@ enum ll_rxq_result ll_rxq_get(struct ll_rx_pdu *out)
 {
 	uint8_t tail = q.tail;
 
+	if (q.mic_failed) {
+		return LL_RXQ_MIC_FAIL;   /* sticky: nothing more of this link */
+	}
 	if (tail != q.head) {
 		struct rxq_entry *e = &q.ring[tail & RING_MASK];
 		enum ll_rxq_result res = LL_RXQ_OK;
@@ -122,6 +129,7 @@ enum ll_rxq_result ll_rxq_get(struct ll_rx_pdu *out)
 
 			if (r < 0) {
 				res = LL_RXQ_MIC_FAIL;
+				q.mic_failed = true;
 			} else {
 				out->len = (uint8_t)r;
 			}
