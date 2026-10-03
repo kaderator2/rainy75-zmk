@@ -8,9 +8,9 @@
  *                       "wake": uint, "mv": uint (battery, 0 if unavailable)}
  *   All counters are cumulative since boot and uint32 (wrap after 49 days).
  *   plan/listen/skip/kick/ev/miss come from ll_conn_get_stats (ev = events
- *   issued to the radio, miss = events without a valid packet), wake counts
- *   controller-thread passes. With peripheral latency active and idle, skip
- *   grows much faster than listen.
+ *   issued to the radio, miss = events without any CRC-valid packet plus
+ *   late alarms), wake counts controller-thread passes. With peripheral
+ *   latency active and idle, skip grows much faster than listen.
  *
  * "idle" is the CPU idle time (k_thread_runtime_stats_all_get); needs
  * CONFIG_THREAD_RUNTIME_STATS (about +290 B ROM, +240 B RAM, set in
@@ -45,7 +45,10 @@ LOG_MODULE_REGISTER(openll_mgmt, LOG_LEVEL_INF);
 /*
  * The battery sensor is shared with ZMK's own battery reporting. There is no
  * lock around the sample: a rare overlap with a ZMK read would at worst yield
- * one odd millivolt value in a diagnostic reply, never a stuck ADC.
+ * one odd millivolt value in a diagnostic reply, never a stuck ADC. Since the
+ * driver's voltage / state-of-charge fields are shared too, such an overlap
+ * can also overwrite them under ZMK's battery work, so ZMK's next reported
+ * battery level (BLE battery service) may be odd once as well.
  */
 static uint32_t battery_mv(void)
 {

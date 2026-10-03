@@ -32,7 +32,8 @@ class T(unittest.TestCase):
         self.assertIn("% skipped", o.format_stats(s, {"up": 1000, "listen": 1, "skip": 9, "wake": 2}))
 
     def test_group_matches_firmware(self):
-        src = open(os.path.join(os.path.dirname(__file__), "../../zmk/src/openll_mgmt.c")).read()
+        with open(os.path.join(os.path.dirname(__file__), "../../zmk/src/openll_mgmt.c")) as f:
+            src = f.read()
         self.assertIn("MGMT_GROUP_ID_PERUSER + 2", src)
         self.assertEqual(o.GROUP, 66)
 

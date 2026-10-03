@@ -393,10 +393,16 @@ below). It removes everything that made the CPU or the radio work for nothing:
   re-planned to the first event whose alarm is still in the future, so queued
   data leaves within one connection interval instead of waiting out the skip
   window. Kicks during an event are no-ops: the next plan sees the backlog.
+  A connection update or channel map instant that lands in the skip window
+  re-plans to the first reachable event as well, and every event up to the
+  instant is then listened to, so a kick never waits for an instant.
 - **Quiet controller thread.** The thread blocks with `K_FOREVER` and is woken
-  only by queued data PDUs, a CONNECT_IND log entry, TX acknowledgements and
-  timers. The 40 s LLCP response timeout is a delayable work item that exists
-  only while a procedure is pending. There is no polling.
+  only by events (queued data PDUs, a CONNECT_IND log entry, TX
+  acknowledgements, host ACL and HCI traffic, link establishment, parameter
+  updates and link ends, the host's LTK negative reply, HCI Reset, and the
+  LLCP and optional stats timers). The 40 s LLCP response timeout is a
+  delayable work item that exists only while a procedure is pending. There is
+  no polling.
 - **Deep sleep.** `z_sys_poweroff()` calls `b91_bt_controller_poweroff()`
   first. The open controller clears both scheduler slots, masks the system
   timer compare, stops the radio, clears the RF interrupt state and disables
@@ -418,8 +424,8 @@ reverse/tools/openll_stats.py --ble           # over BLE (needs bleak)
 Reply fields: `up` (ms), `idle` (CPU idle ms, from
 `CONFIG_THREAD_RUNTIME_STATS`), `plan` (listen alarms armed), `listen`
 (events listened to), `skip` (events skipped by latency), `kick`, `ev`, `miss`
-(events without a valid first packet), `wake` (controller thread wakeups) and
-`mv` (battery millivolts, 0 if unavailable). The tool prints deltas, idle
+(events without any CRC-valid packet, plus late alarms), `wake` (controller
+thread wakeups) and `mv` (battery millivolts, 0 if unavailable). The tool prints deltas, idle
 percentage and the share of skipped events. `ev`, `miss` and `skip` are counted
 when planned or closed, so `skip` may overstate by up to the latency when a
 link ends. Over BLE the read itself is traffic: the host raises the link to
@@ -442,7 +448,7 @@ All on the keyboard with the bonded Linux/BlueZ PC, link at interval 12
 | Kick to RX open of the listen | 1.2 to 13.7 ms, always below one interval; the data PDU is on air in that event |
 | 30 min connected soak, SMP echo every 30 s | 60/60 echoes, 0 disconnects, 120 connection updates |
 | Deep sleep | USB detached and advertising stopped after the idle timeout (0 ADV packets from the keyboard in a 45 s scan) |
-| Wake by keypress | cold boot, bonded host reconnected by itself about 13 s after the key press, encrypted echo 10/10 |
+| Wake by keypress | cold boot, bonded host reconnected by itself about 13 s after boot (about 14 s after the key press), encrypted echo 10/10 |
 
 ### Slice 5b (not done)
 

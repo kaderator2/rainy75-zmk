@@ -22,7 +22,6 @@ since boot; deltas are computed modulo 2**32.
 
 import argparse
 import asyncio
-import base64
 import os
 import struct
 import sys
