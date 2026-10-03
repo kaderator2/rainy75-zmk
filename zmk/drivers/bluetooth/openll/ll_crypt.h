@@ -9,6 +9,7 @@
 #define LL_CRYPT_H_
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 struct ll_crypt {
@@ -37,5 +38,10 @@ int ll_crypt_encrypt(struct ll_crypt *c, uint8_t hdr0, uint8_t *payload, uint8_t
  * MIC failure the payload content is unspecified (the link is terminated
  * with LL_ST_MIC_FAILURE anyway). */
 int ll_crypt_decrypt(struct ll_crypt *c, uint8_t hdr0, uint8_t *payload, uint8_t len);
+/* Zero n bytes of key material in a way the compiler cannot elide: a memset
+ * of a local that is dead afterwards may legally be removed (dead store
+ * elimination), stores through a volatile pointer may not. Used for every
+ * stack copy of the LTK, SKD, session key and AES blocks. */
+void ll_crypt_wipe(void *p, size_t n);
 
 #endif /* LL_CRYPT_H_ */

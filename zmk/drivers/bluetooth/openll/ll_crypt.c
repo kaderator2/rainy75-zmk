@@ -31,6 +31,15 @@ static void reverse(uint8_t *dst, const uint8_t *src, unsigned int n)
 	}
 }
 
+void ll_crypt_wipe(void *p, size_t n)
+{
+	volatile uint8_t *v = p;
+
+	while (n--) {
+		*v++ = 0;
+	}
+}
+
 void ll_crypt_session_key(const uint8_t ltk[16], const uint8_t skdm[8], const uint8_t skds[8],
 			  uint8_t sk[16])
 {
@@ -41,6 +50,8 @@ void ll_crypt_session_key(const uint8_t ltk[16], const uint8_t skdm[8], const ui
 	reverse(&skd[0], skds, 8);
 	reverse(&skd[8], skdm, 8);
 	ll_plat_aes_ecb(key, skd, sk);
+	ll_crypt_wipe(key, sizeof(key));
+	ll_crypt_wipe(skd, sizeof(skd));
 }
 
 /* First 14 octets of B0 and of the A_i blocks: flags || nonce. */

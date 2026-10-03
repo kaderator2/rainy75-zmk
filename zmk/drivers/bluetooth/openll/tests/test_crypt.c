@@ -262,5 +262,19 @@ int main(void)
 	memcpy(buf, max_dir0, 255);
 	CHECK(ll_crypt_decrypt(&c, 0x1E, buf, 255) == -1);
 
+	/* ll_crypt_wipe zeroes exactly n bytes (key copies on the stack) */
+	{
+		uint8_t k[18];
+
+		memset(k, 0xA5, sizeof(k));
+		ll_crypt_wipe(&k[1], 16);
+		CHECK(k[0] == 0xA5 && k[17] == 0xA5);
+		for (int i = 1; i <= 16; i++) {
+			CHECK(k[i] == 0);
+		}
+		ll_crypt_wipe(k, 0);
+		CHECK(k[0] == 0xA5);
+	}
+
 	DONE();
 }

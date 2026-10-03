@@ -37,6 +37,7 @@
 #include "trng.h"
 #include "ll_adv.h"
 #include "ll_conn.h"
+#include "ll_crypt.h"
 #include "ll_hci.h"
 #include "ll_llcp.h"
 #include "ll_plat.h"
@@ -205,6 +206,11 @@ void ll_plat_aes_ecb(const uint8_t key[16], const uint8_t in[16], uint8_t out[16
 	} else {
 		memcpy(out, r, 16);
 	}
+	/* key, input (SKD, CCM blocks) and output (session key, keystream)
+	 * copies must not stay on the stack */
+	ll_crypt_wipe(k, sizeof(k));
+	ll_crypt_wipe(d, sizeof(d));
+	ll_crypt_wipe(r, sizeof(r));
 }
 
 /* FIPS-197 Appendix C.1 (AES-128). Logged once at boot. */
