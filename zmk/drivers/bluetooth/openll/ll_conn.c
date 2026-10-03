@@ -53,7 +53,8 @@ static struct {
 	bool planned;         /* alarm pending for event `counter` */
 	bool in_event;        /* BRX issued, CONN_DONE pending */
 	bool established;     /* a packet was received in this connection */
-	bool rx_this_event;
+	bool rx_this_event;   /* a CRC-valid packet was received in this event */
+	bool first_seen;      /* the event's first packet (valid or not) was seen */
 	struct ll_connect_ind ci;
 	struct ll_conn_params p;
 	uint32_t interval_ticks;
@@ -254,14 +255,26 @@ static void prepare(void)
 	}
 	ll_txq_event_start();
 	c.rx_this_event = false;
+	c.first_seen = false;
 	c.in_event = true;
 	stats.events++;
 	ll_radio_conn_event(c.ch, c.open_tick, c.fst_us);
 }
 
+/* A packet with a bad CRC: if it is the event's first, it still was the
+ * anchor packet, so a later valid packet of the event must not re-anchor. */
+static void on_rx_bad(void)
+{
+	if (!c.first_seen) {
+		c.first_seen = true;
+		stats.first_bad++;
+	}
+}
+
 static void on_rx(const uint8_t *pdu, uint8_t len, uint32_t tick)
 {
 	uint32_t anchor;
+	bool first;
 
 	if (len < 2) {
 		return;
@@ -269,11 +282,17 @@ static void on_rx(const uint8_t *pdu, uint8_t len, uint32_t tick)
 	stats.rx_pkts++;
 	ll_txq_rx(pdu[0]);
 	(void)ll_rxq_isr_put(pdu, len);   /* overflow counted by ll_rxq */
-	if (c.rx_this_event) {
+	c.rx_this_event = true;
+	first = !c.first_seen;
+	c.first_seen = true;
+	if (!first) {
+		/* later packet of the event: proof of life only (4.5.2); it is
+		 * not at the anchor, so timing stays as it was */
+		c.sup_tick = tick - US(LL_CONN_SYNC_US);
+		c.established = true;
 		return;
 	}
 	/* first packet of the event: its start is the anchor point */
-	c.rx_this_event = true;
 	anchor = tick - US(LL_CONN_SYNC_US);
 	c.ref_tick = anchor;
 	c.ref_counter = c.counter;
@@ -291,6 +310,9 @@ void ll_conn_radio_evt(enum ll_radio_evt evt, const uint8_t *pdu, uint8_t len, u
 	switch (evt) {
 	case LL_RADIO_CONN_RX:
 		on_rx(pdu, len, tick);
+		break;
+	case LL_RADIO_CONN_RX_CRC_ERR:
+		on_rx_bad();
 		break;
 	case LL_RADIO_CONN_DONE:
 		c.in_event = false;

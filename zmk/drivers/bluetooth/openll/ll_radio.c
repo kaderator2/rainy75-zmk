@@ -127,6 +127,9 @@ static struct {
 static atomic_t cnt_tx2rx, cnt_rx_ok, cnt_rx_crc, cnt_rx_timeout, cnt_rsp_tx, cnt_rsp_late;
 static atomic_t cnt_conn_events, cnt_conn_rx, cnt_conn_tx, cnt_conn_fto, cnt_conn_guard;
 static atomic_t cnt_rx_ptr_odd, cnt_tifs_le150, cnt_tifs_151_152, cnt_tifs_gt152, cnt_restores;
+static atomic_t cnt_rx_ptr_skip, cnt_fst_capped;
+static uint8_t rx_wptr_max;      /* largest raw hardware rx wptr seen */
+static uint8_t guard_streak;     /* consecutive events ended by the guard */
 static uint16_t restore_ptrs_before, restore_ptrs_after;
 
 static void load(uint8_t *dma, const uint8_t *pdu, uint8_t len)
@@ -192,6 +195,9 @@ static void conn_rx(bool rx_irq)
 	uint8_t hw = rf_get_rx_wptr();
 	uint8_t n = (uint8_t)(hw - cn.rx_sw);
 
+	if (hw > rx_wptr_max) {
+		rx_wptr_max = hw;   /* tells Task 9 the counter width */
+	}
 	if (n == 0) {
 		if (rx_irq) {
 			atomic_inc(&cnt_rx_ptr_odd);   /* RX IRQ without a new entry */
@@ -199,9 +205,13 @@ static void conn_rx(bool rx_irq)
 		return;
 	}
 	if (n > RING_N) {
+		/* Either an overrun or the hardware counter is narrower than 8
+		 * bits and wrapped: the entries cannot be told apart from stale
+		 * ones (old timestamps, old NESN), so deliver none of them. */
 		atomic_inc(&cnt_rx_ptr_odd);
-		cn.rx_sw = (uint8_t)(hw - RING_N);   /* overrun: older entries are gone */
-		n = RING_N;
+		atomic_inc(&cnt_rx_ptr_skip);
+		cn.rx_sw = hw;
+		return;
 	}
 	while (n--) {
 		uint8_t *p = &rx_buf[(cn.rx_sw & (RING_N - 1)) * RX_ENTRY_SIZE];
@@ -210,7 +220,13 @@ static void conn_rx(bool rx_irq)
 		cn.rx_sw++;
 		cn.n_any++;
 		if (!RF_BLE_PACKET_VALIDITY_CHECK(p)) {
+			/* timestamp at the length-field offset is meaningless
+			 * if the length is out of range: report tick 0 then */
+			uint32_t bts = p[DMA_RFRX_OFFSET_RFLEN] <= CONN_RX_MAXLEN ?
+				       ll_get_le32(&p[DMA_RFRX_OFFSET_TIME_STAMP(p)]) : 0;
+
 			atomic_inc(&cnt_rx_crc);
+			radio_cb(LL_RADIO_CONN_RX_CRC_ERR, NULL, 0, bts);
 			continue;
 		}
 		uint8_t plen = p[DMA_RFRX_OFFSET_RFLEN];
@@ -273,6 +289,9 @@ static void conn_guard(void)
 		return;
 	}
 	atomic_inc(&cnt_conn_guard);
+	if (guard_streak < UINT8_MAX) {
+		guard_streak++;
+	}
 	rf_set_tx_rx_off_auto_mode();
 	rf_clr_irq_status(FLD_RF_IRQ_ALL);
 	conn_rx(false);
@@ -295,6 +314,7 @@ static void conn_isr(uint16_t st)
 			atomic_inc(&cnt_conn_fto);
 		}
 		ll_sched_guard_cancel();
+		guard_streak = 0;
 		conn_rx(false);
 		conn_done();
 	}
@@ -403,6 +423,9 @@ void ll_radio_get_stats(struct ll_radio_stats *s)
 	s->tifs_151_152 = (uint32_t)atomic_get(&cnt_tifs_151_152);
 	s->tifs_gt152 = (uint32_t)atomic_get(&cnt_tifs_gt152);
 	s->restores = (uint32_t)atomic_get(&cnt_restores);
+	s->rx_ptr_skip = (uint32_t)atomic_get(&cnt_rx_ptr_skip);
+	s->fst_capped = (uint32_t)atomic_get(&cnt_fst_capped);
+	s->rx_wptr_max = rx_wptr_max;
 	s->restore_ptrs_before = restore_ptrs_before;
 	s->restore_ptrs_after = restore_ptrs_after;
 }
@@ -452,6 +475,7 @@ void ll_radio_conn_setup(uint32_t aa, uint32_t crc_init)
 	cn.rx_sw = rf_get_rx_wptr();
 	rf_clr_irq_status(FLD_RF_IRQ_ALL);
 	reg_rf_irq_mask = CONN_IRQ_MASK;
+	guard_streak = 0;
 	mode = MODE_CONN;
 	irq_unlock(key);
 }
@@ -467,7 +491,15 @@ void ll_radio_conn_event(uint8_t ch, uint32_t open_tick, uint32_t first_timeout_
 	rf_set_ble_crc_value(cn.crc_init);
 	rf_tx_settle_us(TX_SETTLE_CONN_US);
 	/* rf_start_brx() would write 0x0fffffff to the first timeout: the
-	 * register sequence is done here with a bounded window instead. */
+	 * register sequence is done here with a bounded window instead.
+	 * reg_rf_rx_timeout is 12 bits (max 4095 us). As in both spikes it gets
+	 * the same window, capped; the first RX of the event is bounded by the
+	 * 32-bit first timeout, so the cap only matters if the hardware also
+	 * applies rx_timeout to that first RX (transmit-window events and long
+	 * widening exceed 4095 us). Counted in fst_capped for Task 9. */
+	if (fst > 0xfff) {
+		atomic_inc(&cnt_fst_capped);
+	}
 	rf_ble_set_rx_timeout(fst > 0xfff ? 0xfff : (u16)fst);
 	reg_rf_ll_rx_fst_timeout = fst;
 	rf_clr_irq_status(FLD_RF_IRQ_ALL);
@@ -485,6 +517,11 @@ void ll_radio_conn_event(uint8_t ch, uint32_t open_tick, uint32_t first_timeout_
 	reg_rf_ll_cmd = FSM_BRX;
 	ll_sched_guard_at(open_tick + (first_timeout_us + CONN_EVENT_MAX_US) * LL_TICKS_PER_US,
 			  conn_guard);
+}
+
+uint8_t ll_radio_conn_guard_streak(void)
+{
+	return guard_streak;
 }
 
 void ll_radio_conn_set_sn_init(uint8_t sn)

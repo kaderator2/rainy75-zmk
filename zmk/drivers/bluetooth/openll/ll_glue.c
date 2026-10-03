@@ -52,6 +52,10 @@ LOG_MODULE_REGISTER(openll, CONFIG_BT_HCI_DRIVER_LOG_LEVEL);
 #define STATS_PERIOD_MS  2000
 #define RX_BUDGET        16    /* PDUs per wakeup (= ll_rxq ring depth) */
 #define RESET_WAIT_MS    200   /* HCI Reset: wait for the connection to end */
+/* Consecutive guard-ended events after which the radio is considered
+ * wedged: the connection is ended with a supervision timeout (0x08); the
+ * next advertising enable does the baseband reset (ll_radio_adv_restore). */
+#define GUARD_STREAK_MAX 3
 
 struct evt_item {
 	uint16_t len;
@@ -103,6 +107,7 @@ static bool held_valid;
 /* ---- counters ---- */
 
 static atomic_t cnt_tx_acked, cnt_acl_in, cnt_acl_out, cnt_acl_drop, cnt_evt_drop, conn_drops;
+static atomic_t cnt_guard_escalations;
 static uint32_t lock_depth, lock_t0, lock_max_ticks, acl_tx_lock_max_ticks, aes_max_ticks;
 static volatile bool in_acl_tx;          /* controller thread is inside ll_llcp_tx() for ACL */
 static bool aes_reversed;                /* hal AES needs reversed byte order (self-test) */
@@ -299,7 +304,15 @@ static void radio_evt(enum ll_radio_evt evt, const uint8_t *pdu, uint8_t len, ui
 {
 	ll_adv_radio_evt(evt, pdu, len, tick);
 	ll_conn_radio_evt(evt, pdu, len, tick);
-	if (evt == LL_RADIO_CONN_DONE && len != 0) {
+	if (evt != LL_RADIO_CONN_DONE) {
+		return;
+	}
+	if (ll_radio_conn_guard_streak() >= GUARD_STREAK_MAX && ll_conn_active()) {
+		/* the event is closed (CONN_DONE handled), so this ends now */
+		atomic_inc(&cnt_guard_escalations);
+		ll_conn_end(LL_ST_CONN_TIMEOUT);
+	}
+	if (len != 0) {
 		k_sem_give(&wake);   /* ll_rxq has data */
 	}
 }
@@ -569,6 +582,7 @@ static void handle_acl_tx(void)
 		}
 		LOG_WRN("host ACL dropped (%d)", r);
 		atomic_inc(&cnt_acl_drop);
+		atomic_inc(&nocp_pending);   /* the host's buffer credit comes back */
 		held_valid = false;
 	}
 }
@@ -585,6 +599,13 @@ static void handle_disconnected(void)
 	bool silent, was_up;
 	unsigned int key;
 
+	/* CONNECTED and DISCONNECTED may both have been raised since the loop
+	 * checked CONNECTED (e.g. 0x3E after six events while the thread was
+	 * busy): report the connection first, so it is not announced to the
+	 * host after its end (or never ended for it). */
+	if (atomic_test_bit(&pend, PEND_CONNECTED)) {
+		handle_connected();
+	}
 	flush_nocp();   /* acks that happened before the end */
 	key = ll_plat_lock();
 	reason = pend_reason;
@@ -648,6 +669,9 @@ static void report_stats(struct ll_radio_stats *last, struct ll_conn_stats *last
 		LOG_INF("conn: tx %u acked %u tifs<=150 %u 151-152 %u >152 %u rxq_of %u ptr_odd %u",
 			st.conn_tx, (uint32_t)atomic_get(&cnt_tx_acked), st.tifs_le150,
 			st.tifs_151_152, st.tifs_gt152, ll_rxq_overflow_count(), st.rx_ptr_odd);
+		LOG_INF("conn: first_bad %u ptr_skip %u wptr_max %u fst_capped %u guard_esc %u",
+			cs.first_bad, st.rx_ptr_skip, st.rx_wptr_max, st.fst_capped,
+			(uint32_t)atomic_get(&cnt_guard_escalations));
 		LOG_INF("conn: acl in %u out %u drop %u evt_drop %u lock max %u us acl_tx %u us aes %u us",
 			(uint32_t)atomic_get(&cnt_acl_in), (uint32_t)atomic_get(&cnt_acl_out),
 			(uint32_t)atomic_get(&cnt_acl_drop), (uint32_t)atomic_get(&cnt_evt_drop),
@@ -749,6 +773,12 @@ void b91_bt_host_send_packet(uint8_t type, uint8_t *data, uint16_t len)
 		if (r != 0) {
 			LOG_WRN("host ACL rejected (%d, %u bytes)", r, len);
 			atomic_inc(&cnt_acl_drop);
+			if (r == -EINVAL && conn_up) {
+				/* our handle: the host counted it against its
+				 * buffers, give the credit back */
+				atomic_inc(&nocp_pending);
+				k_sem_give(&wake);
+			}
 			break;
 		}
 		if (!conn_up) {
@@ -759,6 +789,8 @@ void b91_bt_host_send_packet(uint8_t type, uint8_t *data, uint16_t len)
 		if (k_msgq_put(&acl_q, &it, K_NO_WAIT) != 0) {
 			LOG_ERR("host ACL queue full (host exceeded LE ACL buffers)");
 			atomic_inc(&cnt_acl_drop);
+			atomic_inc(&nocp_pending);
+			k_sem_give(&wake);
 			break;
 		}
 		atomic_inc(&cnt_acl_in);

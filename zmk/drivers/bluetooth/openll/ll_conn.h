@@ -119,6 +119,7 @@ struct ll_conn_stats {
 	uint32_t late;        /* events skipped: alarm too late to issue BRX */
 	uint32_t rx_pkts;     /* CRC-valid packets */
 	uint32_t widen_max_us;
+	uint32_t first_bad;   /* events whose first packet had a bad CRC (no re-anchor) */
 };
 /* Cumulative since boot. */
 void ll_conn_get_stats(struct ll_conn_stats *s);

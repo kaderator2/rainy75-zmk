@@ -221,6 +221,13 @@ static void rx(uint32_t anchor, uint8_t hdr0, uint8_t paylen)
 	ll_conn_radio_evt(LL_RADIO_CONN_RX, pdu, (uint8_t)(2 + paylen), now);
 }
 
+/* CRC-bad packet whose access address ends at anchor + sync */
+static void rx_bad(uint32_t anchor)
+{
+	now = anchor + T(LL_CONN_SYNC_US);
+	ll_conn_radio_evt(LL_RADIO_CONN_RX_CRC_ERR, NULL, 0, now);
+}
+
 static void done(uint8_t n_rx)
 {
 	if ((int32_t)(rad.open + T(rad.fst) - now) > 0) {
@@ -349,6 +356,47 @@ static void test_start_keeps_rxq(void)
 	CHECK(ll_rxq_get(&out) == LL_RXQ_OK);
 	CHECK(out.len == 1 && out.data[0] == 0x5A);
 	CHECK(ll_rxq_get(&out) == LL_RXQ_EMPTY);
+	ll_conn_end(LL_ST_REMOTE_TERM);
+}
+
+/* Only the first packet of an event marks its anchor. When that packet has a
+ * bad CRC, a later valid (MD) packet of the same event, about 400 us later,
+ * must not re-anchor; it only refreshes the supervision timer. */
+static void test_first_packet_bad_crc(void)
+{
+	struct ll_connect_ind ci = mk_ci(12, 10, 1, 1, 0);   /* 15 ms, 100 ms timeout */
+	struct ll_conn_stats st0, st;
+	uint32_t a1;
+
+	reset_all(false);
+	ll_conn_get_stats(&st0);
+	CHECK(ll_conn_start(&ci, 500000) == 0);
+	a1 = 500000 + T(1250 + 300);
+	ev_rx(a1);
+	/* event 1: bad first packet at the true anchor, valid one 400 us later */
+	fire_alarm();
+	rx_bad(a1 + T(15000));
+	rx(a1 + T(15400), 0x01, 0);
+	done(1);
+	/* not re-anchored: event 2 still from a1, widening over 2 intervals
+	 * (300 ppm * 30000 us = 9, + 16 = 25 us) */
+	fire_alarm();
+	CHECK(rad.open == a1 + T(30000) - T(25 + LL_CONN_RX_MARGIN_US));
+	rx_bad(a1 + T(30000));
+	rx(a1 + T(30400), 0x01, 0);
+	done(1);
+	/* supervision refreshed by the later valid packets: keep this up for
+	 * more than 100 ms after the last clean anchor a1 */
+	for (uint32_t k = 3; k <= 8; k++) {
+		fire_alarm();
+		rx_bad(a1 + T(15000 * k));
+		rx(a1 + T(15000 * k + 400), 0x01, 0);
+		done(1);
+		CHECK(ll_conn_active());
+	}
+	ll_conn_get_stats(&st);
+	CHECK(st.first_bad - st0.first_bad == 8);
+	CHECK(st.rx_events - st0.rx_events == 9);
 	ll_conn_end(LL_ST_REMOTE_TERM);
 }
 
@@ -896,6 +944,7 @@ int main(void)
 	test_first_events();
 	test_rx_path();
 	test_start_keeps_rxq();
+	test_first_packet_bad_crc();
 	test_six_interval_rule();
 	test_supervision();
 	test_widening_clamp();

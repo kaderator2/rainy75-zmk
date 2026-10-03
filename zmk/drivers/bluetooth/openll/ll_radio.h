@@ -19,6 +19,7 @@ enum ll_radio_evt {
 	/* Connection mode (ll_radio_conn_event), added in slice 2: */
 	LL_RADIO_CONN_RX,     /* one CRC-valid data PDU from the central */
 	LL_RADIO_CONN_DONE,   /* the connection event (BRX command) ended */
+	LL_RADIO_CONN_RX_CRC_ERR, /* a packet with a bad CRC in a connection event */
 };
 
 /* ISR context. pdu points at the 2-byte PDU header; end_tick is the system
@@ -29,8 +30,12 @@ enum ll_radio_evt {
  *   encrypted, MIC included), len = 2 + payload length, end_tick = stimer
  *   tick at the END OF THE ACCESS ADDRESS (RX DMA trailer timestamp), used
  *   for anchor re-sync. Reported once per CRC-valid packet, in order; pdu is
- *   only valid during the callback. CRC-bad packets are not reported (they
- *   are counted in ll_radio_stats.rx_crc).
+ *   only valid during the callback.
+ * - LL_RADIO_CONN_RX_CRC_ERR: a packet with a bad CRC (also counted in
+ *   ll_radio_stats.rx_crc); pdu = NULL, len = 0, end_tick = its RX DMA
+ *   timestamp. Reported in packet order with the CONN_RX callbacks, so the
+ *   receiver knows which packet was the event's first (only that one marks
+ *   the anchor).
  * - LL_RADIO_CONN_DONE: pdu = NULL, len = number of CRC-valid packets
  *   received in this event (0: first-RX timeout, nothing received),
  *   end_tick = stimer tick when the event ended. Exactly one per
@@ -64,6 +69,9 @@ void ll_radio_conn_setup(uint32_t aa, uint32_t crc_init);
  * (ll_sched_guard_at, open_tick + first_timeout_us + a maximum event length)
  * that stops the FSM if no end IRQ arrives, so the event always ends. */
 void ll_radio_conn_event(uint8_t ch, uint32_t open_tick, uint32_t first_timeout_us);
+/* Consecutive connection events ended by the guard alarm (0 after any
+ * event that ended with a radio IRQ, and per connection). ISR context. */
+uint8_t ll_radio_conn_guard_streak(void);
 /* SN of our last transmitted packet, programmed before every BRX. */
 void ll_radio_conn_set_sn_init(uint8_t sn);
 /* TX FIFO (pipe 0): rptr is advanced by hardware on ack, wptr by software.
@@ -93,6 +101,9 @@ struct ll_radio_stats {
 	uint32_t conn_fto;      /* events ended by the first-RX timeout */
 	uint32_t conn_guard;    /* events ended by the guard alarm (no end IRQ) */
 	uint32_t rx_ptr_odd;    /* RX IRQ without a new RX DMA ring entry, or ring overrun */
+	uint32_t rx_ptr_skip;   /* hw rx wptr jumped by more than the ring: entries skipped */
+	uint32_t fst_capped;    /* events whose RX window exceeded the 12-bit rx_timeout */
+	uint8_t rx_wptr_max;    /* largest raw hw rx wptr seen (its counter width) */
 	/* First-exchange T_IFS from the TX timestamp (us, rounded) */
 	uint32_t tifs_le150;
 	uint32_t tifs_151_152;
