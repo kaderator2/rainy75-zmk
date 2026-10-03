@@ -31,7 +31,12 @@
 #define LL_CONN_SYNC_US        40    /* preamble + access address at 1M */
 #define LL_CONN_RX_MARGIN_US   60    /* synced events (spike-proven) */
 #define LL_CONN_WIN_MARGIN_US  200   /* transmit window events */
-#define LL_CONN_ARM_LEAD_US    300   /* alarm this long before the RX opens */
+/* Alarm this long before the RX opens. Task 10: under traffic the stimer
+ * ISR often starts 150..270 us late (another ISR still running, often the
+ * USB ISR, which has a higher PLIC priority); with 300 us (180 us of
+ * tolerance above LL_CONN_MIN_PREP_US) about 0.4 % of the events at a 7.5
+ * ms interval were skipped as late, with 500 us none in 10 min. */
+#define LL_CONN_ARM_LEAD_US    500
 #define LL_CONN_MIN_PREP_US    120   /* alarm later than this before RX open: skip */
 
 struct ll_conn_params {
