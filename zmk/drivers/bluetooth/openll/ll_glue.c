@@ -500,7 +500,12 @@ static void handle_connected(void)
 	atomic_inc(&conn_gen);
 	held_valid = false;
 	mic_failed = false;
+	/* No credit of an earlier connection may reach this one (credit_back()
+	 * and handle_disconnected() already exclude it; this is the backstop). */
+	key = ll_plat_lock();
+	atomic_clear(&nocp_pending);
 	conn_up = true;
+	ll_plat_unlock(key);
 	LOG_INF("connected: interval %u latency %u timeout %u", ci.interval, ci.latency,
 		ci.timeout);
 	if (!silent_end) {
@@ -641,10 +646,14 @@ static void handle_disconnected(void)
 	ll_llcp_reset();
 	k_msgq_purge(&acl_q);
 	held_valid = false;
-	atomic_clear(&nocp_pending);
 	atomic_clear_bit(&pend, PEND_UPDATED);
+	/* Under the lock, paired with credit_back(): an HCI-thread credit is
+	 * either counted before this clear or sees conn_up false. */
+	key = ll_plat_lock();
+	atomic_clear(&nocp_pending);
 	was_up = conn_up;
 	conn_up = false;
+	ll_plat_unlock(key);
 
 	key = ll_plat_lock();
 	silent = silent_end;
@@ -786,6 +795,22 @@ int b91_bt_controller_init(void)
 	return 0;
 }
 
+/* HCI thread: give the host's LE ACL buffer credit back for a packet that
+ * will never be sent. The conn_up test and the increment are one step under
+ * ll_plat_lock(), so a credit of an ended connection cannot leak into the
+ * next one (handle_disconnected() clears the count and conn_up under the
+ * same lock). */
+static void credit_back(void)
+{
+	unsigned int key = ll_plat_lock();
+
+	if (conn_up) {
+		atomic_inc(&nocp_pending);
+	}
+	ll_plat_unlock(key);
+	k_sem_give(&wake);
+}
+
 void b91_bt_host_send_packet(uint8_t type, uint8_t *data, uint16_t len)
 {
 	struct acl_item it;
@@ -800,13 +825,12 @@ void b91_bt_host_send_packet(uint8_t type, uint8_t *data, uint16_t len)
 		if (r != 0) {
 			LOG_WRN("host ACL rejected (%d, %u bytes)", r, len);
 			atomic_inc(&cnt_acl_drop);
-			if ((r == -EINVAL || r == -ENOTCONN) && conn_up) {
+			if (r == -EINVAL || r == -ENOTCONN) {
 				/* the host counted it against its LE ACL
 				 * buffers (one pool for the controller, the
 				 * only connection is ours): give the credit
-				 * back */
-				atomic_inc(&nocp_pending);
-				k_sem_give(&wake);
+				 * back (only while connected) */
+				credit_back();
 			}
 			break;
 		}
@@ -818,8 +842,7 @@ void b91_bt_host_send_packet(uint8_t type, uint8_t *data, uint16_t len)
 		if (k_msgq_put(&acl_q, &it, K_NO_WAIT) != 0) {
 			LOG_ERR("host ACL queue full (host exceeded LE ACL buffers)");
 			atomic_inc(&cnt_acl_drop);
-			atomic_inc(&nocp_pending);
-			k_sem_give(&wake);
+			credit_back();
 			break;
 		}
 		atomic_inc(&cnt_acl_in);
