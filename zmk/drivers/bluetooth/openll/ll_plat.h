@@ -13,6 +13,14 @@ uint32_t ll_plat_rand32(void);
 unsigned int ll_plat_lock(void);
 void ll_plat_unlock(unsigned int key);
 
+/* Thread-level serialization of the LL TX producers (ll_llcp: controller
+ * thread and HCI thread). Encryption and the push of one data PDU run under
+ * it, so the TX packet counter order equals the queue order, while
+ * ll_plat_lock() (interrupts off) is held only for the push itself and per
+ * AES block. Recursive; thread context only (B91: a k_mutex). */
+void ll_plat_tx_lock(void);
+void ll_plat_tx_unlock(void);
+
 /* AES-128 block encryption (ECB, one block), standard FIPS-197 byte order:
  * key[0], in[0] and out[0] are the first (most significant) bytes, as in the
  * Core Spec security function e (Vol 3 Part H 2.2.1) written MSB first.

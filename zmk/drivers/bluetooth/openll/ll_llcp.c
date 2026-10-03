@@ -21,8 +21,12 @@
  * when it completes; it expiring ends the link with 0x22.
  *
  * All outgoing data PDUs go through ll_llcp_tx(): encrypt (when enc_tx)
- * and push under ll_plat_lock(), so the TX packet counter order equals the
- * queue order whichever thread queues.
+ * and push under ll_plat_tx_lock(), so the TX packet counter order equals
+ * the queue order whichever thread queues. The procedure state is
+ * thread-only and also guarded by ll_plat_tx_lock(); ll_plat_lock()
+ * (interrupts off) is held only for ll_txq_push() and for the switch of
+ * the RX decryption context, never across AES (Task 10: encrypt + push
+ * under the IRQ lock held it for 360-398 us).
  */
 #include <errno.h>
 #include <string.h>
@@ -90,10 +94,12 @@ static struct {
 	uint32_t tmr_start;
 } s;
 
+/* Caller holds ll_plat_tx_lock(). */
 static int tx_locked(enum ll_txq_kind kind, uint8_t llid, const uint8_t *payload, uint8_t len)
 {
 	uint8_t buf[LL_DATA_PDU_MAX + LL_MIC_LEN];
 	uint8_t n = len;
+	unsigned int key;
 	int ret;
 
 	if (len == 0 || len > LL_DATA_PDU_MAX) {
@@ -107,7 +113,9 @@ static int tx_locked(enum ll_txq_kind kind, uint8_t llid, const uint8_t *payload
 		/* the AAD only uses the LLID of hdr0 */
 		n = (uint8_t)ll_crypt_encrypt(&s.crypt, llid, buf, len);
 	}
+	key = ll_plat_lock();
 	ret = ll_txq_push(kind, llid, buf, n, kind == LL_TXQ_CTRL ? payload[0] : 0);
+	ll_plat_unlock(key);
 	if (ret != 0 && s.crypt.enc_tx) {
 		s.crypt.tx_ctr--;   /* not queued: the counter value is reused */
 	}
@@ -116,10 +124,11 @@ static int tx_locked(enum ll_txq_kind kind, uint8_t llid, const uint8_t *payload
 
 int ll_llcp_tx(enum ll_txq_kind kind, uint8_t llid, const uint8_t *payload, uint8_t len)
 {
-	unsigned int key = ll_plat_lock();
-	int ret = tx_locked(kind, llid, payload, len);
+	int ret;
 
-	ll_plat_unlock(key);
+	ll_plat_tx_lock();
+	ret = tx_locked(kind, llid, payload, len);
+	ll_plat_tx_unlock();
 	return ret;
 }
 
@@ -158,7 +167,7 @@ static void reject(uint8_t op, uint8_t err)
 	}
 }
 
-/* caller holds the lock */
+/* caller holds ll_plat_tx_lock() */
 static void timer_start(void)
 {
 	s.tmr_on = true;
@@ -174,10 +183,9 @@ static void put_le32(uint8_t *p, uint32_t v)
 static void rx_enc_req(const uint8_t *p)
 {
 	uint8_t rsp[13];
-	unsigned int key;
 	bool ok;
 
-	key = ll_plat_lock();
+	ll_plat_tx_lock();
 	/* a running procedure, or an encrypted link without the pause
 	 * procedure (unsupported): not allowed */
 	ok = s.enc == ENC_IDLE && !s.crypt.enc_tx;
@@ -196,7 +204,7 @@ static void rx_enc_req(const uint8_t *p)
 		(void)tx_locked(LL_TXQ_CTRL, LL_LLID_CTRL, rsp, sizeof(rsp));
 		timer_start();
 	}
-	ll_plat_unlock(key);
+	ll_plat_tx_unlock();
 	if (!ok) {
 		reject(OP_ENC_REQ, LL_ST_LMP_PDU_NOT_ALLOWED);
 		return;
@@ -211,9 +219,9 @@ static void rx_enc_req(const uint8_t *p)
 static void rx_start_enc_rsp(void)
 {
 	static const uint8_t rsp[1] = {OP_START_ENC_RSP};
-	unsigned int key = ll_plat_lock();
 	bool done = false;
 
+	ll_plat_tx_lock();
 	if (s.enc == ENC_WAIT_START_RSP) {
 		s.crypt.enc_tx = true;
 		if (tx_locked(LL_TXQ_CTRL, LL_LLID_CTRL, rsp, sizeof(rsp)) == 0) {
@@ -227,7 +235,7 @@ static void rx_start_enc_rsp(void)
 			s.crypt.enc_tx = false;
 		}
 	}
-	ll_plat_unlock(key);
+	ll_plat_tx_unlock();
 	if (done && ops.enc_change) {
 		ops.enc_change(LL_ST_SUCCESS, true);
 	}
@@ -236,11 +244,11 @@ static void rx_start_enc_rsp(void)
 static void rx_feature_req(const uint8_t *p)
 {
 	uint8_t rsp[9] = {OP_FEATURE_RSP};
-	unsigned int key = ll_plat_lock();
 
+	ll_plat_tx_lock();
 	s.peer_feat_valid = true;
 	s.peer_feat0 = p[1];
-	ll_plat_unlock(key);
+	ll_plat_tx_unlock();
 	/* byte 0: the features used on this link (ours AND the central's),
 	 * the other bytes are ours (none) */
 	rsp[1] = LL_FEATURES_LOW & p[1];
@@ -252,13 +260,13 @@ static void rx_version_ind(void)
 	static const uint8_t rsp[6] = {OP_VERSION_IND, LL_HCI_VERSION,
 				       LL_COMPANY_ID & 0xFF, LL_COMPANY_ID >> 8,
 				       LL_SUBVERSION & 0xFF, LL_SUBVERSION >> 8};
-	unsigned int key = ll_plat_lock();
 
+	ll_plat_tx_lock();
 	/* answered once per connection (Vol 6 Part B 5.1.5) */
 	if (!s.version_sent && tx_locked(LL_TXQ_CTRL, LL_LLID_CTRL, rsp, sizeof(rsp)) == 0) {
 		s.version_sent = true;
 	}
-	ll_plat_unlock(key);
+	ll_plat_tx_unlock();
 }
 
 /* Result of ll_conn_update_at / ll_conn_chmap_at. LL_ST_INSTANT_PASSED:
@@ -388,44 +396,55 @@ void ll_llcp_rx(const uint8_t *payload, uint8_t len)
 uint8_t ll_llcp_ltk_reply(const uint8_t ltk[16])
 {
 	static const uint8_t req[1] = {OP_START_ENC_REQ};
-	unsigned int key = ll_plat_lock();
 	uint8_t st = LL_ST_DISALLOWED;
+	uint8_t sk[16];
 
+	ll_plat_tx_lock();
 	if (s.enc == ENC_WAIT_LTK) {
-		ll_crypt_session_key(ltk, s.skdm, s.skds, s.crypt.sk);
+		/* AES outside the IRQ lock */
+		ll_crypt_session_key(ltk, s.skdm, s.skds, sk);
+
+		/* The controller thread decrypts (ll_rxq) without the TX
+		 * lock: the key, counters and enc_rx change together under the
+		 * IRQ lock. The central answers LL_START_ENC_REQ encrypted, so
+		 * decryption must be on before that PDU can be on air;
+		 * enabling it now (before the push) guarantees that. Turning
+		 * it on early is safe: since its LL_ENC_REQ the central sends
+		 * no data PDUs and no other control PDU of a procedure
+		 * (5.1.3.1), only empty PDUs, which ll_rxq never decrypts.
+		 * Anything non-empty arriving in between would fail its MIC
+		 * and end the link (0x3D), which is the right outcome for such
+		 * a protocol violation. */
+		unsigned int key = ll_plat_lock();
+
+		memcpy(s.crypt.sk, sk, sizeof(sk));
 		s.crypt.tx_ctr = 0;
 		s.crypt.rx_ctr = 0;
 		s.crypt.enc_tx = false;
-		/* The central answers LL_START_ENC_REQ encrypted, so decryption
-		 * must be on before that PDU can be on air; enabling it now
-		 * (under the lock, before the push) guarantees that. Turning it
-		 * on early is safe: since its LL_ENC_REQ the central sends no
-		 * data PDUs and no other control PDU of a procedure (5.1.3.1),
-		 * only empty PDUs, which ll_rxq never decrypts. Anything
-		 * non-empty arriving in between would fail its MIC and end the
-		 * link (0x3D), which is the right outcome for such a protocol
-		 * violation. */
 		s.crypt.enc_rx = true;
+		ll_plat_unlock(key);
+		memset(sk, 0, sizeof(sk));
 		s.enc = ENC_WAIT_START_RSP;
 		(void)tx_locked(LL_TXQ_CTRL, LL_LLID_CTRL, req, sizeof(req));
 		timer_start();
 		st = LL_ST_SUCCESS;
 	}
-	ll_plat_unlock(key);
+	ll_plat_tx_unlock();
 	return st;
 }
 
 uint8_t ll_llcp_ltk_neg_reply(void)
 {
-	unsigned int key = ll_plat_lock();
-	bool ok = s.enc == ENC_WAIT_LTK;
+	bool ok;
 
+	ll_plat_tx_lock();
+	ok = s.enc == ENC_WAIT_LTK;
 	if (ok) {
 		s.enc = ENC_IDLE;
 		s.paused = false;
 		s.tmr_on = false;
 	}
-	ll_plat_unlock(key);
+	ll_plat_tx_unlock();
 	if (!ok) {
 		return LL_ST_DISALLOWED;
 	}
@@ -444,16 +463,16 @@ uint8_t ll_llcp_terminate(uint8_t reason)
 
 void ll_llcp_tick(uint32_t now_tick)
 {
-	unsigned int key = ll_plat_lock();
-	bool expired = s.tmr_on &&
-		       (int32_t)(now_tick - s.tmr_start) >= (int32_t)RSP_TIMEOUT_TICKS;
+	bool expired;
 
+	ll_plat_tx_lock();
+	expired = s.tmr_on && (int32_t)(now_tick - s.tmr_start) >= (int32_t)RSP_TIMEOUT_TICKS;
 	if (expired) {
 		s.tmr_on = false;
 		s.enc = ENC_IDLE;
 		s.paused = false;
 	}
-	ll_plat_unlock(key);
+	ll_plat_tx_unlock();
 	if (expired) {
 		ll_conn_end(LL_ST_LMP_TIMEOUT);
 	}
@@ -470,8 +489,7 @@ void ll_llcp_init(const struct ll_llcp_ops *o)
 
 void ll_llcp_reset(void)
 {
-	unsigned int key = ll_plat_lock();
-
+	ll_plat_tx_lock();
 	memset(&s, 0, sizeof(s));   /* also wipes the session key */
-	ll_plat_unlock(key);
+	ll_plat_tx_unlock();
 }

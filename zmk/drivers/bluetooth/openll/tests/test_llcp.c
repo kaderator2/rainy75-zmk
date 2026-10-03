@@ -29,11 +29,6 @@
 
 void aes_ref_encrypt(const uint8_t key[16], const uint8_t in[16], uint8_t out[16]);
 
-void ll_plat_aes_ecb(const uint8_t key[16], const uint8_t in[16], uint8_t out[16])
-{
-	aes_ref_encrypt(key, in, out);
-}
-
 /* ---------------- sample data (Vol 6 Part C) ---------------- */
 
 static const uint8_t ltk[16] = {0xBF, 0x01, 0xFB, 0x9D, 0x4E, 0xF3, 0xBC, 0x36,
@@ -71,6 +66,19 @@ uint32_t ll_plat_rand32(void) { return rand_i < rand_n ? rand_seq[rand_i++] : 0x
 unsigned int ll_plat_lock(void) { locks++; return 0; }
 void ll_plat_unlock(unsigned int k) { (void)k; locks--; }
 
+/* TX producer serialization (thread mutex on the device) */
+static int tx_locks;
+void ll_plat_tx_lock(void) { tx_locks++; }
+void ll_plat_tx_unlock(void) { tx_locks--; }
+
+/* AES never runs with interrupts locked by the caller (Task 10: the IRQ
+ * lock of encrypt + push was 360-398 us; the B91 glue locks per block). */
+void ll_plat_aes_ecb(const uint8_t key[16], const uint8_t in[16], uint8_t out[16])
+{
+	CHECK(locks == 0);
+	aes_ref_encrypt(key, in, out);
+}
+
 #define MAX_PUSH 16
 static struct {
 	int n;
@@ -85,7 +93,10 @@ static struct {
 int ll_txq_push(enum ll_txq_kind kind, uint8_t llid, const uint8_t *payload, uint8_t len,
 		uint8_t ctrl_opcode)
 {
+	/* pushed under both: the IRQ lock for the queue, the TX lock for the
+	 * counter order */
 	CHECK(locks > 0);
+	CHECK(tx_locks > 0);
 	if (tx.fail) {
 		tx.fail--;
 		return -ENOMEM;
@@ -204,6 +215,7 @@ static void rx(const uint8_t *pdu, uint8_t len)
 {
 	ll_llcp_rx(pdu, len);
 	CHECK(locks == 0);
+	CHECK(tx_locks == 0);
 }
 
 /* last push is exactly {kind CTRL, LLID 3, opcode, bytes} */

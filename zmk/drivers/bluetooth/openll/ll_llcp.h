@@ -12,10 +12,11 @@
  * Context: thread only, but entry points may come from different threads
  * (controller thread: ll_llcp_rx, ll_llcp_tick, ll_llcp_tx; HCI thread:
  * ll_llcp_ltk_reply/_neg_reply/_terminate). State changes and the
- * encrypt+push step run under ll_plat_lock() (AES therefore runs with
- * interrupts locked, a few blocks per PDU). ll_llcp_reset() may also be
- * called from ISR (ll_conn CONNECTED/DISCONNECTED callbacks). The ops
- * callbacks and ll_conn_* calls are made without the lock held.
+ * encrypt+push step run under ll_plat_tx_lock() (a thread mutex); the IRQ
+ * lock ll_plat_lock() is taken only around ll_txq_push() and the switch of
+ * the RX decryption context, so AES never runs with interrupts locked
+ * except inside one ll_plat_aes_ecb() block. The ops callbacks and
+ * ll_conn_* calls are made without ll_plat_lock() held.
  */
 #ifndef LL_LLCP_H_
 #define LL_LLCP_H_
@@ -26,7 +27,7 @@
 #include "ll_txq.h"
 
 /* Events toward the host (HCI). Called in the context of the entry point
- * that caused them, without ll_plat_lock() held. Disconnection Complete
+ * that caused them, without ll_plat_lock() or ll_plat_tx_lock() held. Disconnection Complete
  * and LE Connection Update Complete come from ll_conn, not from here. */
 struct ll_llcp_ops {
 	/* HCI LE Long Term Key Request: rand as on air / HCI (LSB first),
@@ -43,7 +44,7 @@ struct ll_llcp_ops {
 void ll_llcp_init(const struct ll_llcp_ops *ops);
 /* Per connection (call when ll_conn reports CONNECTED or DISCONNECTED):
  * forgets procedure state, the session key and the encryption flags.
- * ll_rxq_reset() clears ll_rxq's crypt pointer itself. Any context. */
+ * ll_rxq_reset() clears ll_rxq's crypt pointer itself. Thread context. */
 void ll_llcp_reset(void);
 /* One received LLID 3 PDU (decrypted payload: opcode + CtrData). Thread
  * (controller thread, in RX order). */

@@ -19,7 +19,7 @@
  * - HCI thread (host TX): HCI commands (ll_hci) and host ACL, which is only
  *   parsed and queued here, so encryption and the TX packet counter run in
  *   one thread for data (LTK reply / Disconnect queue control PDUs from the
- *   HCI thread under ll_plat_lock(), see ll_llcp.h).
+ *   HCI thread under ll_plat_tx_lock(), see ll_llcp.h).
  *
  * Toward the host, the controller thread delivers directly (after draining
  * the event queue first, so the order of everything it produced is kept);
@@ -121,7 +121,8 @@ uint32_t ll_plat_rand32(void)
 
 /* irq_lock() nests; the hold time of the outermost lock is measured (stats
  * "lock max"), and separately while the controller thread encrypts and
- * pushes host ACL (the IRQ-lock cost of encryption, Task 6 review). */
+ * pushes host ACL (the IRQ-lock cost of the ACL TX path: the push and the
+ * per-block AES locks; encryption itself runs outside the lock). */
 unsigned int ll_plat_lock(void)
 {
 	unsigned int key = irq_lock();
@@ -145,6 +146,21 @@ void ll_plat_unlock(unsigned int key)
 		}
 	}
 	irq_unlock(key);
+}
+
+/* TX producer serialization (ll_plat.h): encrypt + push of one PDU, from
+ * the controller thread or the HCI thread. k_mutex is recursive and has
+ * priority inheritance. */
+K_MUTEX_DEFINE(tx_mutex);
+
+void ll_plat_tx_lock(void)
+{
+	(void)k_mutex_lock(&tx_mutex, K_FOREVER);
+}
+
+void ll_plat_tx_unlock(void)
+{
+	(void)k_mutex_unlock(&tx_mutex);
 }
 
 static void rev16(uint8_t *dst, const uint8_t *src)
