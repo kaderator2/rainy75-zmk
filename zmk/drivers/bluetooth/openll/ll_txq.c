@@ -22,10 +22,21 @@
  *   and rp are kept in that range and differences are taken modulo 32.
  * - Entries are written only between events (event_start) and never while
  *   queued; an entry is complete when rptr has passed it (event_end).
+ * - Multilink (ml-spike-report S1, verified on the device with forced NACKs
+ *   and with foreign TX between events): one FIFO serves all links and its
+ *   rptr cannot be reset, so each link keeps a software copy of every entry
+ *   until it is acked. event_start(link) empties the ring (wptr = rptr),
+ *   rewrites the link's unacked copies in order from rptr, then appends its
+ *   backlog. rp is the rptr at the link's event start, so the rptr advance
+ *   up to event_end is exactly the acks of this link's entries. The
+ *   hardware sends the head entry from RAM at TX time (S2b); the rewrite
+ *   lands on whatever slots rptr points at. With one link the rewrite puts
+ *   the same content into the same slots (S1: rptr never moves between our
+ *   events), so slice 5 behaviour is unchanged.
  * Runs in ISR context except ll_txq_push / ll_txq_backlog: no allocation,
  * no blocking.
  *
- * The backlog is a single-producer (ll_txq_push, thread) / single-consumer
+ * Each link's backlog is a single-producer (ll_txq_push, thread) / single-consumer
  * (ll_txq_event_start, ISR) ring: bl_head is written only by the producer,
  * bl_tail only by the consumer. The callers hold ll_plat_lock() around
  * ll_txq_push (which already implies a compiler barrier), but the ring does
@@ -52,6 +63,7 @@
 
 _Static_assert((LL_TXQ_BACKLOG & (LL_TXQ_BACKLOG - 1)) == 0 && LL_TXQ_BACKLOG <= 128,
 	       "LL_TXQ_BACKLOG must be a power of two that fits the 8-bit counters");
+_Static_assert(LL_MAX_CONN >= 1 && LL_MAX_CONN <= 5, "LL_MAX_CONN must be 1..5");
 
 struct txq_pdu {
 	uint8_t kind;
@@ -61,62 +73,78 @@ struct txq_pdu {
 	uint8_t data[PDU_MAX];
 };
 
-struct txq_slot {           /* software view of one ring entry */
-	uint8_t kind;
-	uint8_t opcode;
+struct txq_slot {           /* software copy of one ring entry, until acked */
+	struct txq_pdu pdu;
 	bool placeholder;
 };
 
-static struct {
-	ll_txq_done_cb_t done;
+struct txq_link {
 	struct txq_pdu backlog[LL_TXQ_BACKLOG];
 	uint8_t bl_head;         /* free-running, written by ll_txq_push */
 	uint8_t bl_tail;         /* free-running, written by event_start */
-	struct txq_slot ring[RING_DEPTH];
-	uint8_t wp;              /* our copy of the hardware wptr */
-	uint8_t rp;              /* rptr value up to which entries are completed */
+	struct txq_slot ring[RING_DEPTH];   /* unacked entries, oldest at head */
+	uint8_t head;            /* ring index of the oldest unacked entry */
+	uint8_t n;               /* entries in the ring (incl. a placeholder) */
+	uint8_t rp;              /* hardware rptr at the link's last event start */
 	uint8_t in_ring;         /* data PDUs (non-placeholder) in the ring */
 	uint8_t sn;              /* SN of our last transmitted packet */
 	uint8_t rx_nesn;         /* NESN of the central's last packet this event */
 	uint8_t nesn;            /* expected SN of the central's next new packet */
 	bool rx_seen;            /* a central packet was received this event */
 	bool base_last;          /* our last transmitted packet was the base PDU */
+};
+
+static struct {
+	ll_txq_done_cb_t done;
+	struct txq_link l[LL_MAX_CONN];
 } q;
 
-static uint8_t backlog_count(void)
+static struct txq_link *get(uint8_t link)
 {
-	return (uint8_t)(q.bl_head - q.bl_tail);
+	return link < LL_MAX_CONN ? &q.l[link] : NULL;
 }
 
-static void ring_put(uint8_t kind, uint8_t llid, const uint8_t *data, uint8_t len,
-		     uint8_t opcode, bool placeholder)
+static uint8_t backlog_count(const struct txq_link *l)
 {
-	struct txq_slot *s = &q.ring[q.wp % RING_DEPTH];
+	return (uint8_t)(l->bl_head - l->bl_tail);
+}
 
-	ll_radio_fifo_write(q.wp, llid, data, len);
-	s->kind = kind;
-	s->opcode = opcode;
+/* Append one entry: software copy at the tail, hardware entry rp + n. */
+static void ring_put(struct txq_link *l, const struct txq_pdu *p, bool placeholder)
+{
+	struct txq_slot *s = &l->ring[(l->head + l->n) % RING_DEPTH];
+
+	ll_radio_fifo_write(PTR(l->rp + l->n), p->llid, p->data, p->len);
+	s->pdu.kind = p->kind;
+	s->pdu.llid = p->llid;
+	s->pdu.len = p->len;
+	s->pdu.opcode = p->opcode;
+	if (p->len) {
+		memcpy(s->pdu.data, p->data, p->len);
+	}
 	s->placeholder = placeholder;
 	if (!placeholder) {
-		q.in_ring++;
+		l->in_ring++;
 	}
-	q.wp = PTR(q.wp + 1);
+	l->n++;
 }
 
 /*
  * Placeholder rule (derived from the measured model; verified on the device
  * in Task 10 under forced NACKs: 2686/2686 encrypted echoes, about 12000
- * encrypted data PDUs at an 18 % NACK rate, no duplicate and no loss). If our last transmitted packet was the base empty PDU, the next
- * command's first ack refers to the base, but the hardware pops the ring head
- * on it. An empty placeholder entry in front of new data takes that pop: if
- * the central acked the base, the placeholder is popped unsent (correct, it
+ * encrypted data PDUs at an 18 % NACK rate, no duplicate and no loss). If
+ * our last transmitted packet was the base empty PDU, the next command's
+ * first ack refers to the base, but the hardware pops the ring head on it.
+ * An empty placeholder entry in front of new data takes that pop: if the
+ * central acked the base, the placeholder is popped unsent (correct, it
  * stands for the acked base); if not, the placeholder is resent with the
  * base's SN and the same (empty) content, a correct retransmission. Called
- * only with an empty ring.
+ * only with an empty ring. The rule is per link: base_last is the link's
+ * own last TX, and SN_INIT is programmed per command from the link's state.
  */
-static bool placeholder_needed(void)
+static bool placeholder_needed(const struct txq_link *l)
 {
-	return q.base_last;
+	return l->base_last;
 }
 
 /* How many data PDUs may be moved into the ring now (used = entries queued,
@@ -133,36 +161,38 @@ static uint8_t ring_room(uint8_t used, bool was_empty)
 #endif
 }
 
-void ll_txq_reset(ll_txq_done_cb_t done)
+void ll_txq_init(ll_txq_done_cb_t done)
 {
-	uint8_t r = ll_radio_fifo_rptr();
-
-	/* rptr cannot be reset: drop leftovers of the previous connection by
-	 * moving wptr back to rptr (empty FIFO, base sent). */
-	ll_radio_fifo_set_wptr(r);
 	memset(&q, 0, sizeof(q));
 	q.done = done;
-	q.wp = r;
-	q.rp = r;
-	/* After reset_sn_nesn the central's first NESN is 0 = SN_INIT, so the
-	 * first ack is not judged and no placeholder is needed. */
-	q.sn = 0;
-	q.nesn = 0;
-	q.base_last = false;
 }
 
-int ll_txq_push(enum ll_txq_kind kind, uint8_t llid, const uint8_t *payload, uint8_t len,
-		uint8_t ctrl_opcode)
+void ll_txq_reset(uint8_t link)
 {
+	struct txq_link *l = get(link);
+
+	if (!l) {
+		return;
+	}
+	/* The ring itself is emptied at the link's next event start. After
+	 * the connection starts the central's first NESN is 0 = SN_INIT, so
+	 * the first ack is not judged and no placeholder is needed. */
+	memset(l, 0, sizeof(*l));
+}
+
+int ll_txq_push(uint8_t link, enum ll_txq_kind kind, uint8_t llid, const uint8_t *payload,
+		uint8_t len, uint8_t ctrl_opcode)
+{
+	struct txq_link *l = get(link);
 	struct txq_pdu *p;
 
-	if (len > PDU_MAX) {
+	if (!l || len > PDU_MAX) {
 		return -EINVAL;
 	}
-	if (backlog_count() >= LL_TXQ_BACKLOG) {
+	if (backlog_count(l) >= LL_TXQ_BACKLOG) {
 		return -ENOMEM;
 	}
-	p = &q.backlog[q.bl_head % LL_TXQ_BACKLOG];
+	p = &l->backlog[l->bl_head % LL_TXQ_BACKLOG];
 	p->kind = (uint8_t)kind;
 	p->llid = llid;
 	p->len = len;
@@ -171,72 +201,98 @@ int ll_txq_push(enum ll_txq_kind kind, uint8_t llid, const uint8_t *payload, uin
 		memcpy(p->data, payload, len);
 	}
 	RING_BARRIER();   /* publish: slot complete before bl_head moves */
-	q.bl_head++;
+	l->bl_head++;
 	return 0;
 }
 
-void ll_txq_event_start(void)
+void ll_txq_event_start(uint8_t link)
 {
-	uint8_t used = PTR(q.wp - ll_radio_fifo_rptr());
-	bool was_empty = used == 0;
+	static const struct txq_pdu empty = { .kind = LL_TXQ_EMPTY, .llid = LL_LLID_CONT };
+	struct txq_link *l = get(link);
+	bool was_empty;
 	uint8_t room;
 
-	ll_radio_conn_set_sn_init(q.sn);
-	ll_radio_conn_set_nesn_init(q.nesn);
-	q.rx_seen = false;
-	if (backlog_count() == 0) {
+	if (!l) {
 		return;
 	}
-	if (was_empty && placeholder_needed()) {
-		ring_put(LL_TXQ_EMPTY, LL_LLID_CONT, NULL, 0, 0, true);
-		used++;
-	}
-	room = ring_room(used, was_empty);
-	RING_BARRIER();   /* consume: bl_head observed before the slots are read */
-	while (room-- && backlog_count()) {
-		const struct txq_pdu *p = &q.backlog[q.bl_tail % LL_TXQ_BACKLOG];
+	/* Rebuild: rptr may have been moved (another link's acks) and the
+	 * entries overwritten since this link's last event. Empty the ring
+	 * first, so no entry is written while it is queued. */
+	l->rp = ll_radio_fifo_rptr();
+	ll_radio_fifo_set_wptr(l->rp);
+	for (uint8_t i = 0; i < l->n; i++) {
+		const struct txq_pdu *p = &l->ring[(l->head + i) % RING_DEPTH].pdu;
 
-		ring_put(p->kind, p->llid, p->data, p->len, p->opcode, false);
-		RING_BARRIER();   /* release: slot read before bl_tail frees it */
-		q.bl_tail++;
+		ll_radio_fifo_write(PTR(l->rp + i), p->llid, p->data, p->len);
 	}
-	ll_radio_fifo_set_wptr(q.wp);
+	was_empty = l->n == 0;
+	ll_radio_conn_set_sn_init(l->sn);
+	ll_radio_conn_set_nesn_init(l->nesn);
+	l->rx_seen = false;
+	if (backlog_count(l) != 0) {
+		if (was_empty && placeholder_needed(l)) {
+			ring_put(l, &empty, true);
+		}
+		room = ring_room(l->n, was_empty);
+		RING_BARRIER();   /* consume: bl_head observed before the slots are read */
+		while (room-- && backlog_count(l)) {
+			ring_put(l, &l->backlog[l->bl_tail % LL_TXQ_BACKLOG], false);
+			RING_BARRIER();   /* release: slot read before bl_tail frees it */
+			l->bl_tail++;
+		}
+	}
+	ll_radio_fifo_set_wptr(PTR(l->rp + l->n));
 }
 
-void ll_txq_rx(uint8_t hdr0)
+void ll_txq_rx(uint8_t link, uint8_t hdr0)
 {
-	q.rx_nesn = (hdr0 & HDR_NESN) ? 1 : 0;
-	q.nesn = (hdr0 & HDR_SN) ? 0 : 1;
-	q.rx_seen = true;
+	struct txq_link *l = get(link);
+
+	if (!l) {
+		return;
+	}
+	l->rx_nesn = (hdr0 & HDR_NESN) ? 1 : 0;
+	l->nesn = (hdr0 & HDR_SN) ? 0 : 1;
+	l->rx_seen = true;
 }
 
-void ll_txq_event_end(void)
+void ll_txq_event_end(uint8_t link)
 {
-	uint8_t r = ll_radio_fifo_rptr();
+	struct txq_link *l = get(link);
+	uint8_t r;
 
-	while (q.rp != r && q.rp != q.wp) {
-		const struct txq_slot *s = &q.ring[q.rp % RING_DEPTH];
+	if (!l) {
+		return;
+	}
+	r = ll_radio_fifo_rptr();
+	/* every rptr step since the event start acked this link's head */
+	while (l->rp != r && l->n != 0) {
+		const struct txq_slot *s = &l->ring[l->head];
 
-		q.rp = PTR(q.rp + 1);
+		l->rp = PTR(l->rp + 1);
+		l->head = (uint8_t)((l->head + 1) % RING_DEPTH);
+		l->n--;
 		if (s->placeholder) {
 			continue;
 		}
-		q.in_ring--;
-		if (s->kind != LL_TXQ_EMPTY && q.done) {
-			q.done((enum ll_txq_kind)s->kind, s->opcode);
+		l->in_ring--;
+		if (s->pdu.kind != LL_TXQ_EMPTY && q.done) {
+			q.done(link, (enum ll_txq_kind)s->pdu.kind, s->pdu.opcode);
 		}
 	}
-	if (q.rx_seen) {
+	if (l->rx_seen) {
 		/* We answered every received central packet; the last answer
 		 * was the base iff the FIFO was empty when it was sent, and no
 		 * pop follows our last TX within the event. */
-		q.sn = q.rx_nesn;
-		q.base_last = q.rp == q.wp;
-		q.rx_seen = false;
+		l->sn = l->rx_nesn;
+		l->base_last = l->n == 0;
+		l->rx_seen = false;
 	}
 }
 
-unsigned int ll_txq_backlog(void)
+unsigned int ll_txq_backlog(uint8_t link)
 {
-	return (unsigned int)backlog_count() + q.in_ring;
+	const struct txq_link *l = get(link);
+
+	return l ? (unsigned int)backlog_count(l) + l->in_ring : 0u;
 }

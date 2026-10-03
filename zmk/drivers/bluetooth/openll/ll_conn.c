@@ -17,7 +17,9 @@
  * CONNECT_IND end).
  *
  * Per event: alarm LL_CONN_ARM_LEAD_US before the RX opens -> prepare():
- * ll_txq_event_start(), BRX via ll_radio_conn_event(). Each CONN_RX:
+ * ll_radio_conn_select() (the link's AA and CRC init), ll_txq_event_start()
+ * (ring rebuilt for this link), BRX via ll_radio_conn_event(). ll_conn
+ * still follows one link, id 0 in the per-link ll_txq calls. Each CONN_RX:
  * ll_txq_rx(), ll_rxq_isr_put(), the first one re-syncs the anchor and the
  * supervision timer, unless the event's first packet was not delivered
  * (bad CRC, or an acked retransmission without an RX entry) or the packet
@@ -247,7 +249,7 @@ static uint16_t skip_count(void)
 	uint32_t deadline;
 	int32_t room;
 
-	if (n == 0 || !c.anchored || c.term_local || ll_txq_backlog() != 0 ||
+	if (n == 0 || !c.anchored || c.term_local || ll_txq_backlog(0) != 0 ||
 	    (c.ops.busy && c.ops.busy())) {
 		return 0;
 	}
@@ -393,7 +395,8 @@ static void prepare(void)
 		event_closed(now);
 		return;
 	}
-	ll_txq_event_start();
+	ll_radio_conn_select(c.ci.aa, c.ci.crc_init);
+	ll_txq_event_start(0);
 	c.rx_this_event = false;
 	c.first_seen = false;
 	c.in_event = true;
@@ -435,7 +438,7 @@ static void on_rx(const uint8_t *pdu, uint8_t len, uint32_t tick)
 		return;
 	}
 	stats.rx_pkts++;
-	ll_txq_rx(pdu[0]);
+	ll_txq_rx(0, pdu[0]);
 	if (!ll_rxq_isr_put(pdu, len)) {
 		/* The hardware has acked this data PDU already, so the central
 		 * will never resend it: it is lost for good, and continuing
@@ -493,7 +496,7 @@ void ll_conn_radio_evt(enum ll_radio_evt evt, const uint8_t *pdu, uint8_t len, u
 		break;
 	case LL_RADIO_CONN_DONE:
 		c.in_event = false;
-		ll_txq_event_end();
+		ll_txq_event_end(0);
 		if (c.rx_this_event) {
 			stats.rx_events++;
 		} else {
@@ -506,13 +509,13 @@ void ll_conn_radio_evt(enum ll_radio_evt evt, const uint8_t *pdu, uint8_t len, u
 	}
 }
 
-static void txq_done(enum ll_txq_kind kind, uint8_t ctrl_opcode)
+static void txq_done(uint8_t link, enum ll_txq_kind kind, uint8_t ctrl_opcode)
 {
 	if (kind == LL_TXQ_CTRL && ctrl_opcode == OP_TERMINATE_IND && c.term_local) {
 		c.term_acked = true;   /* ended at this event's CONN_DONE */
 	}
 	if (c.ops.txq_done) {
-		c.ops.txq_done(kind, ctrl_opcode);
+		c.ops.txq_done(link, kind, ctrl_opcode);
 	}
 }
 
@@ -522,6 +525,7 @@ void ll_conn_init(const struct ll_conn_ops *ops)
 	if (ops) {
 		c.ops = *ops;
 	}
+	ll_txq_init(txq_done);
 }
 
 /* Connection parameters and transmit window (Vol 6 Part B 2.3.3.1 and
@@ -585,8 +589,8 @@ int ll_conn_start(const struct ll_connect_ind *ci, uint32_t connect_ind_end_tick
 	c.sup_tick = connect_ind_end_tick;
 	c.active = true;
 
-	ll_radio_conn_setup(ci->aa, ci->crc_init);
-	ll_txq_reset(txq_done);
+	ll_radio_conn_init();
+	ll_txq_reset(0);
 	/* No ll_rxq_reset() here: this runs in ISR context while the controller
 	 * thread may be inside ll_rxq_get(). The glue resets ll_rxq in its
 	 * thread when it handles LL_CONN_EVT_DISCONNECTED, before advertising
@@ -702,7 +706,8 @@ void ll_conn_terminate(uint8_t reason)
 		(void)c.ops.ctrl_tx(pdu, sizeof(pdu));
 	} else {
 		key = ll_plat_lock();
-		(void)ll_txq_push(LL_TXQ_CTRL, LL_LLID_CTRL, pdu, sizeof(pdu), OP_TERMINATE_IND);
+		(void)ll_txq_push(0, LL_TXQ_CTRL, LL_LLID_CTRL, pdu, sizeof(pdu),
+				  OP_TERMINATE_IND);
 		ll_plat_unlock(key);
 	}
 }

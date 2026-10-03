@@ -9,6 +9,17 @@
 
 #include <stdint.h>
 
+/* Number of peripheral links (slice 6a multilink). Link ids are
+ * 0..LL_MAX_CONN-1. Device builds take it from Kconfig; host tests pass
+ * -DLL_MAX_CONN=N. */
+#ifdef CONFIG_BT_HCI_B91_OPENLL_MAX_CONN
+#define LL_MAX_CONN CONFIG_BT_HCI_B91_OPENLL_MAX_CONN
+#else
+#ifndef LL_MAX_CONN
+#define LL_MAX_CONN 1
+#endif
+#endif
+
 /* HCI status codes (Core Spec Vol 1 Part F) */
 #define LL_ST_SUCCESS        0x00
 #define LL_ST_UNKNOWN_CMD    0x01

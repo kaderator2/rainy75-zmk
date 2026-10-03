@@ -114,7 +114,7 @@ static int tx_locked(enum ll_txq_kind kind, uint8_t llid, const uint8_t *payload
 		n = (uint8_t)ll_crypt_encrypt(&s.crypt, llid, buf, len);
 	}
 	key = ll_plat_lock();
-	ret = ll_txq_push(kind, llid, buf, n, kind == LL_TXQ_CTRL ? payload[0] : 0);
+	ret = ll_txq_push(0, kind, llid, buf, n, kind == LL_TXQ_CTRL ? payload[0] : 0);
 	ll_plat_unlock(key);
 	if (ret != 0) {
 		if (s.crypt.enc_tx) {

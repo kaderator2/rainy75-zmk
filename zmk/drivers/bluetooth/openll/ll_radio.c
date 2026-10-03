@@ -14,10 +14,16 @@
  * timestamp (4), freq offset (2), RSSI (1), status (see ext_rf.h).
  *
  * Connection mode, register recipe from the spikes:
- * - Per connection: access address (byte-swapped into 0x80140808), CRC init
- *   as parsed, ll_ctrl_1 BRX SN/NESN init 0 + first-RX timeout enable,
- *   reset_sn_nesn(), TX timestamps on (T_IFS monitor), TX DMA source = ring
- *   base (an empty PDU); the RX DMA ring (4 x 64 bytes) is set up at boot.
+ * - Once (ll_radio_conn_init, at every connection start, idempotent): save
+ *   the advertising values of ll_ctrl_1 and rxtcrcpkt, base entry = an empty
+ *   PDU, reset_sn_nesn(); the RX DMA ring (4 x 64 bytes) is set up at boot.
+ * - Per event (ll_radio_conn_select, ml-spike-report S2/S3, register writes
+ *   only): access address (byte-swapped into 0x80140808) and CRC init (as
+ *   parsed) of the link that owns the event, ll_ctrl_1 = connection value
+ *   (first-RX timeout enable, SN/NESN init bits as ll_txq set them), TX
+ *   timestamps on (T_IFS monitor), TX DMA source = ring base (stx2rx moves
+ *   it), RX maxlen, IRQ mask. An advertising event in between needs
+ *   ll_radio_adv_enter() (empty TX FIFO first, S3).
  * - TX FIFO (pipe 0): the base is sent while rptr == wptr, else entry
  *   rptr & 3 at base + 64 * (1 + (rptr & 3)); wptr is written by software,
  *   rptr advanced by hardware on the central's ack (never resettable).
@@ -498,7 +504,25 @@ static uint8_t *ring_entry(uint8_t idx)
 	return &conn_tx_buf[(1u + (idx & (RING_N - 1))) * DMA_BUF_SIZE];
 }
 
-void ll_radio_conn_setup(uint32_t aa, uint32_t crc_init)
+/* The connection values of the registers that an advertising event (or
+ * ll_radio_adv_restore) changes. The SN/NESN init bits of ll_ctrl_1 are
+ * kept: ll_txq programs them per event for the link (before or after this). */
+static void conn_regs(void)
+{
+	reg_rf_rxtcrcpkt = cn.saved_rxtcrc | FLD_RF_EN_TS_TX;   /* T_IFS monitor */
+	reg_rf_ll_ctrl_1 = (cn.saved_ctrl1 & ~(FLD_RF_BRX_SN_INIT | FLD_RF_BRX_NESN_INIT)) |
+			   (reg_rf_ll_ctrl_1 & (FLD_RF_BRX_SN_INIT | FLD_RF_BRX_NESN_INIT)) |
+			   FLD_RF_RX_FIRST_TIMEOUT_EN;
+	/* TX: base = empty PDU, sent while the FIFO is empty (md-spike round
+	 * 5); an advertising stx2rx points DMA0 at its own buffer. */
+	dma_set_src_address(DMA0, convert_ram_addr_cpu2bus(conn_tx_buf));
+	/* RX: the 4-entry DMA ring set up at boot (not reconfigured here) */
+	rf_set_rx_maxlen(CONN_RX_MAXLEN);
+	reg_rf_irq_mask = CONN_IRQ_MASK;
+	mode = MODE_CONN;
+}
+
+void ll_radio_conn_init(void)
 {
 	static const uint8_t empty_pdu[2] = {LL_LLID_CONT, 0};
 	unsigned int key = irq_lock();
@@ -511,26 +535,53 @@ void ll_radio_conn_setup(uint32_t aa, uint32_t crc_init)
 		cn.saved_rxtcrc = reg_rf_rxtcrcpkt;
 		cn.saved = true;
 	}
-	/* brx spike round 1: AA byte-swapped, CRC init as parsed */
-	cn.aa_reg = __builtin_bswap32(aa);
-	cn.crc_init = crc_init;
-	reg_rf_rxtcrcpkt = cn.saved_rxtcrc | FLD_RF_EN_TS_TX;   /* T_IFS monitor */
-	/* BRX SN/NESN start values 0, first-RX timeout on, then load them into
-	 * the live SN/NESN state (once per connection). */
+	/* BRX SN/NESN start values 0, then load them into the live SN/NESN
+	 * state. Per event the SN/NESN init bits come from ll_txq. */
 	reg_rf_ll_ctrl_1 = (cn.saved_ctrl1 & ~(FLD_RF_BRX_SN_INIT | FLD_RF_BRX_NESN_INIT)) |
 			   FLD_RF_RX_FIRST_TIMEOUT_EN;
 	reset_sn_nesn();
-	/* TX: base = empty PDU, sent while the FIFO is empty; the DMA source
-	 * stays at the base for the whole connection (md-spike round 5). */
 	load(conn_tx_buf, empty_pdu, sizeof(empty_pdu));
-	dma_set_src_address(DMA0, convert_ram_addr_cpu2bus(conn_tx_buf));
-	/* RX: the 4-entry DMA ring set up at boot (not reconfigured here) */
-	rf_set_rx_maxlen(CONN_RX_MAXLEN);
+	conn_regs();
 	cn.rx_sw = rf_get_rx_wptr() & RX_WPTR_MASK;
 	rf_clr_irq_status(FLD_RF_IRQ_ALL);
-	reg_rf_irq_mask = CONN_IRQ_MASK;
 	guard_streak = 0;
-	mode = MODE_CONN;
+	irq_unlock(key);
+}
+
+void ll_radio_conn_select(uint32_t aa, uint32_t crc_init)
+{
+	rf_set_tx_rx_off_auto_mode();
+	/* brx spike round 1: AA byte-swapped, CRC init as parsed; written to
+	 * the hardware by ll_radio_conn_event() */
+	cn.aa_reg = __builtin_bswap32(aa);
+	cn.crc_init = crc_init;
+	conn_regs();
+}
+
+void ll_radio_adv_enter(void)
+{
+	unsigned int key = irq_lock();
+
+	rf_set_tx_rx_off_auto_mode();
+	cn.evt_open = false;
+	rsp_in_flight = false;
+	/* S3 round 1: an stx2rx with a non-empty TX FIFO wedges the FSM in
+	 * 0x03 and the following BRX commands never end. The next connection
+	 * event rebuilds its link's ring. */
+	rf_set_tx_wptr(0, rf_get_tx_rptr(0));
+	if (cn.saved) {
+		/* advertising value: no first-RX timeout (it would bound the
+		 * stx2rx RX by a connection's window), SN/NESN init 0; the TX
+		 * timestamp bit of rxtcrcpkt may stay on */
+		reg_rf_ll_ctrl_1 = cn.saved_ctrl1;
+	}
+	rf_set_ble_access_code_adv();
+	rf_set_ble_crc_adv();
+	rf_set_rx_maxlen(ADV_RX_MAXLEN);
+	rf_clr_irq_status(FLD_RF_IRQ_ALL);
+	reg_rf_irq_mask = ADV_IRQ_MASK;
+	cn.rx_sw = rf_get_rx_wptr() & RX_WPTR_MASK;
+	mode = MODE_ADV;
 	irq_unlock(key);
 }
 

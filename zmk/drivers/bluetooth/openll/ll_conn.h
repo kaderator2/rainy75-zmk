@@ -115,9 +115,9 @@ struct ll_conn_ops {
 	bool (*busy)(void);
 };
 
-/* ops is copied. */
+/* ops is copied; also ll_txq_init() (completions go to ops->txq_done). */
 void ll_conn_init(const struct ll_conn_ops *ops);
-/* Start following a connection: ll_radio_conn_setup(), ll_txq_reset(),
+/* Start following a connection: ll_radio_conn_init(), ll_txq_reset(0),
  * plan the first event in the transmit window, report
  * LL_CONN_EVT_CONNECTED. ll_rxq is NOT reset here (ISR context, the
  * consumer thread may be inside ll_rxq_get()): the owner of the consumer

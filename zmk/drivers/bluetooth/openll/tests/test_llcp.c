@@ -90,9 +90,10 @@ static struct {
 	int fail;   /* next pushes return -ENOMEM */
 } tx;
 
-int ll_txq_push(enum ll_txq_kind kind, uint8_t llid, const uint8_t *payload, uint8_t len,
-		uint8_t ctrl_opcode)
+int ll_txq_push(uint8_t link, enum ll_txq_kind kind, uint8_t llid, const uint8_t *payload,
+		uint8_t len, uint8_t ctrl_opcode)
 {
+	CHECK(link == 0);   /* single link until the per-link llcp (slice 6a Task 3) */
 	/* pushed under both: the IRQ lock for the queue, the TX lock for the
 	 * counter order */
 	CHECK(locks > 0);

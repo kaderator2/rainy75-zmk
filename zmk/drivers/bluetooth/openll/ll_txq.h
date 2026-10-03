@@ -2,9 +2,10 @@
  * Copyright (c) 2026 scholzri
  * SPDX-License-Identifier: Apache-2.0
  *
- * TX queue: software backlog in front of the 4-entry hardware TX FIFO
- * (accessed via ll_radio_fifo_*), placeholder rule, SN_INIT bookkeeping and
- * ack detection by rptr advance (md-spike-report "TX FIFO model").
+ * TX queue, per link: software backlog in front of the 4-entry hardware TX
+ * FIFO (accessed via ll_radio_fifo_*), placeholder rule, SN_INIT bookkeeping
+ * and ack detection by rptr advance (md-spike-report "TX FIFO model"), ring
+ * rebuilt per event from software copies (ml-spike-report S1).
  *
  * Build option LL_TXQ_SAFE_MODE (fallback of the connection spec): the ring
  * is refilled only when it is empty, with one data PDU per event (no MD for
@@ -23,51 +24,68 @@ enum ll_txq_kind {
 	LL_TXQ_CTRL,    /* LL control PDU, completion goes to ll_llcp */
 };
 
-/* ISR context. ctrl_opcode is the plaintext opcode given to ll_txq_push
- * (only meaningful for LL_TXQ_CTRL). */
-typedef void (*ll_txq_done_cb_t)(enum ll_txq_kind kind, uint8_t ctrl_opcode);
+/* ISR context. link is the link whose entry was acked; ctrl_opcode is the
+ * plaintext opcode given to ll_txq_push (only meaningful for LL_TXQ_CTRL). */
+typedef void (*ll_txq_done_cb_t)(uint8_t link, enum ll_txq_kind kind, uint8_t ctrl_opcode);
 
-#define LL_TXQ_BACKLOG 8
+#define LL_TXQ_BACKLOG 8   /* per link */
 
-/* Invariant: the backlog and the ring are strictly FIFO across all kinds
- * (no priority lane for control PDUs). The encryption start procedure
- * relies on it: ACL queued before LL_ENC_RSP leaves before it (plaintext,
- * counted before the procedure), and everything queued after our encrypted
- * LL_START_ENC_RSP leaves after it, so on-air order equals the order in
- * which ll_llcp assigned TX packet counters. */
+/* Invariant: per link, the backlog and the ring are strictly FIFO across
+ * all kinds (no priority lane for control PDUs). The encryption start
+ * procedure relies on it: ACL queued before LL_ENC_RSP leaves before it
+ * (plaintext, counted before the procedure), and everything queued after
+ * our encrypted LL_START_ENC_RSP leaves after it, so on-air order equals
+ * the order in which ll_llcp assigned TX packet counters. */
 
-/* Calling context: ll_txq_reset() runs in ISR context, from ll_conn_start()
- * in the RX ISR of the CONNECT_IND (before the first event, so no
- * event_start/event_end of the new connection can be running); push runs in
- * thread context under ll_plat_lock(); event_start/rx/event_end run in the
- * radio/stimer ISRs. ll_conn guarantees that every ll_txq_event_end()
- * follows an ll_txq_event_start() of the same event (it handles
- * LL_RADIO_CONN_DONE only while an issued event is open, and a skipped late
- * event calls neither), so the per-event state is always initialized. */
+/* Multilink (slice 6a, ml-spike-report S1): the hardware has one TX FIFO
+ * for all links and its rptr cannot be reset. Each link keeps a software
+ * copy of every ring entry until it is acked; ll_txq_event_start(link)
+ * empties the ring (wptr = rptr) and rewrites the link's unacked copies,
+ * then its backlog, starting at the current rptr. The rptr advance during
+ * the link's own event acks its oldest entries (ll_txq_event_end). Another
+ * link's (or advertising's) use of the FIFO between two events of a link
+ * therefore does not matter: the hardware reads the head entry from RAM at
+ * TX time (S2b). All link ids are 0 <= link < LL_MAX_CONN; other ids are
+ * ignored (push: -EINVAL, backlog: 0). */
 
-/* Per connection, after ll_radio_conn_setup() (reset_sn_nesn). ISR. */
-void ll_txq_reset(ll_txq_done_cb_t done);
-/* Queue one data PDU into the backlog. payload is already encrypted if
+/* Calling context: ll_txq_init() once, before any other call. ll_txq_reset()
+ * runs in ISR context, from ll_conn_start() in the RX ISR of the CONNECT_IND
+ * (before the first event of that link, so no event_start/event_end of it
+ * can be running); push runs in thread context under ll_plat_lock();
+ * event_start/rx/event_end run in the radio/stimer ISRs. ll_conn guarantees
+ * that every ll_txq_event_end(link) follows an ll_txq_event_start(link) of
+ * the same event with no other link's event in between (one radio), and a
+ * skipped late event calls neither, so the per-event state is always
+ * initialized. */
+
+/* Once: all links empty, completion callback set. */
+void ll_txq_init(ll_txq_done_cb_t done);
+/* Per connection of link: drop its backlog and unacked entries (no
+ * completions), SN/NESN 0 (the radio's per-command SN/NESN init bits carry
+ * them, so no hardware access is needed here). ISR. */
+void ll_txq_reset(uint8_t link);
+/* Queue one data PDU into link's backlog. payload is already encrypted if
  * needed (len includes the MIC then). ctrl_opcode is the plaintext opcode
  * of an LL_TXQ_CTRL PDU (the payload may be ciphertext), ignored for other
- * kinds. Returns 0, -ENOMEM (backlog full) or -EINVAL (len too long).
- * Thread context, caller holds ll_plat_lock(). */
-int ll_txq_push(enum ll_txq_kind kind, uint8_t llid, const uint8_t *payload, uint8_t len,
-		uint8_t ctrl_opcode);
-/* ISR, before each BRX: refill the ring from the backlog (placeholder rule)
- * and program SN_INIT and NESN_INIT via ll_radio_conn_set_sn_init() and
- * ll_radio_conn_set_nesn_init(). */
-void ll_txq_event_start(void);
-/* ISR, for each LL_RADIO_CONN_RX of the event, in order: header byte 0 of
- * the central's packet. Its NESN is the SN of our response to it (hardware
- * SN/NESN), so the last one gives SN_INIT for the next event; its SN ^ 1 is
- * NESN_INIT (the hardware delivers only new packets). Acks of the
+ * kinds. Returns 0, -ENOMEM (backlog full) or -EINVAL (len too long or bad
+ * link). Thread context, caller holds ll_plat_lock(). */
+int ll_txq_push(uint8_t link, enum ll_txq_kind kind, uint8_t llid, const uint8_t *payload,
+		uint8_t len, uint8_t ctrl_opcode);
+/* ISR, before each BRX of link: set wptr = rptr, rewrite the ring from the
+ * link's unacked copies then its backlog (placeholder rule), program
+ * SN_INIT and NESN_INIT from the link's state via
+ * ll_radio_conn_set_sn_init() / ll_radio_conn_set_nesn_init(). */
+void ll_txq_event_start(uint8_t link);
+/* ISR, for each LL_RADIO_CONN_RX of link's event, in order: header byte 0
+ * of the central's packet. Its NESN is the SN of our response to it
+ * (hardware SN/NESN), so the last one gives SN_INIT for the next event; its
+ * SN ^ 1 is NESN_INIT (the hardware delivers only new packets). Acks of the
  * base empty PDU do not move rptr, so the SN cannot be tracked from rptr. */
-void ll_txq_rx(uint8_t hdr0);
-/* ISR, after LL_RADIO_CONN_DONE: read rptr, complete acked entries, track
- * our SN. */
-void ll_txq_event_end(void);
-/* PDUs queued and not yet acked (backlog + ring). */
-unsigned int ll_txq_backlog(void);
+void ll_txq_rx(uint8_t link, uint8_t hdr0);
+/* ISR, after LL_RADIO_CONN_DONE of link's event: read rptr, complete the
+ * acked entries, track our SN. */
+void ll_txq_event_end(uint8_t link);
+/* link's PDUs queued and not yet acked (backlog + ring). */
+unsigned int ll_txq_backlog(uint8_t link);
 
 #endif /* LL_TXQ_H_ */

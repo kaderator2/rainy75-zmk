@@ -38,7 +38,9 @@ void ll_plat_aes_ecb(const uint8_t key[16], const uint8_t in[16], uint8_t out[16
 static uint32_t now;
 
 static struct {
-	int setups;
+	int setups;          /* ll_radio_conn_init calls */
+	int selects;
+	bool selected;       /* ll_radio_conn_select since the last event */
 	uint32_t aa, crc;
 	int events;
 	uint8_t ch;
@@ -61,15 +63,22 @@ static struct {
 static int locks;
 
 uint32_t ll_radio_now(void) { return now; }
-void ll_radio_conn_setup(uint32_t aa, uint32_t crc_init)
+void ll_radio_conn_init(void)
 {
 	rad.setups++;
+}
+void ll_radio_conn_select(uint32_t aa, uint32_t crc_init)
+{
+	rad.selects++;
+	rad.selected = true;
 	rad.aa = aa;
 	rad.crc = crc_init;
 }
 void ll_radio_conn_event(uint8_t ch, uint32_t open_tick, uint32_t first_timeout_us,
 			 uint32_t max_event_us)
 {
+	CHECK(rad.selected);   /* the link's AA/CRC are selected for every event */
+	rad.selected = false;
 	rad.events++;
 	rad.ch = ch;
 	rad.open = open_tick;
@@ -136,8 +145,9 @@ static void on_evt(enum ll_conn_evt what, const void *arg)
 	}
 }
 
-static void on_txq_done(enum ll_txq_kind kind, uint8_t op)
+static void on_txq_done(uint8_t link, enum ll_txq_kind kind, uint8_t op)
 {
+	CHECK(link == 0);
 	if (kind == LL_TXQ_CTRL) {
 		cbs.done_ctrl++;
 		cbs.done_op = op;
@@ -291,7 +301,7 @@ static void test_first_events(void)
 	CHECK(ll_conn_start(&ci, t0) == 0);
 	CHECK(ll_conn_active());
 	CHECK(cbs.connected == 1);
-	CHECK(rad.setups == 1 && rad.aa == ci.aa && rad.crc == ci.crc_init);
+	CHECK(rad.setups == 1);
 	CHECK(ll_conn_event_counter() == 0);
 	CHECK(ll_conn_start(&ci, t0) == -EBUSY);
 
@@ -300,6 +310,7 @@ static void test_first_events(void)
 	 * end) = 2.25 -> 3, + 16 = 19 us. open = 1080000 - (19 + 200) * 16. */
 	fire_alarm();
 	CHECK(rad.events == 1);
+	CHECK(rad.selects == 1 && rad.aa == ci.aa && rad.crc == ci.crc_init);
 	CHECK(rad.ch == 7);
 	CHECK(rad.open == 1076496);
 	CHECK(rad.fst == 2500 + 2 * (19 + 200) + 40);
@@ -1029,7 +1040,7 @@ static void test_local_terminate_timeout(void)
 	ll_conn_terminate(0x15);
 	CHECK(cbs.ctrl_tx_calls == 1 && cbs.ctrl_tx_len == 2);
 	CHECK(cbs.ctrl_tx_pdu[0] == 0x02 && cbs.ctrl_tx_pdu[1] == 0x15);
-	CHECK(ll_txq_backlog() == 0);   /* ll_conn did not push itself */
+	CHECK(ll_txq_backlog(0) == 0);   /* ll_conn did not push itself */
 	/* the central keeps talking but never acks: end once 100 ms passed */
 	for (k = 0; k < 20 && ll_conn_active(); k++) {
 		a += T(15000);
@@ -1226,7 +1237,7 @@ static void test_latency_refused_txq(void)
 	(void)ll_csa1_next(&ref);
 	rx(1000000 + T(1250 + 300), 0x01, 0);
 	/* the host queues data during event 0 */
-	CHECK(ll_txq_push(LL_TXQ_ACL, LL_LLID_START, pdu, sizeof(pdu), 0) == 0);
+	CHECK(ll_txq_push(0, LL_TXQ_ACL, LL_LLID_START, pdu, sizeof(pdu), 0) == 0);
 	done(1);
 	a1 = 1000000 + T(1250 + 300 + 15000);
 	fire_alarm();
@@ -1235,7 +1246,7 @@ static void test_latency_refused_txq(void)
 	/* event 1: not acked yet (central's NESN unchanged): still listening */
 	rx(a1, 0x01, 0);
 	done(1);
-	CHECK(ll_txq_backlog() > 0);
+	CHECK(ll_txq_backlog(0) > 0);
 	fire_alarm();
 	CHECK(rad.ch == ref_skip(&ref, 1));
 	CHECK(rad.open == open_at(a1, 1));
@@ -1243,7 +1254,7 @@ static void test_latency_refused_txq(void)
 	rx(a1 + T(15000), 0x01 | HDR_NESN, 0);
 	rad.rptr = rad.wptr;
 	done(1);
-	CHECK(ll_txq_backlog() == 0);
+	CHECK(ll_txq_backlog(0) == 0);
 	fire_alarm();
 	CHECK(rad.ch == ref_skip(&ref, 5));
 	CHECK(rad.open == open_at(a1 + T(15000), 5));
@@ -1285,7 +1296,7 @@ static void test_latency_refused_busy_term(void)
 	rx(a, 0x01, 0);
 	/* local termination (the hook queues nothing): no skip while it runs */
 	ll_conn_terminate(0x13);
-	CHECK(cbs.ctrl_tx_calls == 1 && ll_txq_backlog() == 0);
+	CHECK(cbs.ctrl_tx_calls == 1 && ll_txq_backlog(0) == 0);
 	done(1);
 	fire_alarm();
 	CHECK(rad.open == open_at(a, 1));

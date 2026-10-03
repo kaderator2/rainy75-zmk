@@ -70,10 +70,29 @@ void ll_radio_stop(void);
 void ll_radio_quiesce(void);
 
 /* ---- Connection mode (slice 2; implemented in ll_radio.c, faked in host
- * tests). One connection, peripheral role, 1M PHY. ---- */
-/* Per connection: access address, CRC init, TX ring base, reset_sn_nesn,
- * RX DMA ring. Call after leaving advertising, before the first event. */
-void ll_radio_conn_setup(uint32_t aa, uint32_t crc_init);
+ * tests). Peripheral role, 1M PHY. One radio: the links' connection events
+ * and advertising events take turns (slice 6a, ml-spike-report). ---- */
+/* One-time connection-mode setup (TX ring base, empty base PDU,
+ * reset_sn_nesn); idempotent, call before the first connection event ever.
+ * Replaces the one-time part of the former ll_radio_conn_setup(). Called
+ * at every connection start (CONNECT_IND RX ISR, radio idle) so that it
+ * also covers a baseband reset by ll_radio_adv_restore(). ISR or thread. */
+void ll_radio_conn_init(void);
+/* Per event, register writes only (about 8 us, S2/S3): the access address
+ * and CRC init of the link that owns the next BRX, plus the connection
+ * values of the registers an advertising event changes (ll_ctrl_1 with
+ * first-RX timeout, keeping the SN/NESN init bits ll_txq programs; TX
+ * timestamps; TX DMA source = ring base; RX maxlen; IRQ mask; mode). Call
+ * before ll_txq_event_start() and ll_radio_conn_event() of the event. ISR. */
+void ll_radio_conn_select(uint32_t aa, uint32_t crc_init);
+/* Advertising event after connection events (ml-spike-report S3): set
+ * wptr = rptr (empty ring, else stx2rx wedges the FSM in 0x03), then the
+ * adv register switch (about 60 us with the channel set; no baseband
+ * reset). ll_radio_adv_restore() only as stall recovery and when the last
+ * link has ended, not per adv event (142 us, hurts T_IFS). The next
+ * connection event rebuilds its link's ring (ll_txq_event_start). No
+ * connection event may be open. ISR. */
+void ll_radio_adv_enter(void);
 /* Issue one BRX connection event on data channel ch (0..36): the RX window
  * opens at open_tick; if nothing is received within first_timeout_us the
  * event ends. The hardware then chains RX/TX exchanges while MD. Ends with
@@ -110,7 +129,8 @@ uint8_t ll_radio_fifo_wptr(void);
  * payload (len <= LL_DATA_PDU_MAX + LL_MIC_LEN) into ring entry idx & 3. */
 void ll_radio_fifo_write(uint8_t idx, uint8_t hdr0, const uint8_t *payload, uint8_t len);
 void ll_radio_fifo_set_wptr(uint8_t wptr);
-/* Return to advertising after a connection (baseband reset + re-init). */
+/* Return to advertising after the (last) connection: baseband reset +
+ * re-init. Also the recovery for a stalled radio. */
 void ll_radio_adv_restore(void);
 
 /* Stall visibility: cumulative counts since boot, read from the controller

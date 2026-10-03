@@ -41,6 +41,16 @@ config BT_HCI_B91_CTLR_OPEN
 
 endchoice
 
+config BT_HCI_B91_OPENLL_MAX_CONN
+	int "Open link layer: maximum number of peripheral connections"
+	depends on BT_HCI_B91_CTLR_OPEN
+	range 1 5
+	default 1
+	help
+	  Number of simultaneous peripheral links the open link layer keeps
+	  (link ids and HCI connection handles 0..N-1). Multilink is being
+	  built up in slice 6a; until it is complete only 1 is supported.
+
 config BT_HCI_B91_OPENLL_STATS_LOG
 	bool "Open link layer: periodic radio/connection stats log"
 	depends on BT_HCI_B91_CTLR_OPEN

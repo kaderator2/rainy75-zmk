@@ -341,8 +341,9 @@ static void conn_evt(enum ll_conn_evt what, const void *arg)
 }
 
 /* ll_txq completion (ISR), forwarded by ll_conn. */
-static void txq_done(enum ll_txq_kind kind, uint8_t ctrl_opcode)
+static void txq_done(uint8_t link, enum ll_txq_kind kind, uint8_t ctrl_opcode)
 {
+	ARG_UNUSED(link);
 	ARG_UNUSED(ctrl_opcode);
 	if (kind == LL_TXQ_ACL) {
 		atomic_inc(&nocp_pending);
