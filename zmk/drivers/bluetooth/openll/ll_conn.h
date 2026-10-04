@@ -228,12 +228,18 @@ uint16_t ll_conn_event_counter(uint8_t link);
  * can still be pulled earlier, so a kick never waits for an instant.
  * ISR-safe; takes ll_plat_lock(). */
 void ll_conn_kick(uint8_t link);
+/* The link whose connection event is on air (its BRX issued, CONN_DONE not
+ * yet handled), -1 between events. ISR (the radio callbacks of the event). */
+int ll_conn_event_owner(void);
 /* Slice 6b Task 4: the link's connEffectiveMaxRxTime / MaxTxTime (us), from
  * ll_llcp whenever they change (328 / 328 at every connection start). One
  * exchange of maximum PDUs, rx + T_IFS + tx + T_IFS, is the event length
  * the arbiter reserves after the first RX window and the guard floor
- * (ll_conn_exchange_us), at least LL_CONN_GUARD_MIN_TAIL_US. Any context;
- * takes ll_plat_lock(); used from the next request on. */
+ * (ll_conn_exchange_us), at least LL_CONN_GUARD_MIN_TAIL_US; the TX part
+ * covers at least the longest PDU still queued (ll_txq_max_len: a PDU
+ * queued under a larger TX length stays valid when it shrinks, 4.5.10, so
+ * the reduced length applies to the span once those are acked). Any
+ * context; takes ll_plat_lock(); used from the next request on. */
 void ll_conn_set_dle_times(uint8_t link, uint16_t max_rx_time, uint16_t max_tx_time);
 /* The reserved tail of one exchange for these times (pure):
  * max(LL_CONN_GUARD_MIN_TAIL_US, rx + 150 + tx + 150). */

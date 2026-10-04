@@ -96,9 +96,16 @@ struct ll_link {
 	bool first_seen;      /* the event's first packet (valid or not) was seen */
 	bool anchored;        /* the last closed event re-anchored (latency rule) */
 	bool holdoff_done;    /* LL_CONN_LATENCY_HOLDOFF_MS has passed (latched, see skip_count) */
-	/* one exchange of PDUs of the effective maximum times after the first
-	 * RX window (ll_conn_set_dle_times; guard floor, arbiter span) */
-	uint32_t xchg_us;
+	/* effective maximum RX / TX times (ll_conn_set_dle_times): one
+	 * exchange of such PDUs after the first RX window is the guard floor
+	 * and part of the arbiter span (xchg_of) */
+	uint16_t dle_rx_time;
+	uint16_t dle_tx_time;
+	/* xchg_of() at the last request: the planned event's prepare checks
+	 * its cap against the span it was accepted with (no ll_txq walk in
+	 * the time-critical prepare, which runs about 400 us of the 420 us
+	 * before the RX trigger already) */
+	uint32_t xchg_req;
 	struct ll_connect_ind ci;
 	struct ll_conn_params p;
 	uint32_t interval_ticks;
@@ -195,6 +202,20 @@ static void end(struct ll_link *c, uint8_t reason)
 	}
 	c->end_r = reason;
 	report(c, LL_CONN_EVT_DISCONNECTED, &c->end_r);
+}
+
+/* One exchange after the first RX window: the effective maximum times, and
+ * our TX at least as long as the longest PDU still queued (slice 6b Task 4
+ * review: a PDU queued under a larger effective TX length stays valid after
+ * it shrank, 4.5.10, and is sent as it is until its ack). On-air time on
+ * 1M: 8 us per octet of preamble 1 + AA 4 + header 2 + payload (MIC
+ * included) + CRC 3. */
+static uint32_t xchg_of(const struct ll_link *c)
+{
+	uint32_t q = 8u * (10u + ll_txq_max_len(c->id));
+	uint16_t tx = c->dle_tx_time > q ? c->dle_tx_time : (uint16_t)q;
+
+	return ll_conn_exchange_us(c->dle_rx_time, tx);
 }
 
 /* End now, or at CONN_DONE when an event is on air (first reason wins). */
@@ -381,12 +402,12 @@ static uint16_t skip_count(struct ll_link *c)
 /* Event length cap for the radio guard (see LL_CONN_EVENT_SAFETY_US): the
  * next event opens no earlier than one interval after this one, minus the
  * widening growth over that interval (no re-sync in this event). */
-static uint32_t event_max_us(const struct ll_link *c)
+static uint32_t event_max_us(const struct ll_link *c, uint32_t xchg_us)
 {
 	uint32_t ival_us = (uint32_t)c->p.interval * UNIT_US;
 	uint32_t growth = (uint32_t)(((uint64_t)c->ppm * ival_us + 999999u) / 1000000u);
 	uint32_t reserve = growth + LL_CONN_ARM_LEAD_US + LL_CONN_EVENT_SAFETY_US;
-	uint32_t floor_us = c->fst_us + c->xchg_us;
+	uint32_t floor_us = c->fst_us + xchg_us;
 	uint32_t cap = ival_us > reserve ? ival_us - reserve : 0;
 
 	return cap > floor_us ? cap : floor_us;
@@ -412,21 +433,25 @@ static uint8_t prio_of(struct ll_link *c)
 
 /* Request the planned event. Span: the alarm LL_CONN_ARM_LEAD_US before
  * the RX opens, to the first RX window + one exchange at the link's
- * effective times (xchg_us, at least LL_CONN_GUARD_MIN_TAIL_US) + the
+ * effective times (xchg_of, at least LL_CONN_GUARD_MIN_TAIL_US) + the
  * arbiter's clipping reserve, so an accepted event is never started with
  * a cap below its floor. */
 static int request(struct ll_link *c)
 {
+	uint32_t x = xchg_of(c);
 	struct ll_arb_req r = {
 		.alarm_tick = c->open_tick - US(LL_CONN_ARM_LEAD_US),
 		.open_tick = c->open_tick,
-		.min_len_us = c->fst_us + c->xchg_us + LL_CONN_EVENT_SAFETY_US +
-			      LL_CONN_ARM_LEAD_US,
-		.max_len_us = event_max_us(c),
+		.min_len_us = c->fst_us + x + LL_CONN_EVENT_SAFETY_US + LL_CONN_ARM_LEAD_US,
+		.max_len_us = event_max_us(c, x),
 		.prio = prio_of(c),
 	};
-	unsigned int key = ll_plat_lock();
-	int ret = ll_arb_request(c->id, &r);
+	unsigned int key;
+	int ret;
+
+	c->xchg_req = x;
+	key = ll_plat_lock();
+	ret = ll_arb_request(c->id, &r);
 
 	ll_plat_unlock(key);
 	return ret;
@@ -620,7 +645,7 @@ static void prepare(struct ll_link *c, uint32_t cap_us)
 	uint32_t now = ll_radio_now();
 
 	c->planned = false;
-	if (ev_owner >= 0 || cap_us < c->fst_us + c->xchg_us) {
+	if (ev_owner >= 0 || cap_us < c->fst_us + c->xchg_req) {
 		/* another event is on air (it overran its cap), or no room
 		 * before the next request: yield this event (not a miss) */
 		unsigned int key = ll_plat_lock();
@@ -826,7 +851,8 @@ static void link_clear(uint8_t i)
 	links[i].id = i;
 	links[i].state = LINK_FREE;
 	/* 27 / 328 both ways for a new connection (4.5.10) */
-	links[i].xchg_us = ll_conn_exchange_us(LL_DLE_MIN_TIME, LL_DLE_MIN_TIME);
+	links[i].dle_rx_time = LL_DLE_MIN_TIME;
+	links[i].dle_tx_time = LL_DLE_MIN_TIME;
 }
 
 void ll_conn_init(const struct ll_conn_ops *o)
@@ -1129,6 +1155,11 @@ uint16_t ll_conn_event_counter(uint8_t link)
 	return c->planned ? c->skip_base : c->counter;
 }
 
+int ll_conn_event_owner(void)
+{
+	return ev_owner;
+}
+
 void ll_conn_kick(uint8_t link)
 {
 	struct ll_link *c = link_of(link);
@@ -1227,6 +1258,7 @@ void ll_conn_set_dle_times(uint8_t link, uint16_t max_rx_time, uint16_t max_tx_t
 		return;
 	}
 	key = ll_plat_lock();
-	c->xchg_us = ll_conn_exchange_us(max_rx_time, max_tx_time);
+	c->dle_rx_time = max_rx_time;
+	c->dle_tx_time = max_tx_time;
 	ll_plat_unlock(key);
 }

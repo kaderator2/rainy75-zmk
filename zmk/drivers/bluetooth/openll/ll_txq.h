@@ -37,9 +37,13 @@ typedef void (*ll_txq_done_cb_t)(uint8_t link, enum ll_txq_kind kind, uint8_t ct
  * and not yet acked (backlog + ring), their bytes (len, each rounded up to
  * 4) in one FIFO area of LL_TXQ_POOL_BYTES (ll_fifo.h). The ring copies are
  * the oldest records of the same area, so a PDU is copied in once and
- * stays until it is acked. A host ACL packet of LL_ACL_MTU split into
- * 27-octet fragments (10 x (27 + MIC)) and 5 maximum PDUs (255) fit an
- * empty area. */
+ * stays until it is acked. An empty area holds a host ACL packet of
+ * LL_ACL_MTU split into 27-octet fragments (10 x (27 + MIC), 320 bytes
+ * rounded), or 5 maximum PDUs (255, 256 rounded); not both at once: with 4
+ * maximum PDUs in the ring (1024) the 10 fragments (320) do not fit, and
+ * the host packet waits (-ENOMEM, all or nothing, ll_txq_fits) until acks
+ * free the room. Not a guarantee for every mix, only that each fits
+ * alone. */
 #define LL_TXQ_ENTRIES 16
 #ifndef LL_TXQ_POOL_BYTES
 #define LL_TXQ_POOL_BYTES 1280
@@ -111,5 +115,11 @@ void ll_txq_rx(uint8_t link, uint8_t hdr0);
 void ll_txq_event_end(uint8_t link);
 /* link's PDUs queued and not yet acked (backlog + ring). */
 unsigned int ll_txq_backlog(uint8_t link);
+/* The longest of link's PDUs queued and not yet acked (on-air payload
+ * length, MIC included), 0 when none (or a bad link). Slice 6b Task 4
+ * review: a PDU queued under a larger effective TX length stays valid when
+ * the length shrinks (4.5.10) and is sent as it is, so ll_conn's exchange
+ * span covers it until its ack. ISR, or thread under ll_plat_lock(). */
+uint8_t ll_txq_max_len(uint8_t link);
 
 #endif /* LL_TXQ_H_ */

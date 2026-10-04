@@ -3082,6 +3082,77 @@ static void test_dle_times(void)
 	ll_conn_end(0, LL_ST_REMOTE_TERM);
 }
 
+/* Review minor 6: the glue's mid-event RX wake looks at the event owner's
+ * ll_rxq only: the owner is the link whose BRX is on air, none between
+ * events. */
+static void test_event_owner(void)
+{
+	struct ll_connect_ind ci = mk_ci(24, 400, 1, 1, 0);
+	uint32_t a = 1000000 + T(1250 + 100);
+
+	reset_all(false);
+	CHECK(ll_conn_event_owner() == -1);
+	CHECK(ll_conn_start(&ci, 1000000) == 0);
+	CHECK(ll_conn_event_owner() == -1);   /* planned, not on air */
+	ev_rx(a);
+	CHECK(ll_conn_event_owner() == -1);
+	fire_alarm();
+	CHECK(ll_conn_event_owner() == 0);
+	rx(a + T(30000), 0x01, 0);
+	CHECK(ll_conn_event_owner() == 0);
+	done(1);
+	CHECK(ll_conn_event_owner() == -1);
+	ll_conn_end(0, LL_ST_REMOTE_TERM);
+	CHECK(ll_conn_event_owner() == -1);
+}
+
+/* Slice 6b Task 4 review: the effective TX time shrinks while a PDU built
+ * under the old limit is queued. 4.5.10: "These PDUs remain valid; only PDUs
+ * queued after the Data Length Update procedure is completed are required
+ * to conform", so it is still sent at its length: the arbiter span (and the
+ * guard floor) keep covering it until it is acked, then follow the new
+ * values. */
+static void test_dle_shrink_queued(void)
+{
+	struct ll_connect_ind ci = mk_ci(24, 400, 1, 1, 0);   /* 30 ms */
+	uint32_t a = 1000000 + T(1250 + 100);
+	uint8_t pdu[LL_DATA_PDU_MAX + LL_MIC_LEN];
+	uint32_t g27;
+
+	memset(pdu, 0x5a, sizeof(pdu));
+	reset_all(false);
+	CHECK(ll_conn_start(&ci, 1000000) == 0);
+	ev_rx(a);
+	g27 = ll_arb_gap(sch.tick + T(LL_CONN_ARM_LEAD_US), 0, 0) - sch.tick;
+	ll_conn_set_dle_times(0, 2120, 2120);
+	CHECK(ll_txq_push(0, LL_TXQ_ACL, LL_LLID_START, pdu, sizeof(pdu), 0, true) == 0);
+	/* the central shrinks our TX to 27 / 328 (its LL_LENGTH_REQ) */
+	ll_conn_set_dle_times(0, 2120, 328);
+	fire_alarm();
+	rx(a + T(30000), 0x01, 0);   /* sent, not acked */
+	done(1);
+	CHECK(ll_txq_backlog(0) == 1);
+	CHECK(ll_arb_gap(sch.tick + T(LL_CONN_ARM_LEAD_US), 0, 0) - sch.tick ==
+	      g27 + T(4540 - LL_CONN_GUARD_MIN_TAIL_US));
+	/* acked: the new TX time from the next request on */
+	fire_alarm();
+	rx(a + T(60000), 0x01 | HDR_NESN, 0);
+	rad.rptr = rad.wptr;
+	done(1);
+	CHECK(ll_txq_backlog(0) == 0);
+	CHECK(ll_arb_gap(sch.tick + T(LL_CONN_ARM_LEAD_US), 0, 0) - sch.tick ==
+	      g27 + T(2120 + 150 + 328 + 150 - LL_CONN_GUARD_MIN_TAIL_US));
+	/* a short PDU queued under the new limit does not widen it */
+	pdu[0] = 0;
+	CHECK(ll_txq_push(0, LL_TXQ_ACL, LL_LLID_START, pdu, 31, 0, true) == 0);
+	fire_alarm();
+	rx(a + T(90000), 0x01, 0);
+	done(1);
+	CHECK(ll_arb_gap(sch.tick + T(LL_CONN_ARM_LEAD_US), 0, 0) - sch.tick ==
+	      g27 + T(2120 + 150 + 328 + 150 - LL_CONN_GUARD_MIN_TAIL_US));
+	ll_conn_end(0, LL_ST_REMOTE_TERM);
+}
+
 int main(void)
 {
 	test_first_events();
@@ -3138,5 +3209,7 @@ int main(void)
 	test_instant_late_refused_by_arbiter();
 	test_rx_long_pdu();
 	test_dle_times();
+	test_dle_shrink_queued();
+	test_event_owner();
 	DONE();
 }

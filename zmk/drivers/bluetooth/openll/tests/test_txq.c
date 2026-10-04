@@ -892,6 +892,39 @@ static void test_last_flag(void)
 	check_hw_clean();
 }
 
+/* Slice 6b Task 4 review: the longest PDU queued and not yet acked (on-air
+ * payload incl. MIC), which ll_conn's exchange span must cover after the
+ * effective TX length shrank (4.5.10: PDUs queued under the old values
+ * remain valid). Backlog and ring entries count until their ack. */
+static void test_max_len(void)
+{
+	boot(0);
+	CHECK(ll_txq_max_len(0) == 0);
+	CHECK(ll_txq_max_len(LL_MAX_CONN) == 0);
+	CHECK(push_len_l(0, LL_TXQ_ACL, 1, 20, true) == 0);
+	CHECK(push_len_l(0, LL_TXQ_ACL, 2, 255, true) == 0);
+	CHECK(push_len_l(0, LL_TXQ_ACL, 3, 31, true) == 0);
+	CHECK(ll_txq_max_len(0) == 255);
+	if (LL_MAX_CONN > 1) {
+		CHECK(ll_txq_max_len(LL_MAX_CONN - 1) == 0);   /* per link */
+	}
+	/* sent, our response lost: nothing acked, still queued */
+	run_event((const struct xchg[]){ { .tx_lost = true } }, 1);
+	CHECK(ll_txq_backlog(0) == 3 && ll_txq_max_len(0) == 255);
+	for (int ev = 0; ev < 20 && ll_txq_backlog(0); ev++) {
+		run_event(NULL, 0);
+	}
+	/* acked: a later short PDU alone counts */
+	CHECK(ll_txq_max_len(0) == 0);
+	CHECK(push_len_l(0, LL_TXQ_ACL, 4, 31, true) == 0);
+	CHECK(ll_txq_max_len(0) == 31);
+	for (int ev = 0; ev < 5 && ll_txq_backlog(0); ev++) {
+		run_event(NULL, 0);
+	}
+	CHECK(ll_txq_backlog(0) == 0 && ll_txq_max_len(0) == 0);
+	check_hw_clean();
+}
+
 /* ---------------- tests: per-link state (slice 6a) ---------------- */
 
 static void test_link_bounds(void)
@@ -1119,6 +1152,7 @@ int main(void)
 	test_big_pdus();
 	test_fits();
 	test_last_flag();
+	test_max_len();
 	test_reset_per_connection();
 	test_link_bounds();
 #if LL_MAX_CONN >= 2

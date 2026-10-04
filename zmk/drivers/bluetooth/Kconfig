@@ -53,7 +53,8 @@ config BT_HCI_B91_OPENLL_MAX_CONN
 	  between the links and advertising; advertising is allowed while a
 	  link is free (connectable advertising with all links taken is
 	  refused with Connection Limit Exceeded, 0x09). Each link costs about
-	  5 KB of RAM (TX and RX queues for 251-octet PDUs, slice 6b). 1 behaves as the single-link controller of slice 5.
+	  5 KB of RAM (TX and RX queues for 251-octet PDUs, slice 6b). 1
+	  behaves as the single-link controller of slice 5.
 
 config BT_HCI_B91_OPENLL_STATS_LOG
 	bool "Open link layer: periodic radio/connection stats log"

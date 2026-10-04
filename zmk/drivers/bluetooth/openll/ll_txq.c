@@ -78,8 +78,9 @@ _Static_assert((LL_TXQ_ENTRIES & (LL_TXQ_ENTRIES - 1)) == 0 && LL_TXQ_ENTRIES <=
 	       "LL_TXQ_ENTRIES must be a power of two that fits the 8-bit counters");
 _Static_assert(LL_TXQ_POOL_BYTES % LL_FIFO_ALIGN == 0 && LL_TXQ_POOL_BYTES <= 0xFFFF,
 	       "LL_TXQ_POOL_BYTES must be a multiple of 4 below 64 KiB");
-/* a host ACL packet of LL_ACL_MTU in the smallest fragments (27 + MIC), and
- * the 4 ring entries of maximum PDUs, fit an empty area */
+/* a host ACL packet of LL_ACL_MTU in the smallest fragments (27 + MIC), or
+ * the 4 ring entries of maximum PDUs, fits an empty area (each alone, see
+ * ll_txq.h) */
 _Static_assert(LL_TXQ_POOL_BYTES >= 4 * 256 &&
 	       LL_TXQ_POOL_BYTES >= ((LL_ACL_MTU + 26) / 27) * 32,
 	       "LL_TXQ_POOL_BYTES too small");
@@ -403,4 +404,23 @@ unsigned int ll_txq_backlog(uint8_t link)
 	const struct txq_link *l = get(link);
 
 	return l ? (unsigned int)(uint8_t)(l->head - l->tail) : 0u;
+}
+
+uint8_t ll_txq_max_len(uint8_t link)
+{
+	const struct txq_link *l = get(link);
+	uint8_t m = 0;
+
+	if (!l) {
+		return 0;
+	}
+	/* tail..head-1: ring (unacked) and backlog; at most LL_TXQ_ENTRIES */
+	for (uint8_t i = l->tail; i != l->head; i++) {
+		const struct txq_ent *e = &l->ent[ENT(i)];
+
+		if (e->len > m) {
+			m = e->len;
+		}
+	}
+	return m;
 }

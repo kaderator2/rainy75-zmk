@@ -2184,6 +2184,20 @@ static void acl_fragments(void)
 	}
 	CHECK(kk.bad == 0 && kk.calls >= 1);
 	CHECK(locks == 0 && tx_locks == 0);
+	/* review minor: the fit check covers every fragment but the last with
+	 * the longest of them, not with the first one's length */
+	f[0].len = 10;
+	f[1].off = 10;
+	f[2].off = 37;
+	f[3].off = 64;
+	f[3].len = 5;
+	tx.n = 0;
+	CHECK(ll_llcp_tx_acl(L, big, f, 4) == 0);
+	CHECK(tx.fits_n == 4 && tx.fits_len == 27 && tx.fits_last == 5);
+	for (uint8_t i = 0; i < 10; i++) {
+		f[i].off = (uint8_t)(27 * i);
+		f[i].len = i < 9 ? 27 : 8;
+	}
 	/* not all fit: nothing is queued */
 	tx.n = 0;
 	tx.room = 9;

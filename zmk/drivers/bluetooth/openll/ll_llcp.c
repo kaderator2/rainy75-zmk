@@ -244,7 +244,7 @@ uint8_t ll_llcp_tx_limit(uint8_t link)
 int ll_llcp_tx_acl(uint8_t link, const uint8_t *data, const struct ll_acl_frag *f, uint8_t n)
 {
 	struct llcp_link *s;
-	uint8_t lim, mic;
+	uint8_t lim, mic, mid = 0;
 	int ret = 0;
 
 	if (link >= LL_MAX_CONN || n == 0) {
@@ -262,11 +262,16 @@ int ll_llcp_tx_acl(uint8_t link, const uint8_t *data, const struct ll_acl_frag *
 			ret = -EINVAL;
 			goto out;
 		}
+		if (i + 1 < n && f[i].len > mid) {
+			mid = f[i].len;   /* the fit check's length for all but the last */
+		}
 	}
 	/* all or nothing: the TX lock keeps every other producer out, and
-	 * the consumer only frees room, so what fits now is accepted below */
+	 * the consumer only frees room, so what fits now is accepted below
+	 * (every fragment but the last counted at the longest of them, an
+	 * upper bound) */
 	mic = s->crypt.enc_tx ? LL_MIC_LEN : 0;
-	if (!ll_txq_fits(link, n, (uint8_t)(f[0].len + mic), (uint8_t)(f[n - 1].len + mic))) {
+	if (!ll_txq_fits(link, n, (uint8_t)(mid + mic), (uint8_t)(f[n - 1].len + mic))) {
 		ret = -ENOMEM;
 		goto out;
 	}
@@ -476,6 +481,12 @@ static void dle_flush_locked(uint8_t link)
 	}
 }
 
+/* A lower effective TX length applies to the next push at once (the TX
+ * limit is read under the TX lock); PDUs queued before stay valid and are
+ * sent as they are (4.5.10: "These PDUs remain valid; only PDUs queued
+ * after the Data Length Update procedure is completed are required to
+ * conform to the changed parameters"), and ll_conn's exchange span covers
+ * them until their ack (ll_txq_max_len). */
 static void dle_notify(uint8_t link, const struct ll_llcp_dle *eff)
 {
 	/* arbiter span and guard floor first, then the host */

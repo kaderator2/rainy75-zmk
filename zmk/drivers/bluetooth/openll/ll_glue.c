@@ -162,7 +162,13 @@ static struct acl_item *held[LL_MAX_CONN];  /* host ACL waiting for ll_llcp_tx_a
 /* LE Data Length Change to report (slice 6b Task 4, see llcp_data_len_change) */
 static atomic_t dle_pend;                    /* bit per link, set for the controller thread */
 static struct ll_llcp_dle dle_val[LL_MAX_CONN];   /* under ll_plat_lock() */
-static uint32_t hci_dle_defer;               /* HCI thread only: changes during a command */
+/* connection generation (ll_credit) the value belongs to, under
+ * ll_plat_lock(): a change raised for an ended connection is never
+ * reported to a new one on the reused id */
+static uint32_t dle_gen[LL_MAX_CONN];
+/* HCI thread only (set from ll_llcp_set_data_len() inside a command, taken
+ * in b91_bt_host_send_packet() after it): no lock needed */
+static uint32_t hci_dle_defer;
 static bool mic_failed[LL_MAX_CONN];        /* MIC failure logged for this connection */
 static uint8_t rr_first;                    /* round-robin: link served first in this pass */
 
@@ -433,21 +439,23 @@ static void radio_evt(enum ll_radio_evt evt, const uint8_t *pdu, uint16_t len, u
 	/* advertising PDUs are at most 39 bytes (8-bit length there) */
 	ll_adv_radio_evt(evt, pdu, (uint8_t)len, tick);
 	ll_conn_radio_evt(evt, pdu, len, tick);
-	/* Wake the controller thread before the event ends when the link's
-	 * RX queue is half full: it then runs between the RX IRQs of a long
-	 * central burst and drains ll_rxq, so the burst does not overflow it
-	 * (an overflow ends the link with 0x08). With long PDUs the byte area
-	 * holds 8 maximum PDUs (LL_RXQ_POOL_BYTES), and one event at a 50 ms
-	 * interval can carry 11 exchanges of 4.5 ms; 27-octet PDUs fill the
-	 * 16 entries in about 12 ms of MD burst. Only then: the thread running
-	 * during an event (decryption, copies) moved the first-exchange T_IFS
-	 * later on the device (<= 150 us 74 % -> 45 % with a wake per PDU). */
+	/* Wake the controller thread before the event ends when the event
+	 * owner's RX queue is half full (entries or bytes, ll_rxq): it then
+	 * runs between the exchanges of a long central burst and drains
+	 * ll_rxq, so the burst does not overflow it (an overflow ends the
+	 * link with 0x08). With long PDUs the byte area holds 8 maximum PDUs
+	 * (LL_RXQ_POOL_BYTES), and one event at a 50 ms interval can carry 11
+	 * exchanges of 4.5 ms; 27-octet PDUs fill the 16 entries in about
+	 * 12 ms of MD burst. Only the owner: no other link receives during
+	 * this event, and its queue was looked at in its own events. The
+	 * CONN_RX callbacks run only once our response has started
+	 * (ll_radio.c): CPU work in the RX -> TX turnaround moves the TX
+	 * later, and a thread woken there would do so too. */
 	if (evt == LL_RADIO_CONN_RX) {
-		for (uint8_t i = 0; i < LL_MAX_CONN; i++) {
-			if (ll_rxq_isr_half_full(i)) {
-				k_sem_give(&wake);
-				break;
-			}
+		int owner = ll_conn_event_owner();
+
+		if (owner >= 0 && ll_rxq_isr_half_full((uint8_t)owner)) {
+			k_sem_give(&wake);
 		}
 	}
 	if (evt != LL_RADIO_CONN_DONE) {
@@ -499,16 +507,24 @@ static void llcp_enc_change(uint8_t link, uint8_t status, bool enabled)
 static void llcp_data_len_change(uint8_t link, const struct ll_llcp_dle *eff)
 {
 	unsigned int key;
+	uint32_t gen;
 
+	/* never from an ISR: ll_llcp reports changes from the LENGTH PDUs
+	 * (controller thread) and LE Set Data Length (HCI thread) only */
+	__ASSERT_NO_MSG(!k_is_in_isr());
 	LOG_INF("data length (handle %u): tx %u B / %u us, rx %u B / %u us", link,
 		eff->max_tx_octets, eff->max_tx_time, eff->max_rx_octets, eff->max_rx_time);
+	if (!ll_credit_up_gen(link, &gen)) {
+		return;   /* not reported to the host (yet), or ended */
+	}
 	key = ll_plat_lock();
 	dle_val[link] = *eff;
+	dle_gen[link] = gen;
 	ll_plat_unlock(key);
-	if (!k_is_in_isr() && k_current_get() == &ctrl_thread) {
+	if (k_current_get() == &ctrl_thread) {
 		atomic_set_bit(&dle_pend, link);
 	} else {
-		hci_dle_defer |= BIT(link);
+		hci_dle_defer |= BIT(link);   /* the HCI thread, see above */
 	}
 }
 
@@ -836,14 +852,16 @@ static void flush_dle(uint8_t link)
 {
 	struct ll_llcp_dle e;
 	unsigned int key;
+	uint32_t gen, cur;
 
 	if (!atomic_test_and_clear_bit(&dle_pend, link)) {
 		return;
 	}
 	key = ll_plat_lock();
 	e = dle_val[link];
+	gen = dle_gen[link];
 	ll_plat_unlock(key);
-	if (ll_credit_up(link) && !pend_test(link, PEND_DISCONNECTED)) {
+	if (ll_credit_up_gen(link, &cur) && cur == gen && !pend_test(link, PEND_DISCONNECTED)) {
 		ll_hci_evt_data_len_change(link, e.max_tx_octets, e.max_tx_time, e.max_rx_octets,
 					   e.max_rx_time);
 	}
@@ -1068,10 +1086,10 @@ static void report_stats(struct ll_radio_stats *last, struct ll_conn_stats *last
 		LOG_INF("conn: tx %u acked %u tifs<=150 %u 151-152 %u >152 %u rxq_of %u ptr_odd %u",
 			st.conn_tx, (uint32_t)atomic_get(&cnt_tx_acked), st.tifs_le150,
 			st.tifs_151_152, st.tifs_gt152, rxq_of, st.rx_ptr_odd);
-		LOG_INF("conn: first_bad %u nodata %u outside %u ptr_skip %u wptr_max %u fst_capped %u guard_esc %u",
+		LOG_INF("conn: first_bad %u nodata %u outside %u ptr_skip %u wptr_max %u fst_capped %u guard_esc %u hold %u",
 			cs.first_bad, cs.first_nodata, cs.first_outside, st.rx_ptr_skip,
 			st.rx_wptr_max, st.fst_capped,
-			(uint32_t)atomic_get(&cnt_guard_escalations));
+			(uint32_t)atomic_get(&cnt_guard_escalations), st.holds);
 		LOG_INF("conn: latency planned %u listened %u skipped %u kicks %u coll %u links %u",
 			cs.planned, cs.listened, cs.skipped, cs.kicks, cs.collisions,
 			ll_conn_count());
@@ -1149,6 +1167,11 @@ static void ctrl_thread_fn(void *p1, void *p2, void *p3)
 		rr_first = (uint8_t)((rr_first + 1) % LL_MAX_CONN);
 		if (any_conn_up()) {
 			ll_llcp_tick(ll_radio_now());   /* all links */
+		}
+		/* changes raised later in the pass (another link's step, the
+		 * LLCP tick): reported in this pass, not on the next wakeup */
+		for (uint8_t i = 0; i < LL_MAX_CONN; i++) {
+			flush_dle(i);
 		}
 		llcp_tmr_update();
 		drain_evt_q();
