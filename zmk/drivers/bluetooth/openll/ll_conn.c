@@ -1155,6 +1155,24 @@ uint16_t ll_conn_event_counter(uint8_t link)
 	return c->planned ? c->skip_base : c->counter;
 }
 
+uint8_t ll_conn_pending_instants(uint8_t link)
+{
+	struct ll_link *c = link_of(link);
+	uint8_t r = 0;
+	unsigned int key;
+
+	if (!c) {
+		return 0;
+	}
+	key = ll_plat_lock();
+	if (c->active) {
+		r = (c->upd_pending ? LL_CONN_PENDING_UPDATE : 0) |
+		    (c->chm_pending || c->chm_win ? LL_CONN_PENDING_CHMAP : 0);
+	}
+	ll_plat_unlock(key);
+	return r;
+}
+
 int ll_conn_event_owner(void)
 {
 	return ev_owner;

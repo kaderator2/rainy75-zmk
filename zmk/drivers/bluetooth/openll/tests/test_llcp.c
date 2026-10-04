@@ -217,6 +217,13 @@ void ll_conn_end(uint8_t link, uint8_t reason)
 	cnl[link].end_calls++;
 	cnl[link].end_reason = reason;
 }
+/* slice 6d Task 2: instants not yet reached (LL_CONN_PENDING_*) */
+static uint8_t pend_inst[LL_MAX_CONN];
+uint8_t ll_conn_pending_instants(uint8_t link)
+{
+	CHECK(link < LL_MAX_CONN);
+	return pend_inst[link];
+}
 bool ll_conn_active(uint8_t link)
 {
 	CHECK(link < LL_MAX_CONN);
@@ -299,9 +306,29 @@ static void on_apto_expired(uint8_t link)
 	aptol[link]++;
 }
 
+/* LE Remote Connection Parameter Request (slice 6d Task 2), per link: the
+ * last request; `masked` makes the op report the event as not sent */
+static struct {
+	int calls;
+	struct ll_llcp_cpr req;
+	bool masked;
+} cprl[LL_MAX_CONN];
+#define cpr_ev (cprl[L])
+
+static bool on_conn_param_req(uint8_t link, const struct ll_llcp_cpr *req)
+{
+	CHECK(locks == 0);
+	CHECK(tx_locks == 0);
+	CHECK(link < LL_MAX_CONN);
+	cprl[link].calls++;
+	cprl[link].req = *req;
+	return !cprl[link].masked;
+}
+
 static const struct ll_llcp_ops ops = {.ltk_req = on_ltk_req, .enc_change = on_enc_change,
 				       .data_len_change = on_data_len_change,
-				       .apto_expired = on_apto_expired};
+				       .apto_expired = on_apto_expired,
+				       .conn_param_req = on_conn_param_req};
 
 /* ---------------- helpers ---------------- */
 
@@ -312,6 +339,8 @@ static void fresh(void)
 	memset(hcil, 0, sizeof(hcil));
 	memset(dlcl, 0, sizeof(dlcl));
 	memset(aptol, 0, sizeof(aptol));
+	memset(cprl, 0, sizeof(cprl));
+	memset(pend_inst, 0, sizeof(pend_inst));
 	memset(dtl, 0, sizeof(dtl));
 	memset(&kk, 0, sizeof(kk));
 	memset(rxq_crypt_l, 0, sizeof(rxq_crypt_l));
@@ -402,12 +431,13 @@ static void single_link_suite(void)
 	fresh();
 	features(0xFF);
 	{
-		/* ours: LE Encryption (bit 0) + Extended Reject Indication (bit 2)
-		 * + LE Ping (bit 4, slice 6d) + LE Data Packet Length Extension
-		 * (bit 5); byte 1 is ours: CSA#2 (bit 14) */
-		static const uint8_t exp[9] = {0x09, 0x35, 0x40, 0, 0, 0, 0, 0, 0};
+		/* ours: LE Encryption (bit 0) + Connection Parameters Request
+		 * procedure (bit 1, slice 6d Task 2) + Extended Reject
+		 * Indication (bit 2) + LE Ping (bit 4, slice 6d) + LE Data
+		 * Packet Length Extension (bit 5); byte 1 is ours: CSA#2 (bit 14) */
+		static const uint8_t exp[9] = {0x09, 0x37, 0x40, 0, 0, 0, 0, 0, 0};
 
-		CHECK(LL_FEATURES_LOW == 0x35);
+		CHECK(LL_FEATURES_LOW == 0x37);
 		CHECK(tx.n == 1);
 		CHECK(last_is(exp, 9));
 	}
@@ -446,10 +476,12 @@ static void single_link_suite(void)
 	{
 		/* LL_LENGTH_REQ (0x14), LL_PHY_REQ (0x16) and LL_PHY_UPDATE_IND
 		 * (0x18) are answered since slice 6b Task 3 (dle_phy_suite) */
-		/* LL_PING_REQ (0x12) is answered since slice 6d (ping_suite) */
-		static const uint8_t ops_unk[] = {0x19, 0x1A, 0x0E, 0x0F, 0x04, 0x05,
+		/* LL_PING_REQ (0x12) is answered since slice 6d (ping_suite),
+		 * LL_CONNECTION_PARAM_REQ (0x0F) since slice 6d Task 2
+		 * (cpr_suite) */
+		static const uint8_t ops_unk[] = {0x19, 0x1A, 0x0E, 0x04, 0x05,
 						  0x1F, 0x20, 0xFF};
-		static const uint8_t lens[] = {3, 1, 9, 24, 13, 1, 5, 1, 1};
+		static const uint8_t lens[] = {3, 1, 9, 13, 1, 5, 1, 1};
 
 		for (unsigned int i = 0; i < sizeof(ops_unk); i++) {
 			uint8_t pdu[27] = {0};
@@ -1804,7 +1836,7 @@ static void test_routing_per_link(void)
 
 static const uint8_t vi_c[6] = {0x0C, 0x0A, 0x02, 0x00, 0x34, 0x12};
 static const uint8_t vi_ours[6] = {0x0C, 0x09, 0xFF, 0xFF, 0x01, 0x00};
-static const uint8_t feat_ours[9] = {0x09, 0x35, 0x40, 0, 0, 0, 0, 0, 0};
+static const uint8_t feat_ours[9] = {0x09, 0x37, 0x40, 0, 0, 0, 0, 0, 0};
 
 /* push k is exactly the control PDU exp */
 static int push_is(int k, const uint8_t *exp, uint8_t len)
@@ -2383,7 +2415,7 @@ static void ping_suite(void)
 
 	/* ---- the timer does not run while the link is unencrypted ---- */
 	fresh();
-	ll_llcp_conn_params(L, 24, 4);
+	ll_llcp_conn_params(L, 24, 4, 3200);
 	features(0xFF);
 	CHECK(ll_llcp_read_apto(L, &v) == LL_ST_SUCCESS && v == 3000);
 	CHECK(ll_llcp_timeout_ticks(now) == -1);
@@ -2405,7 +2437,7 @@ static void ping_suite(void)
 
 	/* ---- encrypted: 30 s from the end of the encryption start ---- */
 	fresh();
-	ll_llcp_conn_params(L, 24, 4);
+	ll_llcp_conn_params(L, 24, 4, 3200);
 	start_encryption();
 	t0 = now;
 	CHECK(ll_llcp_timeout_ticks(t0) == (int32_t)APTO_T(3000));
@@ -2471,7 +2503,7 @@ static void ping_suite(void)
 
 	/* ---- a full backlog owes LL_PING_REQ (slice 7) ---- */
 	fresh();
-	ll_llcp_conn_params(L, 24, 4);
+	ll_llcp_conn_params(L, 24, 4, 3200);
 	start_encryption();
 	t0 = now;
 	n0 = tx.n;
@@ -2483,7 +2515,7 @@ static void ping_suite(void)
 
 	/* ---- HCI Read / Write ---- */
 	fresh();
-	ll_llcp_conn_params(L, 24, 4);       /* 30 ms x 5 = 150 ms = 15 x 10 ms */
+	ll_llcp_conn_params(L, 24, 4, 3200);       /* 30 ms x 5 = 150 ms = 15 x 10 ms */
 	CHECK(ll_llcp_write_apto(L, 15) == LL_ST_SUCCESS);
 	CHECK(ll_llcp_read_apto(L, &v) == LL_ST_SUCCESS && v == 15);
 	CHECK(ll_llcp_write_apto(L, 14) == LL_ST_INVALID_PARAM);
@@ -2492,16 +2524,16 @@ static void ping_suite(void)
 	CHECK(ll_llcp_write_apto(L, 0xFFFF) == LL_ST_SUCCESS);
 	CHECK(ll_llcp_read_apto(L, &v) == LL_ST_SUCCESS && v == 0xFFFF);
 	/* 7.5 ms x 1 = 0.75 x 10 ms: 1 is enough */
-	ll_llcp_conn_params(L, 6, 0);
+	ll_llcp_conn_params(L, 6, 0, 3200);
 	CHECK(ll_llcp_write_apto(L, 1) == LL_ST_SUCCESS);
 	/* an update raises a timeout below the new minimum: 15 ms x 11 =
 	 * 165 ms -> 17 (rounded up); a later shorter interval keeps it */
-	ll_llcp_conn_params(L, 12, 10);
+	ll_llcp_conn_params(L, 12, 10, 3200);
 	CHECK(ll_llcp_read_apto(L, &v) == LL_ST_SUCCESS && v == 17);
-	ll_llcp_conn_params(L, 6, 0);
+	ll_llcp_conn_params(L, 6, 0, 3200);
 	CHECK(ll_llcp_read_apto(L, &v) == LL_ST_SUCCESS && v == 17);
 	/* saturates at the largest value */
-	ll_llcp_conn_params(L, 3200, 499);
+	ll_llcp_conn_params(L, 3200, 499, 3200);
 	CHECK(ll_llcp_read_apto(L, &v) == LL_ST_SUCCESS && v == 0xFFFF);
 	/* out of range or not connected */
 	CHECK(ll_llcp_read_apto(LL_MAX_CONN, &v) == LL_ST_UNKNOWN_CONN_ID);
@@ -2516,7 +2548,7 @@ static void ping_suite(void)
 
 	/* ---- a write restarts the running timer with the new value ---- */
 	fresh();
-	ll_llcp_conn_params(L, 24, 4);
+	ll_llcp_conn_params(L, 24, 4, 3200);
 	start_encryption();
 	t0 = now;
 	now = t0 + APTO_T(2000);
@@ -2528,7 +2560,7 @@ static void ping_suite(void)
 	CHECK(apto_ev == 1 && last_is_ping_req(L));
 	/* written before the encryption: used from its end */
 	fresh();
-	ll_llcp_conn_params(L, 24, 4);
+	ll_llcp_conn_params(L, 24, 4, 3200);
 	CHECK(ll_llcp_write_apto(L, 100) == LL_ST_SUCCESS);
 	CHECK(ll_llcp_timeout_ticks(now) == -1);
 	start_encryption();
@@ -2537,7 +2569,7 @@ static void ping_suite(void)
 	/* ---- the longest timeout (655.35 s) spans several 32-bit tick wraps:
 	 * the wakeup is capped so the controller never misses one ---- */
 	fresh();
-	ll_llcp_conn_params(L, 24, 4);
+	ll_llcp_conn_params(L, 24, 4, 3200);
 	CHECK(ll_llcp_write_apto(L, 0xFFFF) == LL_ST_SUCCESS);
 	start_encryption();
 	{
@@ -2577,8 +2609,8 @@ static void test_ping_per_link(void)
 		return;
 	}
 	fresh();
-	ll_llcp_conn_params(a, 24, 4);
-	ll_llcp_conn_params(b, 24, 4);
+	ll_llcp_conn_params(a, 24, 4, 3200);
+	ll_llcp_conn_params(b, 24, 4, 3200);
 	start_enc_l(a);
 	ta = now;
 	now += T(1000000);
@@ -2596,10 +2628,10 @@ static void test_ping_per_link(void)
 	/* values and parameters per link */
 	CHECK(ll_llcp_write_apto(b, 100) == LL_ST_SUCCESS);
 	CHECK(ll_llcp_read_apto(a, &v) == LL_ST_SUCCESS && v == 3000);
-	ll_llcp_conn_params(a, 400, 30);     /* 500 ms x 31 = 15.5 s: a keeps 30 s */
+	ll_llcp_conn_params(a, 400, 30, 3200);     /* 500 ms x 31 = 15.5 s: a keeps 30 s */
 	CHECK(ll_llcp_read_apto(a, &v) == LL_ST_SUCCESS && v == 3000);
 	CHECK(ll_llcp_read_apto(b, &v) == LL_ST_SUCCESS && v == 100);
-	ll_llcp_conn_params(b, 400, 30);
+	ll_llcp_conn_params(b, 400, 30, 3200);
 	CHECK(ll_llcp_read_apto(b, &v) == LL_ST_SUCCESS && v == 1550);
 	CHECK(ll_llcp_read_apto(a, &v) == LL_ST_SUCCESS && v == 3000);
 	/* b ends; a goes on */
@@ -2612,6 +2644,451 @@ static void test_ping_per_link(void)
 	/* b, unencrypted now, never expires */
 	ll_llcp_tick(now + APTO_T(3000) * 3);
 	CHECK(aptol[b] == 1);
+	CHECK(locks == 0 && tx_locks == 0);
+}
+
+/* ---------------- Connection Parameters Request (slice 6d Task 2) ----------------
+ * Vol 6 Part B 2.4.2.16/17 (CtrData: Interval_Min, Interval_Max, Latency,
+ * Timeout (2 octets each), PreferredPeriodicity (1), ReferenceConnEventCount
+ * (2), Offset0..5 (2 each); 24 octets with the opcode), 5.1.7, 5.3. */
+
+#define CPR_LEN 24
+
+static void build_cpr(uint8_t pdu[CPR_LEN], uint16_t imin, uint16_t imax, uint16_t lat,
+		      uint16_t to, uint8_t pp, uint16_t ref, uint16_t off0)
+{
+	pdu[0] = 0x0F;
+	ll_put_le16(&pdu[1], imin);
+	ll_put_le16(&pdu[3], imax);
+	ll_put_le16(&pdu[5], lat);
+	ll_put_le16(&pdu[7], to);
+	pdu[9] = pp;
+	ll_put_le16(&pdu[10], ref);
+	ll_put_le16(&pdu[12], off0);
+	for (int i = 1; i < 6; i++) {
+		ll_put_le16(&pdu[12 + 2 * i], 0xFFFF);
+	}
+}
+
+static void rx_cpr(uint16_t imin, uint16_t imax, uint16_t lat, uint16_t to, uint8_t pp,
+		   uint16_t ref)
+{
+	uint8_t pdu[CPR_LEN];
+
+	build_cpr(pdu, imin, imax, lat, to, pp, ref, 0xFFFF);
+	rx(pdu, sizeof(pdu));
+}
+
+/* last push is our LL_CONNECTION_PARAM_RSP with these values, no offset
+ * preference (all 0xFFFF) */
+static int last_is_cpr_rsp(uint16_t imin, uint16_t imax, uint16_t lat, uint16_t to, uint8_t pp,
+			   uint16_t ref)
+{
+	uint8_t exp[CPR_LEN];
+
+	build_cpr(exp, imin, imax, lat, to, pp, ref, 0xFFFF);
+	exp[0] = 0x10;
+	return last_is(exp, sizeof(exp));
+}
+
+static int last_is_rej_ext(uint8_t op, uint8_t err)
+{
+	const uint8_t exp[3] = {0x11, op, err};
+
+	return last_is(exp, 3);
+}
+
+static uint8_t cpr_reply(uint16_t imin, uint16_t imax, uint16_t lat, uint16_t to)
+{
+	const struct ll_llcp_cpr p = {imin, imax, lat, to};
+	uint8_t st = ll_llcp_conn_param_reply(L, &p);
+
+	CHECK(locks == 0 && tx_locks == 0);
+	return st;
+}
+
+static void cpr_suite(void)
+{
+	static const uint8_t upd[12] = {0x00, 0x02, 0x03, 0x00, 0x09, 0x00, 0x1E, 0x00,
+					0x90, 0x01, 0x34, 0x12};
+	uint32_t t0;
+
+	/* ---- accepted by the host: event, Reply, LL_CONNECTION_PARAM_RSP
+	 * with the host's values, then the central's LL_CONNECTION_UPDATE_IND
+	 * goes to ll_conn ---- */
+	fresh();
+	ll_llcp_conn_params(L, 24, 0, 72);
+	t0 = now;
+	rx_cpr(6, 12, 30, 400, 4, 0x1234);
+	CHECK(cpr_ev.calls == 1);
+	CHECK(cpr_ev.req.interval_min == 6 && cpr_ev.req.interval_max == 12);
+	CHECK(cpr_ev.req.latency == 30 && cpr_ev.req.timeout == 400);
+	CHECK(tx.n == 0);   /* nothing on air until the host answers */
+	CHECK(ll_llcp_busy(L));
+	CHECK(ll_llcp_timeout_ticks(now) == (int32_t)T(TIMEOUT_US));
+	now = t0 + T(1000000);
+	CHECK(cpr_reply(6, 9, 30, 400) == LL_ST_SUCCESS);
+	CHECK(tx.n == 1 && last_is_cpr_rsp(6, 9, 30, 400, 4, 0x1234));
+	CHECK(kk.calls == 1 && kk.bad == 0);
+	/* the timer restarts with the queued RSP; still waiting on the central */
+	CHECK(ll_llcp_busy(L));
+	CHECK(ll_llcp_timeout_ticks(now) == (int32_t)T(TIMEOUT_US));
+	/* a second answer: nothing waits on the host any more */
+	CHECK(cpr_reply(6, 9, 30, 400) == LL_ST_DISALLOWED);
+	CHECK(ll_llcp_conn_param_neg_reply(L, 0x3B) == LL_ST_DISALLOWED);
+	CHECK(tx.n == 1);
+	rx(upd, sizeof(upd));
+	CHECK(cn.upd_calls == 1 && cn.instant == 0x1234 && cn.p.interval == 9);
+	CHECK(!ll_llcp_busy(L) && ll_llcp_timeout_ticks(now) == -1);
+	CHECK(tx.n == 1 && cn.end_calls == 0);
+
+	/* ---- PreferredPeriodicity of our RSP: the central's when 1..
+	 * Interval_Max, else 1 ("shall be ... other than zero" when the
+	 * interval is a range) or 0 for a fixed interval ---- */
+	{
+		static const struct {
+			uint8_t c_pp;
+			uint16_t h_min, h_max;
+			uint8_t exp_pp;
+		} v[] = {{4, 6, 9, 4}, {9, 6, 9, 9}, {10, 6, 9, 1}, {0, 6, 9, 1},
+			 {0, 9, 9, 0}, {12, 9, 9, 0}, {3, 9, 9, 3}};
+
+		for (unsigned int i = 0; i < sizeof(v) / sizeof(v[0]); i++) {
+			fresh();
+			rx_cpr(6, 12, 30, 400, v[i].c_pp, 0x00AB);
+			CHECK(cpr_reply(v[i].h_min, v[i].h_max, 30, 400) == LL_ST_SUCCESS);
+			CHECK(last_is_cpr_rsp(v[i].h_min, v[i].h_max, 30, 400, v[i].exp_pp, 0x00AB));
+		}
+	}
+
+	/* ---- Negative Reply: LL_REJECT_EXT_IND with the host's reason ---- */
+	fresh();
+	rx_cpr(6, 12, 30, 400, 0, 0);
+	CHECK(ll_llcp_conn_param_neg_reply(L, LL_ST_UNACCEPT_CONN_PARAM) == LL_ST_SUCCESS);
+	CHECK(tx.n == 1 && last_is_rej_ext(0x0F, 0x3B));
+	CHECK(!ll_llcp_busy(L) && ll_llcp_timeout_ticks(now) == -1);
+	CHECK(ll_llcp_conn_param_neg_reply(L, 0x3B) == LL_ST_DISALLOWED);
+	CHECK(cpr_reply(6, 12, 30, 400) == LL_ST_DISALLOWED);
+	CHECK(tx.n == 1);
+	/* Zephyr rejects with Invalid LL Parameters: passed on as given */
+	rx_cpr(6, 12, 30, 400, 0, 0);
+	CHECK(ll_llcp_conn_param_neg_reply(L, LL_ST_INVALID_LL_PARAM) == LL_ST_SUCCESS);
+	CHECK(tx.n == 2 && last_is_rej_ext(0x0F, 0x1E));
+	CHECK(cpr_ev.calls == 2);
+
+	/* ---- invalid parameters: LL_REJECT_EXT_IND(0x1E), the host is not
+	 * asked, nothing waits ---- */
+	{
+		static const uint16_t bad[][4] = {
+			{5, 12, 0, 400},       /* Interval_Min < 6 */
+			{6, 3201, 0, 3200},    /* Interval_Max > 3200 */
+			{13, 12, 0, 400},      /* Interval_Min > Interval_Max */
+			{6, 12, 500, 3200},    /* Latency > 499 */
+			{6, 12, 0, 9},         /* Timeout < 10 */
+			{6, 12, 0, 3201},      /* Timeout > 3200 */
+			{6, 12, 30, 93},       /* 930 ms <= 2 x 15 ms x 31 = 930 ms */
+			{0, 0, 0, 0},
+		};
+
+		for (unsigned int i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+			fresh();
+			rx_cpr(bad[i][0], bad[i][1], bad[i][2], bad[i][3], 0, 0);
+			CHECK(tx.n == 1 && last_is_rej_ext(0x0F, 0x1E));
+			CHECK(cpr_ev.calls == 0);
+			CHECK(!ll_llcp_busy(L) && ll_llcp_timeout_ticks(now) == -1);
+			CHECK(cpr_reply(6, 12, 0, 400) == LL_ST_DISALLOWED);
+		}
+	}
+	/* the limits themselves are valid */
+	{
+		static const uint16_t good[][4] = {
+			{6, 6, 0, 10},         /* 100 ms > 15 ms */
+			{3200, 3200, 0, 3200}, /* 32 s > 8 s */
+			{6, 12, 30, 94},       /* 940 ms > 930 ms */
+			{6, 6, 499, 3200},     /* 32 s > 7.5 s */
+		};
+
+		for (unsigned int i = 0; i < sizeof(good) / sizeof(good[0]); i++) {
+			fresh();
+			rx_cpr(good[i][0], good[i][1], good[i][2], good[i][3], 0, 0);
+			CHECK(tx.n == 0 && cpr_ev.calls == 1 && ll_llcp_busy(L));
+		}
+	}
+	/* PreferredPeriodicity / offsets we do not use are not checked */
+	fresh();
+	{
+		uint8_t pdu[CPR_LEN];
+
+		build_cpr(pdu, 6, 12, 0, 400, 200, 0x0010, 50);
+		rx(pdu, sizeof(pdu));
+		CHECK(tx.n == 0 && cpr_ev.calls == 1);
+	}
+	/* a wrong length: LL_UNKNOWN_RSP, like any malformed request */
+	fresh();
+	{
+		uint8_t pdu[CPR_LEN];
+		static const uint8_t exp[2] = {0x07, 0x0F};
+
+		build_cpr(pdu, 6, 12, 0, 400, 0, 0, 0xFFFF);
+		rx(pdu, CPR_LEN - 1);
+		CHECK(tx.n == 1 && last_is(exp, 2) && cpr_ev.calls == 0 && !ll_llcp_busy(L));
+	}
+
+	/* ---- the event is masked (or the host does not know the link): the
+	 * Link Layer accepts with the central's values (5.1.7.2: not
+	 * indicated, "proceed as if the Host has accepted") ---- */
+	fresh();
+	cpr_ev.masked = true;
+	rx_cpr(8, 16, 4, 300, 8, 0x0042);
+	CHECK(cpr_ev.calls == 1);
+	CHECK(tx.n == 1 && last_is_cpr_rsp(8, 16, 4, 300, 8, 0x0042));
+	CHECK(ll_llcp_busy(L));   /* until LL_CONNECTION_UPDATE_IND */
+	CHECK(cpr_reply(8, 16, 4, 300) == LL_ST_DISALLOWED && tx.n == 1);
+	rx(upd, sizeof(upd));
+	CHECK(!ll_llcp_busy(L) && cn.upd_calls == 1);
+
+	/* ---- only the anchor points move (same interval, latency and
+	 * timeout): never indicated to the host (5.1.7.2), RSP at once ---- */
+	fresh();
+	ll_llcp_conn_params(L, 12, 30, 400);
+	{
+		uint8_t pdu[CPR_LEN];
+
+		build_cpr(pdu, 12, 12, 30, 400, 0, 0x0100, 3);
+		rx(pdu, sizeof(pdu));
+	}
+	CHECK(cpr_ev.calls == 0);
+	CHECK(tx.n == 1 && last_is_cpr_rsp(12, 12, 30, 400, 0, 0x0100));
+	CHECK(ll_llcp_busy(L));
+	/* a changed timeout (or interval range, latency) is a real request */
+	fresh();
+	ll_llcp_conn_params(L, 12, 30, 400);
+	rx_cpr(12, 12, 30, 500, 0, 0);
+	CHECK(cpr_ev.calls == 1 && tx.n == 0);
+	fresh();
+	ll_llcp_conn_params(L, 12, 30, 400);
+	rx_cpr(6, 12, 30, 400, 0, 0);
+	CHECK(cpr_ev.calls == 1 && tx.n == 0);
+	fresh();
+	ll_llcp_conn_params(L, 12, 30, 400);
+	rx_cpr(12, 12, 0, 400, 0, 0);
+	CHECK(cpr_ev.calls == 1 && tx.n == 0);
+
+	/* ---- collisions (5.3): the central starts an incompatible procedure
+	 * (one with an instant) while one is in progress ---- */
+	/* a second LL_CONNECTION_PARAM_REQ while the first waits on the host:
+	 * same procedure, 0x23; the first goes on */
+	fresh();
+	rx_cpr(6, 12, 30, 400, 0, 0x0001);
+	rx_cpr(6, 24, 0, 400, 0, 0x0002);
+	CHECK(cpr_ev.calls == 1 && cpr_ev.req.interval_max == 12);
+	CHECK(tx.n == 1 && last_is_rej_ext(0x0F, 0x23));
+	CHECK(cpr_reply(6, 12, 30, 400) == LL_ST_SUCCESS);
+	CHECK(tx.n == 2 && last_is_cpr_rsp(6, 12, 30, 400, 1, 0x0001));
+	/* ... and while our RSP waits on the central's LL_CONNECTION_UPDATE_IND */
+	rx_cpr(6, 24, 0, 400, 0, 0x0003);
+	CHECK(cpr_ev.calls == 1 && tx.n == 3 && last_is_rej_ext(0x0F, 0x23));
+	CHECK(ll_llcp_busy(L));
+	rx(upd, sizeof(upd));
+	CHECK(!ll_llcp_busy(L));
+	/* a connection update instant still ahead: Connection Update vs.
+	 * Connection Parameters Request, 0x23 */
+	fresh();
+	pend_inst[L] = LL_CONN_PENDING_UPDATE;
+	rx_cpr(6, 12, 30, 400, 0, 0);
+	CHECK(cpr_ev.calls == 0 && tx.n == 1 && last_is_rej_ext(0x0F, 0x23));
+	CHECK(!ll_llcp_busy(L));
+	/* a channel map instant ahead: a different procedure, 0x2A */
+	fresh();
+	pend_inst[L] = LL_CONN_PENDING_CHMAP;
+	rx_cpr(6, 12, 30, 400, 0, 0);
+	CHECK(cpr_ev.calls == 0 && tx.n == 1 && last_is_rej_ext(0x0F, 0x2A));
+	pend_inst[L] = LL_CONN_PENDING_CHMAP | LL_CONN_PENDING_UPDATE;
+	rx_cpr(6, 12, 30, 400, 0, 0);
+	CHECK(cpr_ev.calls == 0 && tx.n == 2 && last_is_rej_ext(0x0F, 0x23));
+	pend_inst[L] = 0;
+	rx_cpr(6, 12, 30, 400, 0, 0);
+	CHECK(cpr_ev.calls == 1 && tx.n == 2);
+	/* the PHY Update procedure in progress (our LL_PHY_RSP waits on
+	 * LL_PHY_UPDATE_IND): 0x2A; after the IND a request is fine */
+	fresh();
+	{
+		static const uint8_t req[3] = {0x16, 0x01, 0x01};
+		static const uint8_t ind[5] = {0x18, 0, 0, 0x34, 0x12};
+
+		rx(req, 3);
+		rx_cpr(6, 12, 30, 400, 0, 0);
+		CHECK(cpr_ev.calls == 0 && tx.n == 2 && last_is_rej_ext(0x0F, 0x2A));
+		rx(ind, 5);
+		rx_cpr(6, 12, 30, 400, 0, 0);
+		CHECK(cpr_ev.calls == 1 && tx.n == 2);
+	}
+	/* while the request waits on the host, the central's
+	 * LL_CONNECTION_UPDATE_IND crosses it: applied, the procedure ends, a
+	 * late host answer is refused and sends nothing */
+	fresh();
+	rx_cpr(6, 12, 30, 400, 0, 0);
+	rx(upd, sizeof(upd));
+	CHECK(cn.upd_calls == 1 && !ll_llcp_busy(L) && ll_llcp_timeout_ticks(now) == -1);
+	CHECK(cpr_reply(6, 12, 30, 400) == LL_ST_DISALLOWED);
+	CHECK(ll_llcp_conn_param_neg_reply(L, 0x3B) == LL_ST_DISALLOWED);
+	CHECK(tx.n == 0);
+	/* procedures without an instant are compatible: our LL_PING_REQ or
+	 * LL_LENGTH_REQ waiting does not refuse the request */
+	fresh();
+	CHECK(ll_llcp_set_data_len(L, 100, LL_DLE_TIME_1M(100)) == LL_ST_SUCCESS);
+	t0 = (uint32_t)tx.n;
+	rx_cpr(6, 12, 30, 400, 0, 0);
+	CHECK(cpr_ev.calls == 1 && (uint32_t)tx.n == t0);
+	/* inside the encryption start the central "shall not" start another
+	 * procedure (5.1.3.1): dropped like LL_PING_REQ, the host not asked */
+	fresh();
+	{
+		uint8_t req[23];
+
+		sample_rand();
+		build_enc_req(req);
+		rx(req, sizeof(req));
+		CHECK(tx.n == 1);
+		rx_cpr(6, 12, 30, 400, 0, 0);
+		CHECK(tx.n == 1 && cpr_ev.calls == 0);
+		CHECK(ll_llcp_ltk_reply(L, ltk) == LL_ST_SUCCESS);
+		rx_cpr(6, 12, 30, 400, 0, 0);
+		CHECK(tx.n == 2 && cpr_ev.calls == 0);
+	}
+
+	/* ---- the central refuses our RSP: LL_REJECT_EXT_IND naming 0x10 or
+	 * 0x0F, or LL_UNKNOWN_RSP naming 0x10, ends the procedure ---- */
+	{
+		static const uint8_t ends[][3] = {{0x11, 0x10, 0x3B}, {0x11, 0x0F, 0x3B},
+						  {0x07, 0x10, 0}};
+
+		for (unsigned int i = 0; i < 3; i++) {
+			fresh();
+			rx_cpr(6, 12, 30, 400, 0, 0);
+			CHECK(cpr_reply(6, 12, 30, 400) == LL_ST_SUCCESS);
+			CHECK(ll_llcp_busy(L));
+			rx(ends[i], ends[i][0] == 0x11 ? 3 : 2);
+			CHECK(!ll_llcp_busy(L) && ll_llcp_timeout_ticks(now) == -1);
+			CHECK(tx.n == 1 && cn.end_calls == 0);
+		}
+	}
+	/* ... but not a reject naming another opcode */
+	fresh();
+	rx_cpr(6, 12, 30, 400, 0, 0);
+	CHECK(cpr_reply(6, 12, 30, 400) == LL_ST_SUCCESS);
+	{
+		static const uint8_t rej[3] = {0x11, 0x14, 0x1A};
+		static const uint8_t rej2[3] = {0x11, 0x16, 0x1A};
+		static const uint8_t unk[2] = {0x07, 0x0C};
+
+		rx(rej, 3);
+		rx(rej2, 3);
+		rx(unk, 2);
+		CHECK(ll_llcp_busy(L) && ll_llcp_timeout_ticks(now) == (int32_t)T(TIMEOUT_US));
+	}
+
+	/* ---- procedure response timeout (5.2): no host answer within 40 s,
+	 * or no LL_CONNECTION_UPDATE_IND within 40 s of our RSP: 0x22 ---- */
+	fresh();
+	t0 = now;
+	rx_cpr(6, 12, 30, 400, 0, 0);
+	ll_llcp_tick(t0 + T(TIMEOUT_US) - 1);
+	CHECK(cn.end_calls == 0);
+	ll_llcp_tick(t0 + T(TIMEOUT_US));
+	CHECK(cn.end_calls == 1 && cn.end_reason == LL_ST_LMP_TIMEOUT);
+	CHECK(!ll_llcp_busy(L));
+	CHECK(cpr_reply(6, 12, 30, 400) == LL_ST_DISALLOWED);
+	fresh();
+	t0 = now;
+	rx_cpr(6, 12, 30, 400, 0, 0);
+	now = t0 + T(30000000);
+	CHECK(cpr_reply(6, 12, 30, 400) == LL_ST_SUCCESS);
+	ll_llcp_tick(t0 + T(TIMEOUT_US));
+	CHECK(cn.end_calls == 0);
+	ll_llcp_tick(now + T(TIMEOUT_US) - 1);
+	CHECK(cn.end_calls == 0);
+	ll_llcp_tick(now + T(TIMEOUT_US));
+	CHECK(cn.end_calls == 1 && cn.end_reason == LL_ST_LMP_TIMEOUT);
+
+	/* ---- a full backlog owes the RSP (slice 7), the state moves on ---- */
+	fresh();
+	rx_cpr(6, 12, 30, 400, 0, 0x0007);
+	tx.fail = 1;
+	CHECK(cpr_reply(6, 12, 30, 400) == LL_ST_SUCCESS);
+	CHECK(tx.n == 0 && ll_llcp_busy(L));
+	CHECK(ll_llcp_timeout_ticks(now) == (int32_t)T(LL_LLCP_RETRY_MS * 1000u));
+	ll_llcp_retry(L);
+	CHECK(tx.n == 1 && last_is_cpr_rsp(6, 12, 30, 400, 1, 0x0007));
+	CHECK(ll_llcp_timeout_ticks(now) == (int32_t)T(TIMEOUT_US));
+	/* the masked path owes it the same way */
+	fresh();
+	cpr_ev.masked = true;
+	tx.fail = 1;
+	rx_cpr(6, 12, 30, 400, 0, 0x0007);
+	CHECK(tx.n == 0 && ll_llcp_busy(L));
+	ll_llcp_retry(L);
+	CHECK(tx.n == 1 && last_is_cpr_rsp(6, 12, 30, 400, 1, 0x0007));
+	/* a reject is owed too */
+	fresh();
+	tx.fail = 1;
+	rx_cpr(5, 12, 30, 400, 0, 0);
+	CHECK(tx.n == 0);
+	ll_llcp_retry(L);
+	CHECK(tx.n == 1 && last_is_rej_ext(0x0F, 0x1E));
+
+	/* ---- link checks and reset ---- */
+	fresh();
+	{
+		const struct ll_llcp_cpr p = {6, 12, 30, 400};
+
+		CHECK(ll_llcp_conn_param_reply(LL_MAX_CONN, &p) == LL_ST_UNKNOWN_CONN_ID);
+		CHECK(ll_llcp_conn_param_neg_reply(LL_MAX_CONN, 0x3B) == LL_ST_UNKNOWN_CONN_ID);
+		rx_cpr(6, 12, 30, 400, 0, 0);
+		cn.active = false;
+		CHECK(ll_llcp_conn_param_reply(L, &p) == LL_ST_UNKNOWN_CONN_ID);
+		CHECK(ll_llcp_conn_param_neg_reply(L, 0x3B) == LL_ST_UNKNOWN_CONN_ID);
+		cn.active = true;
+		ll_llcp_reset(L);
+		CHECK(!ll_llcp_busy(L) && ll_llcp_timeout_ticks(now) == -1);
+		CHECK(ll_llcp_conn_param_reply(L, &p) == LL_ST_DISALLOWED);
+		CHECK(tx.n == 0);
+	}
+	CHECK(locks == 0 && tx_locks == 0);
+}
+
+/* N >= 2: the procedure is per link */
+static void test_cpr_per_link(void)
+{
+	const uint8_t a = 0, b = (uint8_t)(LL_MAX_CONN - 1);
+	const struct ll_llcp_cpr p = {6, 12, 30, 400};
+	uint8_t pdu[CPR_LEN];
+	uint32_t t0;
+
+	if (LL_MAX_CONN < 2) {
+		return;
+	}
+	fresh();
+	ll_llcp_reset(b);
+	t0 = now;
+	build_cpr(pdu, 6, 12, 30, 400, 0, 0, 0xFFFF);
+	rx_l(a, pdu, sizeof(pdu));
+	CHECK(cprl[a].calls == 1 && cprl[b].calls == 0);
+	CHECK(ll_llcp_busy(a) && !ll_llcp_busy(b));
+	/* b has no request: its answers are refused, a's stays */
+	CHECK(ll_llcp_conn_param_reply(b, &p) == LL_ST_DISALLOWED);
+	CHECK(ll_llcp_conn_param_neg_reply(b, 0x3B) == LL_ST_DISALLOWED);
+	CHECK(tx.n == 0);
+	/* b's own request, collisions judged per link */
+	pend_inst[a] = LL_CONN_PENDING_UPDATE;
+	rx_l(b, pdu, sizeof(pdu));
+	CHECK(cprl[b].calls == 1 && tx.n == 0);
+	CHECK(ll_llcp_conn_param_neg_reply(b, 0x3B) == LL_ST_SUCCESS);
+	CHECK(tx.n == 1 && tx.p[0].link == b && tx.p[0].d[0] == 0x11);
+	CHECK(ll_llcp_busy(a) && !ll_llcp_busy(b));
+	/* a's timer ends only a */
+	ll_llcp_tick(t0 + T(TIMEOUT_US));
+	CHECK(cnl[a].end_calls == 1 && cnl[b].end_calls == 0);
 	CHECK(locks == 0 && tx_locks == 0);
 }
 
@@ -2628,6 +3105,7 @@ int main(void)
 		push_retry_suite();
 		push_retry_dle_phy();
 		ping_suite();
+		cpr_suite();
 	}
 	L = 0;
 	dle_bounds();
@@ -2638,6 +3116,7 @@ int main(void)
 	test_timeouts_per_link();
 	test_routing_per_link();
 	test_ping_per_link();
+	test_cpr_per_link();
 	CHECK(locks == 0 && tx_locks == 0);
 	DONE();
 }

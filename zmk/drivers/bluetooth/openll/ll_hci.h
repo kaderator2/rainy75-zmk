@@ -68,6 +68,16 @@ struct ll_hci_ops {
 	 * connInterval x (1 + connPeripheralLatency)). Required. */
 	uint8_t (*read_apto)(uint16_t handle, uint16_t *apto);
 	uint8_t (*write_apto)(uint16_t handle, uint16_t apto);
+	/* Slice 6d Task 2: LE Remote Connection Parameter Request Reply /
+	 * Negative Reply (0x2020 / 0x2021, Vol 4 Part E 7.8.31 / 7.8.32),
+	 * handle validated before the call; the Reply's values checked against
+	 * the 7.8.31 ranges, Interval_Min <= Interval_Max, the timeout rule
+	 * (Timeout x 10 ms > (1 + Max_Latency) x Interval_Max x 1.25 ms x 2) and
+	 * Min_CE_Length <= Max_CE_Length; the Negative Reply's reason nonzero.
+	 * ll_llcp_conn_param_reply / _neg_reply. Required. */
+	uint8_t (*conn_param_reply)(uint16_t handle, uint16_t interval_min, uint16_t interval_max,
+				    uint16_t latency, uint16_t timeout);
+	uint8_t (*conn_param_neg_reply)(uint16_t handle, uint8_t reason);
 };
 
 typedef void (*ll_hci_sink_t)(const uint8_t *h4, uint16_t len);
@@ -114,6 +124,12 @@ void ll_hci_evt_phy_update(uint16_t handle, uint8_t status, uint8_t tx_phy, uint
  * handle. Masked by Set Event Mask Page 2 (0x0C63) bit 23, which is 0 after
  * init and Reset (7.3.69), so it is sent only once the host enabled it. */
 void ll_hci_evt_apto_expired(uint16_t handle);
+/* LE Remote Connection Parameter Request (0x3E/0x06, 7.7.65.6), LE event
+ * mask bit 5: handle, Interval_Min, Interval_Max, Max_Latency, Timeout.
+ * Returns true when it was sent, false when masked (the LE Meta bit 61 of
+ * the event mask or LE bit 5; LE bit 5 is 0 by default, 7.8.1). */
+bool ll_hci_evt_conn_param_req(uint16_t handle, uint16_t interval_min, uint16_t interval_max,
+			       uint16_t latency, uint16_t timeout);
 /* Host's Suggested Default Data Length (LE Write Suggested Default Data
  * Length, 27 / 328 after init and Reset): connInitialMaxTx{Octets,Time} for
  * new connections; the glue hands them to ll_llcp_set_data_len() on connect. */

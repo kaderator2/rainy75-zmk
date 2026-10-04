@@ -544,11 +544,34 @@ static void llcp_apto_expired(uint8_t link)
 	}
 }
 
+/* Controller thread: the central's LL_CONNECTION_PARAM_REQ (slice 6d Task
+ * 2). LE Remote Connection Parameter Request goes out only while the host
+ * knows the link and the event is enabled (LE event mask bit 5, which
+ * Zephyr sets because we claim the feature); else ll_llcp accepts the
+ * request as the Link Layer (returns false). */
+static bool llcp_conn_param_req(uint8_t link, const struct ll_llcp_cpr *r)
+{
+	bool sent = false;
+
+	/* logged first: the host may answer before this returns */
+	LOG_INF("LL_CONNECTION_PARAM_REQ (handle %u): interval %u..%u latency %u timeout %u",
+		link, r->interval_min, r->interval_max, r->latency, r->timeout);
+	if (ll_credit_up(link) && !pend_test(link, PEND_DISCONNECTED)) {
+		sent = ll_hci_evt_conn_param_req(link, r->interval_min, r->interval_max, r->latency,
+						 r->timeout);
+	}
+	if (!sent) {
+		LOG_INF("  not indicated to the host: accepted by the LL");
+	}
+	return sent;
+}
+
 static const struct ll_llcp_ops llcp_ops = {
 	.ltk_req = llcp_ltk_req,
 	.enc_change = llcp_enc_change,
 	.data_len_change = llcp_data_len_change,
 	.apto_expired = llcp_apto_expired,
+	.conn_param_req = llcp_conn_param_req,
 };
 
 /* ---- HCI ops ---- */
@@ -697,6 +720,32 @@ static uint8_t hci_write_apto(uint16_t handle, uint16_t apto)
 	return st;
 }
 
+/* Slice 6d Task 2: the host's answer to LE Remote Connection Parameter
+ * Request. HCI thread: LL_CONNECTION_PARAM_RSP / LL_REJECT_EXT_IND may be
+ * owed and the 40 s timer restarts: wake the controller thread (retry,
+ * timer). */
+static uint8_t hci_conn_param_reply(uint16_t handle, uint16_t interval_min,
+				    uint16_t interval_max, uint16_t latency, uint16_t timeout)
+{
+	const struct ll_llcp_cpr p = {interval_min, interval_max, latency, timeout};
+	uint8_t st = ll_llcp_conn_param_reply((uint8_t)handle, &p);
+
+	LOG_INF("conn param reply (handle %u): interval %u..%u latency %u timeout %u, status 0x%02x",
+		handle, interval_min, interval_max, latency, timeout, st);
+	k_sem_give(&wake);
+	return st;
+}
+
+static uint8_t hci_conn_param_neg_reply(uint16_t handle, uint8_t reason)
+{
+	uint8_t st = ll_llcp_conn_param_neg_reply((uint8_t)handle, reason);
+
+	LOG_INF("conn param negative reply (handle %u): reason 0x%02x, status 0x%02x", handle,
+		reason, st);
+	k_sem_give(&wake);
+	return st;
+}
+
 /* 1M only (slice 6b): both directions are always LE 1M */
 static uint8_t hci_read_phy(uint16_t handle, uint8_t *tx_phy, uint8_t *rx_phy)
 {
@@ -750,6 +799,8 @@ static const struct ll_hci_ops hci_ops = {
 	.set_random_addr = ll_adv_set_random_addr,
 	.read_apto = hci_read_apto,
 	.write_apto = hci_write_apto,
+	.conn_param_reply = hci_conn_param_reply,
+	.conn_param_neg_reply = hci_conn_param_neg_reply,
 };
 
 /* ---- controller thread ---- */
@@ -808,7 +859,7 @@ static void handle_connected(uint8_t link)
 	mic_failed[link] = false;
 	atomic_clear_bit(&dle_pend, link);
 	/* the lower bound of the authenticated payload timeout (slice 6d) */
-	ll_llcp_conn_params(link, ci.interval, ci.latency);
+	ll_llcp_conn_params(link, ci.interval, ci.latency, ci.timeout);
 	/* new generation, up, no credit of an earlier connection (ll_credit) */
 	ll_credit_open(link);
 	/* ci (also kept by ll_conn for the link) records the local address
@@ -849,7 +900,7 @@ static void handle_updated(uint8_t link)
 	ll_plat_unlock(key);
 	LOG_INF("connection update (handle %u): interval %u latency %u timeout %u", link,
 		p.interval, p.latency, p.timeout);
-	ll_llcp_conn_params(link, p.interval, p.latency);
+	ll_llcp_conn_params(link, p.interval, p.latency, p.timeout);
 	if (ll_credit_up(link) && !pend_test(link, PEND_DISCONNECTED)) {
 		ll_hci_evt_conn_update(link, &p);
 	}
@@ -866,11 +917,20 @@ static void flush_nocp(uint8_t link)
 	}
 }
 
-/* The LENGTH and PHY requests from the central (rare: once per connection
- * at most, typically): logged so the exchange is visible on the device. */
+/* The LENGTH, PHY and connection update requests from the central (rare:
+ * a few per connection, typically): logged so the exchange is visible on
+ * the device. LL_CONNECTION_PARAM_REQ is logged with its outcome
+ * (llcp_conn_param_req). */
 static void log_llcp_rx(uint8_t link, const uint8_t *d, uint8_t len)
 {
-	if (len == 9 && (d[0] == 0x14 || d[0] == 0x15)) {
+	if (len == 12 && d[0] == 0x00) {
+		LOG_INF("LL_CONNECTION_UPDATE_IND (handle %u): interval %u latency %u timeout %u "
+			"instant %u", link, ll_get_le16(&d[4]), ll_get_le16(&d[6]),
+			ll_get_le16(&d[8]), ll_get_le16(&d[10]));
+	} else if (len == 3 && d[0] == 0x11) {
+		LOG_INF("LL_REJECT_EXT_IND (handle %u): opcode 0x%02x error 0x%02x", link, d[1],
+			d[2]);
+	} else if (len == 9 && (d[0] == 0x14 || d[0] == 0x15)) {
 		LOG_INF("LL_LENGTH_%s (handle %u): rx %u B / %u us, tx %u B / %u us",
 			d[0] == 0x14 ? "REQ" : "RSP", link, ll_get_le16(&d[1]), ll_get_le16(&d[3]),
 			ll_get_le16(&d[5]), ll_get_le16(&d[7]));

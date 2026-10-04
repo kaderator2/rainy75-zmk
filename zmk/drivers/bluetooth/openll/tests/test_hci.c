@@ -91,6 +91,20 @@ static uint8_t write_apto(uint16_t h, uint16_t v)
 	wapto_calls++; got_handle = h; wapto_val = v; return next_status;
 }
 
+/* slice 6d Task 2 */
+static int cpr_calls, cpr_neg_calls;
+static uint16_t cpr_v[4];
+static uint8_t cpr_reason;
+static uint8_t cpr_reply(uint16_t h, uint16_t imin, uint16_t imax, uint16_t lat, uint16_t to)
+{
+	cpr_calls++; got_handle = h; cpr_v[0] = imin; cpr_v[1] = imax; cpr_v[2] = lat;
+	cpr_v[3] = to; return next_status;
+}
+static uint8_t cpr_neg(uint16_t h, uint8_t reason)
+{
+	cpr_neg_calls++; got_handle = h; cpr_reason = reason; return next_status;
+}
+
 static const struct ll_hci_ops ops = {
 	.get_bd_addr = get_addr, .rand = rnd, .reset = reset,
 	.adv_set_params = set_params, .adv_set_data = set_data,
@@ -100,6 +114,7 @@ static const struct ll_hci_ops ops = {
 	.set_data_len = set_data_len, .read_phy = read_phy, .set_phy = set_phy,
 	.set_random_addr = set_random_addr,
 	.read_apto = read_apto, .write_apto = write_apto,
+	.conn_param_reply = cpr_reply, .conn_param_neg_reply = cpr_neg,
 };
 
 static void cmd(uint16_t op, const uint8_t *p, uint8_t plen)
@@ -893,6 +908,13 @@ static void test_init_requires_handle_valid(void)
 	bad = ops;
 	bad.write_apto = NULL;
 	init_must_abort(bad);
+	/* slice 6d Task 2: the Connection Parameter Request replies */
+	bad = ops;
+	bad.conn_param_reply = NULL;
+	init_must_abort(bad);
+	bad = ops;
+	bad.conn_param_neg_reply = NULL;
+	init_must_abort(bad);
 }
 
 /* LE Set Random Address (0x2005, Vol 4 Part E 7.8.4): 6 octets, the
@@ -1084,6 +1106,147 @@ static void test_apto_cmds(void)
 	valid_mask = 0x1;
 }
 
+/* Slice 6d Task 2: LE Remote Connection Parameter Request Reply (0x2020,
+ * 7.8.31: handle, Interval_Min, Interval_Max, Max_Latency, Timeout,
+ * Min_CE_Length, Max_CE_Length; returns status, handle), Negative Reply
+ * (0x2021, 7.8.32: handle, reason; returns status, handle), and the event
+ * (7.7.65.6, LE event mask bit 5). */
+static void cpr_cmd(uint16_t h, uint16_t imin, uint16_t imax, uint16_t lat, uint16_t to,
+		    uint16_t ce_min, uint16_t ce_max, uint8_t plen)
+{
+	uint8_t p[14];
+
+	ll_put_le16(&p[0], h);
+	ll_put_le16(&p[2], imin);
+	ll_put_le16(&p[4], imax);
+	ll_put_le16(&p[6], lat);
+	ll_put_le16(&p[8], to);
+	ll_put_le16(&p[10], ce_min);
+	ll_put_le16(&p[12], ce_max);
+	cmd(0x2020, p, plen);
+}
+
+static void test_cpr_cmds(void)
+{
+	const uint16_t last = LL_MAX_CONN - 1;
+	uint8_t n[3], m[8];
+	int u0 = unknown_calls;
+
+	valid_mask = (1u << LL_MAX_CONN) - 1u;
+	next_status = LL_ST_SUCCESS;
+	cpr_calls = cpr_neg_calls = 0;
+
+	/* Reply: values passed on, Command Complete (status, handle) */
+	cpr_cmd(last, 6, 12, 30, 400, 0, 0, 14);
+	CHECK(is_cc(0x2020, LL_ST_SUCCESS) && evt_len == 9 && ll_get_le16(&evt[7]) == last);
+	CHECK(cpr_calls == 1 && got_handle == last);
+	CHECK(cpr_v[0] == 6 && cpr_v[1] == 12 && cpr_v[2] == 30 && cpr_v[3] == 400);
+	/* the op's status reaches the host (no request pending: 0x0C) */
+	next_status = LL_ST_DISALLOWED;
+	cpr_cmd(last, 6, 12, 30, 400, 0, 0, 14);
+	CHECK(is_cc(0x2020, LL_ST_DISALLOWED) && evt_len == 9 && cpr_calls == 2);
+	next_status = LL_ST_SUCCESS;
+	/* limits valid */
+	cpr_cmd(last, 6, 3200, 0, 3200, 0, 0xFFFF, 14);
+	CHECK(is_cc(0x2020, LL_ST_SUCCESS) && cpr_calls == 3);
+	cpr_cmd(last, 6, 6, 499, 3200, 5, 5, 14);
+	CHECK(is_cc(0x2020, LL_ST_SUCCESS) && cpr_calls == 4);
+	cpr_cmd(last, 6, 12, 30, 94, 0, 0, 14);   /* 940 ms > 2 x 15 ms x 31 */
+	CHECK(is_cc(0x2020, LL_ST_SUCCESS) && cpr_calls == 5);
+	/* out of range: Invalid HCI Command Parameters with the handle, op
+	 * not called */
+	{
+		static const uint16_t bad[][6] = {
+			{5, 12, 0, 400, 0, 0},     /* Interval_Min */
+			{6, 3201, 0, 3200, 0, 0},  /* Interval_Max */
+			{13, 12, 0, 400, 0, 0},    /* Interval_Min > Interval_Max */
+			{6, 12, 500, 3200, 0, 0},  /* Max_Latency */
+			{6, 12, 0, 9, 0, 0},       /* Timeout < 10 */
+			{6, 12, 0, 3201, 0, 0},    /* Timeout > 3200 */
+			{6, 12, 30, 93, 0, 0},     /* 930 ms is not > 930 ms */
+			{6, 12, 0, 400, 2, 1},     /* Min_CE_Length > Max_CE_Length */
+		};
+
+		for (unsigned int i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+			cpr_cmd(last, bad[i][0], bad[i][1], bad[i][2], bad[i][3], bad[i][4],
+				bad[i][5], 14);
+			CHECK(is_cc(0x2020, LL_ST_INVALID_PARAM) && evt_len == 9);
+			CHECK(ll_get_le16(&evt[7]) == last);
+		}
+		CHECK(cpr_calls == 5);
+	}
+	/* unknown handle */
+	cpr_cmd(LL_MAX_CONN, 6, 12, 30, 400, 0, 0, 14);
+	CHECK(is_cc(0x2020, LL_ST_UNKNOWN_CONN_ID) && ll_get_le16(&evt[7]) == LL_MAX_CONN);
+	CHECK(cpr_calls == 5);
+	/* wrong length */
+	cpr_cmd(last, 6, 12, 30, 400, 0, 0, 13);
+	CHECK(is_cc(0x2020, LL_ST_INVALID_PARAM) && evt_len == 7 && cpr_calls == 5);
+
+	/* Negative Reply: the reason passed on (0x3B, or Zephyr's 0x1E) */
+	ll_put_le16(n, last);
+	n[2] = 0x3B;
+	cmd(0x2021, n, 3);
+	CHECK(is_cc(0x2021, LL_ST_SUCCESS) && evt_len == 9 && ll_get_le16(&evt[7]) == last);
+	CHECK(cpr_neg_calls == 1 && got_handle == last && cpr_reason == 0x3B);
+	n[2] = 0x1E;
+	next_status = LL_ST_DISALLOWED;
+	cmd(0x2021, n, 3);
+	CHECK(is_cc(0x2021, LL_ST_DISALLOWED) && cpr_neg_calls == 2 && cpr_reason == 0x1E);
+	next_status = LL_ST_SUCCESS;
+	/* reason 0 is no error code */
+	n[2] = 0x00;
+	cmd(0x2021, n, 3);
+	CHECK(is_cc(0x2021, LL_ST_INVALID_PARAM) && evt_len == 9 && cpr_neg_calls == 2);
+	n[2] = 0x3B;
+	ll_put_le16(n, LL_MAX_CONN);
+	cmd(0x2021, n, 3);
+	CHECK(is_cc(0x2021, LL_ST_UNKNOWN_CONN_ID) && cpr_neg_calls == 2);
+	ll_put_le16(n, last);
+	cmd(0x2021, n, 2);
+	CHECK(is_cc(0x2021, LL_ST_INVALID_PARAM) && evt_len == 7 && cpr_neg_calls == 2);
+	CHECK(unknown_calls == u0);
+
+	/* the event: masked by default (LE event mask 0x1F, 7.8.1) */
+	cmd(0x0C03, NULL, 0);
+	evt_len = 0;
+	CHECK(!ll_hci_evt_conn_param_req(last, 6, 12, 30, 400));
+	CHECK(evt_len == 0);
+	/* LE bit 5 set, and LE Meta (page 1 bit 61, off by default) */
+	memset(m, 0, 8);
+	m[0] = 0x20;
+	cmd(0x2001, m, 8);
+	evt_len = 0;
+	CHECK(!ll_hci_evt_conn_param_req(last, 6, 12, 30, 400) && evt_len == 0);
+	memset(m, 0xFF, 8);
+	cmd(0x0C01, m, 8);
+	evt_len = 0;
+	CHECK(ll_hci_evt_conn_param_req(last, 6, 0x0C80, 499, 0x0C80));
+	{
+		const uint8_t e[] = {0x04, 0x3E, 11, 0x06, (uint8_t)last, 0x00, 0x06, 0x00,
+				     0x80, 0x0C, 0xF3, 0x01, 0x80, 0x0C};
+
+		CHECK(evt_len == sizeof(e) && memcmp(evt, e, sizeof(e)) == 0);
+	}
+	/* other LE bits do not enable it */
+	memset(m, 0xFF, 8);
+	m[0] = 0xDF;
+	cmd(0x2001, m, 8);
+	evt_len = 0;
+	CHECK(!ll_hci_evt_conn_param_req(last, 6, 12, 30, 400) && evt_len == 0);
+	/* LE Meta off in page 1: not sent either */
+	memset(m, 0xFF, 8);
+	cmd(0x2001, m, 8);
+	m[7] = 0xDF;
+	cmd(0x0C01, m, 8);
+	evt_len = 0;
+	CHECK(!ll_hci_evt_conn_param_req(last, 6, 12, 30, 400) && evt_len == 0);
+	all_events_on();
+	evt_len = 0;
+	CHECK(ll_hci_evt_conn_param_req(0, 6, 12, 30, 400) && evt_len == 14);
+	valid_mask = 0x1;
+}
+
 int main(void)
 {
 	test_init_requires_handle_valid();
@@ -1143,7 +1306,8 @@ int main(void)
 	CHECK(evt[7 + 35] & 0x10);         /* LE Read PHY */
 	CHECK(evt[7 + 35] & 0x20);         /* LE Set Default PHY */
 	CHECK(evt[7 + 35] & 0x40);         /* LE Set PHY */
-	CHECK(!(evt[7 + 33] & 0x30));      /* no Connection Parameter Request replies */
+	CHECK(evt[7 + 33] & 0x10);         /* LE Remote Conn Param Request Reply (slice 6d) */
+	CHECK(evt[7 + 33] & 0x20);         /* ... Negative Reply */
 	CHECK(!(evt[7 + 35] & 0x87));      /* no resolving-list / RPA commands */
 	CHECK(evt[7 + 25] & 0x10);         /* LE Set Random Address (slice 6c) */
 	CHECK(!(evt[7 + 34] & 0xF8));      /* no resolving list (Add .. Read Peer/Local RPA) */
@@ -1164,8 +1328,9 @@ int main(void)
 	CHECK(is_cc(0x2003, LL_ST_SUCCESS));
 	CHECK(evt_len == 7 + 8);
 	/* + bit 5 LE Data Packet Length Extension (slice 6b Task 3); no 2M (bit 8) */
-	/* + bit 4 LE Ping (slice 6d) */
-	CHECK(evt[7] == LL_FEATURES_LOW && evt[7] == 0x35);
+	/* + bit 4 LE Ping (slice 6d), bit 1 Connection Parameters Request
+	 * procedure (slice 6d Task 2) */
+	CHECK(evt[7] == LL_FEATURES_LOW && evt[7] == 0x37);
 	CHECK(!(evt[8] & 0x01));
 	/* byte 1: bit 14 Channel Selection Algorithm #2 (Vol 6 Part B 4.6) */
 	CHECK(evt[8] == LL_FEATURES_BYTE1 && evt[8] == 0x40);
@@ -1251,6 +1416,7 @@ int main(void)
 	test_set_random_addr();
 	test_host_ncp();
 	test_apto_cmds();
+	test_cpr_cmds();
 
 	DONE();
 }

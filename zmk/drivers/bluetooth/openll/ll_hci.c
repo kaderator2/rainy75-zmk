@@ -32,6 +32,8 @@
 #define OP_LE_RAND               OP(0x08, 0x0018)
 #define OP_LE_LTK_REPLY          OP(0x08, 0x001A)
 #define OP_LE_LTK_NEG_REPLY      OP(0x08, 0x001B)
+#define OP_LE_CPR_REPLY          OP(0x08, 0x0020)
+#define OP_LE_CPR_NEG_REPLY      OP(0x08, 0x0021)
 #define OP_LE_SET_DATA_LEN       OP(0x08, 0x0022)
 #define OP_LE_READ_DEF_DATA_LEN  OP(0x08, 0x0023)
 #define OP_LE_WRITE_DEF_DATA_LEN OP(0x08, 0x0024)
@@ -51,6 +53,7 @@
 #define SUBEVT_CONN_COMPLETE     0x01
 #define SUBEVT_CONN_UPDATE       0x03
 #define SUBEVT_LTK_REQ           0x05
+#define SUBEVT_CONN_PARAM_REQ    0x06
 #define SUBEVT_DATA_LEN_CHANGE   0x07
 #define SUBEVT_PHY_UPDATE        0x0C
 #define SUBEVT_CHAN_SEL_ALGO     0x14
@@ -92,6 +95,8 @@ static const uint8_t supported_cmds[][2] = {
 	{28, 2}, /* LE Long Term Key Request Negative Reply */
 	{32, 4}, /* Read Authenticated Payload Timeout (slice 6d) */
 	{32, 5}, /* Write Authenticated Payload Timeout (slice 6d) */
+	{33, 4}, /* LE Remote Connection Parameter Request Reply (slice 6d) */
+	{33, 5}, /* LE Remote Connection Parameter Request Negative Reply (slice 6d) */
 	{33, 6}, /* LE Set Data Length */
 	{33, 7}, /* LE Read Suggested Default Data Length */
 	{34, 0}, /* LE Write Suggested Default Data Length */
@@ -143,6 +148,7 @@ void ll_hci_init(const struct ll_hci_ops *ops, ll_hci_sink_t sink)
 	assert(ops->set_data_len != NULL && ops->read_phy != NULL && ops->set_phy != NULL);
 	assert(ops->set_random_addr != NULL);
 	assert(ops->read_apto != NULL && ops->write_apto != NULL);
+	assert(ops->conn_param_reply != NULL && ops->conn_param_neg_reply != NULL);
 	hci_ops = ops;
 	hci_sink = sink;
 	masks_default();
@@ -286,6 +292,55 @@ static void auth_payload_to(uint16_t op, const uint8_t *p, uint8_t plen)
 		ll_put_le16(&ret[3], ret[0] == LL_ST_SUCCESS ? v : 0);
 		cmd_complete(op, ret, 5);
 	}
+}
+
+/* Connection parameter ranges of the Reply (7.8.31) */
+#define HCI_CONN_INTERVAL_MIN    0x0006
+#define HCI_CONN_INTERVAL_MAX    0x0C80
+#define HCI_CONN_LATENCY_MAX     0x01F3
+#define HCI_SUP_TIMEOUT_MIN      0x000A
+#define HCI_SUP_TIMEOUT_MAX      0x0C80
+
+/* LE Remote Connection Parameter Request Reply (7.8.31) / Negative Reply
+ * (7.8.32): Command Complete (status, handle). The values are checked
+ * before the handle, as in LE Set Data Length. Timeout x 10 ms > (1 +
+ * Max_Latency) x Interval_Max x 1.25 ms x 2 (no subrating) is Timeout x 4 >
+ * (1 + Max_Latency) x Interval_Max. The Negative Reply's Reason is passed
+ * on as the LL_REJECT_EXT_IND ErrorCode: 7.8.32 lists 0x3B only, Zephyr
+ * sends 0x1E; 0x00 (no error) is refused. */
+static void conn_param_reply(uint16_t op, const uint8_t *p, uint8_t plen)
+{
+	uint8_t ret[3];
+	uint16_t h;
+
+	if (plen != (op == OP_LE_CPR_REPLY ? 14 : 3)) {
+		status_only(op, LL_ST_INVALID_PARAM);
+		return;
+	}
+	h = ll_get_le16(p);
+	memcpy(&ret[1], p, 2);
+	if (op == OP_LE_CPR_REPLY) {
+		uint16_t imin = ll_get_le16(&p[2]), imax = ll_get_le16(&p[4]);
+		uint16_t lat = ll_get_le16(&p[6]), to = ll_get_le16(&p[8]);
+
+		if (imin < HCI_CONN_INTERVAL_MIN || imax > HCI_CONN_INTERVAL_MAX || imin > imax ||
+		    lat > HCI_CONN_LATENCY_MAX || to < HCI_SUP_TIMEOUT_MIN ||
+		    to > HCI_SUP_TIMEOUT_MAX || (uint32_t)to * 4u <= (1u + lat) * (uint32_t)imax ||
+		    ll_get_le16(&p[10]) > ll_get_le16(&p[12])) {
+			ret[0] = LL_ST_INVALID_PARAM;
+		} else if (!hci_ops->handle_valid(h)) {
+			ret[0] = LL_ST_UNKNOWN_CONN_ID;
+		} else {
+			ret[0] = hci_ops->conn_param_reply(h, imin, imax, lat, to);
+		}
+	} else if (p[2] == 0) {
+		ret[0] = LL_ST_INVALID_PARAM;
+	} else if (!hci_ops->handle_valid(h)) {
+		ret[0] = LL_ST_UNKNOWN_CONN_ID;
+	} else {
+		ret[0] = hci_ops->conn_param_neg_reply(h, p[2]);
+	}
+	cmd_complete(op, ret, 3);
 }
 
 /* LE Read PHY: Command Complete (status, handle, TX_PHY, RX_PHY) */
@@ -454,6 +509,10 @@ void ll_hci_cmd(const uint8_t *cmd, uint16_t len)
 	case OP_LE_LTK_NEG_REPLY:
 		ltk_reply(op, p, plen);
 		break;
+	case OP_LE_CPR_REPLY:
+	case OP_LE_CPR_NEG_REPLY:
+		conn_param_reply(op, p, plen);
+		break;
 	case OP_READ_LOCAL_VERSION:
 		ret[1] = LL_HCI_VERSION;
 		ll_put_le16(&ret[2], 0);
@@ -591,13 +650,14 @@ static void send_evt(uint8_t code, const uint8_t *params, uint8_t plen)
 	hci_sink(evt, (uint16_t)(3 + plen));
 }
 
-/* params[0] = subevent code */
-static void send_le_evt(const uint8_t *params, uint8_t plen)
+/* params[0] = subevent code; false when masked */
+static bool send_le_evt(const uint8_t *params, uint8_t plen)
 {
 	if (!(event_mask & MASK_LE_META) || !(le_event_mask & (1ULL << (params[0] - 1)))) {
-		return;
+		return false;
 	}
 	send_evt(EVT_LE_META, params, plen);
+	return true;
 }
 
 void ll_hci_evt_conn_complete(uint16_t handle, const struct ll_connect_ind *ci)
@@ -652,6 +712,20 @@ void ll_hci_evt_ltk_req(uint16_t handle, const uint8_t rand[8], uint16_t ediv)
 	memcpy(&p[3], rand, 8);
 	ll_put_le16(&p[11], ediv);
 	send_le_evt(p, sizeof(p));
+}
+
+bool ll_hci_evt_conn_param_req(uint16_t handle, uint16_t interval_min, uint16_t interval_max,
+			       uint16_t latency, uint16_t timeout)
+{
+	uint8_t p[11];
+
+	p[0] = SUBEVT_CONN_PARAM_REQ;
+	ll_put_le16(&p[1], handle);
+	ll_put_le16(&p[3], interval_min);
+	ll_put_le16(&p[5], interval_max);
+	ll_put_le16(&p[7], latency);
+	ll_put_le16(&p[9], timeout);
+	return send_le_evt(p, sizeof(p));   /* LE event mask bit 5 */
 }
 
 void ll_hci_evt_enc_change(uint16_t handle, uint8_t status, bool enabled)
@@ -799,3 +873,4 @@ uint8_t ll_hci_acl_fragment(const struct ll_hci_acl_pdu *in, uint8_t frag_max,
 	}
 	return n;
 }
+

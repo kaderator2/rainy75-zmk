@@ -42,6 +42,9 @@ _Static_assert(LL_MAX_CONN >= 1 && LL_MAX_CONN <= 5, "LL_MAX_CONN must be 1..5")
 #define LL_ST_INVALID_LL_PARAM 0x1E
 #define LL_ST_UNSPECIFIED     0x1F
 #define LL_ST_INSTANT_PASSED  0x28
+#define LL_ST_LL_PROC_COLLISION 0x23   /* LMP Error Transaction Collision / LL Procedure Collision */
+#define LL_ST_DIFF_TRANS_COLLISION 0x2A /* Different Transaction Collision */
+#define LL_ST_UNACCEPT_CONN_PARAM 0x3B  /* Unacceptable Connection Parameters */
 #define LL_ST_MIC_FAILURE     0x3D
 #define LL_ST_CONN_FAIL_EST   0x3E
 
@@ -72,10 +75,12 @@ _Static_assert(LL_MAX_CONN >= 1 && LL_MAX_CONN <= 5, "LL_MAX_CONN must be 1..5")
 /* LL feature set (Vol 6 Part B 4.6), bytes 0 and 1; bytes 2..7 are 0.
  * Used by LL_FEATURE_RSP and HCI LE Read Local Supported Features. */
 #define LL_FEAT_LE_ENC        0x01   /* bit 0: LE Encryption */
+#define LL_FEAT_CONN_PARAM_REQ 0x02  /* bit 1: Connection Parameters Request procedure (slice 6d Task 2) */
 #define LL_FEAT_EXT_REJ_IND   0x04   /* bit 2: Extended Reject Indication */
 #define LL_FEAT_LE_PING       0x10   /* bit 4: LE Ping (slice 6d; "O" to the peer, Table 4.7) */
 #define LL_FEAT_DLE           0x20   /* bit 5: LE Data Packet Length Extension */
-#define LL_FEATURES_LOW       (LL_FEAT_LE_ENC | LL_FEAT_EXT_REJ_IND | LL_FEAT_LE_PING | LL_FEAT_DLE)
+#define LL_FEATURES_LOW       (LL_FEAT_LE_ENC | LL_FEAT_CONN_PARAM_REQ | LL_FEAT_EXT_REJ_IND | \
+			       LL_FEAT_LE_PING | LL_FEAT_DLE)
 /* byte 1 of the feature set (LL_FEATURE_RSP sends our own byte 1, HCI LE
  * Read Local Supported Features reports it) */
 #define LL_FEAT1_CSA2         0x40   /* bit 14: Channel Selection Algorithm #2 */

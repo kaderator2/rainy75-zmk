@@ -77,6 +77,7 @@
 #define OP_PAUSE_ENC_RSP     0x0B
 #define OP_VERSION_IND       0x0C
 #define OP_REJECT_IND        0x0D
+#define OP_CONN_PARAM_REQ    0x0F
 #define OP_CONN_PARAM_RSP    0x10
 #define OP_REJECT_EXT_IND    0x11
 #define OP_PING_REQ          0x12
@@ -104,21 +105,23 @@
 #define LEN_PHY_REQ          3
 #define LEN_PHY_UPDATE_IND   5
 #define LEN_PING             1    /* LL_PING_REQ / LL_PING_RSP: no CtrData (2.4.2.19/20) */
+#define LEN_CONN_PARAM       24   /* LL_CONNECTION_PARAM_REQ / _RSP (2.4.2.16/17) */
 
 #define RSP_TIMEOUT_TICKS    (40000000u * LL_TICKS_PER_US)
 #define RETRY_TICKS          (LL_LLCP_RETRY_MS * 1000u * LL_TICKS_PER_US)
-#define OWE_PDU_MAX          16   /* >= every control PDU we send (assert below) */
+#define OWE_PDU_MAX          24   /* >= every control PDU we send (assert below) */
 /* authenticatedPayloadTO unit (10 ms) in ticks, and the longest stretch the
  * timer is measured across before it is folded into apto_carry (the 32-bit
  * stimer wraps after 268 s, the timeout reaches 655.35 s) */
 #define APTO_UNIT_TICKS      (10000u * LL_TICKS_PER_US)
 #define APTO_FOLD_TICKS      (1u << 30)
-/* The control PDUs we send (owed copies are kept whole): LL_ENC_RSP (13)
- * is the longest, then LL_LENGTH_REQ/_RSP and LL_FEATURE_RSP (9),
- * LL_VERSION_IND (6), LL_REJECT_EXT_IND / LL_PHY_RSP (3), LL_UNKNOWN_RSP /
+/* The control PDUs we send (owed copies are kept whole):
+ * LL_CONNECTION_PARAM_RSP (24, slice 6d Task 2) is the longest, then
+ * LL_ENC_RSP (13), LL_LENGTH_REQ/_RSP and LL_FEATURE_RSP (9), LL_VERSION_IND (6), LL_REJECT_EXT_IND / LL_PHY_RSP (3), LL_UNKNOWN_RSP /
  * LL_REJECT_IND / LL_TERMINATE_IND (2), LL_START_ENC_REQ/_RSP and
  * LL_PING_REQ/_RSP (1). */
-_Static_assert(OWE_PDU_MAX >= LEN_ENC_RSP && OWE_PDU_MAX >= LEN_LENGTH &&
+_Static_assert(OWE_PDU_MAX >= LEN_CONN_PARAM && OWE_PDU_MAX >= LEN_ENC_RSP &&
+	       OWE_PDU_MAX >= LEN_LENGTH &&
 	       OWE_PDU_MAX >= LEN_FEATURE_RSP && OWE_PDU_MAX >= LEN_VERSION_IND,
 	       "OWE_PDU_MAX must hold every control PDU we send");
 
@@ -128,6 +131,8 @@ enum {
 	TMR_DLE,   /* our LL_LENGTH_REQ: waits on LL_LENGTH_RSP */
 	TMR_PHY,   /* our LL_PHY_RSP: waits on LL_PHY_UPDATE_IND */
 	TMR_PING,  /* our LL_PING_REQ: waits on LL_PING_RSP (slice 6d) */
+	TMR_CPR,   /* the central's LL_CONNECTION_PARAM_REQ: waits on the host, then on
+		    * LL_CONNECTION_UPDATE_IND (slice 6d Task 2) */
 	TMR_N,
 };
 
@@ -135,6 +140,13 @@ enum {
 enum owe_post {
 	POST_NONE,
 	POST_ENC_DONE,   /* our LL_START_ENC_RSP: the encryption start is complete */
+};
+
+/* Connection Parameters Request procedure, responder (slice 6d Task 2) */
+enum cpr_state {
+	CPR_IDLE,
+	CPR_WAIT_HOST,   /* LE Remote Connection Parameter Request at the host */
+	CPR_WAIT_IND,    /* our LL_CONNECTION_PARAM_RSP queued (or owed) */
 };
 
 enum enc_state {
@@ -177,10 +189,15 @@ static struct llcp_link {
 	 * TLE_Authenticated_Payload (5.4): elapsed = apto_carry + (now -
 	 * apto_mark), running while apto_on (the link encrypts) */
 	uint16_t apto;
-	uint16_t conn_interval, conn_latency;
+	uint16_t conn_interval, conn_latency, conn_timeout;
 	bool apto_on;
 	uint32_t apto_mark;
 	uint64_t apto_carry;
+	/* Connection Parameters Request (slice 6d Task 2): state, the
+	 * central's PreferredPeriodicity and ReferenceConnEventCount */
+	uint8_t cpr;          /* enum cpr_state */
+	uint8_t cpr_pp;
+	uint16_t cpr_ref;
 } links[LL_MAX_CONN];
 
 /* The link's TX limit (ll_dle_tx_limit). Caller holds ll_plat_tx_lock(). */
@@ -563,6 +580,190 @@ static void rx_length_rsp(uint8_t link, const uint8_t *p)
 	}
 }
 
+/* ---- Connection Parameters Request (5.1.7), responder ----
+ *
+ * LL_CONNECTION_PARAM_REQ from the central:
+ *  - inside the encryption start: dropped (5.1.3.1, as LL_PING_REQ);
+ *  - collisions (5.3; the central "shall not" start a procedure with an
+ *    instant while one is in progress): LL_REJECT_EXT_IND with 0x23 (LL
+ *    Procedure Collision) when it is the same procedure (an earlier request
+ *    still waits on the host or on the central's LL_CONNECTION_UPDATE_IND)
+ *    or a connection update instant
+ *    is ahead ("procedure A is the Connection Update procedure and procedure
+ *    B is the Connection Parameters Request procedure"), 0x2A (Different
+ *    Transaction Collision) when a channel map instant is ahead or the PHY
+ *    Update procedure runs (our LL_PHY_RSP waits on LL_PHY_UPDATE_IND). We
+ *    start no procedure with an instant ourselves, so the "own procedure
+ *    pending" case of 5.3 cannot occur; LENGTH and Ping have no instant and
+ *    are compatible;
+ *  - a field out of its valid range (2.4.2.16: Interval_Min/Max 6..3200,
+ *    Min <= Max, Latency <= 499, Timeout 10..3200 and Timeout > 2 x
+ *    Interval_Max x (Latency + 1) in ms): LL_REJECT_EXT_IND 0x1E.
+ *    PreferredPeriodicity and the offsets are hints we do not use: not
+ *    checked;
+ *  - only the anchor points move (Interval_Min == Interval_Max == the
+ *    connInterval, same latency and timeout): not indicated to the host
+ *    (5.1.7.2), LL_CONNECTION_PARAM_RSP at once;
+ *  - else LE Remote Connection Parameter Request to the host; when it is
+ *    masked (or the host does not know the link) the request is not
+ *    indicated and the Link Layer accepts it with the central's values (the
+ *    host gave us no ranges, 5.1.7.2 "proceed as if the Host has
+ *    accepted"). Reply -> LL_CONNECTION_PARAM_RSP with the host's values;
+ *    Negative Reply -> LL_REJECT_EXT_IND with the host's reason.
+ * Our RSP (2.4.2.17, filled as 5.1.7.1 says for the request): the values,
+ * PreferredPeriodicity = the central's when 1..Interval_Max, else 1 when
+ * the interval is a range (it "shall" be nonzero then; 1 = any multiple
+ * of 1.25 ms) or 0, ReferenceConnEventCount = the central's, Offset0..5 =
+ * 0xFFFF (no preference). The central answers LL_CONNECTION_UPDATE_IND
+ * (ll_conn applies it at the instant) or LL_REJECT_EXT_IND; both end the
+ * procedure. The 40 s response timer (5.2) runs from the request until
+ * then and restarts with our RSP; ll_llcp_busy() is true meanwhile. */
+
+/* LL_REJECT_EXT_IND: a central that uses this procedure supports Extended
+ * Reject Indication (4.6.2), so no LL_REJECT_IND fallback. Caller holds
+ * ll_plat_tx_lock(). */
+static void reject_ext_locked(uint8_t link, uint8_t op, uint8_t err)
+{
+	const uint8_t pdu[LEN_REJECT_EXT_IND] = {OP_REJECT_EXT_IND, op, err};
+
+	(void)ctrl_send_locked(link, pdu, sizeof(pdu), POST_NONE);
+}
+
+static bool cpr_valid(const struct ll_llcp_cpr *r)
+{
+	return r->interval_min >= 6 && r->interval_max <= 3200 &&
+	       r->interval_min <= r->interval_max && r->latency <= 499 && r->timeout >= 10 &&
+	       r->timeout <= 3200 &&
+	       (uint32_t)r->timeout * 4u > (1u + r->latency) * (uint32_t)r->interval_max;
+}
+
+/* Queue (or owe) our LL_CONNECTION_PARAM_RSP; the procedure then waits on
+ * the central. A full owed queue drops the PDU: the response timer ends
+ * the link then. Caller holds ll_plat_tx_lock(). */
+static void cpr_rsp_locked(uint8_t link, const struct ll_llcp_cpr *v)
+{
+	struct llcp_link *s = &links[link];
+	uint8_t pdu[LEN_CONN_PARAM];
+	uint8_t pp = s->cpr_pp;
+
+	if (pp == 0 || pp > v->interval_max) {
+		pp = v->interval_min != v->interval_max ? 1 : 0;
+	}
+	pdu[0] = OP_CONN_PARAM_RSP;
+	ll_put_le16(&pdu[1], v->interval_min);
+	ll_put_le16(&pdu[3], v->interval_max);
+	ll_put_le16(&pdu[5], v->latency);
+	ll_put_le16(&pdu[7], v->timeout);
+	pdu[9] = pp;
+	ll_put_le16(&pdu[10], s->cpr_ref);
+	memset(&pdu[12], 0xFF, 12);   /* Offset0..5: not valid */
+	(void)ctrl_send_locked(link, pdu, sizeof(pdu), POST_NONE);
+	s->cpr = CPR_WAIT_IND;
+	timer_start(s, TMR_CPR);
+}
+
+static void cpr_end(uint8_t link)
+{
+	struct llcp_link *s = &links[link];
+
+	ll_plat_tx_lock();
+	s->cpr = CPR_IDLE;
+	s->tmr_on[TMR_CPR] = false;
+	ll_plat_tx_unlock();
+}
+
+static void rx_conn_param_req(uint8_t link, const uint8_t *p)
+{
+	struct llcp_link *s = &links[link];
+	const struct ll_llcp_cpr r = {
+		.interval_min = ll_get_le16(&p[1]),
+		.interval_max = ll_get_le16(&p[3]),
+		.latency = ll_get_le16(&p[5]),
+		.timeout = ll_get_le16(&p[7]),
+	};
+	uint8_t inst, err = 0;
+	bool indicate = false;
+
+	ll_plat_tx_lock();
+	if (s->enc != ENC_IDLE) {
+		ll_plat_tx_unlock();
+		return;
+	}
+	inst = ll_conn_pending_instants(link);
+	if (s->cpr != CPR_IDLE || (inst & LL_CONN_PENDING_UPDATE)) {
+		err = LL_ST_LL_PROC_COLLISION;
+	} else if ((inst & LL_CONN_PENDING_CHMAP) || s->tmr_on[TMR_PHY]) {
+		err = LL_ST_DIFF_TRANS_COLLISION;
+	} else if (!cpr_valid(&r)) {
+		err = LL_ST_INVALID_LL_PARAM;
+	}
+	if (err != 0) {
+		reject_ext_locked(link, OP_CONN_PARAM_REQ, err);
+	} else {
+		s->cpr_pp = p[9];
+		s->cpr_ref = ll_get_le16(&p[10]);
+		if (r.interval_min == r.interval_max && r.interval_min == s->conn_interval &&
+		    r.latency == s->conn_latency && r.timeout == s->conn_timeout) {
+			cpr_rsp_locked(link, &r);   /* anchor points only */
+		} else {
+			s->cpr = CPR_WAIT_HOST;
+			timer_start(s, TMR_CPR);
+			indicate = true;
+		}
+	}
+	ll_plat_tx_unlock();
+	if (!indicate) {
+		return;
+	}
+	if (!ops.conn_param_req || !ops.conn_param_req(link, &r)) {
+		/* not indicated: the Link Layer accepts */
+		ll_plat_tx_lock();
+		if (s->cpr == CPR_WAIT_HOST) {
+			cpr_rsp_locked(link, &r);
+		}
+		ll_plat_tx_unlock();
+	}
+}
+
+uint8_t ll_llcp_conn_param_reply(uint8_t link, const struct ll_llcp_cpr *p)
+{
+	struct llcp_link *s;
+	uint8_t st = LL_ST_DISALLOWED;
+
+	if (link >= LL_MAX_CONN || !ll_conn_active(link)) {
+		return LL_ST_UNKNOWN_CONN_ID;
+	}
+	s = &links[link];
+	ll_plat_tx_lock();
+	if (s->cpr == CPR_WAIT_HOST) {
+		cpr_rsp_locked(link, p);
+		st = LL_ST_SUCCESS;
+	}
+	ll_plat_tx_unlock();
+	return st;
+}
+
+uint8_t ll_llcp_conn_param_neg_reply(uint8_t link, uint8_t reason)
+{
+	struct llcp_link *s;
+	uint8_t st = LL_ST_DISALLOWED;
+
+	if (link >= LL_MAX_CONN || !ll_conn_active(link)) {
+		return LL_ST_UNKNOWN_CONN_ID;
+	}
+	s = &links[link];
+	ll_plat_tx_lock();
+	if (s->cpr == CPR_WAIT_HOST) {
+		/* complete once the reject is queued (5.1.7.2: on its ack) */
+		s->cpr = CPR_IDLE;
+		s->tmr_on[TMR_CPR] = false;
+		reject_ext_locked(link, OP_CONN_PARAM_REQ, reason);
+		st = LL_ST_SUCCESS;
+	}
+	ll_plat_tx_unlock();
+	return st;
+}
+
 /* ---- LE Ping (5.1.8) ---- */
 
 /* Responder: at any time in the connection (5.1.8), encrypted like every
@@ -602,6 +803,16 @@ static void rx_proc_refused(uint8_t link, uint8_t op, bool unknown)
 		/* the procedure may be used even if the peer lacks it (5.1.8):
 		 * this answer carries a MIC too, so it is complete */
 		ping_done(link);
+		return;
+	}
+	if (op == OP_CONN_PARAM_REQ || op == OP_CONN_PARAM_RSP) {
+		/* the central refuses our LL_CONNECTION_PARAM_RSP (5.1.7.2) */
+		ll_plat_tx_lock();
+		if (s->cpr == CPR_WAIT_IND) {
+			s->cpr = CPR_IDLE;
+			s->tmr_on[TMR_CPR] = false;
+		}
+		ll_plat_tx_unlock();
 		return;
 	}
 	if (op != OP_LENGTH_REQ) {
@@ -868,6 +1079,12 @@ static void rx_conn_update(uint8_t link, const uint8_t *p)
 		.latency = ll_get_le16(&p[6]),
 		.timeout = ll_get_le16(&p[8]),
 	};
+
+	/* the central's answer to our LL_CONNECTION_PARAM_RSP, or its own
+	 * update crossing a request that still waits on the host: either way
+	 * the Connection Parameters Request procedure ends here (the instant
+	 * belongs to ll_conn; Connection Update has no response timer, 5.2) */
+	cpr_end(link);
 	instant_result(link, ll_conn_update_at(link, ll_get_le16(&p[10]), p[1],
 						 ll_get_le16(&p[2]), &cp));
 }
@@ -903,6 +1120,7 @@ static uint8_t expected_len(uint8_t op)
 	case OP_PHY_REQ:         return LEN_PHY_REQ;
 	case OP_PHY_UPDATE_IND:  return LEN_PHY_UPDATE_IND;
 	case OP_PING_REQ:        return LEN_PING;
+	case OP_CONN_PARAM_REQ:  return LEN_CONN_PARAM;
 	default:                 return 0;
 	}
 }
@@ -1003,6 +1221,9 @@ void ll_llcp_rx(uint8_t link, const uint8_t *payload, uint8_t len)
 		break;
 	case OP_PING_REQ:
 		rx_ping_req(link);
+		break;
+	case OP_CONN_PARAM_REQ:
+		rx_conn_param_req(link, payload);
 		break;
 	default:
 		break;
@@ -1209,6 +1430,7 @@ void ll_llcp_tick(uint32_t now_tick)
 			s->dle_want = false;
 			s->owe_n = 0;
 			s->apto_on = false;
+			s->cpr = CPR_IDLE;
 		}
 		apto_fired[i] = !expired[i] && apto_check_locked(i, now_tick);
 	}
@@ -1347,7 +1569,7 @@ void ll_llcp_rx_auth(uint8_t link)
 	ll_plat_tx_unlock();
 }
 
-void ll_llcp_conn_params(uint8_t link, uint16_t interval, uint16_t latency)
+void ll_llcp_conn_params(uint8_t link, uint16_t interval, uint16_t latency, uint16_t timeout)
 {
 	struct llcp_link *s;
 	uint16_t m;
@@ -1360,6 +1582,7 @@ void ll_llcp_conn_params(uint8_t link, uint16_t interval, uint16_t latency)
 	ll_plat_tx_lock();
 	s->conn_interval = interval;
 	s->conn_latency = latency;
+	s->conn_timeout = timeout;
 	/* keep authenticatedPayloadTO >= connInterval x (1 + latency) */
 	if (s->apto < m) {
 		s->apto = m;
@@ -1404,3 +1627,4 @@ uint8_t ll_llcp_write_apto(uint8_t link, uint16_t apto)
 	ll_plat_tx_unlock();
 	return st;
 }
+

@@ -3153,6 +3153,71 @@ static void test_dle_shrink_queued(void)
 	ll_conn_end(0, LL_ST_REMOTE_TERM);
 }
 
+/* Slice 6d Task 2: ll_conn_pending_instants() (procedure collisions of the
+ * Connection Parameters Request responder) follows the instants until
+ * they are applied; a map instant applied to the planned listen of a skip
+ * window counts until that window is left. */
+static void test_pending_instants(void)
+{
+	struct ll_connect_ind ci = mk_ci(12, 400, 1, 1, 0);
+	struct ll_conn_params np = {.interval = 12, .latency = 0, .timeout = 400};
+	struct ll_csa1 ref;
+	uint32_t a = 4000000 + T(1250 + 300);
+	uint16_t c;
+
+	reset_all(false);
+	CHECK(ll_conn_pending_instants(0) == 0);
+	CHECK(ll_conn_pending_instants(LL_MAX_CONN) == 0);
+	CHECK(ll_conn_start(&ci, 4000000) == 0);
+	CHECK(ll_conn_pending_instants(0) == 0);
+	ev_rx(a);
+	c = ll_conn_event_counter(0);
+	CHECK(ll_conn_update_at(0, c + 6, 1, 0, &np) == 0);
+	CHECK(ll_conn_pending_instants(0) == LL_CONN_PENDING_UPDATE);
+	CHECK(ll_conn_chmap_at(0, c + 3, no0to9) == 0);
+	CHECK(ll_conn_pending_instants(0) == (LL_CONN_PENDING_UPDATE | LL_CONN_PENDING_CHMAP));
+	for (int k = 1; k <= 3; k++) {
+		a += T(15000);
+		ev_rx(a);
+	}
+	/* the map was applied when event c + 3 was planned */
+	CHECK(ll_conn_pending_instants(0) == LL_CONN_PENDING_UPDATE);
+	for (int k = 4; k <= 6; k++) {
+		a += T(15000);
+		ev_rx(a);
+	}
+	CHECK(ll_conn_pending_instants(0) == 0);
+	/* invalid parameters change nothing */
+	np.timeout = 5;
+	CHECK(ll_conn_update_at(0, ll_conn_event_counter(0) + 6, 1, 0, &np) ==
+	      LL_ST_INVALID_LL_PARAM);
+	CHECK(ll_conn_pending_instants(0) == 0);
+	np.timeout = 400;
+	CHECK(ll_conn_update_at(0, ll_conn_event_counter(0) + 6, 1, 0, &np) == 0);
+	ll_conn_end(0, LL_ST_REMOTE_TERM);
+	CHECK(ll_conn_pending_instants(0) == 0);
+
+	/* map instant inside a latency skip window: applied to the planned
+	 * listen, still pending until that event */
+	a = start_lat(4, 400, &ref, false);
+	fire_alarm();
+	CHECK(ll_conn_event_counter(0) == EV(5));
+	a += T(75000);
+	rx(a, 0x01, 0);
+	CHECK(ll_conn_chmap_at(0, EV(8), no0to9) == 0);
+	CHECK(ll_conn_pending_instants(0) == LL_CONN_PENDING_CHMAP);
+	done(1);
+	/* EV(8) planned with the new map: still ahead */
+	CHECK(ll_conn_event_counter(0) == EV(6));
+	CHECK(ll_conn_pending_instants(0) == LL_CONN_PENDING_CHMAP);
+	fire_alarm();
+	a += T(45000);
+	rx(a, 0x01, 0);
+	done(1);
+	CHECK(ll_conn_pending_instants(0) == 0);
+	ll_conn_end(0, LL_ST_REMOTE_TERM);
+}
+
 int main(void)
 {
 	test_first_events();
@@ -3169,6 +3234,7 @@ int main(void)
 	test_conn_update_same_params();
 	test_update_restarts_supervision();
 	test_chmap();
+	test_pending_instants();
 	test_instant_replan();
 	test_instant_passed();
 	test_counter_wrap();

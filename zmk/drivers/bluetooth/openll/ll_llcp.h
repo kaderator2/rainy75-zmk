@@ -40,6 +40,13 @@ struct ll_llcp_dle {
 	uint16_t max_tx_octets, max_tx_time, max_rx_octets, max_rx_time;
 };
 
+/* Connection parameters of a Connection Parameters Request (slice 6d Task
+ * 2): Interval_Min / Interval_Max (1.25 ms units), Latency, Timeout (10 ms
+ * units), as in LL_CONNECTION_PARAM_REQ / _RSP and the HCI event / Reply. */
+struct ll_llcp_cpr {
+	uint16_t interval_min, interval_max, latency, timeout;
+};
+
 /* Events toward the host (HCI). Called in the context of the entry point
  * that caused them, without ll_plat_lock() or ll_plat_tx_lock() held. Disconnection Complete
  * and LE Connection Update Complete come from ll_conn, not from here. */
@@ -59,6 +66,14 @@ struct ll_llcp_ops {
 	 * authenticatedPayloadTO passed without a packet with a valid MIC.
 	 * From ll_llcp_tick() (controller thread). */
 	void (*apto_expired)(uint8_t link);
+	/* HCI LE Remote Connection Parameter Request (slice 6d Task 2): the
+	 * central's LL_CONNECTION_PARAM_REQ, to be answered with
+	 * ll_llcp_conn_param_reply() / _neg_reply(). Returns true when the
+	 * event went to the host, false when it did not (event masked, or the
+	 * host does not know the link): ll_llcp then accepts the request as
+	 * the Link Layer (LL_CONNECTION_PARAM_RSP with the central's values).
+	 * NULL: never indicated. Controller thread. */
+	bool (*conn_param_req)(uint8_t link, const struct ll_llcp_cpr *req);
 };
 
 /* Owed control PDUs (slice 7). A control PDU we must send (a response, our
@@ -193,7 +208,7 @@ void ll_llcp_rx_auth(uint8_t link);
  * connect and after every update (glue). A timeout below connInterval x
  * (1 + latency) (HCI 7.3.94) is raised to it, so the rule holds after an
  * update too. Thread. */
-void ll_llcp_conn_params(uint8_t link, uint16_t interval, uint16_t latency);
+void ll_llcp_conn_params(uint8_t link, uint16_t interval, uint16_t latency, uint16_t timeout);
 /* HCI Read / Write Authenticated Payload Timeout of the link (10 ms
  * units). Read returns LL_ST_SUCCESS, or LL_ST_UNKNOWN_CONN_ID (link out
  * of range or not connected). Write: LL_ST_INVALID_PARAM for 0 or a value
@@ -201,6 +216,16 @@ void ll_llcp_conn_params(uint8_t link, uint16_t interval, uint16_t latency);
  * interval x (1 + latency)); it restarts a running timer. Thread. */
 uint8_t ll_llcp_read_apto(uint8_t link, uint16_t *apto);
 uint8_t ll_llcp_write_apto(uint8_t link, uint16_t apto);
+
+/* Connection Parameters Request procedure, responder (slice 6d Task 2;
+ * Vol 6 Part B 5.1.7, 5.3; HCI 7.7.65.6, 7.8.31, 7.8.32), per link. See
+ * ll_llcp.c for the rules. Reply / Negative Reply return LL_ST_SUCCESS,
+ * LL_ST_UNKNOWN_CONN_ID (link out of range or not connected) or
+ * LL_ST_DISALLOWED (no request waits on the host). The HCI layer checked
+ * the parameters (Reply: ranges and the timeout rule; Negative Reply: a
+ * nonzero reason). Thread (HCI thread). */
+uint8_t ll_llcp_conn_param_reply(uint8_t link, const struct ll_llcp_cpr *p);
+uint8_t ll_llcp_conn_param_neg_reply(uint8_t link, uint8_t reason);
 
 /* Encrypt (when the link is encrypted) and queue one data PDU on the link:
  * ll_txq_push(link, ...) with ctrl_opcode = payload[0] for LL_TXQ_CTRL,

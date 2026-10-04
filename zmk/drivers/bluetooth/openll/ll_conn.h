@@ -216,6 +216,15 @@ void ll_conn_release(uint8_t link);
  * instant is >= 6 events after the PDU, which arrives in a listened event;
  * after yields it may be passed in rare multilink overlaps). */
 uint16_t ll_conn_event_counter(uint8_t link);
+/* Instants of the link not yet reached (slice 6d Task 2, procedure
+ * collisions, Vol 6 Part B 5.3): LL_CONN_PENDING_UPDATE while an
+ * LL_CONNECTION_UPDATE_IND waits for its instant, LL_CONN_PENDING_CHMAP
+ * while an LL_CHANNEL_MAP_IND does (also while its instant was applied to a
+ * planned event of a skip window that has not come yet). 0 for an inactive
+ * or out-of-range link. ISR-safe; takes ll_plat_lock(). */
+#define LL_CONN_PENDING_UPDATE 0x01
+#define LL_CONN_PENDING_CHMAP  0x02
+uint8_t ll_conn_pending_instants(uint8_t link);
 /* New TX data was queued (call after a successful ll_txq_push; the
  * ll_plat_lock() it takes nests, so the caller may hold it): if the planned
  * event lies beyond the next regular event that can still be prepared
