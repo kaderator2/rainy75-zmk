@@ -204,8 +204,9 @@ void ll_conn_release(uint8_t link);
  * instant if that comes first, and is passed only once the instant
  * event's anchor has gone by; slice 7: an instant event whose alarm time
  * is gone but not its anchor is planned late, issued if it can still be
- * prepared, else a late miss, and the instant is applied). After a re-plan (kick, instant, or a yield to the
- * arbiter) it is the planned event, so an instant for an earlier event is
+ * prepared, else a late miss, and the instant is applied). After a
+ * re-plan (kick, instant, or a yield to the arbiter) it is the planned
+ * event, so an instant for an earlier event is
  * treated as passed (0x28); a conforming central never sends one (the
  * instant is >= 6 events after the PDU, which arrives in a listened event;
  * after yields it may be passed in rare multilink overlaps). */

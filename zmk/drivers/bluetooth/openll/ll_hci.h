@@ -9,11 +9,11 @@
  * Connection handle == link id (0..LL_MAX_CONN-1, slice 6a); commands act
  * on the handle they carry, events and ACL carry the link's handle, and a
  * handle that is not an active link (ops.handle_valid) is refused with
- * Unknown Connection Identifier (0x02) / -ENOTCONN. Event masks (Set Event Mask, LE
- * Set Event Mask) are honoured for the events below; Number Of Completed
- * Packets cannot be masked. Defaults after init/Reset are the Core Spec
- * ones (Vol 4 Part E 7.3.1, 7.8.1): LE Meta events stay off until the host
- * sets bit 61, as Zephyr does during init.
+ * Unknown Connection Identifier (0x02) / -ENOTCONN. Event masks (Set Event
+ * Mask, LE Set Event Mask) are honoured for the events below; Number Of
+ * Completed Packets cannot be masked. Defaults after init/Reset are the
+ * Core Spec ones (Vol 4 Part E 7.3.1, 7.8.1): LE Meta events stay off until
+ * the host sets bit 61, as Zephyr does during init.
  */
 #ifndef LL_HCI_H_
 #define LL_HCI_H_
@@ -48,8 +48,10 @@ struct ll_hci_ops {
 	bool (*handle_valid)(uint16_t handle);
 	/* Slice 6b Task 3, handle validated before the call, parameters
 	 * range-checked (Vol 4 Part E 7.8.33 / 7.8.49). */
-	uint8_t (*set_data_len)(uint16_t handle, uint16_t tx_octets, uint16_t tx_time); /* ll_llcp_set_data_len */
-	uint8_t (*read_phy)(uint16_t handle, uint8_t *tx_phy, uint8_t *rx_phy);       /* 1M / 1M */
+	/* ll_llcp_set_data_len */
+	uint8_t (*set_data_len)(uint16_t handle, uint16_t tx_octets, uint16_t tx_time);
+	/* always 1M / 1M */
+	uint8_t (*read_phy)(uint16_t handle, uint8_t *tx_phy, uint8_t *rx_phy);
 	/* LE Set PHY: on LL_ST_SUCCESS ll_hci sends the Command Status and right
 	 * after it LE PHY Update Complete (status 0, read_phy values), so the
 	 * order is fixed whatever thread delivers events. */
