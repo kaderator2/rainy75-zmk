@@ -281,6 +281,11 @@ struct ll_conn_stats {
 	 * nor missed nor skipped. planned - listened includes the yields at
 	 * start. */
 	uint32_t collisions;
+	/* Slice 7 Task 2c, RX flow control: events not listened to because
+	 * ll_rxq lacked room (also counted in missed), and events stopped
+	 * early for the same reason. */
+	uint32_t rx_paused;
+	uint32_t rx_stops;
 };
 /* Per link, cumulative since boot (not reset per connection). Out-of-range
  * link: all zero. */

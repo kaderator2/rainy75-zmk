@@ -621,6 +621,92 @@ static void test_capacity_bytes(void)
 	}
 }
 
+/* Slice 7 Task 2c: ll_rxq_isr_room(link, n, len) tells whether n more PDUs
+ * of len payload bytes each fit now, in entries and in bytes (the producer
+ * stops receiving before the queue can overflow). Exact: n puts of len
+ * then all succeed if and only if it said so, checked after random
+ * put/get histories that wrap the byte area. */
+static uint32_t room_rng;
+
+static uint32_t room_rand(void)
+{
+	room_rng = room_rng * 1103515245u + 12345u;
+	return room_rng >> 8;
+}
+
+static void room_history(uint32_t seed, int steps)
+{
+	struct ll_rx_pdu out;
+	uint8_t p[255] = {0};
+
+	reset_all();
+	room_rng = seed;
+	for (int i = 0; i < steps; i++) {
+		if (room_rand() % 3 != 0) {
+			(void)try_put_l(L, 0x02, p, (uint8_t)(1 + room_rand() % 255));
+		} else {
+			(void)ll_rxq_get(L, &out);
+		}
+	}
+}
+
+static void test_room(void)
+{
+	uint8_t p[255] = {0};
+	struct ll_rx_pdu out;
+	const int cap = LL_RXQ_POOL_BYTES / 256;
+
+	reset_all();
+	CHECK(!ll_rxq_isr_room(LL_MAX_CONN, 1, 1));
+	CHECK(ll_rxq_isr_room(L, 0, 255));
+	CHECK(ll_rxq_isr_room(L, LL_RXQ_ENTRIES, 1));
+	CHECK(!ll_rxq_isr_room(L, LL_RXQ_ENTRIES + 1, 1));
+	CHECK(ll_rxq_isr_room(L, (uint8_t)cap, 255));
+	CHECK(!ll_rxq_isr_room(L, (uint8_t)(cap + 1), 255));
+	/* entries: one put less room, the empty PDU takes none */
+	put(0x02, p, 3);
+	put(0x01, NULL, 0);
+	CHECK(ll_rxq_isr_room(L, LL_RXQ_ENTRIES - 1, 1));
+	CHECK(!ll_rxq_isr_room(L, LL_RXQ_ENTRIES, 1));
+	CHECK(ll_rxq_get(L, &out) == LL_RXQ_OK);
+	CHECK(ll_rxq_isr_room(L, LL_RXQ_ENTRIES, 1));
+	/* other links are not affected */
+	for (uint8_t i = 0; i < LL_MAX_CONN; i++) {
+		put_l(L, 0x02, p, 255);
+		if (i != L) {
+			CHECK(ll_rxq_isr_room(i, (uint8_t)cap, 255));
+		}
+	}
+	/* bytes: records take their rounded size (127 -> 128) */
+	reset_all();
+	for (int i = 0; i < 5; i++) {
+		put(0x02, p, 255);
+	}
+	put(0x02, p, 125);
+	put(0x02, p, 1);              /* 1412 bytes used, 636 free */
+	CHECK(ll_rxq_isr_room(L, 4, 127));
+	CHECK(!ll_rxq_isr_room(L, 5, 127));
+	/* exact after random histories */
+	for (uint32_t seed = 1; seed <= 400; seed++) {
+		int steps = (int)(seed * 7 % 300);
+		uint8_t n;
+		uint16_t len;
+		bool room, all = true;
+
+		room_history(seed, steps);
+		n = (uint8_t)(room_rand() % (LL_RXQ_ENTRIES + 2));
+		len = (uint16_t)(1 + room_rand() % 255);
+		room = ll_rxq_isr_room(L, n, len);
+		for (uint8_t k = 0; k < n; k++) {
+			all &= try_put_l(L, 0x02, p, (uint8_t)len);
+		}
+		if (room != all) {
+			CHECK(room == all);
+			break;
+		}
+	}
+}
+
 int main(void)
 {
 	L = 0;
@@ -635,9 +721,11 @@ int main(void)
 	test_half_full();
 	test_long_pdus();
 	test_capacity_bytes();
+	test_room();
 	L = (uint8_t)(LL_MAX_CONN - 1);
 	test_half_full();
 	test_long_pdus();
 	test_capacity_bytes();
+	test_room();
 	DONE();
 }

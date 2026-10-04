@@ -30,7 +30,10 @@
  * (bad CRC, or an acked retransmission without an RX entry) or the packet
  * starts after the RX window (it is then a chained packet, not the
  * anchor). A data PDU that ll_rxq cannot take (ring full) is lost, as the
- * hardware has acked it: the link then ends with 0x08 at CONN_DONE.
+ * hardware has acked it: the link then ends with 0x08 at CONN_DONE. RX
+ * flow control (slice 7 Task 2c, rx_room) keeps that from happening: an
+ * event is not listened to, or is stopped early, while ll_rxq could not
+ * take what may still arrive.
  * CONN_DONE: ll_txq_event_end(), counter++, termination
  * and supervision checks, plan the next event (applying instants).
  *
@@ -94,6 +97,7 @@ struct ll_link {
 	bool established;     /* a packet was received in this connection */
 	bool rx_this_event;   /* a CRC-valid packet was received in this event */
 	bool first_seen;      /* the event's first packet (valid or not) was seen */
+	bool rx_stopped;      /* this event was stopped for lack of ll_rxq room */
 	bool anchored;        /* the last closed event re-anchored (latency rule) */
 	bool holdoff_done;    /* LL_CONN_LATENCY_HOLDOFF_MS has passed (latched, see skip_count) */
 	/* effective maximum RX / TX times (ll_conn_set_dle_times): one
@@ -229,6 +233,28 @@ static void request_end(struct ll_link *c, uint8_t reason)
 		return;
 	}
 	end(c, reason);
+}
+
+/* RX flow control (slice 7 Task 2c). The baseband acks every new central
+ * packet before the ISR copies it out of the RX ring, so a packet ll_rxq
+ * cannot take is lost (the link then ends, on_rx). The controller thread
+ * that drains ll_rxq can be held off for a long time (cooperative host
+ * threads: about 2.5 ms per delivered 27-octet fragment while the host
+ * processes it, up to 150..300 ms at connection setup), while a central
+ * burst brings a PDU every 0.7 ms. So an event is listened to only while
+ * ll_rxq has room for RX_FLOW_N PDUs of the largest size, and a packet that
+ * leaves less stops the event (ll_radio_conn_stop): what can still arrive
+ * then is at most the radio's RX ring (LL_RADIO_RX_RING_N), which fits. The
+ * central keeps the rest and resends it in a later event; a long stall
+ * shows as missed events and, beyond the supervision timeout, a link loss
+ * as before. The largest size (not the effective one) keeps the rule
+ * independent of the LENGTH procedure's timing. */
+#define RX_FLOW_N   (LL_RADIO_RX_RING_N + 1)
+#define RX_FLOW_LEN (LL_DATA_PDU_MAX + LL_MIC_LEN)
+
+static bool rx_room(const struct ll_link *c)
+{
+	return ll_rxq_isr_room(c->id, RX_FLOW_N, RX_FLOW_LEN);
 }
 
 /* 4.5.4 window widening. Above interval / 2 - T_IFS it is clamped (4.5.7
@@ -663,10 +689,18 @@ static void prepare(struct ll_link *c, uint32_t cap_us)
 		event_closed(c, now);
 		return;
 	}
+	if (!rx_room(c)) {
+		/* not listened: the central resends (RX flow control) */
+		ST(c)->rx_paused++;
+		ST(c)->missed++;
+		event_closed(c, now);
+		return;
+	}
 	ll_radio_conn_select(c->ci.aa, c->ci.crc_init);
 	ll_txq_event_start(c->id);
 	c->rx_this_event = false;
 	c->first_seen = false;
+	c->rx_stopped = false;
 	c->in_event = true;
 	ev_owner = (int8_t)c->id;
 	ST(c)->events++;
@@ -766,6 +800,11 @@ static void on_rx(struct ll_link *c, const uint8_t *pdu, uint16_t len, uint32_t 
 		 * central sees a supervision timeout too and both hosts treat
 		 * it as an ordinary link loss (reconnect). */
 		request_end(c, LL_ST_CONN_TIMEOUT);
+	} else if (!c->rx_stopped && !rx_room(c)) {
+		/* RX flow control: the rest of the burst stays with the central */
+		c->rx_stopped = true;
+		ST(c)->rx_stops++;
+		ll_radio_conn_stop();
 	}
 	c->rx_this_event = true;
 	first = !c->first_seen;
@@ -1256,6 +1295,8 @@ void ll_conn_get_stats_total(struct ll_conn_stats *s)
 		s->skipped += t->skipped;
 		s->kicks += t->kicks;
 		s->collisions += t->collisions;
+		s->rx_paused += t->rx_paused;
+		s->rx_stops += t->rx_stops;
 	}
 	ll_plat_unlock(key);
 }

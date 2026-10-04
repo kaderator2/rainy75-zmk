@@ -55,6 +55,7 @@ static struct {
 	uint8_t fifo[4][LL_DATA_PDU_MAX + LL_MIC_LEN];
 	uint8_t fifo_len[4];
 	uint8_t fifo_hdr[4];
+	int stops;           /* ll_radio_conn_stop() requests */
 } rad;
 
 static struct {
@@ -88,6 +89,7 @@ void ll_radio_conn_event(uint8_t ch, uint32_t open_tick, uint32_t first_timeout_
 	rad.fst = first_timeout_us;
 	rad.max_ev = max_event_us;
 }
+void ll_radio_conn_stop(void) { rad.stops++; }
 void ll_radio_conn_set_sn_init(uint8_t sn) { rad.sn_init = sn; }
 void ll_radio_conn_set_nesn_init(uint8_t nesn) { (void)nesn; }
 uint8_t ll_radio_fifo_rptr(void) { return rad.rptr; }
@@ -427,8 +429,11 @@ static void test_rx_path(void)
 /* A data PDU that does not fit into ll_rxq is lost for good: the hardware
  * has acked it already, the central will not resend it. The link must end
  * deterministically (0x08, at the end of the event) instead of continuing
- * with a hole in the L2CAP stream or the CCM packet counter. Empty PDUs
- * never fill the ring, so a full ring of data PDUs alone is fine. */
+ * with a hole in the L2CAP stream or the CCM packet counter. Slice 7 Task
+ * 2c: ll_conn stops the event before that can happen (test_rx_flow_*), so
+ * here the radio ignores the stop and keeps delivering (more packets than
+ * its RX ring holds, which the hardware cannot do). Empty PDUs never fill
+ * the ring. */
 static void test_rxq_overflow_ends_link(void)
 {
 	struct ll_connect_ind ci = mk_ci(12, 400, 1, 1, 0);
@@ -439,33 +444,192 @@ static void test_rxq_overflow_ends_link(void)
 	reset_all(false);
 	CHECK(ll_conn_start(&ci, 500000) == 0);
 	a1 = 500000 + T(1250 + 300);
-	/* 16 data PDUs (the ring depth) over 4 events, nothing drained */
-	for (uint32_t k = 0; k < 4; k++) {
-		fire_alarm();
-		for (uint32_t i = 0; i < 4; i++) {
-			rx(a1 + T(15000 * k + 400 * i), LL_LLID_START | sn, 4);
-			sn ^= HDR_SN;
-		}
-		rx(a1 + T(15000 * k + 1600), 0x01 | sn, 0);   /* empty: not queued */
-		sn ^= HDR_SN;
-		done(5);
-		CHECK(ll_conn_active(0));
-	}
-	CHECK(cbs.disconnected == 0);
-	/* the 17th data PDU overflows: the event completes, then the link ends */
 	fire_alarm();
-	rx(a1 + T(60000), LL_LLID_START | sn, 4);
+	for (uint32_t i = 0; i < LL_RXQ_ENTRIES; i++) {
+		rx(a1 + T(400 * i), LL_LLID_START | sn, 4);
+		sn ^= HDR_SN;
+		rx(a1 + T(400 * i + 200), 0x01 | sn, 0);   /* empty: not queued */
+		sn ^= HDR_SN;
+	}
+	CHECK(rad.stops >= 1);
+	CHECK(ll_conn_active(0) && cbs.disconnected == 0);
+	/* one more data PDU overflows: the event completes, then the link ends */
+	rx(a1 + T(400 * LL_RXQ_ENTRIES), LL_LLID_START | sn, 4);
 	CHECK(ll_conn_active(0));
-	done(1);
+	done(LL_RXQ_ENTRIES * 2 + 1);
 	CHECK(!ll_conn_active(0));
 	CHECK(cbs.disconnected == 1 && cbs.reason == LL_ST_CONN_TIMEOUT);
 	CHECK(sch.cb == NULL);
 	CHECK(ll_rxq_overflow_count(0) == 1);
-	/* the 16 queued PDUs are still delivered in order */
-	for (int i = 0; i < 16; i++) {
+	/* the queued PDUs are still delivered in order */
+	for (int i = 0; i < LL_RXQ_ENTRIES; i++) {
 		CHECK(ll_rxq_get(0, &out) == LL_RXQ_OK && out.len == 4);
 	}
 	CHECK(ll_rxq_get(0, &out) == LL_RXQ_EMPTY);
+}
+
+/* Slice 7 Task 2c, RX flow control. The hardware acks every new central
+ * packet, so a full ll_rxq would lose one (test above). ll_conn keeps room
+ * for what can still arrive: LL_RADIO_RX_RING_N packets of the largest
+ * size (the radio's RX ring entries not yet copied out) after the decision.
+ * An event whose rxq lacks room for LL_RADIO_RX_RING_N + 1 such PDUs is not
+ * listened to (the central keeps its data and resends it later, like after
+ * any missed event), and a packet that leaves less room stops the open
+ * event (ll_radio_conn_stop: the rest of the central's burst is not acked
+ * and is resent in a later event). */
+#define FLOW_N  (LL_RADIO_RX_RING_N + 1)
+#define FLOW_LEN (LL_DATA_PDU_MAX + LL_MIC_LEN)
+
+static void fill_rxq(uint8_t link, uint8_t paylen, int n)
+{
+	uint8_t pdu[2 + LL_DATA_PDU_MAX + LL_MIC_LEN] = {LL_LLID_START, paylen};
+
+	for (int i = 0; i < n; i++) {
+		CHECK(ll_rxq_isr_put(link, pdu, (uint16_t)(2 + paylen)));
+	}
+}
+
+static void test_rx_flow_pause(void)
+{
+	struct ll_connect_ind ci = mk_ci(12, 400, 1, 1, 0);
+	struct ll_conn_stats st0, st;
+	struct ll_rx_pdu out;
+	int ev;
+
+	for (int bytes = 0; bytes < 2; bytes++) {
+		reset_all(false);
+		ll_conn_get_stats(0, &st0);
+		CHECK(ll_conn_start(&ci, 500000) == 0);
+		/* short PDUs fill the entries, maximum ones the bytes first */
+		while (ll_rxq_isr_room(0, FLOW_N, FLOW_LEN)) {
+			fill_rxq(0, bytes ? 255 : 4, 1);
+		}
+		ev = rad.events;
+		fire_alarm();
+		CHECK(rad.events == ev);           /* not listened */
+		CHECK(ll_conn_active(0) && sch.cb != NULL);
+		ll_conn_get_stats(0, &st);
+		CHECK(st.rx_paused - st0.rx_paused == 1);
+		CHECK(st.missed - st0.missed == 1 && st.late == st0.late);
+		CHECK(ll_conn_event_counter(0) == 1);
+		fire_alarm();
+		CHECK(rad.events == ev);
+		/* the consumer catches up: listened again */
+		CHECK(ll_rxq_get(0, &out) == LL_RXQ_OK);
+		CHECK(ll_rxq_isr_room(0, FLOW_N, FLOW_LEN));
+		fire_alarm();
+		CHECK(rad.events == ev + 1);
+		CHECK(rad.stops == 0);
+		ll_conn_get_stats(0, &st);
+		CHECK(st.rx_paused - st0.rx_paused == 2);
+		ll_conn_end(0, LL_ST_REMOTE_TERM);
+	}
+}
+
+static void test_rx_flow_stop(void)
+{
+	struct ll_connect_ind ci = mk_ci(12, 400, 1, 1, 0);
+	struct ll_conn_stats st0, st;
+	uint32_t a1 = 500000 + T(1250 + 300);
+	uint8_t sn = 0;
+	int k = 0;
+
+	reset_all(false);
+	ll_conn_get_stats(0, &st0);
+	CHECK(ll_conn_start(&ci, 500000) == 0);
+	fire_alarm();
+	/* no stop while the room lasts, then exactly one */
+	while (ll_rxq_isr_room(0, FLOW_N + 1, FLOW_LEN)) {
+		rx(a1 + T(400 * k++), LL_LLID_START | sn, 27);
+		sn ^= HDR_SN;
+		CHECK(rad.stops == 0);
+	}
+	rx(a1 + T(400 * k++), LL_LLID_START | sn, 27);
+	sn ^= HDR_SN;
+	CHECK(rad.stops == 1);
+	/* up to LL_RADIO_RX_RING_N packets were still in the radio: they fit */
+	for (int i = 0; i < LL_RADIO_RX_RING_N; i++) {
+		rx(a1 + T(400 * k++), LL_LLID_START | sn, 251);
+		sn ^= HDR_SN;
+	}
+	done((uint8_t)k);
+	CHECK(ll_conn_active(0) && cbs.disconnected == 0);
+	CHECK(ll_rxq_overflow_count(0) == 0);
+	ll_conn_get_stats(0, &st);
+	CHECK(st.rx_stops - st0.rx_stops == 1);
+	ll_conn_end(0, LL_ST_REMOTE_TERM);
+}
+
+/* A central burst far beyond the queue while the consumer is slow (the
+ * controller thread starved by the host): with the radio stopping after at
+ * most LL_RADIO_RX_RING_N more packets, every PDU arrives once, in order,
+ * and the link stays up. Before Task 2c the 17th PDU ended the link. */
+static void test_rx_flow_burst(void)
+{
+	struct ll_connect_ind ci = mk_ci(6, 42, 1, 1, 0);   /* 7.5 ms, 420 ms */
+	struct ll_rx_pdu out;
+	const int total = 400;
+	int sent = 0, got = 0;
+	uint32_t a1 = 500000 + T(1250 + 300);
+	uint8_t sn = 0;
+
+	for (int lens = 0; lens < 2; lens++) {
+		reset_all(false);
+		sent = got = 0;
+		sn = 0;
+		CHECK(ll_conn_start(&ci, 500000) == 0);
+		for (uint32_t e = 0; e < 4000 && got < total; e++) {
+			uint32_t anchor = a1 + T(7500 * e);
+			int ev = rad.events, stops = rad.stops, n = 0, after = 0;
+
+
+			fire_alarm();
+			if (!ll_conn_active(0)) {
+				break;
+			}
+			if (rad.events != ev) {
+				/* the central sends up to 10 PDUs per event; after a
+				 * stop request at most the radio ring's worth more */
+				while (sent < total && n < 10 &&
+				       (rad.stops == stops || after < LL_RADIO_RX_RING_N)) {
+					uint8_t len = lens ? (uint8_t)(1 + sent % 255) : 27;
+					uint8_t pdu[2 + 255] = {(uint8_t)(LL_LLID_START | sn), len};
+					bool stopped = rad.stops != stops;
+
+					pdu[2] = (uint8_t)sent;
+					now = anchor + T(LL_CONN_SYNC_US + 300 * n);
+					ll_conn_radio_evt(LL_RADIO_CONN_RX, pdu, (uint16_t)(2 + len), now);
+					after += stopped ? 1 : 0;
+					sn ^= HDR_SN;
+					sent++;
+					n++;
+				}
+				done((uint8_t)n);
+				CHECK(ll_conn_active(0));
+			}
+			/* the slow consumer: one PDU every other event */
+			if ((e & 1) == 0 && ll_rxq_get(0, &out) == LL_RXQ_OK) {
+				if (out.data[0] != (uint8_t)got) {
+					CHECK(out.data[0] == (uint8_t)got);
+				}
+				got++;
+			}
+		}
+		while (ll_rxq_get(0, &out) == LL_RXQ_OK) {
+			CHECK(out.data[0] == (uint8_t)got);
+			got++;
+		}
+		CHECK(ll_conn_active(0) && cbs.disconnected == 0);
+		CHECK(ll_rxq_overflow_count(0) == 0);
+		CHECK(got == sent && sent == total);
+		{
+			struct ll_conn_stats st;
+
+			ll_conn_get_stats(0, &st);
+			CHECK(st.rx_stops > 0 && st.rx_paused > 0);   /* both rules ran */
+		}
+		ll_conn_end(0, LL_ST_REMOTE_TERM);
+	}
 }
 
 /* ll_conn_start runs in ISR context and must not reset ll_rxq (the
@@ -3224,6 +3388,9 @@ int main(void)
 	test_rx_path();
 	test_start_keeps_rxq();
 	test_rxq_overflow_ends_link();
+	test_rx_flow_pause();
+	test_rx_flow_stop();
+	test_rx_flow_burst();
 	test_first_packet_bad_crc();
 	test_first_packet_retransmission();
 	test_first_packet_after_window();

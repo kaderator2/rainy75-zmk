@@ -70,6 +70,14 @@ bool ll_rxq_isr_take_queued(void);
  * in entries or in bytes, so the consumer should drain it before the
  * event ends (slice 6b Task 4: a long central burst). */
 bool ll_rxq_isr_half_full(uint8_t link);
+/* ISR (producer side, slice 7 Task 2c): true when n more PDUs of len
+ * payload bytes each (as received, MIC included) fit into the link's
+ * queue now, in entries and in bytes (the same placement as
+ * ll_rxq_isr_put). The radio acks every new central packet in hardware, so
+ * the producer stops receiving (ll_conn) while fewer than the PDUs that can
+ * still arrive would fit, instead of losing one. n = 0: true; an
+ * out-of-range link: false. */
+bool ll_rxq_isr_room(uint8_t link, uint8_t n, uint16_t len);
 /* Thread: the link's next queued PDU, decrypted when the link's encryption
  * is on; call again after LL_RXQ_OK to continue draining. Single consumer. */
 enum ll_rxq_result ll_rxq_get(uint8_t link, struct ll_rx_pdu *out);

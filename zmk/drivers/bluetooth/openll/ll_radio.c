@@ -79,7 +79,8 @@ LOG_MODULE_DECLARE(openll, CONFIG_BT_HCI_DRIVER_LOG_LEVEL);
 #define POWER_INDEX_0DBM       11   /* same index the blob shim uses, about 0 dBm */
 
 /* Connection mode */
-#define RING_N                 4    /* TX ring entries (tx_chn_dep 2) and RX DMA entries */
+#define RING_N                 LL_RADIO_RX_RING_N   /* TX ring entries (tx_chn_dep 2) and RX DMA entries */
+BUILD_ASSERT(RING_N == 4, "the boot-time DMA geometry (tx_chn_dep 2) has 4 entries");
 #define RX_ENTRY_SIZE          272  /* DMA writes up to p[271] for a 255-byte packet (spike S2) */
 #define TX_ENTRY_SIZE          272  /* 4 + 2 + 251 + 4 MIC = 261, 16-byte unit (spike S1) */
 /* The hardware rx wptr (0x1004f4) is a 5-bit counter (Task 9: maximum seen
@@ -176,6 +177,7 @@ static struct {
 	uint32_t first_ts;
 	uint8_t first_len;
 	bool tx_seen;           /* first TX IRQ of the event handled */
+	bool stop_req;          /* ll_radio_conn_stop(): end the event after this ISR's callbacks */
 } cn;
 /* Adv snapshot of ll_ctrl_1 / rxtcrcpkt and "connection setup done"
  * (ll_radio_mode.h, host-tested). */
@@ -184,7 +186,7 @@ static struct ll_radio_mode rm;
 static atomic_t cnt_tx2rx, cnt_rx_ok, cnt_rx_crc, cnt_rx_timeout, cnt_rsp_tx, cnt_rsp_late;
 static atomic_t cnt_conn_events, cnt_conn_rx, cnt_conn_tx, cnt_conn_fto, cnt_conn_guard;
 static atomic_t cnt_rx_ptr_odd, cnt_tifs_le150, cnt_tifs_151_152, cnt_tifs_gt152, cnt_restores;
-static atomic_t cnt_rx_ptr_skip, cnt_fst_capped, cnt_holds;
+static atomic_t cnt_rx_ptr_skip, cnt_fst_capped, cnt_holds, cnt_conn_stopped;
 static uint8_t rx_wptr_max;      /* largest raw hardware rx wptr seen */
 static uint8_t guard_streak;     /* consecutive guard-ended events without a valid packet */
 static uint16_t restore_ptrs_before, restore_ptrs_after;
@@ -479,6 +481,30 @@ static void conn_guard(void)
 	conn_done();
 }
 
+void ll_radio_conn_stop(void)
+{
+	if (cn.evt_open) {
+		cn.stop_req = true;
+	}
+}
+
+/* ll_radio_conn_stop() (RX flow control, slice 7 Task 2c): turn the FSM off
+ * as the guard does, then deliver what the RX ring already holds (at most
+ * RING_N packets, which ll_conn kept room for) and end the event. The
+ * central's packets after the stop get no ack and are resent later; our
+ * unacked TX entries stay in the ring (rptr is advanced only by acks), as
+ * after a guard-cut MD burst. Packets were received, so no wedge sign. */
+static void conn_stop_now(void)
+{
+	ll_sched_guard_cancel();
+	rf_set_tx_rx_off_auto_mode();
+	rf_clr_irq_status(FLD_RF_IRQ_ALL);
+	conn_rx_drain();
+	guard_streak = 0;
+	atomic_inc(&cnt_conn_stopped);
+	conn_done();
+}
+
 static void conn_isr(uint16_t st)
 {
 	if (!cn.evt_open) {
@@ -500,6 +526,9 @@ static void conn_isr(uint16_t st)
 		guard_streak = 0;
 		conn_rx_drain();
 		conn_done();
+	}
+	if (cn.evt_open && cn.stop_req) {
+		conn_stop_now();
 	}
 }
 
@@ -638,6 +667,7 @@ void ll_radio_get_stats(struct ll_radio_stats *s)
 	s->rx_ptr_skip = (uint32_t)atomic_get(&cnt_rx_ptr_skip);
 	s->fst_capped = (uint32_t)atomic_get(&cnt_fst_capped);
 	s->holds = (uint32_t)atomic_get(&cnt_holds);
+	s->conn_stopped = (uint32_t)atomic_get(&cnt_conn_stopped);
 	s->rx_wptr_max = rx_wptr_max;
 	s->restore_ptrs_before = restore_ptrs_before;
 	s->restore_ptrs_after = restore_ptrs_after;
@@ -793,6 +823,7 @@ void ll_radio_conn_event(uint8_t ch, uint32_t open_tick, uint32_t first_timeout_
 	cn.nodata = false;
 	cn.first_valid = false;
 	cn.tx_seen = false;
+	cn.stop_req = false;
 	atomic_inc(&cnt_conn_events);
 	reg_rf_ll_cmd_schedule = trigger;
 	reg_rf_ll_ctrl3 |= FLD_RF_R_CMD_SCHDULE_EN;

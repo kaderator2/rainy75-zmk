@@ -27,7 +27,10 @@
  * finds the ring full (or has a malformed length) will never be resent by
  * the central. ll_rxq_isr_put returns false and ll_conn ends the link
  * deterministically (0x08 at the end of the event, ll_conn.c on_rx)
- * rather than continuing with a hole in the stream.
+ * rather than continuing with a hole in the stream. Slice 7 Task 2c: the
+ * producer side asks ll_rxq_isr_room() first and stops receiving (ll_conn
+ * RX flow control) while what may still arrive would not fit, so an
+ * overflow means the radio delivered more than its RX ring holds.
  *
  * No duplicate detection here: the baseband filters retransmissions itself.
  * With NESN init programmed per BRX (ll_txq), a central packet whose SN is
@@ -138,6 +141,48 @@ bool ll_rxq_isr_half_full(uint8_t link)
 		bytes = w->off >= o->off ? end - o->off : LL_RXQ_POOL_BYTES - o->off + end;
 	}
 	return 2u * used >= LL_RXQ_ENTRIES || 2u * bytes >= LL_RXQ_POOL_BYTES;
+}
+
+bool ll_rxq_isr_room(uint8_t link, uint8_t n, uint16_t len)
+{
+	const struct rxq_link *q;
+	uint8_t head, used;
+	uint16_t oldest, newest, end;
+
+	if (link >= LL_MAX_CONN) {
+		return false;
+	}
+	q = &links[link];
+	head = q->head;
+	used = (uint8_t)(head - q->tail);
+	RING_BARRIER();   /* tail read before its record's offset (as in the put) */
+	if ((uint32_t)used + n > LL_RXQ_ENTRIES) {
+		return false;
+	}
+	if (used) {
+		const struct rxq_ent *w = &q->ent[ENT(head - 1)];
+
+		oldest = q->ent[ENT(q->tail)].off;
+		newest = w->off;
+		end = (uint16_t)(w->off + ll_fifo_size(w->len));
+	} else {
+		oldest = newest = end = 0;
+	}
+	/* place the n records one after the other, as the puts would */
+	for (uint8_t k = 0; k < n; k++) {
+		int32_t at = ll_fifo_place(LL_RXQ_POOL_BYTES, (uint8_t)(used + k), oldest, newest,
+					   end, len);
+
+		if (at < 0) {
+			return false;
+		}
+		if (used + k == 0) {
+			oldest = (uint16_t)at;
+		}
+		newest = (uint16_t)at;
+		end = (uint16_t)(at + ll_fifo_size(len));
+	}
+	return true;
 }
 
 void ll_rxq_set_crypt(uint8_t link, struct ll_crypt *c)

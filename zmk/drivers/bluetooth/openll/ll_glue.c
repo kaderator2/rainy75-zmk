@@ -450,7 +450,10 @@ static void radio_evt(enum ll_radio_evt evt, const uint8_t *pdu, uint16_t len, u
 	 * link with 0x08). With long PDUs the byte area holds 8 maximum PDUs
 	 * (LL_RXQ_POOL_BYTES), and one event at a 50 ms interval can carry 11
 	 * exchanges of 4.5 ms; 27-octet PDUs fill the 16 entries in about
-	 * 12 ms of MD burst. Only the owner: no other link receives during
+	 * 12 ms of MD burst. If the thread does not get the CPU in time
+	 * (cooperative host threads run first), ll_conn's RX flow control
+	 * stops the event before ll_rxq can overflow (slice 7 Task 2c).
+	 * Only the owner: no other link receives during
 	 * this event, and its queue was looked at in its own events. The
 	 * CONN_RX callbacks run only once our response has started
 	 * (ll_radio.c): CPU work in the RX -> TX turnaround moves the TX
@@ -1205,6 +1208,8 @@ static void report_stats(struct ll_radio_stats *last, struct ll_conn_stats *last
 		LOG_INF("conn: latency planned %u listened %u skipped %u kicks %u coll %u links %u apto %u",
 			cs.planned, cs.listened, cs.skipped, cs.kicks, cs.collisions,
 			ll_conn_count(), (uint32_t)atomic_get(&cnt_apto));
+		LOG_INF("conn: rx flow paused %u stops %u (radio %u)", cs.rx_paused, cs.rx_stops,
+			st.conn_stopped);
 		LOG_INF("adv: events %u slid %u dropped %u cut %u stuck %u adv_guard %u",
 			as.events, as.slid, as.dropped, as.cut, as.stuck, st.adv_guard);
 		LOG_INF("conn: acl in %u out %u drop %u frag %u evt_drop %u lock max %u us acl_tx %u us aes %u us",

@@ -115,6 +115,16 @@ void ll_radio_adv_enter(void);
  * (interval based, LL_CONN_EVENT_SAFETY_US) and exceeds first_timeout_us. */
 void ll_radio_conn_event(uint8_t ch, uint32_t open_tick, uint32_t first_timeout_us,
 			 uint32_t max_event_us);
+/* RX DMA ring entries of a connection event (ll_radio.c RING_N): the
+ * packets the hardware can hold (acked) before the ISR copies them out. */
+#define LL_RADIO_RX_RING_N 4
+/* Stop the open connection event (slice 7 Task 2c, RX flow control): the
+ * FSM is turned off once the current radio callbacks return, the packets
+ * already in the RX ring are still delivered (CONN_RX), then CONN_DONE.
+ * Central packets after the stop are not received (not acked) and are
+ * resent by the central in a later event. No-op without an open event.
+ * ISR: from the connection radio callbacks only. */
+void ll_radio_conn_stop(void);
 /* Consecutive guard-ended connection events that received no CRC-valid
  * packet: the radio-wedge indicator, counted on the shared radio over all
  * links (the glue ends every active link with 0x08 at 3). A guard
@@ -166,6 +176,7 @@ struct ll_radio_stats {
 	uint32_t rx_ptr_skip;   /* hw rx wptr jumped by more than the ring: entries skipped */
 	uint32_t fst_capped;    /* events whose RX window exceeded the 12-bit rx_timeout */
 	uint32_t holds;         /* first RX IRQs that held the CPU until our TX started */
+	uint32_t conn_stopped;  /* events ended by ll_radio_conn_stop() (RX flow control) */
 	uint8_t rx_wptr_max;    /* largest raw hw rx wptr seen (its counter width) */
 	/* First-exchange T_IFS from the TX timestamp (us, rounded) */
 	uint32_t tifs_le150;

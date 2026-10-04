@@ -86,6 +86,7 @@ void ll_radio_conn_event(uint8_t ch, uint32_t open_tick, uint32_t first_timeout_
 	rad.fst = first_timeout_us;
 	rad.max_ev = max_event_us;
 }
+void ll_radio_conn_stop(void) {}
 void ll_radio_conn_set_sn_init(uint8_t sn) { (void)sn; }
 void ll_radio_conn_set_nesn_init(uint8_t nesn) { (void)nesn; }
 uint8_t ll_radio_fifo_rptr(void) { return rad.rptr; }
