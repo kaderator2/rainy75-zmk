@@ -56,7 +56,9 @@ _Static_assert(LL_MAX_CONN >= 1 && LL_MAX_CONN <= 5, "LL_MAX_CONN must be 1..5")
 #define LL_ADV_DATA_MAX   31
 #define LL_ADV_PDU_MAX    (2 + 6 + LL_ADV_DATA_MAX)
 
-/* Data channel PDUs (Vol 6 Part B 2.4), no DLE */
+/* Data channel PDUs (Vol 6 Part B 2.4). The data path carries at most
+ * LL_DATA_PDU_MAX payload octets; the Data Length Update procedure runs
+ * (ll_llcp), with supportedMax following this (LL_DLE_SUPP_OCTETS). */
 #define LL_DATA_PDU_MAX   27     /* payload bytes */
 #define LL_MIC_LEN        4
 #define LL_LLID_CONT      0x1    /* ACL continuation fragment or empty PDU */

@@ -148,12 +148,14 @@ uint8_t ll_llcp_set_data_len(uint8_t link, uint16_t tx_octets, uint16_t tx_time)
  * out-of-range link. Thread. */
 void ll_llcp_get_dle(uint8_t link, struct ll_llcp_dle *out);
 
-/* PHY Update procedure (5.1.10), responder, 1M only: LL_PHY_REQ ->
- * LL_PHY_RSP(TX 1M, RX 1M) and the 40 s timer until the central's
+/* PHY Update procedure (5.1.10), handled by ll_llcp_rx() (there is no
+ * separate entry point): as a 1M-only responder it answers LL_PHY_REQ with
+ * LL_PHY_RSP(TX 1M, RX 1M) and runs the 40 s timer until the central's
  * LL_PHY_UPDATE_IND. Every LL_PHY_UPDATE_IND keeps 1M: 0 (no change), 1M,
  * and a PHY we lack / an RFU bit / several bits ("shall not change the PHY
  * in that direction"); nothing goes to the host (no change, not host
- * initiated). */
+ * initiated). HCI LE Read PHY / LE Set PHY are answered by the glue
+ * (always 1M). */
 
 /* Encrypt (when the link is encrypted) and queue one data PDU on the link:
  * ll_txq_push(link, ...) with ctrl_opcode = payload[0] for LL_TXQ_CTRL.

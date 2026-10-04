@@ -117,8 +117,8 @@ struct ll_hci_acl_pdu {
 };
 /* Parse one host ACL packet (handle + PB/BC flags LE16, length LE16,
  * data) into a self-contained PDU the glue can hold until ll_llcp_tx()
- * accepts it (-EAGAIN while encryption start pauses data, -ENOMEM while
- * the TX backlog is full). PB 0x00/0x02 (first) -> LLID 2, 0x01
+ * accepts it (-EAGAIN while encryption start pauses data or the link owes
+ * control PDUs, -ENOMEM while the TX backlog is full). PB 0x00/0x02 (first) -> LLID 2, 0x01
  * (continuation) -> LLID 1. Returns 0, -EINVAL (PB 0x03, broadcast flags,
  * length 0 or > LL_DATA_PDU_MAX, length field not matching len) or
  * -ENOTCONN (ops.handle_valid false). out->handle is set whenever the

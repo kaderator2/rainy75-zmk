@@ -97,9 +97,10 @@ LOG_MODULE_DECLARE(openll, CONFIG_BT_HCI_DRIVER_LOG_LEVEL);
 /* A whole-event gap is taken instead of a sliced start when it begins at
  * most this long after the earliest single-channel gap */
 #define ADV_WHOLE_WAIT_TICKS (10000 * LL_TICKS_PER_US)
-/* Starving: no event started for this many adv intervals (each with the
- * maximum advDelay), or this many events dropped in a row; the first
- * channel then asks at ACTIVE */
+/* Starving: no event completed all its channels for this many adv
+ * intervals (each with the maximum advDelay), or this many events dropped
+ * or cut in a row; the channel requests (first and continuation) then ask
+ * at ACTIVE (file header) */
 #define ADV_STARVE_INTERVALS 2
 /* slide / drop rounds per planned event (each drop moves one interval) */
 #define ADV_PLAN_TRIES       8

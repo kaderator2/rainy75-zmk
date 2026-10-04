@@ -1271,9 +1271,9 @@ static uint8_t ref_skip(struct ll_csa1 *ref, uint32_t n)
 	return ch;
 }
 
-/* Idle and synced: events 1..4 are skipped, event 5 is listened to; the
- * counter and CSA#1 advance over the skipped events, widening grows over
- * the real time since the anchor. Stats count it. */
+/* Idle and synced (after the holdoff): EV(1)..EV(4) are skipped, EV(5) is
+ * listened to; the counter and CSA#1 advance over the skipped events,
+ * widening grows over the real time since the anchor. Stats count it. */
 static void test_latency_skip(void)
 {
 	struct ll_conn_stats s0, s1;
@@ -1491,8 +1491,12 @@ static void test_latency_instant_pending(void)
 }
 
 /* An instant that arrives while a skip is planned and falls into the
- * skipped part: re-planned to listen at the instant; if that event is no
- * longer reachable, the instant has passed (0x28). */
+ * skipped part: re-planned to listen at the first reachable event of the
+ * window, or at the instant if that comes first (slice 5 final fix; the
+ * earlier-reachable case is test_latency_instant_replan_reachable); once
+ * the instant event's anchor has passed, the instant has passed (0x28;
+ * slice 7: by the anchor, not the alarm, see
+ * test_instant_alarm_passed_anchor_not). */
 static void test_latency_instant_in_window(void)
 {
 	struct ll_csa1 ref;
@@ -1718,9 +1722,9 @@ static void test_latency_from_update(void)
 	ll_conn_end(0, LL_ST_REMOTE_TERM);
 }
 
-/* Review fix: once an instant re-plan applied the instant to the planned
- * event, nothing may re-plan to an earlier event (it would use the new
- * timing / the old map, and the instant would never be applied again). */
+/* Slice 5 review fix: once an instant re-plan applied the instant to the
+ * planned event, nothing may re-plan to an earlier event (it would use the
+ * new timing / the old map, and the instant would never be applied again). */
 static void test_latency_instant_replan_then_kick(void)
 {
 	struct ll_conn_params p24 = {.interval = 24, .latency = 0, .timeout = 400};
@@ -1783,11 +1787,11 @@ static void test_latency_instant_replan_then_kick(void)
 	ll_conn_end(0, LL_ST_REMOTE_TERM);
 }
 
-/* Final review fix: an instant inside the planned skip window re-plans to
- * the first reachable event (not to the instant), so a kick right after it
- * still reaches the next event; every event up to and including the
- * instant is then listened to, the instant is applied at its own event and
- * the channel sequence follows CSA#1. */
+/* Slice 5 final review fix: an instant inside the planned skip window
+ * re-plans to the first reachable event (not to the instant), so a kick
+ * right after it still reaches the next event; every event up to and
+ * including the instant is then listened to, the instant is applied at
+ * its own event and the channel sequence follows CSA#1. */
 static void test_latency_instant_replan_reachable(void)
 {
 	struct ll_conn_params p24 = {.interval = 24, .latency = 0, .timeout = 400};
