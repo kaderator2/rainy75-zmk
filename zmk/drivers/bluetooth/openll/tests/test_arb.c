@@ -887,11 +887,17 @@ static void test_dodge(void)
 	sim_reset();
 	CHECK(sim_connect(0, t0, 12, 4, 400, 0) == 0);
 	busy[1] = true;
-	/* link 1's window event 0 lies 0.5 ms after link 0's event 5 (WinOffset
-	 * 25 ms, so link 0 can still move), its events (75 ms) then land on
-	 * every 5th event of link 0 */
-	sim_win_offset = 20;
-	CHECK(sim_connect(1, t0 + T(50000 + 500), 60, 0, 400, 0) == 1);
+	/* link 1's window event 0 lies 0.5 ms after a listened event of link 0
+	 * (WinOffset 25 ms, so link 0 can still move), its events (75 ms) then
+	 * land on every 5th event of link 0. Slice 7: link 0 skips only after
+	 * its latency holdoff (events 0..h - 1 listened, then h + 4, h + 9,
+	 * ...), so link 1 connects 5 events before event h + 9 (h = 67). */
+	{
+		uint32_t h = (LL_CONN_LATENCY_HOLDOFF_MS * 1000u - 1350u + 14999u) / 15000u;
+
+		sim_win_offset = 20;
+		CHECK(sim_connect(1, t0 + T(15000) * (h + 4) + T(50000 + 500), 60, 0, 400, 0) == 1);
+	}
 	sim_win_offset = 0;
 	prev = sim.last_ev[0];
 	for (int guard = 0; guard < 100000 && ll_conn_event_counter(0) < 600; guard++) {

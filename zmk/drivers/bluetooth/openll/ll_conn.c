@@ -123,6 +123,7 @@ struct ll_link {
 	uint32_t win_us;
 	uint32_t sync_tick;
 	uint32_t sup_tick;    /* supervision timer start */
+	uint32_t start_tick;  /* CONNECT_IND end: LL_CONN_LATENCY_HOLDOFF_MS counts from it */
 	/* planned event */
 	uint8_t ch;
 	uint32_t open_tick;
@@ -325,6 +326,12 @@ static uint16_t skip_count(struct ll_link *c)
 	}
 	if (instant_within(c, c->chm_pending, c->chm_instant, n) ||
 	    instant_within(c, c->upd_pending, c->upd_instant, n)) {
+		return 0;
+	}
+	/* holdoff after connect: the first candidate's anchor must lie at
+	 * least LL_CONN_LATENCY_HOLDOFF_MS after the connection start */
+	if ((int32_t)(anchor_of(c, c->counter) - c->start_tick) <
+	    (int32_t)US(LL_CONN_LATENCY_HOLDOFF_MS * 1000u)) {
 		return 0;
 	}
 	/* supervision: listened anchor <= last RX + timeout - 2 * interval */
@@ -857,6 +864,7 @@ int ll_conn_start(const struct ll_connect_ind *ci, uint32_t connect_ind_end_tick
 	c->win_us = (uint32_t)ci->win_size * UNIT_US;
 	c->sync_tick = connect_ind_end_tick;
 	c->sup_tick = connect_ind_end_tick;
+	c->start_tick = connect_ind_end_tick;
 	c->active = true;
 	c->state = LINK_ACTIVE;
 
