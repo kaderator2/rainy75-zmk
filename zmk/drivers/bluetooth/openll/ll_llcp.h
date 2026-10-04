@@ -65,12 +65,10 @@ struct ll_llcp_ops {
  * and host ACL of the link gets -EAGAIN, so control PDUs take the next free
  * slot) and ll_llcp_retry() pushes it. While a link owes a PDU,
  * ll_llcp_timeout_ticks() asks for a wakeup within LL_LLCP_RETRY_MS, and
- * ll_llcp_busy() is true. LL_LLCP_RETRY_LIMIT_MS without any owed PDU of
- * the link queued (the central acks nothing) ends the link with 0x22 at
- * ll_llcp_tick(). */
+ * ll_llcp_busy() is true. Owing never ends a link: a dead link ends by
+ * supervision, a stuck procedure by its 40 s response timer. */
 #define LL_LLCP_OWE_N           4
 #define LL_LLCP_RETRY_MS        10
-#define LL_LLCP_RETRY_LIMIT_MS  2000
 
 /* Once at startup. ops is copied (members may be NULL). Resets all links. */
 void ll_llcp_init(const struct ll_llcp_ops *ops);
@@ -97,17 +95,16 @@ uint8_t ll_llcp_terminate(uint8_t link, uint8_t reason);
  * (encryption start, our LENGTH request, the PHY update after our
  * LL_PHY_RSP): 40 s from the last LL control PDU the procedure queued while
  * it waits on the central (or on the host's LTK), then
- * ll_conn_end(LL_ST_LMP_TIMEOUT) of that link only; the same for owed
- * control PDUs without progress for LL_LLCP_RETRY_LIMIT_MS (it retries them
- * first). Checks all links. Call from the controller thread with
+ * ll_conn_end(LL_ST_LMP_TIMEOUT) of that link only (its owed PDUs are
+ * dropped with it). Checks all links. Call from the controller thread with
  * the stimer tick when ll_llcp_timeout_ticks() says it is due (calling it
  * earlier or more often is harmless). */
 void ll_llcp_tick(uint32_t now_tick);
 /* Push the link's owed control PDUs, in order, until the backlog is full
  * again (runs the steps that wait for them, e.g. Encryption Change after
  * our LL_START_ENC_RSP). Controller thread: call it for every link before
- * its host ACL, at every wakeup; ll_llcp_tick() also calls it for all
- * links. No-op for an out-of-range link or when nothing is owed. */
+ * its host ACL, at every wakeup. No-op for an out-of-range link or when
+ * nothing is owed. */
 void ll_llcp_retry(uint8_t link);
 /* Ticks until the earliest running per-link procedure response timer
  * expires at now_tick (0 when one is due), at most LL_LLCP_RETRY_MS while

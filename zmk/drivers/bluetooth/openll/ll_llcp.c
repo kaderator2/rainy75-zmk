@@ -46,8 +46,9 @@
  * of the link queue behind it (order kept) and the link's host ACL waits
  * (-EAGAIN), so the encrypted LL_START_ENC_RSP still precedes the first
  * encrypted data PDU; the only step that waits for an owed PDU is the end
- * of the encryption start (POST_ENC_DONE). TMR_OWE bounds the time
- * without progress (LL_LLCP_RETRY_LIMIT_MS).
+ * of the encryption start (POST_ENC_DONE). Owing never ends a link by
+ * itself: a dead link ends by supervision, a stuck procedure by its 40 s
+ * timer; owed PDUs only ask for a wakeup every LL_LLCP_RETRY_MS.
  */
 #include <errno.h>
 #include <string.h>
@@ -97,20 +98,27 @@
 #define LEN_UNKNOWN_RSP      2
 #define LEN_REJECT_EXT_IND   3
 #define LEN_LENGTH           9    /* LL_LENGTH_REQ and LL_LENGTH_RSP */
+#define LEN_ENC_RSP          13   /* our LL_ENC_RSP: SKDs + IVs */
+#define LEN_FEATURE_RSP      9
 #define LEN_PHY_REQ          3
 #define LEN_PHY_UPDATE_IND   5
 
 #define RSP_TIMEOUT_TICKS    (40000000u * LL_TICKS_PER_US)
 #define RETRY_TICKS          (LL_LLCP_RETRY_MS * 1000u * LL_TICKS_PER_US)
-#define RETRY_LIMIT_TICKS    (LL_LLCP_RETRY_LIMIT_MS * 1000u * LL_TICKS_PER_US)
-#define OWE_PDU_MAX          16   /* our longest control PDU: LL_ENC_RSP, 13 */
+#define OWE_PDU_MAX          16   /* >= every control PDU we send (assert below) */
+/* The control PDUs we send (owed copies are kept whole): LL_ENC_RSP (13)
+ * is the longest, then LL_LENGTH_REQ/_RSP and LL_FEATURE_RSP (9),
+ * LL_VERSION_IND (6), LL_REJECT_EXT_IND / LL_PHY_RSP (3), LL_UNKNOWN_RSP /
+ * LL_REJECT_IND / LL_TERMINATE_IND (2), LL_START_ENC_REQ/_RSP (1). */
+_Static_assert(OWE_PDU_MAX >= LEN_ENC_RSP && OWE_PDU_MAX >= LEN_LENGTH &&
+	       OWE_PDU_MAX >= LEN_FEATURE_RSP && OWE_PDU_MAX >= LEN_VERSION_IND,
+	       "OWE_PDU_MAX must hold every control PDU we send");
 
 /* per-link procedure response timers (Vol 6 Part B 5.2) */
 enum {
 	TMR_ENC,   /* encryption start: waits on the host's LTK / the central */
 	TMR_DLE,   /* our LL_LENGTH_REQ: waits on LL_LENGTH_RSP */
 	TMR_PHY,   /* our LL_PHY_RSP: waits on LL_PHY_UPDATE_IND */
-	TMR_OWE,   /* owed control PDUs: since the last progress (LL_LLCP_RETRY_LIMIT_MS) */
 	TMR_N,
 };
 
@@ -290,9 +298,7 @@ static int ctrl_send_locked(uint8_t link, const uint8_t *pdu, uint8_t len, enum 
 		s->owe[i].post = (uint8_t)post;
 		memcpy(s->owe[i].d, pdu, len);
 	}
-	if (s->owe_n++ == 0) {
-		timer_start(s, TMR_OWE);   /* no progress since now */
-	}
+	s->owe_n++;
 	return 1;
 }
 
@@ -579,7 +585,7 @@ static void put_le32(uint8_t *p, uint32_t v)
 static void rx_enc_req(uint8_t link, const uint8_t *p)
 {
 	struct llcp_link *s = &links[link];
-	uint8_t rsp[13];
+	uint8_t rsp[LEN_ENC_RSP];
 	bool ok, sent = false;
 
 	ll_plat_tx_lock();
@@ -675,7 +681,7 @@ static void rx_start_enc_rsp(uint8_t link)
 static void rx_feature_req(uint8_t link, const uint8_t *p)
 {
 	struct llcp_link *s = &links[link];
-	uint8_t rsp[9] = {OP_FEATURE_RSP};
+	uint8_t rsp[LEN_FEATURE_RSP] = {OP_FEATURE_RSP};
 
 	ll_plat_tx_lock();
 	s->peer_feat_valid = true;
@@ -945,11 +951,6 @@ uint8_t ll_llcp_terminate(uint8_t link, uint8_t reason)
 	return LL_ST_SUCCESS;
 }
 
-static uint32_t tmr_limit(unsigned int t)
-{
-	return t == TMR_OWE ? RETRY_LIMIT_TICKS : RSP_TIMEOUT_TICKS;
-}
-
 void ll_llcp_retry(uint8_t link)
 {
 	struct llcp_link *s;
@@ -974,11 +975,6 @@ void ll_llcp_retry(uint8_t link)
 		}
 		s->owe_head = (uint8_t)((i + 1) % LL_LLCP_OWE_N);
 		s->owe_n--;
-		if (s->owe_n == 0) {
-			s->tmr_on[TMR_OWE] = false;
-		} else {
-			timer_start(s, TMR_OWE);   /* progress */
-		}
 		if (s->owe[i].post == POST_ENC_DONE) {
 			/* host ACL waited (-EAGAIN) while it was owed */
 			enc_done = enc_done_locked(link);
@@ -994,10 +990,8 @@ void ll_llcp_tick(uint32_t now_tick)
 {
 	bool expired[LL_MAX_CONN];
 
-	/* what can leave now is not given up */
-	for (uint8_t i = 0; i < LL_MAX_CONN; i++) {
-		ll_llcp_retry(i);
-	}
+	/* No ll_llcp_retry() here: the glue retries every link before its
+	 * host ACL at every pass, and owed PDUs never end a link. */
 	ll_plat_tx_lock();
 	for (uint8_t i = 0; i < LL_MAX_CONN; i++) {
 		struct llcp_link *s = &links[i];
@@ -1005,7 +999,8 @@ void ll_llcp_tick(uint32_t now_tick)
 		expired[i] = false;
 		for (unsigned int t = 0; t < TMR_N; t++) {
 			expired[i] |= s->tmr_on[t] &&
-				      (int32_t)(now_tick - s->tmr_start[t]) >= (int32_t)tmr_limit(t);
+				      (int32_t)(now_tick - s->tmr_start[t]) >=
+					      (int32_t)RSP_TIMEOUT_TICKS;
 		}
 		if (expired[i]) {
 			/* the link is lost: every procedure on it ends */
@@ -1039,17 +1034,17 @@ int32_t ll_llcp_timeout_ticks(uint32_t now_tick)
 			if (!s->tmr_on[t]) {
 				continue;
 			}
-			left = (int32_t)tmr_limit(t) - (int32_t)(now_tick - s->tmr_start[t]);
+			left = (int32_t)RSP_TIMEOUT_TICKS - (int32_t)(now_tick - s->tmr_start[t]);
 			if (left < 0) {
 				left = 0;
-			}
-			if (t == TMR_OWE && left > (int32_t)RETRY_TICKS) {
-				/* owed PDUs: retry at least every LL_LLCP_RETRY_MS */
-				left = (int32_t)RETRY_TICKS;
 			}
 			if (min < 0 || left < min) {
 				min = left;
 			}
+		}
+		/* owed PDUs: a retry wakeup within LL_LLCP_RETRY_MS */
+		if (s->owe_n != 0 && (min < 0 || min > (int32_t)RETRY_TICKS)) {
+			min = (int32_t)RETRY_TICKS;
 		}
 	}
 	ll_plat_tx_unlock();
@@ -1075,7 +1070,8 @@ bool ll_llcp_busy(uint8_t link)
 			return true;
 		}
 	}
-	return false;
+	/* a control PDU owed (slice 7) */
+	return *(volatile uint8_t *)&s->owe_n != 0;
 }
 
 void ll_llcp_init(const struct ll_llcp_ops *o)

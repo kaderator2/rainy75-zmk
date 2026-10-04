@@ -807,7 +807,7 @@ static void single_link_suite(void)
 		rx(buf, 1);
 		CHECK(hci.enc_change == 0);
 		CHECK(!rxq_crypt->enc_tx && rxq_crypt->tx_ctr == 0);
-		/* the owed bound (2 s without progress) comes first: 0x22 */
+		/* the encryption start's 40 s timer ends it (0x22) */
 		ll_llcp_tick(now + T(TIMEOUT_US));
 		CHECK(cn.end_calls == 1 && cn.end_reason == LL_ST_LMP_TIMEOUT);
 		tx.fail = 0;
@@ -1749,8 +1749,8 @@ static void test_routing_per_link(void)
  * link's owed queue (in order; later control PDUs of the link queue behind
  * it, host ACL waits with -EAGAIN) and ll_llcp_retry() pushes it from the
  * controller thread. While something is owed ll_llcp_timeout_ticks() asks
- * for a wakeup within LL_LLCP_RETRY_MS; no progress for
- * LL_LLCP_RETRY_LIMIT_MS ends the link (0x22) at ll_llcp_tick(). */
+ * for a wakeup within LL_LLCP_RETRY_MS; owing never ends the link (a dead
+ * link ends by supervision, a stuck procedure by its 40 s timer). */
 
 static const uint8_t vi_c[6] = {0x0C, 0x0A, 0x02, 0x00, 0x34, 0x12};
 static const uint8_t vi_ours[6] = {0x0C, 0x09, 0xFF, 0xFF, 0x01, 0x00};
@@ -1903,48 +1903,44 @@ static void push_retry_suite(void)
 		CHECK(tx.n == 1 && push_is(0, ti, 2));
 	}
 
-	/* bounded: no progress for LL_LLCP_RETRY_LIMIT_MS ends the link with
-	 * 0x22 (instead of the 40 s procedure timeout or never) */
+	/* owing never ends a link (review fix: supervision and the 40 s
+	 * procedure timers cover dead links): a response owed for a minute
+	 * keeps the 10 ms retry wakeup and goes out once there is room */
 	fresh();
 	{
+		tx.fail = 100000;
+		features(0xFF);
+		for (int i = 0; i < 6000; i++) {
+			now += T(LL_LLCP_RETRY_MS * 1000u);
+			ll_llcp_retry(L);
+			ll_llcp_tick(now);
+			CHECK(ll_llcp_timeout_ticks(now) == retry);
+		}
+		CHECK(cn.end_calls == 0 && ll_llcp_busy(L) && tx.n == 0);
+		tx.fail = 0;
+		ll_llcp_retry(L);
+		CHECK(tx.n == 1 && push_is(0, feat_ours, 9));
+		CHECK(!ll_llcp_busy(L) && ll_llcp_timeout_ticks(now) == -1);
+	}
+	/* a procedure whose PDU stays owed: its own 40 s timer ends the link
+	 * (0x22), and the owed PDU is dropped with it */
+	fresh();
+	{
+		static const uint8_t req[3] = {0x16, 0x03, 0x03};
 		uint32_t t0 = now;
 
 		tx.fail = 1000;
-		features(0xFF);
-		for (int i = 0; i < 10; i++) {
-			now += T(LL_LLCP_RETRY_MS * 1000u);
-			ll_llcp_retry(L);
-			CHECK(ll_llcp_timeout_ticks(now) <= retry);
-		}
-		ll_llcp_tick(t0 + T(LL_LLCP_RETRY_LIMIT_MS * 1000u) - 1);
+		rx(req, 3);                            /* LL_PHY_RSP owed, timer on */
+		CHECK(ll_llcp_timeout_ticks(t0) == retry);
+		ll_llcp_tick(t0 + T(TIMEOUT_US) - 1);
 		CHECK(cn.end_calls == 0);
-		CHECK(ll_llcp_timeout_ticks(t0 + T(LL_LLCP_RETRY_LIMIT_MS * 1000u) - 1) == 1);
-		ll_llcp_tick(t0 + T(LL_LLCP_RETRY_LIMIT_MS * 1000u));
+		CHECK(ll_llcp_timeout_ticks(t0 + T(TIMEOUT_US) - 1) == 1);
+		ll_llcp_tick(t0 + T(TIMEOUT_US));
 		CHECK(cn.end_calls == 1 && cn.end_reason == LL_ST_LMP_TIMEOUT);
 		CHECK(!ll_llcp_busy(L) && ll_llcp_timeout_ticks(now) == -1);
 		tx.fail = 0;
 		ll_llcp_retry(L);
 		CHECK(tx.n == 0);
-	}
-	/* progress restarts the bound: one PDU out, the next one owed */
-	fresh();
-	{
-		uint32_t t0 = now;
-		uint8_t pdu[3] = {0x19, 0, 0};
-
-		tx.fail = 1;
-		features(0xFF);
-		rx(pdu, 3);
-		now = t0 + T(LL_LLCP_RETRY_LIMIT_MS * 1000u) - 10;
-		tx.ok_first = 1;
-		tx.fail = 1;
-		ll_llcp_retry(L);
-		CHECK(tx.n == 1);
-		tx.fail = 1000;
-		ll_llcp_tick(t0 + T(LL_LLCP_RETRY_LIMIT_MS * 1000u));
-		CHECK(cn.end_calls == 0);
-		ll_llcp_tick(now + T(LL_LLCP_RETRY_LIMIT_MS * 1000u));
-		CHECK(cn.end_calls == 1 && cn.end_reason == LL_ST_LMP_TIMEOUT);
 	}
 
 	/* the owed queue holds LL_LLCP_OWE_N PDUs; one more response is
