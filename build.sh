@@ -1,6 +1,6 @@
 #!/bin/bash
 # Build ZMK firmware for Rainy 75 Pro
-# Usage: ./build.sh [-p] [-v] [-m] [-c] [-o] [-b] [-a] (--iso | --ansi)
+# Usage: ./build.sh [-p] [-v] [-m] [-c] [-o] [-b] [-a] (--iso | --ansi) [--openll [--privacy]]
 #   -p  pristine build (clean rebuild)
 #   -v  verbose output
 #   -m  build MCUboot bootloader
@@ -11,6 +11,8 @@
 #   --iso / --ansi   physical layout, REQUIRED for any app build (no default)
 #                    e.g. ./build.sh -pa --iso   or   ./build.sh -pa --ansi
 #   --openll  use the open BLE link layer instead of the Telink blob (issue #13)
+#   --privacy with --openll only: resolvable private address (BT_PRIVACY). Every
+#             host must be paired again; the blob does not support it.
 
 set -e
 
@@ -30,6 +32,7 @@ LAYOUT=""             # "iso" or "ansi" — REQUIRED for app builds, no default
 ANSI_DTFLAG=""        # set when LAYOUT=ansi
 APP_CONF="$(pwd)/conf/app.conf"
 USE_OPENLL=0          # set by --openll
+USE_PRIVACY=0         # set by --privacy (needs --openll)
 
 # ── Apply upstream patches if needed ──────────────────────────
 #
@@ -81,11 +84,12 @@ ARGS=(); for a in "$@"; do case "$a" in
     --iso)    ARGS+=("-I");;
     --ansi)   ARGS+=("-A");;
     --openll) ARGS+=("-O");;
+    --privacy) ARGS+=("-Y");;
     *)        ARGS+=("$a");;
 esac; done
 set -- "${ARGS[@]}"
 
-while getopts "pvmcobaIAO" opt; do
+while getopts "pvmcobaIAOY" opt; do
     case $opt in
         p) PRISTINE="-p" ;;
         v) VERBOSE_CMAKE="-DCMAKE_VERBOSE_MAKEFILE=ON" ;;
@@ -97,7 +101,8 @@ while getopts "pvmcobaIAO" opt; do
         I) [ "$LAYOUT" = ansi ] && { echo "Error: --iso and --ansi are mutually exclusive" >&2; exit 1; }; LAYOUT="iso" ;;
         A) [ "$LAYOUT" = iso  ] && { echo "Error: --iso and --ansi are mutually exclusive" >&2; exit 1; }; LAYOUT="ansi"; ANSI_DTFLAG="-DDTS_EXTRA_CPPFLAGS=-DRAINY75_ANSI -DCONFIG_RAINY_RGB_ANSI_LEDMAP=y" ;;
         O) APP_CONF="$APP_CONF;$(pwd)/conf/openll.conf"; USE_OPENLL=1 ;;
-        *) echo "Usage: $0 [-p] [-v] [-m] [-c] [-o] [-b] [-a] (--iso | --ansi) [--openll]"; exit 1 ;;
+        Y) USE_PRIVACY=1 ;;
+        *) echo "Usage: $0 [-p] [-v] [-m] [-c] [-o] [-b] [-a] (--iso | --ansi) [--openll [--privacy]]"; exit 1 ;;
     esac
 done
 
@@ -108,6 +113,17 @@ if [ "$BUILD_APP" -eq 1 ] && [ -z "$LAYOUT" ]; then
     echo "  ./build.sh -pa --iso    # ISO DE  (the original board)" >&2
     echo "  ./build.sh -pa --ansi   # ANSI    (community-verified)" >&2
     exit 1
+fi
+
+# --privacy needs the open controller: the Telink blob has no LE Set Random
+# Address, so BT_PRIVACY hangs bt_enable() there.
+if [ "$USE_PRIVACY" -eq 1 ]; then
+    if [ "$USE_OPENLL" -eq 0 ]; then
+        echo "Error: --privacy requires --openll (the Telink blob does not support" >&2
+        echo "       LE Set Random Address). Use: ./build.sh --iso --openll --privacy" >&2
+        exit 1
+    fi
+    APP_CONF="$APP_CONF;$(pwd)/conf/privacy.conf"
 fi
 
 # ── Fetch the (non-redistributable) Telink BLE blob if missing ──

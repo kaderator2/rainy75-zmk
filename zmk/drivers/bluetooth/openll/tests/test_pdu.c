@@ -27,7 +27,7 @@ static void test_random_adva(void)
 	n = ll_pdu_build_adv(out, LL_PDU_ADV_SCAN_IND, rnda, 1, ad, 3);
 	CHECK(out[0] == (0x06 | 0x40));
 	/* any non-zero tx_add is 1 */
-	n = ll_pdu_build_adv(out, LL_PDU_ADV_IND, rnda, 2, ad, 3);
+	(void)ll_pdu_build_adv(out, LL_PDU_ADV_IND, rnda, 2, ad, 3);
 	CHECK(out[0] == (0x20 | 0x40));
 
 	/* SCAN_REQ: RxAdd must match our TxAdd */
@@ -55,7 +55,6 @@ static void test_random_adva(void)
 	/* a CONNECT_IND to our public AdvA (RxAdd 0) while we advertise random */
 	memcpy(&ci_pdu[8], adva, 6);
 	CHECK(ll_pdu_parse_connect_ind(ci_pdu, 36, rnda, 1, &ci) == -1);
-	(void)n;
 }
 
 int main(void)

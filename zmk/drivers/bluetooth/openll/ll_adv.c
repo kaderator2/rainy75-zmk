@@ -552,7 +552,11 @@ uint8_t ll_adv_set_random_addr(const uint8_t addr[6])
 	} else {
 		memcpy(adv.rnd_a, addr, 6);
 		adv.rnd_set = true;
-		build_pdus();   /* no change on air while advertising public */
+		if (!adv.enabled) {
+			/* while enabled (public AdvA) nothing changes on air;
+			 * the next enable rebuilds the PDUs */
+			build_pdus();
+		}
 	}
 	ll_plat_unlock(key);
 	return st;
@@ -603,7 +607,8 @@ void ll_adv_radio_evt(enum ll_radio_evt evt, const uint8_t *pdu, uint8_t len,
 			}
 			/* too late to answer; no TX_DONE will come, so move on now */
 		}
-		if (connectable() && ll_pdu_parse_connect_ind(pdu, len, adv.use_a, adv.use_tx_add, &ci) == 0) {
+		if (connectable() &&
+		    ll_pdu_parse_connect_ind(pdu, len, adv.use_a, adv.use_tx_add, &ci) == 0) {
 			if (adv.on_connect) {
 				adv.on_connect(&ci);
 			}

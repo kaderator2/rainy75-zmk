@@ -16,9 +16,10 @@
 uint8_t ll_pdu_build_adv(uint8_t *out, uint8_t pdu_type, const uint8_t adva[6], uint8_t tx_add,
 			 const uint8_t *data, uint8_t len)
 {
-	/* TxAdd: 0 public AdvA, 1 random (Own_Address_Type 1). ChSel 1 (CSA#2 supported, Vol 6 Part B
-	 * 2.3.1) in the connectable PDUs; RFU (0) in the others. A link uses
-	 * CSA#2 only when the CONNECT_IND has ChSel 1 too (4.5.8.1). */
+	/* TxAdd: 0 public AdvA, 1 random (Own_Address_Type 1). ChSel 1 (CSA#2
+	 * supported, Vol 6 Part B 2.3.1) in the connectable PDUs; RFU (0) in
+	 * the others. A link uses CSA#2 only when the CONNECT_IND has ChSel 1
+	 * too (4.5.8.1). */
 	out[0] = pdu_type & 0x0F;
 	if (out[0] == LL_PDU_ADV_IND || out[0] == LL_PDU_ADV_DIRECT_IND) {
 		out[0] |= HDR_CHSEL_BIT;

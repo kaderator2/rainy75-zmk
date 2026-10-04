@@ -28,14 +28,14 @@ struct ll_adv_params {
 	uint8_t filter_policy;
 };
 
-/* adva: the public device address. Every advertising PDU carries the AdvA
- * of Own_Address_Type (public, or the address of LE Set Random Address)
- * with the matching TxAdd; only a SCAN_REQ / CONNECT_IND to that AdvA and
- * address type is ours (ci->adv_a / adv_addr_random record it). */
 /* Called (ISR) for every CONNECT_IND addressed to us, before it is handed
  * to ll_conn_start(); informational (logging). May be NULL. */
 typedef void (*ll_adv_connect_cb_t)(const struct ll_connect_ind *ci);
 
+/* adva: the public device address. Every advertising PDU carries the AdvA
+ * of Own_Address_Type (public, or the address of LE Set Random Address)
+ * with the matching TxAdd; only a SCAN_REQ / CONNECT_IND to that AdvA and
+ * address type is ours (ci->adv_a / adv_addr_random record it). */
 void ll_adv_init(const uint8_t adva[6], ll_adv_connect_cb_t on_connect);
 void ll_adv_reset(void);
 /* LL_ST_UNSUPPORTED (0x11) for own types 2/3, directed types and filter
