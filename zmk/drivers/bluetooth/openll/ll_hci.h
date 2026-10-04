@@ -109,24 +109,34 @@ void ll_hci_evt_phy_update(uint16_t handle, uint8_t status, uint8_t tx_phy, uint
 void ll_hci_default_data_len(uint16_t *tx_octets, uint16_t *tx_time);
 
 /* ---- ACL data framing (no H4 type byte on input, H4 type 0x02 on
- * output). LE ACL is never fragmented here: LE Read Buffer Size reports
- * LL_ACL_MTU = LL_DATA_PDU_MAX, so one host ACL packet is one data PDU. */
+ * output). LE Read Buffer Size reports LL_ACL_MTU (251); one host ACL
+ * packet is split into PDUs of the link's TX limit (ll_hci_acl_fragment,
+ * slice 6b Task 4), received PDUs go to the host one by one (no
+ * recombination: the host reassembles L2CAP). */
 struct ll_hci_acl_pdu {
 	uint16_t handle;                   /* connection handle (== link id) */
 	uint8_t llid;                      /* LL_LLID_START or LL_LLID_CONT */
-	uint8_t len;                       /* 1..LL_DATA_PDU_MAX */
-	uint8_t data[LL_DATA_PDU_MAX];
+	uint8_t len;                       /* 1..LL_ACL_MTU */
+	uint8_t data[LL_ACL_MTU];
 };
 /* Parse one host ACL packet (handle + PB/BC flags LE16, length LE16,
  * data) into a self-contained PDU the glue can hold until ll_llcp_tx()
  * accepts it (-EAGAIN while encryption start pauses data or the link owes
  * control PDUs, -ENOMEM while the TX backlog is full). PB 0x00/0x02 (first) -> LLID 2, 0x01
  * (continuation) -> LLID 1. Returns 0, -EINVAL (PB 0x03, broadcast flags,
- * length 0 or > LL_DATA_PDU_MAX, length field not matching len) or
+ * length 0 or > LL_ACL_MTU, length field not matching len) or
  * -ENOTCONN (ops.handle_valid false). out->handle is set whenever the
  * header could be read (len >= 4), also on an error, so the caller can
  * give the buffer credit back to that handle. Needs ll_hci_init(). */
 int ll_hci_acl_from_host(const uint8_t *acl, uint16_t len, struct ll_hci_acl_pdu *out);
+/* Split one host ACL packet (in->len 1..LL_ACL_MTU) into PDUs of at most
+ * frag_max octets (the link's TX limit, ll_dle_tx_limit): the first with
+ * in->llid (2, or 1 for a host continuation packet), the others LLID 1,
+ * all full but the last. Returns the number of fragments written to out[]
+ * (at most n_out), 0 on error (frag_max 0, a bad length or LLID, or more
+ * than n_out fragments needed). Pure. */
+uint8_t ll_hci_acl_fragment(const struct ll_hci_acl_pdu *in, uint8_t frag_max,
+			    struct ll_acl_frag *out, uint8_t n_out);
 
 /* H4 type + ACL header + one data PDU payload */
 #define LL_HCI_ACL_MAX (1 + 4 + LL_DATA_PDU_MAX)

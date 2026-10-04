@@ -23,6 +23,7 @@
 #include "../ll_rxq.h"
 #include "../ll_sched.h"
 #include "../ll_txq.h"
+#include "crypt_max_vec.h"
 
 #define T(us)      ((uint32_t)(us) * LL_TICKS_PER_US)
 #define HDR_NESN   0x04
@@ -167,8 +168,9 @@ static void on_evt(uint8_t link, enum ll_conn_evt what, const void *arg)
 	}
 }
 
-static void on_txq_done(uint8_t link, enum ll_txq_kind kind, uint8_t op)
+static void on_txq_done(uint8_t link, enum ll_txq_kind kind, uint8_t op, bool last)
 {
+	(void)last;
 	CHECK(link < LL_MAX_CONN);
 	if (kind == LL_TXQ_CTRL) {
 		cbs.done_ctrl++;
@@ -287,7 +289,7 @@ static void rx(uint32_t anchor, uint8_t hdr0, uint8_t paylen)
 		pdu[2 + i] = (uint8_t)(0xA0 + i);
 	}
 	now = anchor + T(LL_CONN_SYNC_US);
-	ll_conn_radio_evt(LL_RADIO_CONN_RX, pdu, (uint8_t)(2 + paylen), now);
+	ll_conn_radio_evt(LL_RADIO_CONN_RX, pdu, (uint16_t)(2 + paylen), now);
 }
 
 /* CRC-bad packet whose access address ends at anchor + sync */
@@ -1324,7 +1326,7 @@ static void test_latency_refused_txq(void)
 	CHECK(rad.ch == ref_skip(&ref, 5));
 	a1 = a0 + T(75000);
 	rx(a1, 0x01, 0);
-	CHECK(ll_txq_push(0, LL_TXQ_ACL, LL_LLID_START, pdu, sizeof(pdu), 0) == 0);
+	CHECK(ll_txq_push(0, LL_TXQ_ACL, LL_LLID_START, pdu, sizeof(pdu), 0, true) == 0);
 	done(1);
 	fire_alarm();
 	CHECK(rad.ch == ref_skip(&ref, 1));
@@ -2241,7 +2243,7 @@ static void test_last_link_alone(void)
 	CHECK(rad.open == open_at(a0, 5));
 	CHECK(rad.ch == ref_skip(&ref, 5));
 	/* backlog on this link: the next event is listened to */
-	CHECK(ll_txq_push(last, LL_TXQ_ACL, LL_LLID_START, pdu, sizeof(pdu), 0) == 0);
+	CHECK(ll_txq_push(last, LL_TXQ_ACL, LL_LLID_START, pdu, sizeof(pdu), 0, true) == 0);
 	rx(a0 + T(75000), 0x01, 0);
 	done(1);
 	fire_alarm();
@@ -2952,6 +2954,134 @@ static void test_instant_late_refused_by_arbiter(void)
 	ll_conn_end(1, LL_ST_REMOTE_TERM);
 }
 
+/* ---------------- slice 6b Task 4: long PDUs ---------------- */
+
+/* A 251-octet encrypted PDU is 255 bytes on air: the radio reports len 257
+ * (header + payload), which an 8-bit length wrapped to 1 (spike: acked by
+ * the hardware, then dropped, MIC failure at the next PDU). Through
+ * ll_conn and ll_rxq to the decrypted payload, link kept. */
+static void test_rx_long_pdu(void)
+{
+	static const uint8_t ltk_[16] = {0xBF, 0x01, 0xFB, 0x9D, 0x4E, 0xF3, 0xBC, 0x36,
+					 0xD8, 0x74, 0xF5, 0x39, 0x41, 0x38, 0x68, 0x4C};
+	static const uint8_t skdm_[8] = {0x13, 0x02, 0xF1, 0xE0, 0xDF, 0xCE, 0xBD, 0xAC};
+	static const uint8_t skds_[8] = {0x79, 0x68, 0x57, 0x46, 0x35, 0x24, 0x13, 0x02};
+	static const uint8_t iv_[8] = {0x24, 0xAB, 0xDC, 0xBA, 0xBE, 0xBA, 0xAF, 0xDE};
+	struct ll_connect_ind ci = mk_ci(12, 400, 1, 1, 0);
+	uint32_t a = 500000 + T(1250 + 100);
+	struct ll_crypt c;
+	struct ll_rx_pdu out;
+	uint8_t pdu[2 + 255];
+
+	reset_all(false);
+	CHECK(ll_conn_start(&ci, 500000) == 0);
+	memset(&c, 0, sizeof(c));
+	ll_crypt_session_key(ltk_, skdm_, skds_, c.sk);
+	memcpy(c.iv, iv_, 8);
+	c.enc_rx = true;
+	c.rx_ctr = 0x7FFFFFFFFFull;
+	ll_rxq_set_crypt(0, &c);
+	fire_alarm();
+	pdu[0] = 0x1E;
+	pdu[1] = 255;
+	memcpy(&pdu[2], max_dir1, 255);
+	now = a + T(LL_CONN_SYNC_US);
+	ll_conn_radio_evt(LL_RADIO_CONN_RX, pdu, 257, now);
+	done(1);
+	CHECK(ll_conn_active(0) && cbs.disconnected == 0);
+	CHECK(ll_rxq_overflow_count(0) == 0);
+	CHECK(ll_rxq_get(0, &out) == LL_RXQ_OK);
+	CHECK(out.len == 251 && out.hdr0 == 0x1E);
+	for (int i = 0; i < 251; i++) {
+		if (out.data[i] != (uint8_t)i) {
+			CHECK(out.data[i] == (uint8_t)i);
+			break;
+		}
+	}
+	CHECK(c.rx_ctr == 0x8000000000ull);
+	/* next event, unencrypted: 255 bytes as they came */
+	ll_rxq_set_crypt(0, NULL);
+	pdu[0] = 0x02 | HDR_SN;
+	for (int i = 0; i < 255; i++) {
+		pdu[2 + i] = (uint8_t)i;
+	}
+	fire_alarm();
+	now = a + T(15000) + T(LL_CONN_SYNC_US);
+	ll_conn_radio_evt(LL_RADIO_CONN_RX, pdu, 257, now);
+	done(1);
+	CHECK(ll_rxq_get(0, &out) == LL_RXQ_OK);
+	CHECK(out.len == 255 && out.data[0] == 0 && out.data[254] == 254);
+	CHECK(ll_rxq_get(0, &out) == LL_RXQ_EMPTY);
+	CHECK(ll_conn_active(0) && cbs.disconnected == 0);
+	ll_conn_end(0, LL_ST_REMOTE_TERM);
+}
+
+/* The guard floor and the arbiter span follow the link's effective times
+ * (ll_conn_set_dle_times): one exchange of maximum PDUs after the first RX
+ * window, 1000 us for 27-octet PDUs (unchanged), 4540 us at 251 / 2120. */
+static void test_dle_times(void)
+{
+	struct ll_connect_ind ci3 = mk_ci(6, 3200, 0, 1, 0);  /* 7.5 ms, 500 ppm */
+	struct ll_connect_ind ci = mk_ci(24, 400, 1, 1, 0);   /* 30 ms */
+	uint32_t a = 1000000 + T(1250 + 100);
+	uint32_t g27, g251;
+
+	CHECK(ll_conn_exchange_us(328, 328) == LL_CONN_GUARD_MIN_TAIL_US);
+	CHECK(ll_conn_exchange_us(2120, 2120) == 2120 + 150 + 2120 + 150);
+	CHECK(ll_conn_exchange_us(2120, 328) == 2120 + 150 + 328 + 150);
+	CHECK(ll_conn_exchange_us(400, 400) == 1100);
+
+	/* clamped widening (the first RX window exceeds the interval): the
+	 * guard leaves the window plus one maximum exchange */
+	reset_all(false);
+	CHECK(ll_conn_start(&ci3, 3000000) == 0);
+	ll_conn_set_dle_times(0, 2120, 2120);
+	ev_rx(3000000 + T(1250 + 100));
+	for (int k = 0; k < 1000; k++) {
+		ev_miss();
+	}
+	fire_alarm();
+	CHECK(rad.max_ev == rad.fst + 4540);
+	done(0);
+	ll_conn_end(0, LL_ST_REMOTE_TERM);
+	/* a new connection on the link starts at 328 / 328 again */
+	reset_all(false);
+	CHECK(ll_conn_start(&ci3, 3000000) == 0);
+	ev_rx(3000000 + T(1250 + 100));
+	for (int k = 0; k < 1000; k++) {
+		ev_miss();
+	}
+	fire_alarm();
+	CHECK(rad.max_ev == rad.fst + LL_CONN_GUARD_MIN_TAIL_US);
+	done(0);
+	ll_conn_end(0, LL_ST_REMOTE_TERM);
+
+	/* the accepted request's span (probed with ll_arb_gap from its RX
+	 * open, the alarm tick + LL_CONN_ARM_LEAD_US) grows by the difference
+	 * of the two exchanges, from the next request on */
+	reset_all(false);
+	CHECK(ll_conn_start(&ci, 1000000) == 0);
+	ev_rx(a);
+	g27 = ll_arb_gap(sch.tick + T(LL_CONN_ARM_LEAD_US), 0, 0) - sch.tick;
+	ll_conn_set_dle_times(0, 2120, 2120);
+	CHECK(ll_arb_gap(sch.tick + T(LL_CONN_ARM_LEAD_US), 0, 0) - sch.tick == g27);
+	fire_alarm();
+	rx(a + T(30000), 0x01, 0);
+	done(1);
+	g251 = ll_arb_gap(sch.tick + T(LL_CONN_ARM_LEAD_US), 0, 0) - sch.tick;
+	CHECK(g27 > T(LL_CONN_ARM_LEAD_US + LL_CONN_GUARD_MIN_TAIL_US));
+	CHECK(g251 - g27 == T(4540 - LL_CONN_GUARD_MIN_TAIL_US));
+	/* back to 27 / 328 */
+	ll_conn_set_dle_times(0, 328, 328);
+	fire_alarm();
+	rx(a + T(60000), 0x01, 0);
+	done(1);
+	CHECK(ll_arb_gap(sch.tick + T(LL_CONN_ARM_LEAD_US), 0, 0) - sch.tick == g27);
+	/* out of range: ignored */
+	ll_conn_set_dle_times(LL_MAX_CONN, 2120, 2120);
+	ll_conn_end(0, LL_ST_REMOTE_TERM);
+}
+
 int main(void)
 {
 	test_first_events();
@@ -3006,5 +3136,7 @@ int main(void)
 	test_instant_alarm_passed_anchor_not();
 	test_latency_holdoff_long_link();
 	test_instant_late_refused_by_arbiter();
+	test_rx_long_pdu();
+	test_dle_times();
 	DONE();
 }

@@ -87,26 +87,31 @@ struct evt_item {
 	uint8_t data[LL_HCI_EVT_MAX];
 };
 
-/* An H4 ACL packet fits an item too (not queued today, see file header). */
-BUILD_ASSERT(LL_HCI_ACL_MAX <= LL_HCI_EVT_MAX);
+/* ACL toward the host never goes through evt_q: the controller thread
+ * delivers it directly (handle_rx), so an item only holds events. */
 
 /* Only the HCI thread queues here (command completions, one outstanding
  * command at a time with Zephyr), so a small depth suffices. */
 K_MSGQ_DEFINE(evt_q, sizeof(struct evt_item), 8, 4);
 K_MSGQ_DEFINE(conn_q, sizeof(struct ll_connect_ind), 2, 4);
 
-/* Host ACL waiting for the controller thread, one queue per link (a PDU
- * held back on one link never blocks another). The host holds at most
- * LL_ACL_NUM unacknowledged packets over all links (LE Read Buffer Size is
- * shared), one of which may be held by the thread itself, so no queue can
- * overflow. gen: the link's connection generation at queue time. */
+/* Host ACL waiting for the controller thread, one queue per link (a packet
+ * held back on one link never blocks another). The packets themselves
+ * (up to LL_ACL_MTU = 251 octets, slice 6b) live in one slab shared by all
+ * links: the host holds at most LL_ACL_NUM unacknowledged packets over all
+ * links (LE Read Buffer Size is shared), and an item is freed when its
+ * fragments are queued (the credit then waits for the ack in ll_credit),
+ * so LL_ACL_NUM items suffice and no queue can overflow; a host exceeding
+ * its credits gets the packet dropped with the credit back. gen: the
+ * link's connection generation at queue time. */
 struct acl_item {
 	uint32_t gen;
 	struct ll_hci_acl_pdu pdu;
 };
-#define ACL_Q_DEPTH (LL_ACL_NUM + 1)
+#define ACL_Q_DEPTH LL_ACL_NUM
+K_MEM_SLAB_DEFINE_STATIC(acl_slab, sizeof(struct acl_item), LL_ACL_NUM, 4);
 static struct k_msgq acl_q[LL_MAX_CONN];
-static char __aligned(4) acl_q_buf[LL_MAX_CONN][ACL_Q_DEPTH * sizeof(struct acl_item)];
+static char __aligned(4) acl_q_buf[LL_MAX_CONN][ACL_Q_DEPTH * sizeof(struct acl_item *)];
 
 static K_SEM_DEFINE(wake, 0, 1);
 
@@ -153,8 +158,11 @@ static volatile bool silent_end[LL_MAX_CONN]; /* HCI Reset: end without Disconne
 
 /* ---- controller thread state ---- */
 
-static struct acl_item held[LL_MAX_CONN];   /* host ACL waiting for ll_llcp_tx() */
-static bool held_valid[LL_MAX_CONN];
+static struct acl_item *held[LL_MAX_CONN];  /* host ACL waiting for ll_llcp_tx_acl() */
+/* LE Data Length Change to report (slice 6b Task 4, see llcp_data_len_change) */
+static atomic_t dle_pend;                    /* bit per link, set for the controller thread */
+static struct ll_llcp_dle dle_val[LL_MAX_CONN];   /* under ll_plat_lock() */
+static uint32_t hci_dle_defer;               /* HCI thread only: changes during a command */
 static bool mic_failed[LL_MAX_CONN];        /* MIC failure logged for this connection */
 static uint8_t rr_first;                    /* round-robin: link served first in this pass */
 
@@ -176,6 +184,7 @@ static bool any_conn_up(void)
 /* ---- counters ---- */
 
 static atomic_t cnt_tx_acked, cnt_acl_in, cnt_acl_out, cnt_acl_drop, cnt_evt_drop, conn_drops;
+static atomic_t cnt_acl_frag;           /* host ACL packets sent in more than one PDU */
 static atomic_t cnt_guard_escalations;
 static atomic_t cnt_wakeups;             /* controller thread passes (power counter) */
 static uint32_t lock_depth, lock_t0, lock_max_ticks, acl_tx_lock_max_ticks, aes_max_ticks;
@@ -378,11 +387,12 @@ static void conn_evt(uint8_t link, enum ll_conn_evt what, const void *arg)
 	k_sem_give(&wake);
 }
 
-/* ll_txq completion (ISR), forwarded by ll_conn. */
-static void txq_done(uint8_t link, enum ll_txq_kind kind, uint8_t ctrl_opcode)
+/* ll_txq completion (ISR), forwarded by ll_conn. A host ACL packet's
+ * buffer credit returns with the ack of its last fragment. */
+static void txq_done(uint8_t link, enum ll_txq_kind kind, uint8_t ctrl_opcode, bool last)
 {
 	ARG_UNUSED(ctrl_opcode);
-	if (kind == LL_TXQ_ACL) {
+	if (kind == LL_TXQ_ACL && last) {
 		ll_credit_acked(link);
 	}
 	if (kind != LL_TXQ_EMPTY) {
@@ -418,9 +428,10 @@ static const struct ll_arb_ops arb_ops = {
 /* One dispatcher for both users of the radio: ll_adv ignores everything
  * while advertising is disabled, ll_conn everything outside a connection
  * event. */
-static void radio_evt(enum ll_radio_evt evt, const uint8_t *pdu, uint8_t len, uint32_t tick)
+static void radio_evt(enum ll_radio_evt evt, const uint8_t *pdu, uint16_t len, uint32_t tick)
 {
-	ll_adv_radio_evt(evt, pdu, len, tick);
+	/* advertising PDUs are at most 39 bytes (8-bit length there) */
+	ll_adv_radio_evt(evt, pdu, (uint8_t)len, tick);
 	ll_conn_radio_evt(evt, pdu, len, tick);
 	if (evt != LL_RADIO_CONN_DONE) {
 		return;
@@ -461,14 +472,25 @@ static void llcp_enc_change(uint8_t link, uint8_t status, bool enabled)
 }
 
 /* Controller thread (LL_LENGTH_REQ / _RSP) or HCI thread (LE Set Data
- * Length). Not for a link the host does not know (yet) or any more. */
+ * Length). Slice 6b Task 4 (Task 3 review carry-over c): the event is
+ * always sent by the controller thread (flush_dle), which also sends
+ * Disconnection Complete, so it never follows that; a change from inside
+ * an HCI command is handed over only after the command returned
+ * (b91_bt_host_send_packet), so its Command Complete, already in evt_q,
+ * goes first. Not for a link the host does not know (yet) or any more. */
 static void llcp_data_len_change(uint8_t link, const struct ll_llcp_dle *eff)
 {
+	unsigned int key;
+
 	LOG_INF("data length (handle %u): tx %u B / %u us, rx %u B / %u us", link,
 		eff->max_tx_octets, eff->max_tx_time, eff->max_rx_octets, eff->max_rx_time);
-	if (ll_credit_up(link) && !pend_test(link, PEND_DISCONNECTED)) {
-		ll_hci_evt_data_len_change(link, eff->max_tx_octets, eff->max_tx_time,
-					   eff->max_rx_octets, eff->max_rx_time);
+	key = ll_plat_lock();
+	dle_val[link] = *eff;
+	ll_plat_unlock(key);
+	if (!k_is_in_isr() && k_current_get() == &ctrl_thread) {
+		atomic_set_bit(&dle_pend, link);
+	} else {
+		hci_dle_defer |= BIT(link);
 	}
 }
 
@@ -715,8 +737,8 @@ static void handle_connected(uint8_t link)
 	atomic_clear_bit(&pend[link], PEND_CONNECTED);
 	ll_plat_unlock(key);
 
-	held_valid[link] = false;
 	mic_failed[link] = false;
+	atomic_clear_bit(&dle_pend, link);
 	/* new generation, up, no credit of an earlier connection (ll_credit) */
 	ll_credit_open(link);
 	/* ci (also kept by ll_conn for the link) records the local address
@@ -735,7 +757,8 @@ static void handle_connected(uint8_t link)
 		/* connInitialMaxTx* from the host's Suggested Default Data
 		 * Length (4.5.10 "For a new connection"); ll_llcp starts the
 		 * LENGTH procedure only when the central does not know our
-		 * values yet (never while LL_DLE_SUPP_OCTETS is 27). A full
+		 * values yet (with the host's default of 251 / 2120: at every
+		 * connection, slice 6b Task 4). A full
 		 * backlog owes LL_LENGTH_REQ (retried, slice 7); only a full
 		 * owed queue fails it (Memory Capacity, ignored: the link then
 		 * keeps 27 / 328, which stay valid) */
@@ -789,11 +812,32 @@ static void log_llcp_rx(uint8_t link, const uint8_t *d, uint8_t len)
 	}
 }
 
-/* Received PDUs: LLID 3 to ll_llcp, LLID 1/2 to the host. */
+/* LE Data Length Change of the link, if one is pending (controller
+ * thread; see llcp_data_len_change). */
+static void flush_dle(uint8_t link)
+{
+	struct ll_llcp_dle e;
+	unsigned int key;
+
+	if (!atomic_test_and_clear_bit(&dle_pend, link)) {
+		return;
+	}
+	key = ll_plat_lock();
+	e = dle_val[link];
+	ll_plat_unlock(key);
+	if (ll_credit_up(link) && !pend_test(link, PEND_DISCONNECTED)) {
+		ll_hci_evt_data_len_change(link, e.max_tx_octets, e.max_tx_time, e.max_rx_octets,
+					   e.max_rx_time);
+	}
+}
+
+/* Received PDUs: LLID 3 to ll_llcp, LLID 1/2 to the host. The PDU and the
+ * H4 packet (up to 257 + 256 bytes with long PDUs) are static: controller
+ * thread only, so they stay off its stack. */
 static void handle_rx(uint8_t link)
 {
-	struct ll_rx_pdu pdu;
-	uint8_t h4[LL_HCI_ACL_MAX];
+	static struct ll_rx_pdu pdu;
+	static uint8_t h4[LL_HCI_ACL_MAX];
 
 	if (!ll_credit_up(link)) {
 		return;
@@ -835,30 +879,65 @@ static void handle_rx(uint8_t link)
 	k_sem_give(&wake);   /* budget used up: continue on the next pass */
 }
 
-/* Host ACL -> ll_llcp_tx(). -EAGAIN (encryption start pauses data) and
- * -ENOMEM (TX backlog full) keep the PDU for the next wakeup; it is never
- * counted as completed before ll_txq reports its ack. */
+static void acl_free(struct acl_item *it)
+{
+	k_mem_slab_free(&acl_slab, (void *)it);
+}
+
+/* Drop the link's held and queued host ACL (no Number Of Completed
+ * Packets: the host frees its buffers on disconnect). */
+static void acl_drop_all(uint8_t link)
+{
+	struct acl_item *it;
+
+	if (held[link]) {
+		acl_free(held[link]);
+		held[link] = NULL;
+	}
+	while (k_msgq_get(&acl_q[link], &it, K_NO_WAIT) == 0) {
+		acl_free(it);
+	}
+}
+
+/* Host ACL -> ll_llcp_tx_acl(): split into PDUs of the link's TX limit
+ * (slice 6b Task 4: effective Octets and Time, MIC when encrypted) and
+ * queued all or none, under the TX lock so the limit and the encryption
+ * state cannot change in between. -EAGAIN (encryption start pauses data,
+ * or control PDUs are owed) and -ENOMEM (not all fragments fit the TX
+ * queue) keep the packet for the next wakeup; its credit returns only when
+ * the last fragment is acked (txq_done). */
 static void handle_acl_tx(uint8_t link)
 {
-	struct acl_item *h = &held[link];
+	struct ll_acl_frag frags[(LL_ACL_MTU + LL_DLE_MIN_OCTETS - 1) / LL_DLE_MIN_OCTETS];
 
 	while (ll_credit_up(link) && !pend_test(link, PEND_DISCONNECTED)) {
-		if (!held_valid[link]) {
-			if (k_msgq_get(&acl_q[link], h, K_NO_WAIT) != 0) {
+		struct acl_item *h = held[link];
+		uint8_t n;
+		int r;
+
+		if (!h) {
+			if (k_msgq_get(&acl_q[link], &h, K_NO_WAIT) != 0) {
 				return;
 			}
 			if (h->gen != ll_credit_gen(link)) {
 				atomic_inc(&cnt_acl_drop);   /* queued for a previous connection */
+				acl_free(h);
 				continue;
 			}
-			held_valid[link] = true;
+			held[link] = h;
 		}
 		in_acl_tx = true;
-		int r = ll_llcp_tx(link, LL_TXQ_ACL, h->pdu.llid, h->pdu.data, h->pdu.len);
-
+		ll_plat_tx_lock();
+		n = ll_hci_acl_fragment(&h->pdu, ll_llcp_tx_limit(link), frags, ARRAY_SIZE(frags));
+		r = n ? ll_llcp_tx_acl(link, h->pdu.data, frags, n) : -EINVAL;
+		ll_plat_tx_unlock();
 		in_acl_tx = false;
 		if (r == 0) {
-			held_valid[link] = false;
+			if (n > 1) {
+				atomic_inc(&cnt_acl_frag);
+			}
+			held[link] = NULL;
+			acl_free(h);
 			continue;
 		}
 		if (r == -EAGAIN || r == -ENOMEM) {
@@ -867,7 +946,8 @@ static void handle_acl_tx(uint8_t link)
 		LOG_WRN("host ACL dropped (handle %u, %d)", link, r);
 		atomic_inc(&cnt_acl_drop);
 		(void)ll_credit_back(link);   /* the host's buffer credit comes back */
-		held_valid[link] = false;
+		held[link] = NULL;
+		acl_free(h);
 	}
 }
 
@@ -898,8 +978,8 @@ static void handle_disconnected(uint8_t link)
 
 	ll_rxq_reset(link);
 	ll_llcp_reset(link);
-	k_msgq_purge(&acl_q[link]);
-	held_valid[link] = false;
+	acl_drop_all(link);
+	atomic_clear_bit(&dle_pend, link);
 	atomic_clear_bit(&pend[link], PEND_UPDATED);
 	/* credits and "up" end together (ll_credit: an HCI-thread credit is
 	 * either counted before this or sees the link down) */
@@ -979,9 +1059,10 @@ static void report_stats(struct ll_radio_stats *last, struct ll_conn_stats *last
 			ll_conn_count());
 		LOG_INF("adv: events %u slid %u dropped %u cut %u stuck %u adv_guard %u",
 			as.events, as.slid, as.dropped, as.cut, as.stuck, st.adv_guard);
-		LOG_INF("conn: acl in %u out %u drop %u evt_drop %u lock max %u us acl_tx %u us aes %u us",
+		LOG_INF("conn: acl in %u out %u drop %u frag %u evt_drop %u lock max %u us acl_tx %u us aes %u us",
 			(uint32_t)atomic_get(&cnt_acl_in), (uint32_t)atomic_get(&cnt_acl_out),
-			(uint32_t)atomic_get(&cnt_acl_drop), (uint32_t)atomic_get(&cnt_evt_drop),
+			(uint32_t)atomic_get(&cnt_acl_drop), (uint32_t)atomic_get(&cnt_acl_frag),
+			(uint32_t)atomic_get(&cnt_evt_drop),
 			ticks_to_us(lock_max), ticks_to_us(acl_lock), ticks_to_us(aes_max));
 	}
 	if (st.restores != last->restores) {
@@ -1034,6 +1115,7 @@ static void ctrl_thread_fn(void *p1, void *p2, void *p3)
 				handle_connected(i);
 			}
 			handle_rx(i);
+			flush_dle(i);
 			if (pend_test(i, PEND_UPDATED)) {
 				handle_updated(i);
 			}
@@ -1096,7 +1178,7 @@ int b91_bt_controller_init(void)
 	ll_credit_init();
 	for (uint8_t i = 0; i < LL_MAX_CONN; i++) {
 		ll_rxq_reset(i);
-		k_msgq_init(&acl_q[i], acl_q_buf[i], sizeof(struct acl_item), ACL_Q_DEPTH);
+		k_msgq_init(&acl_q[i], acl_q_buf[i], sizeof(struct acl_item *), ACL_Q_DEPTH);
 	}
 	ll_adv_init(bd_addr, on_connect_ind);
 	ll_hci_init(&hci_ops, evt_sink);
@@ -1130,41 +1212,65 @@ static void credit_back(uint16_t handle)
 
 void b91_bt_host_send_packet(uint8_t type, uint8_t *data, uint16_t len)
 {
-	struct acl_item it;
+	struct acl_item *it;
 	int r;
 
 	switch (type) {
 	case 0x01:
 		ll_hci_cmd(data, len);
+		/* LE Data Length Change produced inside the command (LE Set
+		 * Data Length): its Command Complete is in evt_q now, so the
+		 * controller thread may report the change (after it) */
+		if (hci_dle_defer) {
+			atomic_or(&dle_pend, (atomic_val_t)hci_dle_defer);
+			hci_dle_defer = 0;
+			k_sem_give(&wake);
+		}
 		break;
 	case 0x02:
-		it.pdu.handle = 0xFFFF;   /* set by the parser once the header is read */
-		r = ll_hci_acl_from_host(data, len, &it.pdu);
+		if (k_mem_slab_alloc(&acl_slab, (void **)&it, K_NO_WAIT) != 0) {
+			/* more packets than LE Read Buffer Size allows */
+			struct ll_hci_acl_pdu hdr;
+
+			LOG_ERR("host ACL buffers exhausted (host exceeded LE ACL buffers)");
+			atomic_inc(&cnt_acl_drop);
+			hdr.handle = 0xFFFF;
+			if (len >= 2) {
+				hdr.handle = ll_get_le16(data) & 0x0FFF;
+			}
+			credit_back(hdr.handle);
+			break;
+		}
+		it->pdu.handle = 0xFFFF;   /* set by the parser once the header is read */
+		r = ll_hci_acl_from_host(data, len, &it->pdu);
 		if (r != 0) {
 			LOG_WRN("host ACL rejected (%d, handle 0x%04x, %u bytes)", r,
-				it.pdu.handle, len);
+				it->pdu.handle, len);
 			atomic_inc(&cnt_acl_drop);
 			if (r == -EINVAL || r == -ENOTCONN) {
 				/* the host counted it against its LE ACL
 				 * buffers (one pool for the controller): give
 				 * the credit back on that handle (only while
 				 * it is connected) */
-				credit_back(it.pdu.handle);
+				credit_back(it->pdu.handle);
 			}
+			acl_free(it);
 			break;
 		}
 		/* handle_valid() passed: the handle is a link id. Up and
 		 * generation in one lock section (ll_credit_up_gen): a packet
 		 * is never tagged with a newer connection's generation after
 		 * its own one ended on that id. */
-		if (!ll_credit_up_gen((uint8_t)it.pdu.handle, &it.gen)) {
+		if (!ll_credit_up_gen((uint8_t)it->pdu.handle, &it->gen)) {
 			atomic_inc(&cnt_acl_drop);   /* not reported yet (or it just ended) */
+			acl_free(it);
 			break;
 		}
-		if (k_msgq_put(&acl_q[it.pdu.handle], &it, K_NO_WAIT) != 0) {
+		if (k_msgq_put(&acl_q[it->pdu.handle], &it, K_NO_WAIT) != 0) {
 			LOG_ERR("host ACL queue full (host exceeded LE ACL buffers)");
 			atomic_inc(&cnt_acl_drop);
-			credit_back(it.pdu.handle);
+			credit_back(it->pdu.handle);
+			acl_free(it);
 			break;
 		}
 		atomic_inc(&cnt_acl_in);

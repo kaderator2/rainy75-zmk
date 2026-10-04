@@ -96,10 +96,13 @@ struct link_model {
 		uint8_t sn, nesn;
 		uint8_t got[MAX_GOT];  /* tags of data PDUs accepted as new */
 		int n_got;
+		uint8_t len[MAX_GOT];  /* their lengths */
+		int n_len;
 		int bad_content;       /* junk, a foreign entry or another link's PDU */
 	} c;
 	struct {
 		int acl, ctrl, empty;
+		int not_last;          /* completions with last == false */
 		uint8_t op[MAX_GOT];
 		int n_op;
 	} cpl;
@@ -248,9 +251,17 @@ static void central_rx(uint8_t link, const struct air_pkt *p)
 	if (sn == m->c.nesn) {
 		m->c.nesn ^= 1;
 		if (p->len) {
-			if (p->len != PAYLEN || p->data[1] != (uint8_t)(0xA0 + link) ||
-			    p->data[2] != (uint8_t)~p->data[0]) {
+			bool bad = p->len < PAYLEN || p->data[1] != (uint8_t)(0xA0 + link) ||
+				   p->data[2] != (uint8_t)~p->data[0];
+
+			for (int i = PAYLEN; !bad && i < p->len; i++) {
+				bad = p->data[i] != (uint8_t)(p->data[0] + i);
+			}
+			if (bad) {
 				m->c.bad_content++;
+			}
+			if (m->c.n_len < MAX_GOT) {
+				m->c.len[m->c.n_len++] = p->len;
 			}
 			if (m->c.n_got < MAX_GOT) {
 				m->c.got[m->c.n_got++] = p->data[0];
@@ -352,7 +363,7 @@ static void run_ok(int events)
 
 static int done_bad_link;
 
-static void done_cb(uint8_t link, enum ll_txq_kind kind, uint8_t ctrl_opcode)
+static void done_cb(uint8_t link, enum ll_txq_kind kind, uint8_t ctrl_opcode, bool last)
 {
 	struct link_model *m;
 
@@ -361,6 +372,9 @@ static void done_cb(uint8_t link, enum ll_txq_kind kind, uint8_t ctrl_opcode)
 		return;
 	}
 	m = &lk[link];
+	if (!last) {
+		m->cpl.not_last++;
+	}
 	switch (kind) {
 	case LL_TXQ_ACL:
 		m->cpl.acl++;
@@ -377,12 +391,21 @@ static void done_cb(uint8_t link, enum ll_txq_kind kind, uint8_t ctrl_opcode)
 	}
 }
 
+/* A PDU of len (>= PAYLEN) bytes: tag, 0xA0 + link, ~tag, then tag + i. */
+static int push_len_l(uint8_t link, enum ll_txq_kind kind, uint8_t tag, uint8_t len, bool last)
+{
+	uint8_t p[LL_DATA_PDU_MAX + LL_MIC_LEN] = { tag, (uint8_t)(0xA0 + link), (uint8_t)~tag };
+
+	for (int i = PAYLEN; i < len; i++) {
+		p[i] = (uint8_t)(tag + i);
+	}
+	return ll_txq_push(link, kind, kind == LL_TXQ_CTRL ? LL_LLID_CTRL : LL_LLID_START, p,
+			   len, tag, last);
+}
+
 static int push_l(uint8_t link, enum ll_txq_kind kind, uint8_t tag)
 {
-	uint8_t p[PAYLEN] = { tag, (uint8_t)(0xA0 + link), (uint8_t)~tag };
-
-	return ll_txq_push(link, kind, kind == LL_TXQ_CTRL ? LL_LLID_CTRL : LL_LLID_START, p,
-			   PAYLEN, tag);
+	return push_len_l(link, kind, tag, PAYLEN, true);
 }
 
 static int push(enum ll_txq_kind kind, uint8_t tag)
@@ -556,13 +579,14 @@ static void test_nack_retransmit(void)
 static void test_backlog_md(void)
 {
 	int ev = 0;
+	const int n = LL_TXQ_ENTRIES;
 
 	boot(0);
-	for (uint8_t t = 1; t <= LL_TXQ_BACKLOG; t++) {
+	for (uint8_t t = 1; t <= n; t++) {
 		CHECK(push(LL_TXQ_CTRL, t) == 0);
 	}
-	CHECK(push(LL_TXQ_CTRL, 99) == -ENOMEM);
-	CHECK(ll_txq_backlog(0) == LL_TXQ_BACKLOG);
+	CHECK(push(LL_TXQ_CTRL, 99) == -ENOMEM);   /* LL_TXQ_ENTRIES per link */
+	CHECK(ll_txq_backlog(0) == (unsigned int)n);
 	run_event(NULL, 0);
 	ev++;
 #ifndef LL_TXQ_SAFE_MODE
@@ -577,24 +601,26 @@ static void test_backlog_md(void)
 #else
 	CHECK(hw.n_air == 1 && lk[0].c.n_got == 1 && !(hw.air[0].hdr0 & HDR_MD));
 #endif
-	/* the software backlog has room again */
-	CHECK(push(LL_TXQ_CTRL, 9) == 0);
-	run_ok(2);
-	ev += 2;
-	CHECK(push(LL_TXQ_CTRL, 10) == 0);
+	/* the acks made room again (safe mode: after the next event) */
+	if (SAFE_MODE_ON) {
+		CHECK(push(LL_TXQ_CTRL, (uint8_t)(n + 1)) == -ENOMEM);
+		run_event(NULL, 0);
+		ev++;
+	}
+	CHECK(push(LL_TXQ_CTRL, (uint8_t)(n + 1)) == 0);
 	while (ll_txq_backlog(0) && ev < 100) {
 		run_event(NULL, 0);
 		ev++;
 	}
-	CHECK(lk[0].c.n_got == 10 && lk[0].cpl.ctrl == 10);
-	for (int i = 0; i < 10; i++) {
+	CHECK(lk[0].c.n_got == n + 1 && lk[0].cpl.ctrl == n + 1);
+	for (int i = 0; i < n + 1; i++) {
 		CHECK(lk[0].c.got[i] == i + 1);
 		CHECK(lk[0].cpl.op[i] == i + 1);
 	}
 #ifndef LL_TXQ_SAFE_MODE
-	CHECK(ev == 5);                  /* 10 at event 4: pushed late */
+	CHECK(ev == 7);                  /* 4, then 3 new per event (one unacked) */
 #else
-	CHECK(ev == 20);                 /* sent in one event, acked in the next */
+	CHECK(ev == 2 * (n + 1));        /* sent in one event, acked in the next */
 #endif
 	check_hw_clean();
 }
@@ -684,7 +710,7 @@ static void random_script(struct xchg *x, int n)
  * our last TX (checked in run_event), every PDU is delivered exactly once,
  * in order, and completed exactly once, in order. With foreign, every event
  * of ours follows another link's event that moved rptr and left entries. */
-static void test_sn_tracking_random(uint8_t start_ptr, uint32_t seed, bool foreign)
+static void test_sn_tracking_random(uint8_t start_ptr, uint32_t seed, bool foreign, bool big)
 {
 	uint8_t next_tag = 0;
 	int pushed = 0;
@@ -700,7 +726,9 @@ static void test_sn_tracking_random(uint8_t start_ptr, uint32_t seed, bool forei
 		if (rnd() % 3 == 0) {
 			int k = (int)(rnd() % 4);
 
-			while (k-- && push(LL_TXQ_CTRL, next_tag) == 0) {
+			while (k-- && push_len_l(0, LL_TXQ_CTRL, next_tag,
+						 big ? (uint8_t)(PAYLEN + rnd() % 253) : PAYLEN,
+						 true) == 0) {
 				next_tag++;
 				pushed++;
 			}
@@ -753,8 +781,114 @@ static void test_reset_per_connection(void)
 	/* first event of the new connection: SN_INIT 0 (reset_sn_nesn) */
 	CHECK(hw.air[air0].ring >= 0 && !(hw.air[air0].hdr0 & HDR_SN));
 	CHECK(push(LL_TXQ_ACL, 1) == 0);
-	CHECK(ll_txq_push(0, LL_TXQ_ACL, LL_LLID_START, (const uint8_t[32]){ 0 },
-			  LL_DATA_PDU_MAX + LL_MIC_LEN + 1, 0) == -EINVAL);
+	check_hw_clean();
+}
+
+/* ---------------- tests: long PDUs (slice 6b Task 4) ---------------- */
+
+/* Maximum PDUs (251 + MIC = 255 bytes): the byte area takes
+ * LL_TXQ_POOL_BYTES / 256 of them; each is sent intact (content checked
+ * byte by byte by the central model), also when the ring is rebuilt after
+ * a NACK and after another link moved rptr (foreign). */
+static void test_big_pdus(void)
+{
+	const int cap = LL_TXQ_POOL_BYTES / 256;
+	int k;
+
+	for (int f = 0; f < 2; f++) {
+		boot(f ? 0x1d : 0);
+		hw.foreign = f;
+		for (k = 0; k < 64; k++) {
+			if (push_len_l(0, LL_TXQ_ACL, (uint8_t)k, 255, true) != 0) {
+				break;
+			}
+		}
+		CHECK(k == cap);
+		CHECK(push_len_l(0, LL_TXQ_ACL, 99, 255, true) == -ENOMEM);
+		CHECK(push_len_l(0, LL_TXQ_ACL, 99, 1 + 252, true) == -ENOMEM);   /* rounded to 256 */
+		CHECK(ll_txq_backlog(0) == (unsigned int)cap);
+		/* our response lost twice: the same entries are rebuilt and resent */
+		run_event((const struct xchg[]){ { .tx_lost = true } }, 1);
+		run_event((const struct xchg[]){ { .tx_lost = true } }, 1);
+		for (int ev = 0; ev < 40 && ll_txq_backlog(0); ev++) {
+			run_event(NULL, 0);
+			/* refill as the acks make room: the area wraps */
+			if (k < 3 * cap && push_len_l(0, LL_TXQ_ACL, (uint8_t)k, 255, true) == 0) {
+				k++;
+			}
+		}
+		run_ok(1);
+		CHECK(lk[0].c.n_got == k && lk[0].cpl.acl == k);
+		for (int i = 0; i < k && i < lk[0].c.n_got; i++) {
+			CHECK(lk[0].c.got[i] == i && lk[0].c.len[i] == 255);
+		}
+		CHECK(k > cap);
+		CHECK(ll_txq_backlog(0) == 0);
+		check_hw_clean();
+	}
+	hw.foreign = false;
+}
+
+/* ll_txq_fits: all or nothing for the fragments of one host packet. */
+static void test_fits(void)
+{
+	const int cap = LL_TXQ_POOL_BYTES / 256;
+
+	boot(0);
+	CHECK(!ll_txq_fits(LL_MAX_CONN, 1, 27, 27));
+	CHECK(!ll_txq_fits(0, 0, 27, 27));
+	CHECK(ll_txq_fits(0, 1, 0, 255));
+	/* 251 octets in 27-octet fragments, encrypted: 9 x 31 + 1 x 12 */
+	CHECK(ll_txq_fits(0, 10, 31, 12));
+	CHECK(ll_txq_fits(0, LL_TXQ_ENTRIES, 4, 4));
+	CHECK(!ll_txq_fits(0, LL_TXQ_ENTRIES + 1, 4, 4));
+	CHECK(ll_txq_fits(0, (uint8_t)cap, 255, 255));
+	CHECK(!ll_txq_fits(0, (uint8_t)(cap + 1), 255, 4));
+	/* entries in use count */
+	for (int i = 0; i < LL_TXQ_ENTRIES - 3; i++) {
+		CHECK(push(LL_TXQ_ACL, (uint8_t)i) == 0);
+	}
+	CHECK(ll_txq_fits(0, 3, 31, 31));
+	CHECK(!ll_txq_fits(0, 4, 31, 31));
+	/* bytes in use count: one maximum PDU less than the area holds */
+	boot(0);
+	for (int i = 0; i < cap - 1; i++) {
+		CHECK(push_len_l(0, LL_TXQ_ACL, (uint8_t)i, 255, true) == 0);
+	}
+	CHECK(ll_txq_fits(0, 1, 255, 255));
+	CHECK(ll_txq_fits(0, 8, 32, 32));
+	CHECK(!ll_txq_fits(0, 9, 32, 32));
+	CHECK(!ll_txq_fits(0, 2, 255, 1));
+	/* what fits is accepted, one by one */
+	for (int i = 0; i < 8; i++) {
+		CHECK(push_len_l(0, LL_TXQ_ACL, (uint8_t)(100 + i), 32, i == 7) == 0);
+	}
+	CHECK(!ll_txq_fits(0, 1, 1, 1));
+	CHECK(push_len_l(0, LL_TXQ_ACL, 1, 1, true) == -ENOMEM);
+	/* fits only when the area is free at the end or at the start (no
+	 * record wraps): after the first acks the start is free again */
+	for (int ev = 0; ev < 3; ev++) {
+		run_event(NULL, 0);
+	}
+	CHECK(ll_txq_fits(0, 1, 255, 255));
+	check_hw_clean();
+}
+
+/* The completion carries the last flag of its push; it never changes the
+ * on-air content or order. */
+static void test_last_flag(void)
+{
+	boot(0);
+	for (uint8_t t = 0; t < 10; t++) {
+		CHECK(push_len_l(0, LL_TXQ_ACL, t, 31, t == 9) == 0);
+	}
+	CHECK(push_len_l(0, LL_TXQ_CTRL, 50, PAYLEN, true) == 0);
+	for (int ev = 0; ev < 60 && ll_txq_backlog(0); ev++) {
+		run_event(NULL, 0);
+	}
+	run_ok(1);
+	CHECK(lk[0].cpl.acl == 10 && lk[0].cpl.not_last == 9 && lk[0].cpl.ctrl == 1);
+	CHECK(lk[0].c.n_got == 11);
 	check_hw_clean();
 }
 
@@ -887,7 +1021,7 @@ static void test_rebuild_after_other_link(void)
  * random losses/NACKs/MD, random pushes, foreign events in between, pointer
  * wrap: per link, SN_INIT/NESN_INIT always right, every PDU delivered once
  * and in order to its own central only, completed once and in order. */
-static void test_links_random(uint32_t seed, bool foreign)
+static void test_links_random(uint32_t seed, bool foreign, bool big)
 {
 	uint8_t ids[3] = { 0, LL_MAX_CONN / 2, LL_MAX_CONN - 1 };
 	int nl = LL_MAX_CONN >= 3 ? 3 : 2;
@@ -911,8 +1045,10 @@ static void test_links_random(uint32_t seed, bool foreign)
 				int k = (int)(rnd() % 4);
 
 				while (k-- && pushed[p] < 600 &&
-				       push_l(ids[p], (p & 1) ? LL_TXQ_ACL : LL_TXQ_CTRL,
-					      next_tag[p]) == 0) {
+				       push_len_l(ids[p], (p & 1) ? LL_TXQ_ACL : LL_TXQ_CTRL,
+						  next_tag[p],
+						  big ? (uint8_t)(PAYLEN + rnd() % 253) : PAYLEN,
+						  true) == 0) {
 					next_tag[p]++;
 					pushed[p]++;
 				}
@@ -972,19 +1108,27 @@ int main(void)
 	test_backlog_md();
 	test_ring_empty_then_data(false);
 	test_ring_empty_then_data(true);
-	test_sn_tracking_random(0, 12345, false);
-	test_sn_tracking_random(0xF0, 777, false);
-	test_sn_tracking_random(0x7F, 31337, false);
-	test_sn_tracking_random(0x1c, 4242, true);
-	test_sn_tracking_random(0x03, 9001, true);
+	test_sn_tracking_random(0, 12345, false, false);
+	test_sn_tracking_random(0xF0, 777, false, false);
+	test_sn_tracking_random(0x7F, 31337, false, false);
+	test_sn_tracking_random(0x1c, 4242, true, false);
+	test_sn_tracking_random(0x03, 9001, true, false);
+	/* slice 6b: PDUs of 3..255 bytes through the byte area (wraps) */
+	test_sn_tracking_random(0x11, 2468, false, true);
+	test_sn_tracking_random(0x1e, 8642, true, true);
+	test_big_pdus();
+	test_fits();
+	test_last_flag();
 	test_reset_per_connection();
 	test_link_bounds();
 #if LL_MAX_CONN >= 2
 	test_two_links_interleaved();
 	test_rebuild_after_other_link();
-	test_links_random(55, false);
-	test_links_random(1234567, true);
-	test_links_random(0xC0FFEE, true);
+	test_links_random(55, false, false);
+	test_links_random(1234567, true, false);
+	test_links_random(0xC0FFEE, true, false);
+	test_links_random(97531, true, true);
+	test_links_random(0xBEEF, false, true);
 #endif
 	DONE();
 }

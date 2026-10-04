@@ -16,6 +16,7 @@
 #ifndef LL_TXQ_H_
 #define LL_TXQ_H_
 
+#include <stdbool.h>
 #include <stdint.h>
 
 enum ll_txq_kind {
@@ -25,10 +26,24 @@ enum ll_txq_kind {
 };
 
 /* ISR context. link is the link whose entry was acked; ctrl_opcode is the
- * plaintext opcode given to ll_txq_push (only meaningful for LL_TXQ_CTRL). */
-typedef void (*ll_txq_done_cb_t)(uint8_t link, enum ll_txq_kind kind, uint8_t ctrl_opcode);
+ * plaintext opcode given to ll_txq_push (only meaningful for LL_TXQ_CTRL);
+ * last is the flag given to ll_txq_push (slice 6b: false for every
+ * fragment but the last of a host ACL packet, whose Number Of Completed
+ * Packets credit comes back only with the last one). */
+typedef void (*ll_txq_done_cb_t)(uint8_t link, enum ll_txq_kind kind, uint8_t ctrl_opcode,
+				 bool last);
 
-#define LL_TXQ_BACKLOG 8   /* per link */
+/* Per link (slice 6b Task 4, long PDUs): at most LL_TXQ_ENTRIES PDUs queued
+ * and not yet acked (backlog + ring), their bytes (len, each rounded up to
+ * 4) in one FIFO area of LL_TXQ_POOL_BYTES (ll_fifo.h). The ring copies are
+ * the oldest records of the same area, so a PDU is copied in once and
+ * stays until it is acked. A host ACL packet of LL_ACL_MTU split into
+ * 27-octet fragments (10 x (27 + MIC)) and 5 maximum PDUs (255) fit an
+ * empty area. */
+#define LL_TXQ_ENTRIES 16
+#ifndef LL_TXQ_POOL_BYTES
+#define LL_TXQ_POOL_BYTES 1280
+#endif
 
 /* Invariant: per link, the backlog and the ring are strictly FIFO across
  * all kinds (no priority lane for control PDUs). The encryption start
@@ -65,12 +80,21 @@ void ll_txq_init(ll_txq_done_cb_t done);
  * them, so no hardware access is needed here). ISR. */
 void ll_txq_reset(uint8_t link);
 /* Queue one data PDU into link's backlog. payload is already encrypted if
- * needed (len includes the MIC then). ctrl_opcode is the plaintext opcode
- * of an LL_TXQ_CTRL PDU (the payload may be ciphertext), ignored for other
- * kinds. Returns 0, -ENOMEM (backlog full) or -EINVAL (len too long or bad
- * link). Thread context, caller holds ll_plat_lock(). */
+ * needed (len includes the MIC then, at most LL_DATA_PDU_MAX + LL_MIC_LEN).
+ * ctrl_opcode is the plaintext opcode of an LL_TXQ_CTRL PDU (the payload
+ * may be ciphertext), ignored for other kinds; last is handed to the
+ * completion. Returns 0, -ENOMEM (LL_TXQ_ENTRIES or the area full) or
+ * -EINVAL (bad link). Thread context, caller holds
+ * ll_plat_lock(); one producer at a time (ll_plat_tx_lock()). */
 int ll_txq_push(uint8_t link, enum ll_txq_kind kind, uint8_t llid, const uint8_t *payload,
-		uint8_t len, uint8_t ctrl_opcode);
+		uint8_t len, uint8_t ctrl_opcode, bool last);
+/* Whether n PDUs (n - 1 of len octets, then one of last_len; on-air
+ * lengths, MIC included) would all be accepted by ll_txq_push now. The
+ * consumer only frees room, so with the producer serialized
+ * (ll_plat_tx_lock()) a true answer holds until the pushes: the glue queues
+ * all fragments of a host packet or none. False for a bad link, n 0 or a
+ * length above LL_DATA_PDU_MAX + LL_MIC_LEN. Thread. */
+bool ll_txq_fits(uint8_t link, uint8_t n, uint8_t len, uint8_t last_len);
 /* ISR, before each BRX of link: set wptr = rptr, rewrite the ring from the
  * link's unacked copies then its backlog (placeholder rule), program
  * SN_INIT and NESN_INIT from the link's state via

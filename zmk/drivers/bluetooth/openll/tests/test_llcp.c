@@ -95,14 +95,43 @@ static struct {
 		uint8_t link;
 		enum ll_txq_kind kind;
 		uint8_t llid, len, op;
-		uint8_t d[40];
+		bool last;
+		uint8_t d[255];
 	} p[MAX_PUSH];
 	int fail;   /* next pushes return -ENOMEM */
 	int ok_first;   /* ... after this many more successful pushes */
+	int room;       /* ll_txq_fits: PDUs that fit (0: no limit) */
+	int fits_calls;
+	uint8_t fits_n, fits_len, fits_last;
 } tx;
 
+bool ll_txq_fits(uint8_t link, uint8_t n, uint8_t len, uint8_t last_len)
+{
+	CHECK(link < LL_MAX_CONN);
+	CHECK(tx_locks > 0);   /* the answer holds only with the producer serialized */
+	tx.fits_calls++;
+	tx.fits_n = n;
+	tx.fits_len = len;
+	tx.fits_last = last_len;
+	return tx.room == 0 || n <= tx.room;
+}
+
+/* effective times handed to ll_conn (arbiter span, guard floor) */
+static struct {
+	int calls;
+	uint16_t rx_time, tx_time;
+} dtl[LL_MAX_CONN];
+
+void ll_conn_set_dle_times(uint8_t link, uint16_t max_rx_time, uint16_t max_tx_time)
+{
+	CHECK(link < LL_MAX_CONN);
+	dtl[link].calls++;
+	dtl[link].rx_time = max_rx_time;
+	dtl[link].tx_time = max_tx_time;
+}
+
 int ll_txq_push(uint8_t link, enum ll_txq_kind kind, uint8_t llid, const uint8_t *payload,
-		uint8_t len, uint8_t ctrl_opcode)
+		uint8_t len, uint8_t ctrl_opcode, bool last)
 {
 	CHECK(link < LL_MAX_CONN);
 	/* pushed under both: the IRQ lock for the queue, the TX lock for the
@@ -115,15 +144,13 @@ int ll_txq_push(uint8_t link, enum ll_txq_kind kind, uint8_t llid, const uint8_t
 		tx.fail--;
 		return -ENOMEM;
 	}
-	if (len > 31) {
-		return -EINVAL;
-	}
 	if (tx.n < MAX_PUSH) {
 		tx.p[tx.n].link = link;
 		tx.p[tx.n].kind = kind;
 		tx.p[tx.n].llid = llid;
 		tx.p[tx.n].len = len;
 		tx.p[tx.n].op = ctrl_opcode;
+		tx.p[tx.n].last = last;
 		memcpy(tx.p[tx.n].d, payload, len);
 	}
 	tx.n++;
@@ -269,6 +296,7 @@ static void fresh(void)
 	memset(cnl, 0, sizeof(cnl));
 	memset(hcil, 0, sizeof(hcil));
 	memset(dlcl, 0, sizeof(dlcl));
+	memset(dtl, 0, sizeof(dtl));
 	memset(&kk, 0, sizeof(kk));
 	memset(rxq_crypt_l, 0, sizeof(rxq_crypt_l));
 	rxq_set_calls = 0;
@@ -1130,9 +1158,6 @@ static void dle_initiator(void)
 	CHECK(eff_is(L, 27, 328, 27, 328) && dlc.calls == 0);
 	CHECK(ll_llcp_busy(L));
 	CHECK(ll_llcp_timeout_ticks(now) == (int32_t)T(TIMEOUT_US));
-	/* a second request while ours runs: Command Disallowed */
-	CHECK(ll_llcp_set_data_len(L, 100, 912) == LL_ST_DISALLOWED);
-	CHECK(tx.n == 1);
 	/* the central answers 251 / 2120: all effective values grow, one event */
 	length_pdu(pdu, 0x15, 251, 2120, 251, 2120);
 	rx(pdu, 9);
@@ -1140,6 +1165,9 @@ static void dle_initiator(void)
 	CHECK(eff_is(L, SUP, SUPT, SUP, SUPT));
 	CHECK(dlc.calls == 1 && dle_is(&dlc.eff, SUP, SUPT, SUP, SUPT));
 	CHECK(!ll_llcp_busy(L) && ll_llcp_timeout_ticks(now) == -1);
+	/* slice 6b Task 4: ll_conn follows the effective times (guard floor,
+	 * arbiter span) */
+	CHECK(dtl[L].calls == 1 && dtl[L].rx_time == SUPT && dtl[L].tx_time == SUPT);
 	/* a second RSP: not a response to anything, ignored */
 	length_pdu(pdu, 0x15, 27, 328, 27, 328);
 	rx(pdu, 9);
@@ -2053,6 +2081,197 @@ static void push_retry_dle_phy(void)
 	}
 }
 
+/* Slice 6b Task 4 (Task 3 review carry-over b): a host LE Set Data Length
+ * while our LL_LENGTH_REQ runs is stored and sent right after its
+ * LL_LENGTH_RSP (no Command Disallowed). */
+static void dle_initiator_pending(void)
+{
+	uint8_t pdu[9];
+
+	if (SUP == 27) {
+		return;
+	}
+	fresh();
+	CHECK(ll_llcp_set_data_len(L, 251, 2120) == LL_ST_SUCCESS);
+	CHECK(tx.n == 1 && last_length(0x14, SUP, SUPT, SUP, SUPT));
+	/* while ours runs: success, nothing sent yet, still busy */
+	CHECK(ll_llcp_set_data_len(L, 100, 912) == LL_ST_SUCCESS);
+	CHECK(tx.n == 1 && ll_llcp_busy(L));
+	CHECK(eff_is(L, 27, 328, 27, 328) && dlc.calls == 0);
+	/* and again: the newest values win */
+	CHECK(ll_llcp_set_data_len(L, 120, 1072) == LL_ST_SUCCESS);
+	CHECK(tx.n == 1);
+	/* the response: the stored values apply (Tx 120 / 1072 against the
+	 * central's Rx 251), one event, and our next LL_LENGTH_REQ tells the
+	 * central at once */
+	length_pdu(pdu, 0x15, 251, 2120, 251, 2120);
+	rx(pdu, 9);
+	CHECK(eff_is(L, 120, 1072, SUP, SUPT));
+	CHECK(dlc.calls == 1 && dle_is(&dlc.eff, 120, 1072, SUP, SUPT));
+	CHECK(dtl[L].calls == 1 && dtl[L].rx_time == SUPT && dtl[L].tx_time == 1072);
+	CHECK(tx.n == 2 && last_length(0x14, SUP, SUPT, 120, 1072));
+	CHECK(ll_llcp_busy(L));
+	CHECK(ll_llcp_timeout_ticks(now) == (int32_t)T(TIMEOUT_US));
+	length_pdu(pdu, 0x15, 251, 2120, 251, 2120);
+	rx(pdu, 9);
+	CHECK(!ll_llcp_busy(L) && tx.n == 2 && dlc.calls == 1);
+
+	/* stored values equal to what the central already knows: nothing more
+	 * is sent after the response */
+	fresh();
+	CHECK(ll_llcp_set_data_len(L, 251, 2120) == LL_ST_SUCCESS);
+	CHECK(ll_llcp_set_data_len(L, 100, 912) == LL_ST_SUCCESS);
+	CHECK(ll_llcp_set_data_len(L, 251, 2120) == LL_ST_SUCCESS);
+	length_pdu(pdu, 0x15, 251, 2120, 251, 2120);
+	rx(pdu, 9);
+	CHECK(tx.n == 1 && !ll_llcp_busy(L));
+	CHECK(eff_is(L, SUP, SUPT, SUP, SUPT));
+
+	/* the central refuses ours (LL_UNKNOWN_RSP): the stored values are
+	 * not sent (it does not know the procedure) */
+	fresh();
+	CHECK(ll_llcp_set_data_len(L, 251, 2120) == LL_ST_SUCCESS);
+	CHECK(ll_llcp_set_data_len(L, 100, 912) == LL_ST_SUCCESS);
+	{
+		static const uint8_t unk[2] = {0x07, 0x14};
+
+		rx(unk, 2);
+	}
+	CHECK(tx.n == 1 && !ll_llcp_busy(L));
+	CHECK(ll_llcp_set_data_len(L, 120, 1072) == LL_ST_UNSUPP_REMOTE);
+
+	/* a crossing request of the central in between answers with the
+	 * stored values (it tells the central), so nothing is left to send */
+	fresh();
+	CHECK(ll_llcp_set_data_len(L, 251, 2120) == LL_ST_SUCCESS);
+	CHECK(ll_llcp_set_data_len(L, 100, 912) == LL_ST_SUCCESS);
+	length_pdu(pdu, 0x14, 251, 2120, 251, 2120);
+	rx(pdu, 9);
+	CHECK(tx.n == 2 && last_length(0x15, SUP, SUPT, 100, 912));
+	length_pdu(pdu, 0x15, 251, 2120, 251, 2120);
+	rx(pdu, 9);
+	CHECK(tx.n == 2 && !ll_llcp_busy(L));
+	CHECK(eff_is(L, 100, 912, SUP, SUPT));
+}
+
+/* Slice 6b Task 4: host ACL in fragments, all or nothing, the credit flag
+ * on the last fragment only, the per-link TX limit by Octets and Time. */
+static void acl_fragments(void)
+{
+	uint8_t big[251], pdu[9];
+	struct ll_acl_frag f[10];
+
+	for (int i = 0; i < 251; i++) {
+		big[i] = (uint8_t)(i ^ 0x5A);
+	}
+	/* a new link: 27 octets */
+	fresh();
+	CHECK(ll_llcp_tx_limit(L) == 27);
+	CHECK(ll_llcp_tx_limit(LL_MAX_CONN) == 27);
+	for (uint8_t i = 0; i < 10; i++) {
+		f[i].off = (uint8_t)(27 * i);
+		f[i].len = i < 9 ? 27 : 8;
+		f[i].llid = i == 0 ? LL_LLID_START : LL_LLID_CONT;
+	}
+	CHECK(ll_llcp_tx_acl(L, big, f, 10) == 0);
+	CHECK(tx.fits_calls == 1 && tx.fits_n == 10 && tx.fits_len == 27 && tx.fits_last == 8);
+	CHECK(tx.n == 10);
+	for (int i = 0; i < 10 && i < tx.n; i++) {
+		CHECK(tx.p[i].kind == LL_TXQ_ACL && tx.p[i].link == L);
+		CHECK(tx.p[i].llid == f[i].llid && tx.p[i].len == f[i].len);
+		CHECK(memcmp(tx.p[i].d, &big[f[i].off], f[i].len) == 0);
+		CHECK(tx.p[i].last == (i == 9));
+	}
+	CHECK(kk.bad == 0 && kk.calls >= 1);
+	CHECK(locks == 0 && tx_locks == 0);
+	/* not all fit: nothing is queued */
+	tx.n = 0;
+	tx.room = 9;
+	CHECK(ll_llcp_tx_acl(L, big, f, 10) == -ENOMEM);
+	CHECK(tx.n == 0);
+	tx.room = 0;
+	/* a fragment above the link's limit: refused, nothing queued */
+	f[0].len = 28;
+	CHECK(ll_llcp_tx_acl(L, big, f, 1) == -EINVAL);
+	CHECK(ll_llcp_tx(L, LL_TXQ_ACL, LL_LLID_START, big, 28) == -EINVAL);
+	CHECK(tx.n == 0);
+	CHECK(ll_llcp_tx_acl(L, big, f, 0) == -EINVAL);
+	CHECK(ll_llcp_tx_acl(LL_MAX_CONN, big, f, 1) == -EINVAL);
+	if (SUP == 27) {
+		return;
+	}
+
+	/* 251 / 2120 both ways: one PDU of 251 */
+	CHECK(ll_llcp_set_data_len(L, 251, 2120) == LL_ST_SUCCESS);
+	length_pdu(pdu, 0x15, 251, 2120, 251, 2120);
+	rx(pdu, 9);
+	CHECK(ll_llcp_tx_limit(L) == 251);
+	f[0].off = 0;
+	f[0].len = 251;
+	f[0].llid = LL_LLID_START;
+	tx.n = 0;
+	CHECK(ll_llcp_tx_acl(L, big, f, 1) == 0);
+	CHECK(tx.n == 1 && tx.p[0].len == 251 && tx.p[0].last);
+	CHECK(memcmp(tx.p[0].d, big, 251) == 0);
+
+	/* the central receives 251 octets but only 1000 us: time-limited,
+	 * 115 plain, 111 encrypted (the MIC counts in the time) */
+	length_pdu(pdu, 0x14, 251, 1000, 251, 2120);
+	rx(pdu, 9);
+	CHECK(ll_llcp_tx_limit(L) == 115);
+	f[0].len = 116;
+	CHECK(ll_llcp_tx_acl(L, big, f, 1) == -EINVAL);
+	f[0].len = 115;
+	tx.n = 0;
+	CHECK(ll_llcp_tx_acl(L, big, f, 1) == 0 && tx.n == 1);
+	features(0xFF);
+	start_encryption();
+	CHECK(ll_llcp_tx_limit(L) == 111);
+	{
+		uint64_t c0 = rxq_crypt->tx_ctr;
+
+		tx.n = 0;
+		CHECK(ll_llcp_tx_acl(L, big, f, 1) == -EINVAL);   /* 115 + MIC too long now */
+		f[0].len = 111;
+		f[1].off = 111;
+		f[1].len = 111;
+		f[1].llid = LL_LLID_CONT;
+		f[2].off = 222;
+		f[2].len = 29;
+		f[2].llid = LL_LLID_CONT;
+		CHECK(ll_llcp_tx_acl(L, big, f, 3) == 0);
+		CHECK(tx.fits_n == 3 && tx.fits_len == 111 + LL_MIC_LEN &&
+		      tx.fits_last == 29 + LL_MIC_LEN);
+		CHECK(tx.n == 3 && tx.p[0].len == 115 && tx.p[2].len == 33);
+		CHECK(!tx.p[0].last && !tx.p[1].last && tx.p[2].last);
+		CHECK(rxq_crypt->tx_ctr == c0 + 3);
+		/* refused as a whole: the counter is not used */
+		tx.room = 2;
+		CHECK(ll_llcp_tx_acl(L, big, f, 3) == -ENOMEM);
+		CHECK(rxq_crypt->tx_ctr == c0 + 3 && tx.n == 3);
+		tx.room = 0;
+	}
+	/* data paused by the encryption start: -EAGAIN before anything */
+	fresh();
+	features(0xFF);
+	{
+		uint8_t req[23];
+		int n0, c0;
+
+		sample_rand();
+		build_enc_req(req);
+		rx(req, sizeof(req));
+		n0 = tx.n;
+		c0 = tx.fits_calls;
+		f[0].off = 0;
+		f[0].len = 27;
+		f[0].llid = LL_LLID_START;
+		CHECK(ll_llcp_tx_acl(L, big, f, 1) == -EAGAIN);
+		CHECK(tx.n == n0 && tx.fits_calls == c0);
+	}
+	CHECK(locks == 0 && tx_locks == 0);
+}
+
 int main(void)
 {
 	for (int k = 0; k < 2; k++) {
@@ -2060,6 +2279,8 @@ int main(void)
 		single_link_suite();
 		dle_responder();
 		dle_initiator();
+		dle_initiator_pending();
+		acl_fragments();
 		phy_procedure();
 		push_retry_suite();
 		push_retry_dle_phy();

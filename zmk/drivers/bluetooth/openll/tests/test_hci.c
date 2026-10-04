@@ -367,11 +367,11 @@ static void test_event_masks(void)
 static void test_acl(void)
 {
 	struct ll_hci_acl_pdu pdu;
-	uint8_t a[4 + 40];
+	uint8_t a[4 + 260];
 
 	/* host -> LL: PB 0x00 (first, non-flushable) -> LLID 2 */
 	a[0] = 0x00; a[1] = 0x00; a[2] = 5; a[3] = 0;
-	for (int i = 0; i < 27; i++) a[4 + i] = (uint8_t)(0x60 + i);
+	for (int i = 0; i < 252; i++) a[4 + i] = (uint8_t)(0x60 + i);
 	memset(&pdu, 0xEE, sizeof(pdu));
 	CHECK(ll_hci_acl_from_host(a, 4 + 5, &pdu) == 0);
 	CHECK(pdu.llid == LL_LLID_START && pdu.len == 5);
@@ -382,12 +382,12 @@ static void test_acl(void)
 	/* PB 0x01 (continuation) -> LLID 1 */
 	a[1] = 0x10;
 	CHECK(ll_hci_acl_from_host(a, 4 + 5, &pdu) == 0 && pdu.llid == LL_LLID_CONT);
-	/* 27 bytes ok, 28 rejected */
-	a[1] = 0x00; a[2] = 27;
-	CHECK(ll_hci_acl_from_host(a, 4 + 27, &pdu) == 0 && pdu.len == 27 && pdu.data[26] == 0x60 + 26);
-	a[2] = 28;
-	a[4 + 27] = 0;
-	CHECK(ll_hci_acl_from_host(a, 4 + 28, &pdu) == -EINVAL);
+	/* LL_ACL_MTU (251, slice 6b) bytes ok, 252 rejected */
+	a[1] = 0x00; a[2] = 251;
+	CHECK(ll_hci_acl_from_host(a, 4 + 251, &pdu) == 0 && pdu.len == 251 &&
+	      pdu.data[250] == (uint8_t)(0x60 + 250));
+	a[2] = 252;
+	CHECK(ll_hci_acl_from_host(a, 4 + 252, &pdu) == -EINVAL);
 	/* PB 0x03 (complete, BR/EDR only), broadcast flags, zero length, length mismatch */
 	a[2] = 5;
 	a[1] = 0x30;
@@ -418,14 +418,114 @@ static void test_acl(void)
 	CHECK(memcmp(out, st, sizeof(st)) == 0);
 	CHECK(ll_hci_acl_to_host(out, 0, LL_LLID_CONT, pl, 3) == 8);
 	CHECK(out[2] == 0x10);
-	uint8_t big[27] = {0};
-	CHECK(ll_hci_acl_to_host(out, 0, LL_LLID_START, big, 27) == LL_HCI_ACL_MAX);
-	CHECK(out[3] == 27 && out[4] == 0);
+	uint8_t big[255] = {0};
+	big[250] = 0x5A;
+	CHECK(ll_hci_acl_to_host(out, 0, LL_LLID_START, big, 251) == LL_HCI_ACL_MAX);
+	CHECK(LL_HCI_ACL_MAX == 256);
+	CHECK(out[3] == 251 && out[4] == 0 && out[5 + 250] == 0x5A);
 	/* not ACL: control, reserved, empty, too long */
 	CHECK(ll_hci_acl_to_host(out, 0, LL_LLID_CTRL, pl, 3) == 0);
 	CHECK(ll_hci_acl_to_host(out, 0, 0, pl, 3) == 0);
 	CHECK(ll_hci_acl_to_host(out, 0, LL_LLID_CONT, pl, 0) == 0);
-	CHECK(ll_hci_acl_to_host(out, 0, LL_LLID_START, big, 28) == 0);
+	CHECK(ll_hci_acl_to_host(out, 0, LL_LLID_START, big, 252) == 0);
+}
+
+/* ---- slice 6b Task 4: TX limit and host ACL fragmentation ---- */
+
+/* The per-link plaintext limit: min(octets, time / 8 - 14) encrypted (the
+ * MIC counts in the time), min(octets, time / 8 - 10) plain (Vol 6 Part B
+ * 4.5.10: no PDU longer than connEffectiveMaxTxTime). */
+static void test_tx_limit(void)
+{
+	CHECK(ll_dle_tx_limit(27, 328, false) == 27);
+	CHECK(ll_dle_tx_limit(27, 328, true) == 27);
+	CHECK(ll_dle_tx_limit(251, 2120, false) == 251);
+	CHECK(ll_dle_tx_limit(251, 2120, true) == 251);
+	/* time-limited: 251 octets but only 1000 us */
+	CHECK(ll_dle_tx_limit(251, 1000, false) == 115);
+	CHECK(ll_dle_tx_limit(251, 1000, true) == 111);
+	/* the minimum time with the maximum octets: 27 either way */
+	CHECK(ll_dle_tx_limit(251, 328, false) == 31);
+	CHECK(ll_dle_tx_limit(251, 328, true) == 27);
+	/* octets-limited */
+	CHECK(ll_dle_tx_limit(100, 2120, false) == 100);
+	CHECK(ll_dle_tx_limit(100, 2120, true) == 100);
+	/* a time just short of a whole octet rounds down */
+	CHECK(ll_dle_tx_limit(251, 1007, true) == 111);
+	CHECK(ll_dle_tx_limit(251, 1008, true) == 112);
+	/* never above what the data path carries, never below 27 */
+	CHECK(ll_dle_tx_limit(251, 17040, false) == LL_DATA_PDU_MAX);
+	CHECK(ll_dle_tx_limit(20, 100, true) == 27);
+}
+
+static void frag_case(uint8_t len, uint8_t llid, uint8_t fmax)
+{
+	struct ll_hci_acl_pdu in = {.handle = 0, .llid = llid, .len = len};
+	struct ll_acl_frag f[16];
+	uint8_t n, want = (uint8_t)((len + fmax - 1) / fmax);
+	unsigned int sum = 0;
+
+	memset(f, 0xEE, sizeof(f));
+	n = ll_hci_acl_fragment(&in, fmax, f, 16);
+	CHECK(n == want);
+	for (uint8_t i = 0; i < n && i < 16; i++) {
+		CHECK(f[i].off == sum);
+		CHECK(f[i].len == (i + 1 < n ? fmax : len - sum));
+		CHECK(f[i].len >= 1 && f[i].len <= fmax);
+		CHECK(f[i].llid == (i == 0 ? llid : LL_LLID_CONT));
+		sum += f[i].len;
+	}
+	CHECK(sum == len);
+	if (n < 16) {
+		CHECK(f[n].llid == 0xEE);   /* nothing written past n */
+	}
+	/* too few slots: error, nothing usable */
+	if (want > 1) {
+		CHECK(ll_hci_acl_fragment(&in, fmax, f, (uint8_t)(want - 1)) == 0);
+	}
+}
+
+static void test_acl_fragment(void)
+{
+	static const uint8_t sizes[] = {1, 27, 28, 251};
+
+	for (int e = 0; e < 2; e++) {
+		/* the limits of a link at 27 / 328, at 251 / 2120 and a
+		 * time-limited one, encryption off (e 0) and on (e 1) */
+		const uint8_t lims[] = {ll_dle_tx_limit(27, 328, e), ll_dle_tx_limit(251, 2120, e),
+					ll_dle_tx_limit(251, 1000, e)};
+
+		for (unsigned int s = 0; s < sizeof(sizes); s++) {
+			for (unsigned int l = 0; l < sizeof(lims); l++) {
+				frag_case(sizes[s], LL_LLID_START, lims[l]);
+				frag_case(sizes[s], LL_LLID_CONT, lims[l]);
+			}
+		}
+	}
+	/* 251 in 27-octet fragments: 9 x 27 + 8 */
+	{
+		struct ll_hci_acl_pdu in = {.llid = LL_LLID_START, .len = 251};
+		struct ll_acl_frag f[10];
+
+		CHECK(ll_hci_acl_fragment(&in, 27, f, 10) == 10);
+		CHECK(f[9].off == 243 && f[9].len == 8 && f[9].llid == LL_LLID_CONT);
+		CHECK(f[0].llid == LL_LLID_START && f[1].llid == LL_LLID_CONT);
+	}
+	/* bad input */
+	{
+		struct ll_hci_acl_pdu in = {.llid = LL_LLID_START, .len = 0};
+		struct ll_acl_frag f[2];
+
+		CHECK(ll_hci_acl_fragment(&in, 27, f, 2) == 0);
+		in.len = 5;
+		CHECK(ll_hci_acl_fragment(&in, 0, f, 2) == 0);
+		CHECK(ll_hci_acl_fragment(&in, 27, f, 0) == 0);
+		in.len = 252;
+		CHECK(ll_hci_acl_fragment(&in, 251, f, 2) == 0);
+		in.len = 5;
+		in.llid = LL_LLID_CTRL;
+		CHECK(ll_hci_acl_fragment(&in, 27, f, 2) == 0);
+	}
 }
 
 /* Slice 6a: handle == link id; commands reach the given handle, events and
@@ -988,6 +1088,8 @@ int main(void)
 	test_events();
 	test_event_masks();
 	test_acl();
+	test_tx_limit();
+	test_acl_fragment();
 	test_handles();
 	test_dle_phy_cmds();
 	test_set_random_addr();

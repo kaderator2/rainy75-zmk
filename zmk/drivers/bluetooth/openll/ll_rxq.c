@@ -2,13 +2,18 @@
  * Copyright (c) 2026 scholzri
  * SPDX-License-Identifier: Apache-2.0
  *
- * RX queue: per link, a lock-free 16-entry software ring between the RX ISR (single
- * producer, ll_rxq_isr_put, copies each CRC-valid connection PDU out of the
- * RX DMA ring before it is overwritten) and the controller thread (single
- * consumer, ll_rxq_get). head/tail are free-running 8-bit counters, each
- * written by exactly one side; the slot content is written by the producer
+ * RX queue: per link, a lock-free FIFO of LL_RXQ_ENTRIES entries between the
+ * RX ISR (single producer, ll_rxq_isr_put, copies each CRC-valid connection
+ * PDU out of the RX DMA ring before it is overwritten) and the controller
+ * thread (single consumer, ll_rxq_get). Slice 6b Task 4: the payloads are
+ * variable-length records in one per-link byte area of LL_RXQ_POOL_BYTES
+ * (ll_fifo.h), freed in FIFO order, so a PDU of up to 255 bytes needs no
+ * 255-byte slot per entry. head/tail are free-running 8-bit counters, each
+ * written by exactly one side; the record is written by the producer
  * strictly before head is advanced, and only read by the consumer after it
- * observes that advance, so on a single core with ISR/thread separation
+ * observes that advance (the producer places records only in the gap in
+ * front of the oldest unconsumed one, ent[tail]), so on a single core with
+ * ISR/thread separation
  * (ll_rxq_isr_put cannot run while ll_rxq_get is executing) no
  * ll_plat_lock() is needed. head/tail are volatile, but volatile does not
  * order the plain slot accesses around them, so explicit compiler barriers
@@ -52,26 +57,31 @@
  */
 #include <string.h>
 
+#include "ll_fifo.h"
 #include "ll_rxq.h"
 
-#define RING_DEPTH 16
-#define RING_MASK  (RING_DEPTH - 1)
+#define ENT(i)     ((uint8_t)((uint8_t)(i) % LL_RXQ_ENTRIES))
 /* compiler-only barrier (no fence instruction); see the file comment */
 #define RING_BARRIER() __atomic_signal_fence(__ATOMIC_SEQ_CST)
 
-_Static_assert((RING_DEPTH & RING_MASK) == 0, "RING_DEPTH must be a power of two");
+_Static_assert((LL_RXQ_ENTRIES & (LL_RXQ_ENTRIES - 1)) == 0 && LL_RXQ_ENTRIES <= 128,
+	       "LL_RXQ_ENTRIES must be a power of two that fits the 8-bit counters");
+_Static_assert(LL_RXQ_POOL_BYTES % LL_FIFO_ALIGN == 0 && LL_RXQ_POOL_BYTES >= 2 * 256 &&
+	       LL_RXQ_POOL_BYTES <= 0xFFFF, "LL_RXQ_POOL_BYTES: multiple of 4, >= 2 maximum PDUs");
 
-struct rxq_entry {
+struct rxq_ent {
+	uint16_t off;  /* record in the link's area */
 	uint8_t hdr0;
 	uint8_t len;   /* payload length as received (ciphertext + MIC if encrypted) */
-	uint8_t data[LL_DATA_PDU_MAX + LL_MIC_LEN];
 };
 
-
 static struct rxq_link {
-	struct rxq_entry ring[RING_DEPTH];
-	volatile uint8_t head;   /* next free slot, advanced by the producer (ISR) */
-	volatile uint8_t tail;   /* next slot to consume, advanced by the consumer (thread) */
+	/* records start 2 bytes past a word boundary, like the payload
+	 * (offset 6) of an RX DMA entry: ll_fifo_copy then moves words */
+	uint8_t area[LL_RXQ_POOL_BYTES + 2] __attribute__((aligned(4)));
+	struct rxq_ent ent[LL_RXQ_ENTRIES];
+	volatile uint8_t head;   /* next free entry, advanced by the producer (ISR) */
+	volatile uint8_t tail;   /* next entry to consume, advanced by the consumer (thread) */
 	uint32_t overflow;
 	struct ll_crypt *crypt;
 	bool mic_failed;         /* sticky until ll_rxq_reset() (consumer only) */
@@ -81,7 +91,15 @@ static struct rxq_link {
 void ll_rxq_reset(uint8_t link)
 {
 	if (link < LL_MAX_CONN) {
-		memset(&links[link], 0, sizeof(links[link]));
+		struct rxq_link *q = &links[link];
+
+		/* the area keeps its bytes: no record is live after this */
+		q->head = 0;
+		q->tail = 0;
+		q->overflow = 0;
+		q->crypt = NULL;
+		q->mic_failed = false;
+		q->queued = false;
 	}
 }
 
@@ -103,39 +121,52 @@ void ll_rxq_set_crypt(uint8_t link, struct ll_crypt *c)
 	}
 }
 
-bool ll_rxq_isr_put(uint8_t link, const uint8_t *pdu, uint8_t len)
+bool ll_rxq_isr_put(uint8_t link, const uint8_t *pdu, uint16_t len)
 {
 	struct rxq_link *q;
-	uint8_t head;
-	uint8_t paylen;
-	struct rxq_entry *e;
+	uint8_t head, tail, used;
+	uint16_t paylen;
+	int32_t at;
+	struct rxq_ent *e;
 
 	if (link >= LL_MAX_CONN) {
 		return false;
 	}
 	q = &links[link];
 	head = q->head;
-	if (len < 2) {
+	if (len < 2 || len > 2 + LL_DATA_PDU_MAX + LL_MIC_LEN) {
 		q->overflow++;
 		return false;
 	}
-	paylen = (uint8_t)(len - 2);
+	paylen = (uint16_t)(len - 2);
 	if (paylen == 0) {
 		return true;   /* empty PDU: nothing to deliver */
 	}
-	if ((uint8_t)(head - q->tail) >= RING_DEPTH) {
+	tail = q->tail;
+	RING_BARRIER();   /* tail read before its record's room is reused */
+	used = (uint8_t)(head - tail);
+	if (used >= LL_RXQ_ENTRIES) {
 		q->overflow++;
 		return false;
 	}
-	e = &q->ring[head & RING_MASK];
-	if (paylen > sizeof(e->data)) {
+	if (used) {
+		const struct rxq_ent *w = &q->ent[ENT(head - 1)];
+
+		at = ll_fifo_place(LL_RXQ_POOL_BYTES, used, q->ent[ENT(tail)].off, w->off,
+				   (uint16_t)(w->off + ll_fifo_size(w->len)), paylen);
+	} else {
+		at = 0;
+	}
+	if (at < 0) {
 		q->overflow++;
 		return false;
 	}
+	e = &q->ent[ENT(head)];
+	e->off = (uint16_t)at;
 	e->hdr0 = pdu[0];
-	e->len = paylen;
-	memcpy(e->data, &pdu[2], paylen);
-	RING_BARRIER();   /* publish: slot complete before head moves */
+	e->len = (uint8_t)paylen;
+	ll_fifo_copy(&q->area[2 + at], &pdu[2], paylen);
+	RING_BARRIER();   /* publish: record complete before head moves */
 	q->head = (uint8_t)(head + 1);
 	q->queued = true;
 	return true;
@@ -156,12 +187,14 @@ enum ll_rxq_result ll_rxq_get(uint8_t link, struct ll_rx_pdu *out)
 		return LL_RXQ_MIC_FAIL;   /* sticky: nothing more of this link */
 	}
 	if (tail != q->head) {
-		struct rxq_entry *e = &q->ring[tail & RING_MASK];
+		struct rxq_ent *e = &q->ent[ENT(tail)];
+		uint8_t *data;
 		enum ll_rxq_result res = LL_RXQ_OK;
 
-		RING_BARRIER();   /* consume: head observed before the slot is read */
+		RING_BARRIER();   /* consume: head observed before the record is read */
+		data = &q->area[2 + e->off];
 		if (q->crypt && q->crypt->enc_rx) {
-			int r = ll_crypt_decrypt(q->crypt, e->hdr0, e->data, e->len);
+			int r = ll_crypt_decrypt(q->crypt, e->hdr0, data, e->len);
 
 			if (r < 0) {
 				res = LL_RXQ_MIC_FAIL;
@@ -174,9 +207,9 @@ enum ll_rxq_result ll_rxq_get(uint8_t link, struct ll_rx_pdu *out)
 		}
 		if (res == LL_RXQ_OK) {
 			out->hdr0 = e->hdr0;
-			memcpy(out->data, e->data, out->len);
+			ll_fifo_copy(out->data, data, out->len);
 		}
-		RING_BARRIER();   /* release: slot fully read before tail frees it */
+		RING_BARRIER();   /* release: record fully read before tail frees it */
 		q->tail = (uint8_t)(tail + 1);
 		return res;
 	}

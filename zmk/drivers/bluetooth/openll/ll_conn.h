@@ -88,8 +88,10 @@
  * alarm. The safety covers the larger margin of a transmit-window event at
  * an update instant (LL_CONN_WIN_MARGIN_US - LL_CONN_RX_MARGIN_US = 140 us)
  * and the guard ISR's own latency. The cap never cuts into the first RX
- * window: it is at least first_timeout_us + LL_CONN_GUARD_MIN_TAIL_US (one
- * exchange of maximum-length PDUs is about 0.8 ms). */
+ * window: it is at least first_timeout_us + one exchange of PDUs of the
+ * link's effective maximum times (ll_conn_exchange_us, slice 6b Task 4:
+ * 328 + 150 + 328 + 150 = 956 us, rounded up to LL_CONN_GUARD_MIN_TAIL_US,
+ * for 27-octet PDUs, 2120 + 150 + 2120 + 150 = 4540 us at 251 / 2120). */
 #define LL_CONN_EVENT_SAFETY_US   300
 #define LL_CONN_GUARD_MIN_TAIL_US 1000
 /* Peripheral latency holdoff (slice 7): no event is skipped while its
@@ -165,7 +167,7 @@ int ll_conn_start(const struct ll_connect_ind *ci, uint32_t connect_ind_end_tick
  * Handles LL_RADIO_CONN_RX / _RX_CRC_ERR / _RX_NODATA / _DONE for the link
  * whose event is on air (the owner recorded when the BRX was issued),
  * ignores the rest and everything while no event is on air. */
-void ll_conn_radio_evt(enum ll_radio_evt evt, const uint8_t *pdu, uint8_t len, uint32_t tick);
+void ll_conn_radio_evt(enum ll_radio_evt evt, const uint8_t *pdu, uint16_t len, uint32_t tick);
 /* Schedule LL_CONNECTION_UPDATE_IND / LL_CHANNEL_MAP_IND parameters for the
  * event with counter == instant. Return 0, or LL_ST_INSTANT_PASSED when
  * (instant - counter) mod 65536 > 32767, when instant is the event
@@ -226,6 +228,16 @@ uint16_t ll_conn_event_counter(uint8_t link);
  * can still be pulled earlier, so a kick never waits for an instant.
  * ISR-safe; takes ll_plat_lock(). */
 void ll_conn_kick(uint8_t link);
+/* Slice 6b Task 4: the link's connEffectiveMaxRxTime / MaxTxTime (us), from
+ * ll_llcp whenever they change (328 / 328 at every connection start). One
+ * exchange of maximum PDUs, rx + T_IFS + tx + T_IFS, is the event length
+ * the arbiter reserves after the first RX window and the guard floor
+ * (ll_conn_exchange_us), at least LL_CONN_GUARD_MIN_TAIL_US. Any context;
+ * takes ll_plat_lock(); used from the next request on. */
+void ll_conn_set_dle_times(uint8_t link, uint16_t max_rx_time, uint16_t max_tx_time);
+/* The reserved tail of one exchange for these times (pure):
+ * max(LL_CONN_GUARD_MIN_TAIL_US, rx + 150 + tx + 150). */
+uint32_t ll_conn_exchange_us(uint16_t max_rx_time, uint16_t max_tx_time);
 
 struct ll_conn_stats {
 	uint32_t events;      /* events issued to the radio */

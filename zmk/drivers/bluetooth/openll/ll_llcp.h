@@ -132,11 +132,14 @@ bool ll_llcp_busy(uint8_t link);
  * the encryption start runs, sent right after it), 40 s response timer;
  * LL_LENGTH_RSP completes it, LL_UNKNOWN_RSP / LL_REJECT_EXT_IND for
  * opcode 0x14 ends it without a change. A crossing LL_LENGTH_REQ is
- * answered normally and ours stays pending. ops.data_len_change reports
- * every change of the effective values.
+ * answered normally and ours stays pending. A request while ours still
+ * runs (slice 6b Task 4) is stored: a lower connMaxTx applies at once, and
+ * LL_LENGTH_REQ with the stored values follows our LL_LENGTH_RSP when the
+ * central does not know them by then. ops.data_len_change reports every
+ * change of the effective values, after ll_conn_set_dle_times() got the
+ * new effective times.
  * Returns LL_ST_SUCCESS, LL_ST_UNKNOWN_CONN_ID (link out of range or not
- * connected), LL_ST_DISALLOWED (our procedure still runs),
- * LL_ST_UNSUPP_REMOTE (the central rejected LL_LENGTH_REQ before, or its
+ * connected), LL_ST_UNSUPP_REMOTE (the central rejected LL_LENGTH_REQ before, or its
  * features lack DLE) or LL_ST_MEM_CAPACITY (backlog and owed queue full,
  * nothing changed; a merely full backlog owes the request, slice 7).
  * Thread. */
@@ -155,8 +158,9 @@ void ll_llcp_get_dle(uint8_t link, struct ll_llcp_dle *out);
  * (always 1M). */
 
 /* Encrypt (when the link is encrypted) and queue one data PDU on the link:
- * ll_txq_push(link, ...) with ctrl_opcode = payload[0] for LL_TXQ_CTRL.
- * len 1..LL_DATA_PDU_MAX (plaintext). Returns 0, -EINVAL (also for an
+ * ll_txq_push(link, ...) with ctrl_opcode = payload[0] for LL_TXQ_CTRL,
+ * last true. len 1..LL_DATA_PDU_MAX (plaintext), for LL_TXQ_ACL at most
+ * ll_llcp_tx_limit(link). Returns 0, -EINVAL (also for an
  * out-of-range link), -ENOMEM (backlog full, nothing queued,
  * counter unchanged) or, for LL_TXQ_ACL, -EAGAIN while the encryption
  * procedure pauses data PDUs (from LL_ENC_REQ until our LL_START_ENC_RSP
@@ -167,6 +171,21 @@ void ll_llcp_get_dle(uint8_t link, struct ll_llcp_dle *out);
  * peripheral latency skips events. Thread. */
 int ll_llcp_tx(uint8_t link, enum ll_txq_kind kind, uint8_t llid, const uint8_t *payload,
 	       uint8_t len);
+/* Slice 6b Task 4: the link's TX limit for one data PDU (plaintext
+ * octets): ll_dle_tx_limit() of the effective Tx values and whether the
+ * link encrypts now (the MIC counts in connEffectiveMaxTxTime). 27 for an
+ * out-of-range link. Thread; stable while the caller holds
+ * ll_plat_tx_lock() (the glue fragments a host packet with it). */
+uint8_t ll_llcp_tx_limit(uint8_t link);
+/* Slice 6b Task 4: queue all fragments of one host ACL packet (f[0..n-1],
+ * payload bytes f[i].off .. + f[i].len - 1 of data, from
+ * ll_hci_acl_fragment) or none: like ll_llcp_tx(LL_TXQ_ACL) for each, with
+ * last = true only for f[n - 1] (its ack returns the host's buffer
+ * credit). Returns 0, -EAGAIN (data paused or control PDUs owed, nothing
+ * queued), -ENOMEM (not all fit, ll_txq_fits; nothing queued, counter
+ * unchanged) or -EINVAL (n 0, a bad link, or a fragment of 0 octets or
+ * above ll_llcp_tx_limit()). Thread. */
+int ll_llcp_tx_acl(uint8_t link, const uint8_t *data, const struct ll_acl_frag *f, uint8_t n);
 /* ll_conn_ops.ctrl_tx hook: one of our control PDUs (opcode first),
  * queued like ll_llcp_tx(link, LL_TXQ_CTRL, LL_LLID_CTRL, ...), or owed when
  * the backlog is full or the link owes PDUs already (retried by

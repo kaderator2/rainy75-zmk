@@ -17,7 +17,7 @@
  * - Once (ll_radio_conn_init, called at every connection start, a no-op
  *   until the next ll_radio_adv_restore): save the advertising values of
  *   ll_ctrl_1 and rxtcrcpkt, base entry = an empty PDU, reset_sn_nesn(); the
- *   RX DMA ring (4 x 64 bytes) is set up at boot.
+ *   RX DMA ring (4 x 272 bytes) is set up at boot.
  * - Per event (ll_radio_conn_select, ml-spike-report S2/S3, register writes
  *   only): access address (byte-swapped into 0x80140808) and CRC init (as
  *   parsed) of the link that owns the event, ll_ctrl_1 = connection value
@@ -26,8 +26,15 @@
  *   it), RX maxlen, IRQ mask. An advertising event in between needs
  *   ll_radio_adv_enter() (empty TX FIFO first, S3).
  * - TX FIFO (pipe 0): the base is sent while rptr == wptr, else entry
- *   rptr & 3 at base + 64 * (1 + (rptr & 3)); wptr is written by software,
+ *   rptr & 3 at base + 272 * (1 + (rptr & 3)); wptr is written by software,
  *   rptr advanced by hardware on the central's ack (never resettable).
+ * - Long PDUs (slice 6b, dle-spike-report S1/S2): TX DMA entries and RX DMA
+ *   entries of 272 bytes (TX: 4 DMA length word + 2 header + 251 + 4 MIC =
+ *   261, in the 16-byte unit of the TX size register; RX: the DMA writes up
+ *   to p[3 + 4 * ceil((len + 13) / 4)], p[271] for len 255, and a central
+ *   retransmission can leave a full packet's tail in an entry it never
+ *   delivers, so every entry holds a full 255-byte packet). RX maxlen 255
+ *   (251 + MIC) in connections. The geometry is set at boot only.
  * - Per event: channel, AA, CRC, TX settle 86 us, first-RX timeout, command
  *   schedule tick = RX open - 80 us RX settle, ll_cmd = BRX (0x82). The SN
  *   init bit is programmed by ll_txq before every BRX.
@@ -46,6 +53,7 @@
 #include "stimer.h"
 #include "ext_driver/ext_rf.h"
 #include "ll_defs.h"
+#include "ll_fifo.h"
 #include "ll_radio.h"
 #include "ll_radio_mode.h"
 #include "ll_sched.h"
@@ -53,12 +61,12 @@
 LOG_MODULE_DECLARE(openll, CONFIG_BT_HCI_DRIVER_LOG_LEVEL);
 
 #define RF_IRQ                 (IRQ_TO_L2(15) | 11)
-#define DMA_BUF_SIZE           64   /* multiple of 16; 4 + 2 + 37 + 16 trailer = 59 */
-/* Worst case the DMA could write if the baseband does not enforce
- * rf_set_rx_maxlen (noise packet with a full 255-byte length field; maxlen
- * enforcement is unverified on this hardware): 4 DMA length word + 4 header/
- * len + 2 + 255 payload + 16 trailer, rounded up to a multiple of 16. */
-#define RX_BUF_SIZE            288  /* (4 + 4 + 2 + 255 + 16) rounded up to 16 */
+#define DMA_BUF_SIZE           64   /* adv TX buffers; multiple of 16; 4 + 2 + 37 + 16 trailer = 59 */
+/* Slack behind the RX ring: every entry holds a full 255-byte packet
+ * (RX_ENTRY_SIZE), so even a packet with the largest length field (noise,
+ * maxlen enforcement unverified) stays inside its entry; the DLE spike's
+ * canary behind entry 3 was never touched. Kept as a small margin. */
+#define RX_BUF_SIZE            32
 #define ADV_RX_MAXLEN          37
 /* Settle times from ext_rf.h (LL_TX_STL_ADV_1M, LL_SCANRSP_TX_SETTLE). */
 #define TX_SETTLE_ADV_US       84
@@ -70,16 +78,16 @@ LOG_MODULE_DECLARE(openll, CONFIG_BT_HCI_DRIVER_LOG_LEVEL);
 
 /* Connection mode */
 #define RING_N                 4    /* TX ring entries (tx_chn_dep 2) and RX DMA entries */
-#define RX_ENTRY_SIZE          64   /* 4 + 2 + 31 + 16 trailer = 53 */
+#define RX_ENTRY_SIZE          272  /* DMA writes up to p[271] for a 255-byte packet (spike S2) */
+#define TX_ENTRY_SIZE          272  /* 4 + 2 + 251 + 4 MIC = 261, 16-byte unit (spike S1) */
 /* The hardware rx wptr (0x1004f4) is a 5-bit counter (Task 9: maximum seen
  * 31, then 0); RING_N divides 32, so entry = wptr & (RING_N - 1) holds
  * across its wrap. */
 #define RX_WPTR_MASK           0x1f
-#define CONN_RX_MAXLEN         (LL_DATA_PDU_MAX + LL_MIC_LEN)
+#define CONN_RX_MAXLEN         (LL_DATA_PDU_MAX + LL_MIC_LEN)   /* 255 */
 /* One RX DMA ring of RING_N entries of RX_ENTRY_SIZE for both modes (an
  * advertising PDU of up to 37 bytes needs 4 + 2 + 37 + 16 = 59). The
- * RX_BUF_SIZE behind the ring is slack for an oversize write into the last
- * entry (maxlen enforcement unverified, see above).
+ * RX_BUF_SIZE behind the ring is slack (see above).
  * The RX and TX DMA are configured once, in ll_radio_init(), and never
  * again: Task 9 found that calling rf_set_rx_dma() while the radio is in
  * use (connection setup from the CONNECT_IND RX ISR, and again in the
@@ -94,8 +102,9 @@ LOG_MODULE_DECLARE(openll, CONFIG_BT_HCI_DRIVER_LOG_LEVEL);
 /* Guard: an event that has produced no end IRQ by open + max_event_us
  * (from ll_conn: interval minus the next event's alarm lead and a safety
  * margin, at least the first RX window plus one exchange) is ended by the
- * guard alarm. A chained (MD) event of 27-byte PDUs takes about 0.7 ms per
- * exchange, so a long central burst may legitimately reach the cap; only a
+ * guard alarm. A chained (MD) event takes about 0.7 ms per exchange of
+ * 27-octet PDUs, 4.5 ms of 251-octet ones (ll_conn_exchange_us), so a long
+ * central burst may legitimately reach the cap; only a
  * guard-ended event without any CRC-valid packet counts as a wedge sign
  * (guard_streak). */
 /* TX timestamp register (with FLD_RF_EN_TS_TX): md-spike round 2, on-air
@@ -121,7 +130,11 @@ static uint8_t tx_buf[DMA_BUF_SIZE] __aligned(4);
 static uint8_t rsp_buf[DMA_BUF_SIZE] __aligned(4);
 static uint8_t rx_buf[RX_AREA_SIZE] __aligned(4);
 /* Connection TX: base entry (empty PDU) + RING_N ring entries */
-static uint8_t conn_tx_buf[(1 + RING_N) * DMA_BUF_SIZE] __aligned(4);
+static uint8_t conn_tx_buf[(1 + RING_N) * TX_ENTRY_SIZE] __aligned(4);
+BUILD_ASSERT(TX_ENTRY_SIZE % 16 == 0 && TX_ENTRY_SIZE >= 4 + 2 + CONN_RX_MAXLEN,
+	     "TX entry: 16-byte unit, a full encrypted PDU");
+BUILD_ASSERT(RX_ENTRY_SIZE % 16 == 0 && RX_ENTRY_SIZE >= 4 + 4 * ((CONN_RX_MAXLEN + 13 + 3) / 4),
+	     "RX entry: the DMA write extent of a full packet (dle-spike-report S2)");
 static ll_radio_cb_t radio_cb;
 static volatile bool rsp_in_flight;
 /* An advertising TX/RX (tx_then_rx, or a SCAN_RSP) whose end IRQ is
@@ -289,10 +302,9 @@ static void conn_rx(bool rx_irq)
 		cn.rx_sw = (cn.rx_sw + 1) & RX_WPTR_MASK;
 		cn.n_any++;
 		if (!RF_BLE_PACKET_VALIDITY_CHECK(p)) {
-			/* timestamp at the length-field offset is meaningless
-			 * if the length is out of range: report tick 0 then */
-			uint32_t bts = p[DMA_RFRX_OFFSET_RFLEN] <= CONN_RX_MAXLEN ?
-				       ll_get_le32(&p[DMA_RFRX_OFFSET_TIME_STAMP(p)]) : 0;
+			/* every length field (<= 255) keeps the timestamp
+			 * inside the 272-byte entry */
+			uint32_t bts = ll_get_le32(&p[DMA_RFRX_OFFSET_TIME_STAMP(p)]);
 
 			atomic_inc(&cnt_rx_crc);
 			radio_cb(LL_RADIO_CONN_RX_CRC_ERR, NULL, 0, bts);
@@ -308,7 +320,9 @@ static void conn_rx(bool rx_irq)
 		}
 		cn.n_valid++;
 		atomic_inc(&cnt_conn_rx);
-		radio_cb(LL_RADIO_CONN_RX, &p[DMA_RFRX_OFFSET_HEADER], (uint8_t)(plen + 2), ts);
+		/* 16-bit: plen + 2 is 257 for a 251-octet encrypted PDU (an
+		 * 8-bit length wrapped and the acked PDU was lost, DLE spike) */
+		radio_cb(LL_RADIO_CONN_RX, &p[DMA_RFRX_OFFSET_HEADER], (uint16_t)(plen + 2), ts);
 	}
 }
 
@@ -415,7 +429,7 @@ static void hw_init_adv(bool dma)
 	rf_set_ble_1M_mode();
 	rf_set_power_level_index((rf_power_level_index_e)POWER_INDEX_0DBM);
 	if (dma) {
-		rf_set_tx_dma(2, DMA_BUF_SIZE);
+		rf_set_tx_dma(2, TX_ENTRY_SIZE);
 		rf_set_rx_dma(rx_buf, RING_N - 1, RX_ENTRY_SIZE);
 	}
 	rf_set_rx_maxlen(ADV_RX_MAXLEN);
@@ -551,7 +565,7 @@ void ll_radio_quiesce(void)
 
 static uint8_t *ring_entry(uint8_t idx)
 {
-	return &conn_tx_buf[(1u + (idx & (RING_N - 1))) * DMA_BUF_SIZE];
+	return &conn_tx_buf[(1u + (idx & (RING_N - 1))) * TX_ENTRY_SIZE];
 }
 
 /* The connection values of the registers that an advertising event (or
@@ -719,9 +733,7 @@ void ll_radio_fifo_write(uint8_t idx, uint8_t hdr0, const uint8_t *payload, uint
 	uint8_t *e = ring_entry(idx);
 	uint32_t dlen;
 
-	if (len > CONN_RX_MAXLEN) {
-		len = CONN_RX_MAXLEN;   /* ll_txq never pushes more (PDU_MAX) */
-	}
+	/* len <= 255 = CONN_RX_MAXLEN by its type: always fits the entry */
 	dlen = rf_tx_packet_dma_len((uint32_t)len + 2u);
 	e[0] = dlen & 0xFF;
 	e[1] = (dlen >> 8) & 0xFF;
@@ -730,7 +742,10 @@ void ll_radio_fifo_write(uint8_t idx, uint8_t hdr0, const uint8_t *payload, uint
 	e[4] = hdr0;    /* NESN/SN/MD are set by hardware */
 	e[5] = len;
 	if (len) {
-		memcpy(&e[6], payload, len);
+		/* ll_txq keeps its records 2 bytes past a word boundary, like
+		 * e[6]: word copies (the per-event ring rebuild, spike: up to
+		 * 4 x 255 bytes in the stimer ISR) */
+		ll_fifo_copy(&e[6], payload, len);
 	}
 }
 

@@ -96,6 +96,9 @@ struct ll_link {
 	bool first_seen;      /* the event's first packet (valid or not) was seen */
 	bool anchored;        /* the last closed event re-anchored (latency rule) */
 	bool holdoff_done;    /* LL_CONN_LATENCY_HOLDOFF_MS has passed (latched, see skip_count) */
+	/* one exchange of PDUs of the effective maximum times after the first
+	 * RX window (ll_conn_set_dle_times; guard floor, arbiter span) */
+	uint32_t xchg_us;
 	struct ll_connect_ind ci;
 	struct ll_conn_params p;
 	uint32_t interval_ticks;
@@ -383,7 +386,7 @@ static uint32_t event_max_us(const struct ll_link *c)
 	uint32_t ival_us = (uint32_t)c->p.interval * UNIT_US;
 	uint32_t growth = (uint32_t)(((uint64_t)c->ppm * ival_us + 999999u) / 1000000u);
 	uint32_t reserve = growth + LL_CONN_ARM_LEAD_US + LL_CONN_EVENT_SAFETY_US;
-	uint32_t floor_us = c->fst_us + LL_CONN_GUARD_MIN_TAIL_US;
+	uint32_t floor_us = c->fst_us + c->xchg_us;
 	uint32_t cap = ival_us > reserve ? ival_us - reserve : 0;
 
 	return cap > floor_us ? cap : floor_us;
@@ -408,15 +411,16 @@ static uint8_t prio_of(struct ll_link *c)
 }
 
 /* Request the planned event. Span: the alarm LL_CONN_ARM_LEAD_US before
- * the RX opens, to the first RX window + one exchange
- * (LL_CONN_GUARD_MIN_TAIL_US) + the arbiter's clipping reserve, so an
- * accepted event is never started with a cap below its floor. */
+ * the RX opens, to the first RX window + one exchange at the link's
+ * effective times (xchg_us, at least LL_CONN_GUARD_MIN_TAIL_US) + the
+ * arbiter's clipping reserve, so an accepted event is never started with
+ * a cap below its floor. */
 static int request(struct ll_link *c)
 {
 	struct ll_arb_req r = {
 		.alarm_tick = c->open_tick - US(LL_CONN_ARM_LEAD_US),
 		.open_tick = c->open_tick,
-		.min_len_us = c->fst_us + LL_CONN_GUARD_MIN_TAIL_US + LL_CONN_EVENT_SAFETY_US +
+		.min_len_us = c->fst_us + c->xchg_us + LL_CONN_EVENT_SAFETY_US +
 			      LL_CONN_ARM_LEAD_US,
 		.max_len_us = event_max_us(c),
 		.prio = prio_of(c),
@@ -616,7 +620,7 @@ static void prepare(struct ll_link *c, uint32_t cap_us)
 	uint32_t now = ll_radio_now();
 
 	c->planned = false;
-	if (ev_owner >= 0 || cap_us < c->fst_us + LL_CONN_GUARD_MIN_TAIL_US) {
+	if (ev_owner >= 0 || cap_us < c->fst_us + c->xchg_us) {
 		/* another event is on air (it overran its cap), or no room
 		 * before the next request: yield this event (not a miss) */
 		unsigned int key = ll_plat_lock();
@@ -717,7 +721,7 @@ static void on_rx_nodata(struct ll_link *c)
 	}
 }
 
-static void on_rx(struct ll_link *c, const uint8_t *pdu, uint8_t len, uint32_t tick)
+static void on_rx(struct ll_link *c, const uint8_t *pdu, uint16_t len, uint32_t tick)
 {
 	uint32_t anchor;
 	bool first;
@@ -767,7 +771,7 @@ static void on_rx(struct ll_link *c, const uint8_t *pdu, uint8_t len, uint32_t t
 	c->anchored = true;
 }
 
-void ll_conn_radio_evt(enum ll_radio_evt evt, const uint8_t *pdu, uint8_t len, uint32_t tick)
+void ll_conn_radio_evt(enum ll_radio_evt evt, const uint8_t *pdu, uint16_t len, uint32_t tick)
 {
 	struct ll_link *c;
 
@@ -804,7 +808,7 @@ void ll_conn_radio_evt(enum ll_radio_evt evt, const uint8_t *pdu, uint8_t len, u
 	}
 }
 
-static void txq_done(uint8_t link, enum ll_txq_kind kind, uint8_t ctrl_opcode)
+static void txq_done(uint8_t link, enum ll_txq_kind kind, uint8_t ctrl_opcode, bool last)
 {
 	struct ll_link *c = link_of(link);
 
@@ -812,7 +816,7 @@ static void txq_done(uint8_t link, enum ll_txq_kind kind, uint8_t ctrl_opcode)
 		c->term_acked = true;   /* ended at this event's CONN_DONE */
 	}
 	if (ops.txq_done) {
-		ops.txq_done(link, kind, ctrl_opcode);
+		ops.txq_done(link, kind, ctrl_opcode, last);
 	}
 }
 
@@ -821,6 +825,8 @@ static void link_clear(uint8_t i)
 	memset(&links[i], 0, sizeof(links[i]));
 	links[i].id = i;
 	links[i].state = LINK_FREE;
+	/* 27 / 328 both ways for a new connection (4.5.10) */
+	links[i].xchg_us = ll_conn_exchange_us(LL_DLE_MIN_TIME, LL_DLE_MIN_TIME);
 }
 
 void ll_conn_init(const struct ll_conn_ops *o)
@@ -1044,7 +1050,7 @@ void ll_conn_terminate(uint8_t link, uint8_t reason)
 	} else {
 		key = ll_plat_lock();
 		(void)ll_txq_push(link, LL_TXQ_CTRL, LL_LLID_CTRL, pdu, sizeof(pdu),
-				  OP_TERMINATE_IND);
+				  OP_TERMINATE_IND, true);
 		ll_plat_unlock(key);
 	}
 }
@@ -1202,5 +1208,25 @@ void ll_conn_get_stats_total(struct ll_conn_stats *s)
 		s->kicks += t->kicks;
 		s->collisions += t->collisions;
 	}
+	ll_plat_unlock(key);
+}
+
+uint32_t ll_conn_exchange_us(uint16_t max_rx_time, uint16_t max_tx_time)
+{
+	uint32_t x = (uint32_t)max_rx_time + LL_T_IFS_US + max_tx_time + LL_T_IFS_US;
+
+	return x > LL_CONN_GUARD_MIN_TAIL_US ? x : LL_CONN_GUARD_MIN_TAIL_US;
+}
+
+void ll_conn_set_dle_times(uint8_t link, uint16_t max_rx_time, uint16_t max_tx_time)
+{
+	struct ll_link *c = link_of(link);
+	unsigned int key;
+
+	if (!c) {
+		return;
+	}
+	key = ll_plat_lock();
+	c->xchg_us = ll_conn_exchange_us(max_rx_time, max_tx_time);
 	ll_plat_unlock(key);
 }

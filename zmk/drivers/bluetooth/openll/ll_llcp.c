@@ -154,7 +154,7 @@ static struct llcp_link {
 	 * LL_LENGTH_REQ or LL_LENGTH_RSP carried others), eff = effective. */
 	struct ll_llcp_dle own, remote, told, eff;
 	bool dle_pending;     /* our LL_LENGTH_REQ queued, LL_LENGTH_RSP awaited */
-	bool dle_want;        /* own != told: send LL_LENGTH_REQ after the encryption start */
+	bool dle_want;        /* own != told: send LL_LENGTH_REQ after the encryption start or our pending one */
 	bool dle_unsupp;      /* the central answered LL_UNKNOWN_RSP to LL_LENGTH_REQ */
 	/* owed control PDUs (plaintext, FIFO from owe_head) */
 	struct {
@@ -165,12 +165,20 @@ static struct llcp_link {
 	uint8_t owe_head, owe_n;
 } links[LL_MAX_CONN];
 
-/* Caller holds ll_plat_tx_lock(); link < LL_MAX_CONN. */
-static int tx_locked(uint8_t link, enum ll_txq_kind kind, uint8_t llid, const uint8_t *payload,
-		     uint8_t len)
+/* The link's TX limit (ll_dle_tx_limit). Caller holds ll_plat_tx_lock(). */
+static uint8_t tx_limit_locked(const struct llcp_link *s)
 {
+	return ll_dle_tx_limit(s->eff.max_tx_octets, s->eff.max_tx_time, s->crypt.enc_tx);
+}
+
+/* Caller holds ll_plat_tx_lock(); link < LL_MAX_CONN. The plaintext is
+ * encrypted into a static buffer: one user at a time under the TX lock,
+ * and no 255-byte copy on the caller's (controller or HCI thread) stack. */
+static int tx_locked(uint8_t link, enum ll_txq_kind kind, uint8_t llid, const uint8_t *payload,
+		     uint8_t len, bool last)
+{
+	static uint8_t buf[LL_DATA_PDU_MAX + LL_MIC_LEN];
 	struct llcp_link *s = &links[link];
-	uint8_t buf[LL_DATA_PDU_MAX + LL_MIC_LEN];
 	uint8_t n = len;
 	unsigned int key;
 	int ret;
@@ -181,13 +189,16 @@ static int tx_locked(uint8_t link, enum ll_txq_kind kind, uint8_t llid, const ui
 	if (kind == LL_TXQ_ACL && (s->paused || s->owe_n != 0)) {
 		return -EAGAIN;
 	}
+	if (kind == LL_TXQ_ACL && len > tx_limit_locked(s)) {
+		return -EINVAL;   /* longer than the link may send (4.5.10) */
+	}
 	memcpy(buf, payload, len);
 	if (s->crypt.enc_tx) {
 		/* the AAD only uses the LLID of hdr0 */
 		n = (uint8_t)ll_crypt_encrypt(&s->crypt, llid, buf, len);
 	}
 	key = ll_plat_lock();
-	ret = ll_txq_push(link, kind, llid, buf, n, kind == LL_TXQ_CTRL ? payload[0] : 0);
+	ret = ll_txq_push(link, kind, llid, buf, n, kind == LL_TXQ_CTRL ? payload[0] : 0, last);
 	ll_plat_unlock(key);
 	if (ret != 0) {
 		if (s->crypt.enc_tx) {
@@ -212,7 +223,57 @@ int ll_llcp_tx(uint8_t link, enum ll_txq_kind kind, uint8_t llid, const uint8_t 
 		return -EINVAL;
 	}
 	ll_plat_tx_lock();
-	ret = tx_locked(link, kind, llid, payload, len);
+	ret = tx_locked(link, kind, llid, payload, len, true);
+	ll_plat_tx_unlock();
+	return ret;
+}
+
+uint8_t ll_llcp_tx_limit(uint8_t link)
+{
+	uint8_t lim;
+
+	if (link >= LL_MAX_CONN) {
+		return LL_DLE_MIN_OCTETS;
+	}
+	ll_plat_tx_lock();
+	lim = tx_limit_locked(&links[link]);
+	ll_plat_tx_unlock();
+	return lim;
+}
+
+int ll_llcp_tx_acl(uint8_t link, const uint8_t *data, const struct ll_acl_frag *f, uint8_t n)
+{
+	struct llcp_link *s;
+	uint8_t lim, mic;
+	int ret = 0;
+
+	if (link >= LL_MAX_CONN || n == 0) {
+		return -EINVAL;
+	}
+	s = &links[link];
+	ll_plat_tx_lock();
+	if (s->paused || s->owe_n != 0) {
+		ret = -EAGAIN;
+		goto out;
+	}
+	lim = tx_limit_locked(s);
+	for (uint8_t i = 0; i < n; i++) {
+		if (f[i].len == 0 || f[i].len > lim) {
+			ret = -EINVAL;
+			goto out;
+		}
+	}
+	/* all or nothing: the TX lock keeps every other producer out, and
+	 * the consumer only frees room, so what fits now is accepted below */
+	mic = s->crypt.enc_tx ? LL_MIC_LEN : 0;
+	if (!ll_txq_fits(link, n, (uint8_t)(f[0].len + mic), (uint8_t)(f[n - 1].len + mic))) {
+		ret = -ENOMEM;
+		goto out;
+	}
+	for (uint8_t i = 0; i < n && ret == 0; i++) {
+		ret = tx_locked(link, LL_TXQ_ACL, f[i].llid, &data[f[i].off], f[i].len, i + 1 == n);
+	}
+out:
 	ll_plat_tx_unlock();
 	return ret;
 }
@@ -283,7 +344,7 @@ static int ctrl_send_locked(uint8_t link, const uint8_t *pdu, uint8_t len, enum 
 	int ret;
 
 	if (s->owe_n == 0) {
-		ret = tx_locked(link, LL_TXQ_CTRL, LL_LLID_CTRL, pdu, len);
+		ret = tx_locked(link, LL_TXQ_CTRL, LL_LLID_CTRL, pdu, len, true);
 		if (ret != -ENOMEM) {
 			return ret;
 		}
@@ -407,6 +468,9 @@ static void dle_flush_locked(uint8_t link)
 		return;
 	}
 	s->dle_want = false;
+	if (s->dle_unsupp) {
+		return;   /* the central does not know the procedure */
+	}
 	if (!dle_same(&s->own, &s->told)) {
 		(void)dle_send_req_locked(link);
 	}
@@ -414,6 +478,8 @@ static void dle_flush_locked(uint8_t link)
 
 static void dle_notify(uint8_t link, const struct ll_llcp_dle *eff)
 {
+	/* arbiter span and guard floor first, then the host */
+	ll_conn_set_dle_times(link, eff->max_rx_time, eff->max_tx_time);
 	if (ops.data_len_change) {
 		ops.data_len_change(link, eff);
 	}
@@ -458,6 +524,8 @@ static void rx_length_rsp(uint8_t link, const uint8_t *p)
 		s->tmr_on[TMR_DLE] = false;
 		dle_parse_remote(s, p);
 		changed = dle_eff_update(s);
+		/* values the host set while ours ran (slice 6b Task 4) */
+		dle_flush_locked(link);
 	}
 	eff = s->eff;
 	ll_plat_tx_unlock();
@@ -482,6 +550,7 @@ static void rx_proc_refused(uint8_t link, uint8_t op, bool unknown)
 		if (unknown) {
 			s->dle_unsupp = true;
 		}
+		dle_flush_locked(link);   /* drops stored values when unsupported */
 	}
 	ll_plat_tx_unlock();
 }
@@ -505,8 +574,12 @@ uint8_t ll_llcp_set_data_len(uint8_t link, uint16_t tx_octets, uint16_t tx_time)
 	s->own.max_tx_octets = tx_octets;
 	s->own.max_tx_time = tx_time;
 	if (s->dle_pending) {
-		s->own = prev;
-		st = LL_ST_DISALLOWED;
+		/* ours still runs (slice 6b Task 4, no Command Disallowed):
+		 * keep the values, a lower connMaxTx applies at once, and
+		 * dle_flush_locked() tells the central after the response */
+		s->dle_want = true;
+		changed = dle_eff_update(s);
+		st = LL_ST_SUCCESS;
 	} else if (dle_same(&s->own, &s->told)) {
 		/* the central knows these values: no procedure needed */
 		s->dle_want = false;
@@ -970,7 +1043,7 @@ void ll_llcp_retry(uint8_t link)
 	while (s->owe_n != 0) {
 		uint8_t i = s->owe_head;
 
-		if (tx_locked(link, LL_TXQ_CTRL, LL_LLID_CTRL, s->owe[i].d, s->owe[i].len) != 0) {
+		if (tx_locked(link, LL_TXQ_CTRL, LL_LLID_CTRL, s->owe[i].d, s->owe[i].len, true) != 0) {
 			break;   /* still full (-EINVAL cannot happen: checked when owed) */
 		}
 		s->owe_head = (uint8_t)((i + 1) % LL_LLCP_OWE_N);

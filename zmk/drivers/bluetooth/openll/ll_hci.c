@@ -678,7 +678,7 @@ int ll_hci_acl_from_host(const uint8_t *acl, uint16_t len, struct ll_hci_acl_pdu
 	out->handle = hf & 0x0FFF;
 	pb = (hf >> 12) & 0x3;
 	bc = (hf >> 14) & 0x3;
-	if (dlen != len - 4 || dlen == 0 || dlen > LL_DATA_PDU_MAX || bc != 0 ||
+	if (dlen != len - 4 || dlen == 0 || dlen > LL_ACL_MTU || bc != 0 ||
 	    (pb != ACL_PB_FIRST_NONFLUSH && pb != ACL_PB_CONT && pb != ACL_PB_FIRST_FLUSH)) {
 		return -EINVAL;
 	}
@@ -711,4 +711,27 @@ uint16_t ll_hci_acl_to_host(uint8_t *out, uint16_t handle, uint8_t llid, const u
 	ll_put_le16(&out[3], len);
 	memcpy(&out[5], payload, len);
 	return (uint16_t)(5 + len);
+}
+
+uint8_t ll_hci_acl_fragment(const struct ll_hci_acl_pdu *in, uint8_t frag_max,
+			    struct ll_acl_frag *out, uint8_t n_out)
+{
+	uint8_t n = 0;
+	uint16_t off = 0;
+
+	if (frag_max == 0 || in->len == 0 || in->len > LL_ACL_MTU ||
+	    (in->llid != LL_LLID_START && in->llid != LL_LLID_CONT) ||
+	    (in->len + frag_max - 1) / frag_max > n_out) {
+		return 0;
+	}
+	while (off < in->len) {
+		uint16_t left = (uint16_t)(in->len - off);
+
+		out[n].off = (uint8_t)off;
+		out[n].len = (uint8_t)(left < frag_max ? left : frag_max);
+		out[n].llid = n == 0 ? in->llid : LL_LLID_CONT;
+		off = (uint16_t)(off + out[n].len);
+		n++;
+	}
+	return n;
 }

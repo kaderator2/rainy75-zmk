@@ -7,6 +7,7 @@
 #ifndef LL_DEFS_H_
 #define LL_DEFS_H_
 
+#include <stdbool.h>
 #include <stdint.h>
 
 /* Number of peripheral links (slice 6a multilink). Link ids are
@@ -57,9 +58,11 @@ _Static_assert(LL_MAX_CONN >= 1 && LL_MAX_CONN <= 5, "LL_MAX_CONN must be 1..5")
 #define LL_ADV_PDU_MAX    (2 + 6 + LL_ADV_DATA_MAX)
 
 /* Data channel PDUs (Vol 6 Part B 2.4). The data path carries at most
- * LL_DATA_PDU_MAX payload octets; the Data Length Update procedure runs
- * (ll_llcp), with supportedMax following this (LL_DLE_SUPP_OCTETS). */
-#define LL_DATA_PDU_MAX   27     /* payload bytes */
+ * LL_DATA_PDU_MAX payload octets (slice 6b Task 4: the Core Spec maximum;
+ * 251 + MIC = 255 bytes on air, the 8-bit header Length); the Data Length
+ * Update procedure (ll_llcp) negotiates the per-link limit, with
+ * supportedMax following this (LL_DLE_SUPP_OCTETS). */
+#define LL_DATA_PDU_MAX   251    /* payload bytes */
 #define LL_MIC_LEN        4
 #define LL_LLID_CONT      0x1    /* ACL continuation fragment or empty PDU */
 #define LL_LLID_START     0x2    /* ACL start fragment or complete message */
@@ -91,14 +94,46 @@ _Static_assert(LL_MAX_CONN >= 1 && LL_MAX_CONN <= 5, "LL_MAX_CONN must be 1..5")
 #define LL_DLE_MAX_TIME_ANY   17040  /* Table 4.6 upper bound (Coded); remote values are capped to it */
 #define LL_DLE_TIME_1M(octets) (((octets) + 14) * 8)
 /* Our supportedMax{Tx,Rx}Octets: what the data path can carry. Follows
- * LL_DATA_PDU_MAX (27 until slice 6b Task 4 raises it); host tests may
- * override it. supportedMax{Tx,Rx}Time is the 1M time for it. */
+ * LL_DATA_PDU_MAX (251); host tests may override it (27: the LENGTH rules
+ * of a controller without long PDUs). supportedMax{Tx,Rx}Time is the 1M
+ * time for it. */
 #ifndef LL_DLE_SUPP_OCTETS
 #define LL_DLE_SUPP_OCTETS    (LL_DATA_PDU_MAX < LL_DLE_MAX_OCTETS ? LL_DATA_PDU_MAX : LL_DLE_MAX_OCTETS)
 #endif
 #define LL_DLE_SUPP_TIME      LL_DLE_TIME_1M(LL_DLE_SUPP_OCTETS)
 _Static_assert(LL_DLE_SUPP_OCTETS >= LL_DLE_MIN_OCTETS && LL_DLE_SUPP_OCTETS <= LL_DLE_MAX_OCTETS,
 	       "LL_DLE_SUPP_OCTETS must be 27..251");
+
+/* Largest plaintext payload the link may send in one PDU (slice 6b Task
+ * 4): connEffectiveMaxTxOctets, and no PDU may take longer than
+ * connEffectiveMaxTxTime on air (4.5.10), whose 1M packet time counts
+ * preamble 1 + AA 4 + header 2 + CRC 3 octets and the MIC when encrypted:
+ * min(octets, time / 8 - 14) encrypted, min(octets, time / 8 - 10) plain.
+ * Kept within 27..LL_DATA_PDU_MAX (the effective values never go below
+ * 27 / 328). */
+static inline uint8_t ll_dle_tx_limit(uint16_t max_tx_octets, uint16_t max_tx_time, bool enc)
+{
+	uint32_t by_time = max_tx_time / 8u;
+	uint32_t over = enc ? 14u : 10u;
+	uint32_t lim = max_tx_octets;
+
+	by_time = by_time > over ? by_time - over : 0;
+	if (by_time < lim) {
+		lim = by_time;
+	}
+	if (lim > LL_DATA_PDU_MAX) {
+		lim = LL_DATA_PDU_MAX;
+	}
+	return (uint8_t)(lim < LL_DLE_MIN_OCTETS ? LL_DLE_MIN_OCTETS : lim);
+}
+
+/* One PDU of a fragmented host ACL packet (ll_hci_acl_fragment): payload
+ * bytes off .. off + len - 1 of the packet, with LLID llid. */
+struct ll_acl_frag {
+	uint8_t off;
+	uint8_t len;
+	uint8_t llid;
+};
 
 /* PHY bits (Vol 6 Part B 2.4.2.22, HCI TX_PHYs/RX_PHYs) and HCI PHY values */
 #define LL_PHY_1M             0x01
@@ -108,8 +143,10 @@ _Static_assert(LL_DLE_SUPP_OCTETS >= LL_DLE_MIN_OCTETS && LL_DLE_SUPP_OCTETS <= 
 #define LL_COMPANY_ID     0xFFFF /* reserved for internal use / testing */
 #define LL_SUBVERSION     0x0001
 
-/* ACL buffers reported via LE Read Buffer Size (used from slice 3 on) */
-#define LL_ACL_MTU        27
+/* ACL buffers reported via LE Read Buffer Size (used from slice 3 on).
+ * Slice 6b Task 4: a host ACL packet of up to LL_ACL_MTU octets is split
+ * into PDUs of the link's TX limit (ll_hci_acl_fragment, ll_dle_tx_limit). */
+#define LL_ACL_MTU        251
 #define LL_ACL_NUM        3
 
 /* Timing: B91 system timer runs at 16 MHz */

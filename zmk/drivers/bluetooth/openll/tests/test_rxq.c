@@ -15,6 +15,7 @@
 #include "../ll_crypt.h"
 #include "../ll_defs.h"
 #include "../ll_rxq.h"
+#include "crypt_max_vec.h"
 
 void aes_ref_encrypt(const uint8_t key[16], const uint8_t in[16], uint8_t out[16]);
 
@@ -38,7 +39,7 @@ static bool try_put_l(uint8_t link, uint8_t hdr0, const uint8_t *payload, uint8_
 	if (paylen) {
 		memcpy(&pdu[2], payload, paylen);
 	}
-	return ll_rxq_isr_put(link, pdu, (uint8_t)(2 + paylen));
+	return ll_rxq_isr_put(link, pdu, (uint16_t)(2 + paylen));
 }
 
 static void put_l(uint8_t link, uint8_t hdr0, const uint8_t *payload, uint8_t paylen)
@@ -475,6 +476,118 @@ static void test_take_queued_any_link(void)
 	reset_all();
 }
 
+/* ---- slice 6b Task 4: long PDUs ---- */
+
+/* A 251-octet encrypted PDU (255 bytes on air, the radio reports len 257)
+ * is queued and decrypted whole; 255 unencrypted bytes too; a length the
+ * header cannot carry is dropped. */
+static void test_long_pdus(void)
+{
+	struct ll_rx_pdu out;
+	struct ll_crypt c;
+	uint8_t pdu[2 + 256];
+
+	reset_all();
+	crypt_setup(&c);
+	c.rx_ctr = 0x7FFFFFFFFFull;
+	ll_rxq_set_crypt(L, &c);
+	pdu[0] = 0x1E;
+	pdu[1] = 255;
+	memcpy(&pdu[2], max_dir1, 255);
+	CHECK(ll_rxq_isr_put(L, pdu, 257));
+	CHECK(ll_rxq_get(L, &out) == LL_RXQ_OK);
+	CHECK(out.hdr0 == 0x1E && out.len == 251);
+	for (int i = 0; i < 251; i++) {
+		if (out.data[i] != (uint8_t)i) {
+			CHECK(out.data[i] == (uint8_t)i);
+			break;
+		}
+	}
+	CHECK(c.rx_ctr == 0x8000000000ull);
+
+	ll_rxq_reset(L);
+	for (int i = 0; i < 255; i++) {
+		pdu[2 + i] = (uint8_t)(0xFF - i);
+	}
+	pdu[0] = 0x02;
+	CHECK(ll_rxq_isr_put(L, pdu, 257));
+	CHECK(ll_rxq_get(L, &out) == LL_RXQ_OK);
+	CHECK(out.len == 255 && memcmp(out.data, &pdu[2], 255) == 0);
+	/* 256 payload bytes: no 8-bit Length holds that, malformed */
+	CHECK(!ll_rxq_isr_put(L, pdu, 258));
+	CHECK(ll_rxq_overflow_count(L) == 1);
+	CHECK(ll_rxq_get(L, &out) == LL_RXQ_EMPTY);
+}
+
+/* Capacity: at most LL_RXQ_ENTRIES PDUs and LL_RXQ_POOL_BYTES of payload
+ * (each rounded up to 4) per link; whatever is refused is counted as an
+ * overflow, what was queued is delivered intact and in order, also across
+ * the wrap of the byte area. */
+static void test_capacity_bytes(void)
+{
+	struct ll_rx_pdu out;
+	uint8_t p[255];
+	const int cap = LL_RXQ_POOL_BYTES / 256;
+	int k;
+
+	reset_all();
+	for (k = 0; k < 64; k++) {
+		memset(p, k, sizeof(p));
+		if (!try_put_l(L, 0x02, p, 255)) {
+			break;
+		}
+	}
+	CHECK(k == cap);
+	CHECK(ll_rxq_overflow_count(L) == 1);
+	/* one consumed: the next maximum PDU wraps to the start of the area */
+	CHECK(ll_rxq_get(L, &out) == LL_RXQ_OK && out.data[0] == 0);
+	memset(p, k, sizeof(p));
+	CHECK(try_put_l(L, 0x02, p, 255));
+	CHECK(!try_put_l(L, 0x02, p, 1));
+	CHECK(ll_rxq_overflow_count(L) == 2);
+	for (int i = 1; i <= k; i++) {
+		CHECK(ll_rxq_get(L, &out) == LL_RXQ_OK);
+		CHECK(out.len == 255 && out.data[0] == i && out.data[254] == i);
+	}
+	CHECK(ll_rxq_get(L, &out) == LL_RXQ_EMPTY);
+
+	/* random sizes, producer ahead of the consumer by up to the capacity */
+	{
+		uint32_t x = 99;
+		uint8_t put_tag = 0, get_tag = 0;
+		uint8_t lens[256];
+		int queued = 0, refused = 0, got = 0;
+
+		reset_all();
+		for (int step = 0; step < 50000; step++) {
+			x = x * 1103515245u + 12345u;
+			if ((x >> 20) % 3 != 0) {
+				uint8_t len = (uint8_t)(1 + (x >> 8) % 255);
+
+				memset(p, put_tag, len);
+				p[0] = len;
+				if (try_put_l(L, 0x02, p, len)) {
+					lens[put_tag] = len;
+					put_tag++;
+					queued++;
+				} else {
+					refused++;
+					CHECK((uint8_t)(put_tag - get_tag) != 0);   /* empty takes any */
+					/* the refused one is gone for good (link ended);
+					 * here the test just goes on */
+				}
+			} else if (ll_rxq_get(L, &out) == LL_RXQ_OK) {
+				CHECK(out.len == lens[get_tag] && out.data[0] == out.len);
+				CHECK(out.len < 2 || out.data[out.len - 1] == get_tag);
+				get_tag++;
+				got++;
+			}
+		}
+		CHECK(queued > 15000 && refused > 1000 && got > 15000);
+		CHECK(ll_rxq_overflow_count(L) == (uint32_t)refused);
+	}
+}
+
 int main(void)
 {
 	L = 0;
@@ -485,5 +598,11 @@ int main(void)
 	test_links_isolated();
 	test_crypt_per_link();
 	test_take_queued_any_link();
+	L = 0;
+	test_long_pdus();
+	test_capacity_bytes();
+	L = (uint8_t)(LL_MAX_CONN - 1);
+	test_long_pdus();
+	test_capacity_bytes();
 	DONE();
 }

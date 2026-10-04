@@ -20,6 +20,7 @@ build_run test_csa1 ../ll_csa1.c
 build_run test_csa2 ../ll_csa2.c
 build_run test_crypt ../ll_crypt.c aes_ref.c
 build_run test_radio_mode ../ll_radio_mode.c
+build_run test_fifo
 # Suites with per-link state run for LL_MAX_CONN 1, 3 and 5 (slice 6a):
 # binaries <test>_n<N>.
 for n in 1 3 5; do
@@ -36,10 +37,10 @@ for n in 1 3 5; do
     build_run_as test_rxq_n$n test_rxq -DLL_MAX_CONN=$n ../ll_rxq.c ../ll_crypt.c aes_ref.c
     build_run_as test_llcp_n$n test_llcp -DLL_MAX_CONN=$n \
         ../ll_llcp.c ../ll_crypt.c aes_ref.c
-    # slice 6b Task 3: the LENGTH rules with a supported maximum above 27
-    # (the device value stays LL_DATA_PDU_MAX = 27 until Task 4)
-    build_run_as test_llcp_dle_n$n test_llcp -DLL_MAX_CONN=$n -DLL_DLE_SUPP_OCTETS=251 \
+    # slice 6b: the LENGTH rules of a controller whose supported maximum is
+    # 27 (the device value is LL_DATA_PDU_MAX = 251 since Task 4)
+    build_run_as test_llcp_sup27_n$n test_llcp -DLL_MAX_CONN=$n -DLL_DLE_SUPP_OCTETS=27 \
         ../ll_llcp.c ../ll_crypt.c aes_ref.c
-    build_run_as test_hci_dle_n$n test_hci -DLL_MAX_CONN=$n -DLL_DLE_SUPP_OCTETS=251 ../ll_hci.c
+    build_run_as test_hci_sup27_n$n test_hci -DLL_MAX_CONN=$n -DLL_DLE_SUPP_OCTETS=27 ../ll_hci.c
 done
 exit 0

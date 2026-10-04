@@ -23,6 +23,15 @@ struct ll_rx_pdu {
 	uint8_t data[LL_DATA_PDU_MAX + LL_MIC_LEN];
 };
 
+/* Per link (slice 6b Task 4, long PDUs): at most LL_RXQ_ENTRIES PDUs
+ * queued, their payload bytes (each rounded up to 4) in one FIFO area of
+ * LL_RXQ_POOL_BYTES (ll_fifo.h): 16 short PDUs, or 8 of the maximum 255
+ * bytes (251 + MIC). */
+#define LL_RXQ_ENTRIES 16
+#ifndef LL_RXQ_POOL_BYTES
+#define LL_RXQ_POOL_BYTES 2048
+#endif
+
 enum ll_rxq_result {
 	LL_RXQ_EMPTY,     /* ring drained, nothing to deliver */
 	LL_RXQ_OK,        /* out filled with a new, non-empty, decrypted PDU */
@@ -45,11 +54,12 @@ void ll_rxq_set_crypt(uint8_t link, struct ll_crypt *c);
 /* ISR: copy one CRC-valid PDU of the link that owns the running event
  * (2-byte header + payload, as delivered by LL_RADIO_CONN_RX: pdu[0] =
  * header byte 0, pdu[1] = on-air length, pdu[2..] = payload; len = 2 +
- * payload length). Single producer (the radio ISR). An empty
- * PDU is accepted and not queued. Returns false on overflow or a malformed
- * length (dropped and counted). A dropped data PDU is lost for good (the
- * hardware has acked it), so the caller ends the link (ll_conn: 0x08). */
-bool ll_rxq_isr_put(uint8_t link, const uint8_t *pdu, uint8_t len);
+ * payload length, up to 257: uint16_t, slice 6b). Single producer (the
+ * radio ISR). An empty PDU is accepted and not queued. Returns false on
+ * overflow (entries or bytes) or a malformed length (dropped and counted).
+ * A dropped data PDU is lost for good (the hardware has acked it), so the
+ * caller ends the link (ll_conn: 0x08). */
+bool ll_rxq_isr_put(uint8_t link, const uint8_t *pdu, uint16_t len);
 /* ISR (the producer side, e.g. at LL_RADIO_CONN_DONE): true if a data PDU
  * was queued on any link since the last call (or that link's
  * ll_rxq_reset()), and clears that flag for all links. Empty and dropped

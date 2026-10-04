@@ -28,7 +28,8 @@ enum ll_radio_evt {
  *
  * Connection mode uses different argument meanings:
  * - LL_RADIO_CONN_RX: pdu = 2-byte data PDU header + payload (still
- *   encrypted, MIC included), len = 2 + payload length, end_tick = stimer
+ *   encrypted, MIC included), len = 2 + payload length (up to 257, so
+ *   len is 16 bits: slice 6b), end_tick = stimer
  *   tick at the END OF THE ACCESS ADDRESS (RX DMA trailer timestamp), used
  *   for anchor re-sync. Reported once per CRC-valid packet, in order; pdu is
  *   only valid during the callback.
@@ -49,7 +50,7 @@ enum ll_radio_evt {
  *   end_tick = stimer tick when the event ended. Exactly one per
  *   ll_radio_conn_event(), always after its LL_RADIO_CONN_RX callbacks. */
 typedef void (*ll_radio_cb_t)(enum ll_radio_evt evt, const uint8_t *pdu,
-			      uint8_t len, uint32_t end_tick);
+			      uint16_t len, uint32_t end_tick);
 
 int ll_radio_init(ll_radio_cb_t cb);
 uint32_t ll_radio_now(void);
@@ -135,7 +136,8 @@ void ll_radio_conn_set_nesn_init(uint8_t nesn);
 uint8_t ll_radio_fifo_rptr(void);
 uint8_t ll_radio_fifo_wptr(void);
 /* Write data PDU header byte 0 (LLID; NESN/SN/MD are set by hardware) and
- * payload (len <= LL_DATA_PDU_MAX + LL_MIC_LEN) into ring entry idx & 3. */
+ * payload (len <= LL_DATA_PDU_MAX + LL_MIC_LEN = 255) into ring entry
+ * idx & 3. payload may be NULL for len 0. */
 void ll_radio_fifo_write(uint8_t idx, uint8_t hdr0, const uint8_t *payload, uint8_t len);
 void ll_radio_fifo_set_wptr(uint8_t wptr);
 /* Return to advertising after the (last) connection: baseband reset +
