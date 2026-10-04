@@ -240,6 +240,11 @@ void ll_conn_kick(uint8_t link);
 /* The link whose connection event is on air (its BRX issued, CONN_DONE not
  * yet handled), -1 between events. ISR (the radio callbacks of the event). */
 int ll_conn_event_owner(void);
+/* RX flow control (slice 7 Task 2c review): true when the link's ll_rxq is
+ * one maximum PDU short of the point where an event is stopped or not
+ * listened to, so the glue wakes the consumer first. False for an
+ * out-of-range link. ISR (producer side). */
+bool ll_conn_rx_wake_due(uint8_t link);
 /* Slice 6b Task 4: the link's connEffectiveMaxRxTime / MaxTxTime (us), from
  * ll_llcp whenever they change (328 / 328 at every connection start). One
  * exchange of maximum PDUs, rx + T_IFS + tx + T_IFS, is the event length
@@ -281,11 +286,16 @@ struct ll_conn_stats {
 	 * nor missed nor skipped. planned - listened includes the yields at
 	 * start. */
 	uint32_t collisions;
-	/* Slice 7 Task 2c, RX flow control: events not listened to because
-	 * ll_rxq lacked room (also counted in missed), and events stopped
-	 * early for the same reason. */
+	/* Slice 7 Task 2c, RX flow control. rx_paused: events not listened
+	 * to because ll_rxq lacked room (also counted in missed).
+	 * rx_pause_streak_max: the longest run of consecutive paused events
+	 * (a maximum, also in the totals). rx_stops: stop requests
+	 * (ll_radio_conn_stop) for the same reason, at most one per event;
+	 * ll_radio_stats.conn_stopped counts the stops the radio executed,
+	 * fewer when the event had already ended in the same ISR (CMD_DONE). */
 	uint32_t rx_paused;
 	uint32_t rx_stops;
+	uint32_t rx_pause_streak_max;
 };
 /* Per link, cumulative since boot (not reset per connection). Out-of-range
  * link: all zero. */

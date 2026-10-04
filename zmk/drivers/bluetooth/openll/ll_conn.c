@@ -98,6 +98,7 @@ struct ll_link {
 	bool rx_this_event;   /* a CRC-valid packet was received in this event */
 	bool first_seen;      /* the event's first packet (valid or not) was seen */
 	bool rx_stopped;      /* this event was stopped for lack of ll_rxq room */
+	uint16_t pause_run;   /* consecutive events not listened to (RX flow control) */
 	bool anchored;        /* the last closed event re-anchored (latency rule) */
 	bool holdoff_done;    /* LL_CONN_LATENCY_HOLDOFF_MS has passed (latched, see skip_count) */
 	/* effective maximum RX / TX times (ll_conn_set_dle_times): one
@@ -693,9 +694,16 @@ static void prepare(struct ll_link *c, uint32_t cap_us)
 		/* not listened: the central resends (RX flow control) */
 		ST(c)->rx_paused++;
 		ST(c)->missed++;
+		if (c->pause_run < UINT16_MAX) {
+			c->pause_run++;
+		}
+		if (c->pause_run > ST(c)->rx_pause_streak_max) {
+			ST(c)->rx_pause_streak_max = c->pause_run;
+		}
 		event_closed(c, now);
 		return;
 	}
+	c->pause_run = 0;
 	ll_radio_conn_select(c->ci.aa, c->ci.crc_init);
 	ll_txq_event_start(c->id);
 	c->rx_this_event = false;
@@ -1212,6 +1220,12 @@ uint8_t ll_conn_pending_instants(uint8_t link)
 	return r;
 }
 
+bool ll_conn_rx_wake_due(uint8_t link)
+{
+	/* one maximum PDU before the stop point (rx_room) */
+	return link < LL_MAX_CONN && !ll_rxq_isr_room(link, RX_FLOW_N + 1, RX_FLOW_LEN);
+}
+
 int ll_conn_event_owner(void)
 {
 	return ev_owner;
@@ -1297,6 +1311,9 @@ void ll_conn_get_stats_total(struct ll_conn_stats *s)
 		s->collisions += t->collisions;
 		s->rx_paused += t->rx_paused;
 		s->rx_stops += t->rx_stops;
+		if (t->rx_pause_streak_max > s->rx_pause_streak_max) {
+			s->rx_pause_streak_max = t->rx_pause_streak_max;
+		}
 	}
 	ll_plat_unlock(key);
 }

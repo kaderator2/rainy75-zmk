@@ -444,24 +444,28 @@ static void radio_evt(enum ll_radio_evt evt, const uint8_t *pdu, uint16_t len, u
 	ll_adv_radio_evt(evt, pdu, (uint8_t)len, tick);
 	ll_conn_radio_evt(evt, pdu, len, tick);
 	/* Wake the controller thread before the event ends when the event
-	 * owner's RX queue is half full (entries or bytes, ll_rxq): it then
-	 * runs between the exchanges of a long central burst and drains
-	 * ll_rxq, so the burst does not overflow it (an overflow ends the
-	 * link with 0x08). With long PDUs the byte area holds 8 maximum PDUs
+	 * owner's RX queue fills up: half full (entries or bytes, ll_rxq), or
+	 * one maximum PDU short of the point where ll_conn's RX flow control
+	 * stops the event (ll_conn_rx_wake_due; slice 7 Task 2c review: with
+	 * maximum PDUs that point, 3 queued, lies below half full, 4). The
+	 * thread then runs between the exchanges of a long central burst and
+	 * drains ll_rxq; the wake comes before the stop, at the latest with the
+	 * stopping packet (random sizes), and if the thread does not get the
+	 * CPU in time (cooperative host threads run first) the event is still
+	 * stopped, so ll_rxq never overflows (an overflow ends the link with
+	 * 0x08). With long PDUs the byte area holds 8 maximum PDUs
 	 * (LL_RXQ_POOL_BYTES), and one event at a 50 ms interval can carry 11
-	 * exchanges of 4.5 ms; 27-octet PDUs fill the 16 entries in about
-	 * 12 ms of MD burst. If the thread does not get the CPU in time
-	 * (cooperative host threads run first), ll_conn's RX flow control
-	 * stops the event before ll_rxq can overflow (slice 7 Task 2c).
-	 * Only the owner: no other link receives during
-	 * this event, and its queue was looked at in its own events. The
-	 * CONN_RX callbacks run only once our response has started
-	 * (ll_radio.c): CPU work in the RX -> TX turnaround moves the TX
-	 * later, and a thread woken there would do so too. */
+	 * exchanges of 4.5 ms; 27-octet PDUs fill the 16 entries in about 12 ms
+	 * of MD burst. Only the owner: no other link receives during this
+	 * event, and its queue was looked at in its own events. The CONN_RX
+	 * callbacks run only once our response has started (ll_radio.c): CPU
+	 * work in the RX -> TX turnaround moves the TX later, and a thread woken
+	 * there would do so too. */
 	if (evt == LL_RADIO_CONN_RX) {
 		int owner = ll_conn_event_owner();
 
-		if (owner >= 0 && ll_rxq_isr_half_full((uint8_t)owner)) {
+		if (owner >= 0 && (ll_rxq_isr_half_full((uint8_t)owner) ||
+				   ll_conn_rx_wake_due((uint8_t)owner))) {
 			k_sem_give(&wake);
 		}
 	}
@@ -1208,8 +1212,8 @@ static void report_stats(struct ll_radio_stats *last, struct ll_conn_stats *last
 		LOG_INF("conn: latency planned %u listened %u skipped %u kicks %u coll %u links %u apto %u",
 			cs.planned, cs.listened, cs.skipped, cs.kicks, cs.collisions,
 			ll_conn_count(), (uint32_t)atomic_get(&cnt_apto));
-		LOG_INF("conn: rx flow paused %u stops %u (radio %u)", cs.rx_paused, cs.rx_stops,
-			st.conn_stopped);
+		LOG_INF("conn: rx flow paused %u (longest run %u) stops %u (radio %u)",
+			cs.rx_paused, cs.rx_pause_streak_max, cs.rx_stops, st.conn_stopped);
 		LOG_INF("adv: events %u slid %u dropped %u cut %u stuck %u adv_guard %u",
 			as.events, as.slid, as.dropped, as.cut, as.stuck, st.adv_guard);
 		LOG_INF("conn: acl in %u out %u drop %u frag %u evt_drop %u lock max %u us acl_tx %u us aes %u us",

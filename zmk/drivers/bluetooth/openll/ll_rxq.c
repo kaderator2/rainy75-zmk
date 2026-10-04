@@ -146,23 +146,28 @@ bool ll_rxq_isr_half_full(uint8_t link)
 bool ll_rxq_isr_room(uint8_t link, uint8_t n, uint16_t len)
 {
 	const struct rxq_link *q;
-	uint8_t head, used;
+	uint8_t head, tail, used;
 	uint16_t oldest, newest, end;
 
 	if (link >= LL_MAX_CONN) {
 		return false;
 	}
 	q = &links[link];
+	/* Producer side (ISR), so head is ours and the consumer cannot run
+	 * until we return: tail is read once and the entries in [tail, head)
+	 * stay valid while we look at them; the barrier only keeps the
+	 * compiler from reading the entries before the counters. */
 	head = q->head;
-	used = (uint8_t)(head - q->tail);
-	RING_BARRIER();   /* tail read before its record's offset (as in the put) */
+	tail = q->tail;
+	used = (uint8_t)(head - tail);
+	RING_BARRIER();
 	if ((uint32_t)used + n > LL_RXQ_ENTRIES) {
 		return false;
 	}
 	if (used) {
 		const struct rxq_ent *w = &q->ent[ENT(head - 1)];
 
-		oldest = q->ent[ENT(q->tail)].off;
+		oldest = q->ent[ENT(tail)].off;
 		newest = w->off;
 		end = (uint16_t)(w->off + ll_fifo_size(w->len));
 	} else {

@@ -176,7 +176,10 @@ struct ll_radio_stats {
 	uint32_t rx_ptr_skip;   /* hw rx wptr jumped by more than the ring: entries skipped */
 	uint32_t fst_capped;    /* events whose RX window exceeded the 12-bit rx_timeout */
 	uint32_t holds;         /* first RX IRQs that held the CPU until our TX started */
-	uint32_t conn_stopped;  /* events ended by ll_radio_conn_stop() (RX flow control) */
+	/* events ended by ll_radio_conn_stop() (RX flow control): the
+	 * executed stops; ll_conn_stats.rx_stops counts the requests, more
+	 * when an event had already ended in the same ISR */
+	uint32_t conn_stopped;
 	uint8_t rx_wptr_max;    /* largest raw hw rx wptr seen (its counter width) */
 	/* First-exchange T_IFS from the TX timestamp (us, rounded) */
 	uint32_t tifs_le150;

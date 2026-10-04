@@ -632,6 +632,105 @@ static void test_rx_flow_burst(void)
 	}
 }
 
+
+/* Review fix: the controller thread is woken before an event has to be
+ * stopped. ll_conn_rx_wake_due() is true one maximum PDU before the stop
+ * point (room for RX_FLOW_N + 1 maximum PDUs missing); the glue wakes on it
+ * or on ll_rxq_isr_half_full(). With maximum PDUs the wake now comes a full
+ * PDU before the stop (before, half full at 4 came after the stop at 4);
+ * with short ones half full (8 entries) stays the first; random sizes: at
+ * the latest with the stopping packet. A healthy flow (two PDUs queued)
+ * does not wake per PDU. */
+static bool wake_given(uint8_t link)
+{
+	return ll_rxq_isr_half_full(link) || ll_conn_rx_wake_due(link);
+}
+
+static void test_rx_flow_wake(void)
+{
+	struct ll_connect_ind ci = mk_ci(12, 400, 1, 1, 0);
+	struct ll_rx_pdu out;
+
+	reset_all(false);
+	CHECK(ll_conn_start(&ci, 500000) == 0);
+	CHECK(!ll_conn_rx_wake_due(0) && !ll_conn_rx_wake_due(LL_MAX_CONN));
+	for (int lens = 0; lens < 2; lens++) {
+		int wake_at = -1, stop_at = -1;
+
+		ll_rxq_reset(0);
+		for (int k = 0; k < LL_RXQ_ENTRIES && stop_at < 0; k++) {
+			fill_rxq(0, lens ? 255 : 27, 1);
+			if (wake_at < 0 && wake_given(0)) {
+				wake_at = k;
+			}
+			if (!ll_rxq_isr_room(0, FLOW_N, FLOW_LEN)) {
+				stop_at = k;
+			}
+		}
+		CHECK(wake_at >= 0 && stop_at >= 0 && wake_at < stop_at);
+	}
+	/* healthy flow: two maximum PDUs queued, no wake request */
+	ll_rxq_reset(0);
+	fill_rxq(0, 255, 2);
+	CHECK(!wake_given(0));
+	CHECK(ll_rxq_get(0, &out) == LL_RXQ_OK);
+	/* random sizes: never a stop without a wake at or before it */
+	for (uint32_t seed = 1; seed < 300; seed++) {
+		uint32_t x = seed;
+		bool woke = false;
+
+		ll_rxq_reset(0);
+		for (int k = 0; k < LL_RXQ_ENTRIES; k++) {
+			x = x * 1103515245u + 12345u;
+			if (!ll_rxq_isr_room(0, 1, 255)) {
+				break;
+			}
+			fill_rxq(0, (uint8_t)(1 + (x >> 8) % 255), 1);
+			woke |= wake_given(0);
+			if (!ll_rxq_isr_room(0, FLOW_N, FLOW_LEN)) {
+				CHECK(woke);
+				break;
+			}
+		}
+	}
+	ll_conn_end(0, LL_ST_REMOTE_TERM);
+}
+
+/* The longest run of consecutive paused events (stats, review minor). */
+static void test_rx_flow_pause_streak(void)
+{
+	struct ll_connect_ind ci = mk_ci(12, 400, 1, 1, 0);
+	struct ll_conn_stats st0, st;
+	struct ll_rx_pdu out;
+	uint32_t run;
+
+	reset_all(false);
+	ll_conn_get_stats(0, &st0);        /* per link since boot */
+	run = st0.rx_pause_streak_max + 3;
+	CHECK(run < 200);                  /* within the 4 s supervision timeout */
+	CHECK(ll_conn_start(&ci, 500000) == 0);
+	ev_rx(500000 + T(1250 + 300));     /* established */
+	while (ll_rxq_isr_room(0, FLOW_N, FLOW_LEN)) {
+		fill_rxq(0, 4, 1);
+	}
+	for (uint32_t i = 0; i < run; i++) {
+		fire_alarm();              /* paused */
+	}
+	CHECK(ll_rxq_get(0, &out) == LL_RXQ_OK);
+	ev_miss();                         /* listened: the run ends */
+	fill_rxq(0, 4, 1);
+	fire_alarm();                      /* a run of 1 */
+	ll_conn_get_stats(0, &st);
+	CHECK(st.rx_pause_streak_max == run);
+	CHECK(st.rx_paused - st0.rx_paused == run + 1);
+	CHECK(ll_rxq_get(0, &out) == LL_RXQ_OK);
+	ev_miss();
+	ll_conn_get_stats(0, &st);
+	CHECK(st.rx_pause_streak_max == run);
+	CHECK(ll_conn_active(0));
+	ll_conn_end(0, LL_ST_REMOTE_TERM);
+}
+
 /* ll_conn_start runs in ISR context and must not reset ll_rxq (the
  * controller thread may be inside ll_rxq_get); the glue resets it in its
  * thread on DISCONNECTED. A PDU already in the ring survives the start. */
@@ -3391,6 +3490,8 @@ int main(void)
 	test_rx_flow_pause();
 	test_rx_flow_stop();
 	test_rx_flow_burst();
+	test_rx_flow_wake();
+	test_rx_flow_pause_streak();
 	test_first_packet_bad_crc();
 	test_first_packet_retransmission();
 	test_first_packet_after_window();
