@@ -433,6 +433,17 @@ static void radio_evt(enum ll_radio_evt evt, const uint8_t *pdu, uint16_t len, u
 	/* advertising PDUs are at most 39 bytes (8-bit length there) */
 	ll_adv_radio_evt(evt, pdu, (uint8_t)len, tick);
 	ll_conn_radio_evt(evt, pdu, len, tick);
+	/* Wake the controller thread as soon as an event queued a data PDU,
+	 * not only at the event's end: it runs between the RX IRQs of a long
+	 * central burst and drains ll_rxq, so a burst longer than the queue
+	 * does not overflow it (an overflow ends the link with 0x08). With
+	 * long PDUs the byte area holds 8 maximum PDUs (LL_RXQ_POOL_BYTES),
+	 * and one event at a 50 ms interval can carry 11 exchanges of 4.5 ms;
+	 * 27-octet PDUs fill the 16 entries in about 12 ms of MD burst. Empty
+	 * PDUs queue nothing, so an idle event still wakes nobody. */
+	if (evt == LL_RADIO_CONN_RX && ll_rxq_isr_take_queued()) {
+		k_sem_give(&wake);
+	}
 	if (evt != LL_RADIO_CONN_DONE) {
 		return;
 	}
@@ -444,10 +455,11 @@ static void radio_evt(enum ll_radio_evt evt, const uint8_t *pdu, uint16_t len, u
 			atomic_inc(&cnt_guard_escalations);
 		}
 	}
-	/* Wake the controller thread only when this event queued a data PDU
-	 * (len counts empty PDUs too, which would wake it at every listened
-	 * event). Acks of our PDUs wake it via txq_done, a link end via
-	 * conn_evt (DISCONNECTED, also after an ll_rxq overflow). */
+	/* At the end of the event, wake it for a data PDU the RX wake above
+	 * has not reported yet (len counts empty PDUs too, which would wake
+	 * it at every listened event). Acks of our PDUs wake it via
+	 * txq_done, a link end via conn_evt (DISCONNECTED, also after an
+	 * ll_rxq overflow). */
 	if (ll_rxq_isr_take_queued()) {
 		k_sem_give(&wake);
 	}
