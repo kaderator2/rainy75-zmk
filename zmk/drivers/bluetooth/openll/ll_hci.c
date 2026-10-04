@@ -20,6 +20,7 @@
 #define OP_LE_SET_EVENT_MASK     OP(0x08, 0x0001)
 #define OP_LE_READ_BUFFER_SIZE   OP(0x08, 0x0002)
 #define OP_LE_READ_FEATURES      OP(0x08, 0x0003)
+#define OP_LE_SET_RANDOM_ADDR    OP(0x08, 0x0005)
 #define OP_LE_SET_ADV_PARAMS     OP(0x08, 0x0006)
 #define OP_LE_SET_ADV_DATA       OP(0x08, 0x0008)
 #define OP_LE_SET_SCAN_RSP_DATA  OP(0x08, 0x0009)
@@ -72,6 +73,7 @@ static const uint8_t supported_cmds[][2] = {
 	{25, 0}, /* LE Set Event Mask */
 	{25, 1}, /* LE Read Buffer Size */
 	{25, 2}, /* LE Read Local Supported Features */
+	{25, 4}, /* LE Set Random Address (slice 6c) */
 	{25, 5}, /* LE Set Advertising Parameters */
 	{25, 7}, /* LE Set Advertising Data */
 	{26, 0}, /* LE Set Scan Response Data */
@@ -126,6 +128,7 @@ void ll_hci_init(const struct ll_hci_ops *ops, ll_hci_sink_t sink)
 	 * init instead of a NULL call on the first Disconnect / ACL packet */
 	assert(ops != NULL && ops->handle_valid != NULL);
 	assert(ops->set_data_len != NULL && ops->read_phy != NULL && ops->set_phy != NULL);
+	assert(ops->set_random_addr != NULL);
 	hci_ops = ops;
 	hci_sink = sink;
 	masks_default();
@@ -425,6 +428,15 @@ void ll_hci_cmd(const uint8_t *cmd, uint16_t len)
 	case OP_LE_RAND:
 		hci_ops->rand(&ret[1], 8);
 		cmd_complete(op, ret, 9);
+		break;
+	case OP_LE_SET_RANDOM_ADDR:
+		/* Vol 4 Part E 7.8.4: Random_Address (6 octets); the 0x0C rule
+		 * (advertising with own type random) is ll_adv's */
+		if (plen != 6) {
+			status_only(op, LL_ST_INVALID_PARAM);
+		} else {
+			status_only(op, hci_ops->set_random_addr(p));
+		}
 		break;
 	case OP_LE_SET_ADV_PARAMS:
 		set_adv_params(op, p, plen);

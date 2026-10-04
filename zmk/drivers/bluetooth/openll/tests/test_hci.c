@@ -71,6 +71,14 @@ static uint8_t set_phy(uint16_t h, uint8_t all, uint8_t tx, uint8_t rx, uint16_t
 	sphy_opts = opts; return next_status;
 }
 
+/* slice 6c */
+static int rnd_addr_calls;
+static uint8_t got_rnd_addr[6];
+static uint8_t set_random_addr(const uint8_t a[6])
+{
+	rnd_addr_calls++; memcpy(got_rnd_addr, a, 6); return next_status;
+}
+
 static const struct ll_hci_ops ops = {
 	.get_bd_addr = get_addr, .rand = rnd, .reset = reset,
 	.adv_set_params = set_params, .adv_set_data = set_data,
@@ -78,6 +86,7 @@ static const struct ll_hci_ops ops = {
 	.disconnect = disconnect, .ltk_reply = ltk_reply, .ltk_neg_reply = ltk_neg,
 	.handle_valid = handle_valid,
 	.set_data_len = set_data_len, .read_phy = read_phy, .set_phy = set_phy,
+	.set_random_addr = set_random_addr,
 };
 
 static void cmd(uint16_t op, const uint8_t *p, uint8_t plen)
@@ -760,6 +769,32 @@ static void test_init_requires_handle_valid(void)
 	CHECK(WIFSIGNALED(st) && WTERMSIG(st) == SIGABRT);
 }
 
+/* LE Set Random Address (0x2005, Vol 4 Part E 7.8.4): 6 octets, the
+ * status comes from ops.set_random_addr (0x0C while advertising random) */
+static void test_set_random_addr(void)
+{
+	static const uint8_t a[6] = {0x11, 0x22, 0x33, 0x44, 0x55, 0x4A};
+
+	int u0 = unknown_calls;
+
+	next_status = LL_ST_SUCCESS;
+	rnd_addr_calls = 0;
+	cmd(0x2005, a, 6);
+	CHECK(is_cc(0x2005, LL_ST_SUCCESS) && evt_len == 7);
+	CHECK(rnd_addr_calls == 1 && memcmp(got_rnd_addr, a, 6) == 0);
+	next_status = LL_ST_DISALLOWED;
+	cmd(0x2005, a, 6);
+	CHECK(is_cc(0x2005, LL_ST_DISALLOWED) && rnd_addr_calls == 2);
+	next_status = LL_ST_SUCCESS;
+	/* wrong length: 0x12, not passed on */
+	cmd(0x2005, a, 5);
+	CHECK(is_cc(0x2005, LL_ST_INVALID_PARAM) && rnd_addr_calls == 2);
+	cmd(0x2005, a, 0);
+	CHECK(is_cc(0x2005, LL_ST_INVALID_PARAM) && rnd_addr_calls == 2);
+	/* not an unknown opcode */
+	CHECK(unknown_calls == u0);
+}
+
 int main(void)
 {
 	test_init_requires_handle_valid();
@@ -821,6 +856,8 @@ int main(void)
 	CHECK(evt[7 + 35] & 0x40);         /* LE Set PHY */
 	CHECK(!(evt[7 + 33] & 0x30));      /* no Connection Parameter Request replies */
 	CHECK(!(evt[7 + 35] & 0x87));      /* no resolving-list / RPA commands */
+	CHECK(evt[7 + 25] & 0x10);         /* LE Set Random Address (slice 6c) */
+	CHECK(!(evt[7 + 34] & 0xF8));      /* no resolving list (Add .. Read Peer/Local RPA) */
 
 	/* Read BD_ADDR */
 	cmd(0x1009, NULL, 0);
@@ -919,6 +956,7 @@ int main(void)
 	test_acl();
 	test_handles();
 	test_dle_phy_cmds();
+	test_set_random_addr();
 
 	DONE();
 }

@@ -643,6 +643,9 @@ static const struct ll_hci_ops hci_ops = {
 	.set_data_len = hci_set_data_len,
 	.read_phy = hci_read_phy,
 	.set_phy = hci_set_phy,
+	/* Slice 6c: host-based privacy (Zephyr sets its RPA with 0x2005,
+	 * after stopping advertising when it rotates it) */
+	.set_random_addr = ll_adv_set_random_addr,
 };
 
 /* ---- controller thread ---- */
@@ -702,8 +705,14 @@ static void handle_connected(uint8_t link)
 	mic_failed[link] = false;
 	/* new generation, up, no credit of an earlier connection (ll_credit) */
 	ll_credit_open(link);
-	LOG_INF("connected (handle %u): interval %u latency %u timeout %u", link, ci.interval,
-		ci.latency, ci.timeout);
+	/* ci (also kept by ll_conn for the link) records the local address
+	 * the connection was made to: public or the random AdvA (slice 6c).
+	 * LE Connection Complete stays the legacy event; Zephyr derives its
+	 * local RPA itself. */
+	LOG_INF("connected (handle %u): interval %u latency %u timeout %u, local %s "
+		"%02x:%02x:%02x:%02x:%02x:%02x", link, ci.interval, ci.latency, ci.timeout,
+		ci.adv_addr_random ? "random" : "public", ci.adv_a[5], ci.adv_a[4],
+		ci.adv_a[3], ci.adv_a[2], ci.adv_a[1], ci.adv_a[0]);
 	if (!silent_end[link]) {
 		ll_hci_evt_conn_complete(link, &ci);
 		/* ll_conn uses CSA#2 exactly when the CONNECT_IND has ChSel 1

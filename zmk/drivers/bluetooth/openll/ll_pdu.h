@@ -25,12 +25,23 @@ struct ll_connect_ind {
 	uint8_t chm[5];
 	uint8_t hop;
 	uint8_t sca;
+	/* Slice 6c: the local address the CONNECT_IND was sent to (our AdvA
+	 * at that advertising event) and its type (RxAdd); kept with the
+	 * link as the record of the address it was made with. */
+	uint8_t adv_a[6];
+	uint8_t adv_addr_random;
 };
 
-uint8_t ll_pdu_build_adv(uint8_t *out, uint8_t pdu_type, const uint8_t adva[6],
+/* Advertising PDU (ADV_IND / ADV_NONCONN_IND / ADV_SCAN_IND / SCAN_RSP)
+ * with AdvA = adva; tx_add != 0 sets TxAdd (AdvA is a random address,
+ * Vol 6 Part B 2.3.1). */
+uint8_t ll_pdu_build_adv(uint8_t *out, uint8_t pdu_type, const uint8_t adva[6], uint8_t tx_add,
 			 const uint8_t *data, uint8_t len);
-bool ll_pdu_is_scan_req_for(const uint8_t *pdu, uint8_t len, const uint8_t adva[6]);
+/* SCAN_REQ / CONNECT_IND for us: AdvA == adva and RxAdd == (tx_add != 0),
+ * the address type we advertise with. */
+bool ll_pdu_is_scan_req_for(const uint8_t *pdu, uint8_t len, const uint8_t adva[6],
+			    uint8_t tx_add);
 int ll_pdu_parse_connect_ind(const uint8_t *pdu, uint8_t len, const uint8_t adva[6],
-			     struct ll_connect_ind *ci);
+			     uint8_t tx_add, struct ll_connect_ind *ci);
 
 #endif /* LL_PDU_H_ */

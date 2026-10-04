@@ -111,7 +111,16 @@ LOG_MODULE_DECLARE(openll, CONFIG_BT_HCI_DRIVER_LOG_LEVEL);
 #define HCI_ADV_DIRECT_LOW   4
 
 static struct {
-	uint8_t adva[6];
+	uint8_t pub_a[6];     /* public device address (BD_ADDR) */
+	uint8_t rnd_a[6];     /* LE Set Random Address; valid when rnd_set */
+	bool rnd_set;
+	/* AdvA in use (Own_Address_Type 0: pub_a, 1: rnd_a) and its TxAdd;
+	 * set with the PDUs, so every PDU we send and every SCAN_REQ /
+	 * CONNECT_IND match of an event use the same address. It cannot
+	 * change while advertising: Set Advertising Parameters is refused
+	 * then, and so is Set Random Address with own type random. */
+	uint8_t use_a[6];
+	uint8_t use_tx_add;
 	ll_adv_connect_cb_t on_connect;
 	struct ll_adv_params prm;
 	uint8_t data[LL_ADV_DATA_MAX];
@@ -158,11 +167,20 @@ static bool connectable(void)
 	return adv.prm.type == HCI_ADV_IND;
 }
 
+/* Caller holds the lock (or advertising is off). */
 static void build_pdus(void)
 {
-	adv.pdu_len = ll_pdu_build_adv(adv.pdu, pdu_type(), adv.adva, adv.data, adv.data_len);
-	adv.rsp_pdu_len = ll_pdu_build_adv(adv.rsp_pdu, LL_PDU_SCAN_RSP, adv.adva,
-					   adv.rsp, adv.rsp_len);
+	if (adv.prm.own_addr_type == LL_OWN_ADDR_RANDOM) {
+		memcpy(adv.use_a, adv.rnd_a, 6);
+		adv.use_tx_add = 1;
+	} else {
+		memcpy(adv.use_a, adv.pub_a, 6);
+		adv.use_tx_add = 0;
+	}
+	adv.pdu_len = ll_pdu_build_adv(adv.pdu, pdu_type(), adv.use_a, adv.use_tx_add,
+				       adv.data, adv.data_len);
+	adv.rsp_pdu_len = ll_pdu_build_adv(adv.rsp_pdu, LL_PDU_SCAN_RSP, adv.use_a,
+					   adv.use_tx_add, adv.rsp, adv.rsp_len);
 }
 
 static void defaults(void)
@@ -173,6 +191,9 @@ static void defaults(void)
 	adv.prm.chan_map = 0x07;
 	adv.data_len = 0;
 	adv.rsp_len = 0;
+	/* HCI Reset: no random address until the host sets one again */
+	memset(adv.rnd_a, 0, 6);
+	adv.rnd_set = false;
 	build_pdus();
 }
 
@@ -433,7 +454,7 @@ void ll_adv_init(const uint8_t adva[6], ll_adv_connect_cb_t on_connect)
 
 	memset(&adv, 0, sizeof(adv));
 	adv.stats = st;   /* cumulative since boot */
-	memcpy(adv.adva, adva, 6);
+	memcpy(adv.pub_a, adva, 6);
 	adv.on_connect = on_connect;
 	defaults();
 }
@@ -446,7 +467,11 @@ uint8_t ll_adv_enable(bool enable)
 	if (enable && !adv.enabled) {
 		uint8_t taken = ll_conn_count();
 
-		if (connectable() && taken >= LL_MAX_CONN) {
+		if (adv.prm.own_addr_type == LL_OWN_ADDR_RANDOM && !adv.rnd_set) {
+			/* Vol 4 Part E 7.8.9: own type random and the random
+			 * address not initialized with LE Set Random Address */
+			st = LL_ST_INVALID_PARAM;
+		} else if (connectable() && taken >= LL_MAX_CONN) {
 			/* every link taken (active or awaiting release): see
 			 * the file header for the code */
 			st = LL_ST_CONN_LIMIT;
@@ -457,6 +482,7 @@ uint8_t ll_adv_enable(bool enable)
 				adv.radio_dirty = false;
 				ll_radio_adv_restore();
 			}
+			build_pdus();   /* AdvA in force from this enable */
 			adv.enabled = true;
 			adv.in_event = false;
 			adv.on_air = false;
@@ -500,8 +526,9 @@ uint8_t ll_adv_set_params(const struct ll_adv_params *p)
 	    p->interval_min > p->interval_max) {
 		return LL_ST_INVALID_PARAM;
 	}
+	/* own types 2/3 (controller-generated RPA) need a resolving list */
 	if (p->type == HCI_ADV_DIRECT_HIGH || p->type == HCI_ADV_DIRECT_LOW ||
-	    p->own_addr_type != 0 || p->filter_policy != 0) {
+	    p->own_addr_type > LL_OWN_ADDR_RANDOM || p->filter_policy != 0) {
 		return LL_ST_UNSUPPORTED;
 	}
 	unsigned int key = ll_plat_lock();
@@ -510,6 +537,24 @@ uint8_t ll_adv_set_params(const struct ll_adv_params *p)
 	build_pdus();
 	ll_plat_unlock(key);
 	return LL_ST_SUCCESS;
+}
+
+uint8_t ll_adv_set_random_addr(const uint8_t addr[6])
+{
+	unsigned int key = ll_plat_lock();
+	uint8_t st = LL_ST_SUCCESS;
+
+	if (adv.enabled && adv.prm.own_addr_type == LL_OWN_ADDR_RANDOM) {
+		/* Vol 4 Part E 7.8.4: not while legacy advertising uses the
+		 * random address (Zephyr stops advertising to rotate the RPA) */
+		st = LL_ST_DISALLOWED;
+	} else {
+		memcpy(adv.rnd_a, addr, 6);
+		adv.rnd_set = true;
+		build_pdus();   /* no change on air while advertising public */
+	}
+	ll_plat_unlock(key);
+	return st;
 }
 
 static uint8_t set_buf(uint8_t *dst, uint8_t *dst_len, const uint8_t *data, uint8_t len)
@@ -551,13 +596,13 @@ void ll_adv_radio_evt(enum ll_radio_evt evt, const uint8_t *pdu, uint8_t len,
 		return;
 	}
 	if (evt == LL_RADIO_RX_OK) {
-		if (scannable() && ll_pdu_is_scan_req_for(pdu, len, adv.adva)) {
+		if (scannable() && ll_pdu_is_scan_req_for(pdu, len, adv.use_a, adv.use_tx_add)) {
 			if (ll_radio_tx_rsp_at(end_tick + LL_T_IFS_US * LL_TICKS_PER_US)) {
 				return; /* continue on LL_RADIO_TX_DONE */
 			}
 			/* too late to answer; no TX_DONE will come, so move on now */
 		}
-		if (connectable() && ll_pdu_parse_connect_ind(pdu, len, adv.adva, &ci) == 0) {
+		if (connectable() && ll_pdu_parse_connect_ind(pdu, len, adv.use_a, adv.use_tx_add, &ci) == 0) {
 			if (adv.on_connect) {
 				adv.on_connect(&ci);
 			}

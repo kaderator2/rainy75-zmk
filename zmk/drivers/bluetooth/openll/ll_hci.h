@@ -55,6 +55,10 @@ struct ll_hci_ops {
 	 * order is fixed whatever thread delivers events. */
 	uint8_t (*set_phy)(uint16_t handle, uint8_t all_phys, uint8_t tx_phys, uint8_t rx_phys,
 			   uint16_t opts);
+	/* Slice 6c: LE Set Random Address (0x2005), the 6-octet address
+	 * (LSB first) after the length check; returns the HCI status
+	 * (ll_adv_set_random_addr). Required. */
+	uint8_t (*set_random_addr)(const uint8_t addr[6]);
 };
 
 typedef void (*ll_hci_sink_t)(const uint8_t *h4, uint16_t len);

@@ -163,6 +163,156 @@ static void test_while_connected(void)
 	conn_is_active = false;
 }
 
+/* Slice 6c: LE Set Random Address and Own_Address_Type 1. */
+static const uint8_t rnda[6] = {0x11, 0x22, 0x33, 0x44, 0x55, 0x4A};   /* RPA: top bits 01 */
+static const uint8_t rndb[6] = {0x66, 0x77, 0x88, 0x99, 0xAA, 0x5B};
+
+/* CONNECT_IND to `a` with RxAdd rx_add */
+static void put_ci_pdu_to(uint8_t *ci_pdu, const uint8_t a[6], uint8_t rx_add)
+{
+	put_ci_pdu(ci_pdu);
+	memcpy(&ci_pdu[8], a, 6);
+	if (rx_add) {
+		ci_pdu[0] |= 0x80;
+	}
+}
+
+static void test_own_random(void)
+{
+	struct ll_adv_params p;
+	uint8_t ci_pdu[36];
+	uint8_t req[14] = {0x43, 12, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF};
+	int c0, s0;
+
+	ll_adv_reset();
+	taken = 0;
+	start_ret = -EINVAL;
+
+	/* type 1 is accepted by Set Advertising Parameters; enabling it with
+	 * no random address set is 0x12 (Vol 4 Part E 7.8.9) */
+	p = params(0, 7);
+	p.own_addr_type = 1;
+	CHECK(ll_adv_set_params(&p) == LL_ST_SUCCESS);
+	CHECK(ll_adv_enable(true) == LL_ST_INVALID_PARAM);
+	CHECK(!ll_adv_is_enabled() && sched_cb == NULL);
+
+	/* 0x2005 while not advertising: stored */
+	CHECK(ll_adv_set_random_addr(rnda) == LL_ST_SUCCESS);
+	CHECK(ll_adv_enable(true) == LL_ST_SUCCESS);
+	fire_sched();
+	CHECK(radio_ch == 37);
+	CHECK(tx_pdu[0] == (LL_PDU_ADV_IND | 0x20 | 0x40));   /* ChSel + TxAdd 1 */
+	CHECK(memcmp(&tx_pdu[2], rnda, 6) == 0);
+	CHECK(rsp_pdu[0] == (LL_PDU_SCAN_RSP | 0x40) && memcmp(&rsp_pdu[2], rnda, 6) == 0);
+
+	/* refused while advertising with the random address (7.8.4) */
+	CHECK(ll_adv_set_random_addr(rndb) == LL_ST_DISALLOWED);
+
+	/* SCAN_REQ to the public AdvA (RxAdd 0): ignored; to the random one:
+	 * answered */
+	s0 = rsp_calls;
+	memcpy(&req[8], adva, 6);
+	ll_adv_radio_evt(LL_RADIO_RX_OK, req, 14, 5000000);
+	CHECK(rsp_calls == s0 && radio_ch == 38);
+	memcpy(&req[8], rnda, 6);
+	req[0] |= 0x80;
+	ll_adv_radio_evt(LL_RADIO_RX_OK, req, 14, 5100000);
+	CHECK(rsp_calls == s0 + 1);
+	ll_adv_radio_evt(LL_RADIO_TX_DONE, NULL, 0, 0);
+	CHECK(radio_ch == 39);
+
+	/* CONNECT_IND to the public AdvA while advertising random: ignored
+	 * (no callback, no ll_conn_start, the event moves on) */
+	c0 = start_calls;
+	put_ci_pdu_to(ci_pdu, adva, 0);
+	ll_adv_radio_evt(LL_RADIO_RX_OK, ci_pdu, 36, 5200000);
+	CHECK(start_calls == c0);
+	CHECK(ll_adv_is_enabled() && sched_cb != NULL);   /* the event ended after 39 */
+
+	/* CONNECT_IND to the random AdvA: accepted; the link's record holds
+	 * the local address it was made to */
+	fire_sched();
+	CHECK(radio_ch == 37);
+	put_ci_pdu_to(ci_pdu, rnda, 1);
+	start_ret = 0;
+	ll_adv_radio_evt(LL_RADIO_RX_OK, ci_pdu, 36, 5300000);
+	CHECK(start_calls == c0 + 1 && !ll_adv_is_enabled());
+	CHECK(memcmp(start_ci.adv_a, rnda, 6) == 0 && start_ci.adv_addr_random == 1);
+	CHECK(memcmp(conn.adv_a, rnda, 6) == 0 && conn.adv_addr_random == 1);
+	start_ret = -EINVAL;
+
+	/* not advertising any more: the address can change */
+	CHECK(ll_adv_set_random_addr(rndb) == LL_ST_SUCCESS);
+
+	/* advertising while connected (N >= 2) uses the address in force at
+	 * the enable: rndb, and a CONNECT_IND to the old rnda is ignored */
+	if (LL_MAX_CONN >= 2) {
+		CHECK(ll_adv_enable(true) == LL_ST_SUCCESS);
+		fire_sched();
+		CHECK(tx_pdu[0] == (LL_PDU_ADV_IND | 0x20 | 0x40));
+		CHECK(memcmp(&tx_pdu[2], rndb, 6) == 0);
+		c0 = start_calls;
+		put_ci_pdu_to(ci_pdu, rnda, 1);
+		ll_adv_radio_evt(LL_RADIO_RX_OK, ci_pdu, 36, 5400000);
+		CHECK(start_calls == c0 && radio_ch == 38);
+		put_ci_pdu_to(ci_pdu, rndb, 1);
+		start_ret = 1;
+		ll_adv_radio_evt(LL_RADIO_RX_OK, ci_pdu, 36, 5500000);
+		CHECK(start_calls == c0 + 1 && memcmp(start_ci.adv_a, rndb, 6) == 0);
+		CHECK(start_ci.adv_addr_random == 1);
+		start_ret = -EINVAL;
+		CHECK(!ll_adv_is_enabled());
+	} else {
+		/* the one link is taken: connectable advertising is refused */
+		CHECK(ll_adv_enable(true) == LL_ST_CONN_LIMIT);
+	}
+	taken = 0;
+	conn_is_active = false;
+
+	/* advertising public: 0x2005 is allowed and does not change the AdvA
+	 * on air; a CONNECT_IND to the random address is not ours */
+	p = params(0, 7);
+	CHECK(ll_adv_set_params(&p) == LL_ST_SUCCESS);
+	CHECK(ll_adv_enable(true) == LL_ST_SUCCESS);
+	CHECK(ll_adv_set_random_addr(rnda) == LL_ST_SUCCESS);
+	fire_sched();
+	CHECK(tx_pdu[0] == (LL_PDU_ADV_IND | 0x20) && memcmp(&tx_pdu[2], adva, 6) == 0);
+	CHECK(rsp_pdu[0] == LL_PDU_SCAN_RSP && memcmp(&rsp_pdu[2], adva, 6) == 0);
+	c0 = start_calls;
+	put_ci_pdu_to(ci_pdu, rnda, 1);
+	ll_adv_radio_evt(LL_RADIO_RX_OK, ci_pdu, 36, 5600000);
+	CHECK(start_calls == c0 && radio_ch == 38);
+	put_ci_pdu_to(ci_pdu, adva, 0);
+	ll_adv_radio_evt(LL_RADIO_RX_OK, ci_pdu, 36, 5700000);
+	CHECK(start_calls == c0 + 1);
+	CHECK(memcmp(start_ci.adv_a, adva, 6) == 0 && start_ci.adv_addr_random == 0);
+	CHECK(ll_adv_is_enabled());   /* refused by ll_conn: advertising goes on */
+	CHECK(ll_adv_enable(false) == LL_ST_SUCCESS);
+
+	/* random type, non-connectable advertising uses the random AdvA too */
+	p = params(3, 7);
+	p.own_addr_type = 1;
+	CHECK(ll_adv_set_params(&p) == LL_ST_SUCCESS);
+	CHECK(ll_adv_enable(true) == LL_ST_SUCCESS);
+	fire_sched();
+	CHECK(tx_pdu[0] == (LL_PDU_ADV_NONCONN_IND | 0x40) && memcmp(&tx_pdu[2], rnda, 6) == 0);
+	CHECK(ll_adv_set_random_addr(rndb) == LL_ST_DISALLOWED);
+	CHECK(ll_adv_enable(false) == LL_ST_SUCCESS);
+
+	/* HCI Reset forgets the random address: type 1 needs a new one */
+	ll_adv_reset();
+	p = params(0, 7);
+	p.own_addr_type = 1;
+	CHECK(ll_adv_set_params(&p) == LL_ST_SUCCESS);
+	CHECK(ll_adv_enable(true) == LL_ST_INVALID_PARAM);
+	CHECK(ll_adv_set_random_addr(rndb) == LL_ST_SUCCESS);
+	CHECK(ll_adv_enable(true) == LL_ST_SUCCESS);
+	fire_sched();
+	CHECK(memcmp(&tx_pdu[2], rndb, 6) == 0);
+	CHECK(ll_adv_enable(false) == LL_ST_SUCCESS);
+	ll_adv_reset();
+}
+
 static int foreign_req(uint32_t t, uint32_t len_us, uint8_t prio)
 {
 	struct ll_arb_req r = {.alarm_tick = t, .open_tick = t, .min_len_us = len_us,
@@ -369,7 +519,11 @@ int main(void)
 	p = params(0, 0); CHECK(ll_adv_set_params(&p) == LL_ST_INVALID_PARAM); /* no channels */
 	p = params(0, 7); p.interval_min = 0x10; CHECK(ll_adv_set_params(&p) == LL_ST_INVALID_PARAM);
 	p = params(0, 7); p.interval_min = 0x200; CHECK(ll_adv_set_params(&p) == LL_ST_INVALID_PARAM); /* min > max */
-	p = params(0, 7); p.own_addr_type = 1; CHECK(ll_adv_set_params(&p) == LL_ST_UNSUPPORTED);
+	/* own address types 2/3 (controller RPA, no resolving list): 0x11;
+	 * above 3: 0x12 (Vol 4 Part E 7.8.5) */
+	p = params(0, 7); p.own_addr_type = 2; CHECK(ll_adv_set_params(&p) == LL_ST_UNSUPPORTED);
+	p = params(0, 7); p.own_addr_type = 3; CHECK(ll_adv_set_params(&p) == LL_ST_UNSUPPORTED);
+	p = params(0, 7); p.own_addr_type = 4; CHECK(ll_adv_set_params(&p) == LL_ST_INVALID_PARAM);
 	p = params(0, 7); p.filter_policy = 1; CHECK(ll_adv_set_params(&p) == LL_ST_UNSUPPORTED);
 	CHECK(ll_adv_set_data(NULL, 32) == LL_ST_INVALID_PARAM);
 	CHECK(ll_adv_set_data(NULL, 5) == LL_ST_INVALID_PARAM);  /* data NULL, len != 0 */
@@ -583,5 +737,6 @@ int main(void)
 	test_while_connected();
 	test_bumped_goes_to_gap();
 	test_sliced();
+	test_own_random();
 	DONE();
 }
