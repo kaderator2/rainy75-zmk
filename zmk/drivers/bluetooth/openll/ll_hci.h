@@ -61,6 +61,13 @@ struct ll_hci_ops {
 	 * (LSB first) after the length check; returns the HCI status
 	 * (ll_adv_set_random_addr). Required. */
 	uint8_t (*set_random_addr)(const uint8_t addr[6]);
+	/* Slice 6d: HCI Read / Write Authenticated Payload Timeout (0x0C7B /
+	 * 0x0C7C, Vol 4 Part E 7.3.93 / 7.3.94), handle validated before the
+	 * call, the Write value (10 ms units) checked for 0x0001..0xFFFF;
+	 * ll_llcp_read_apto / ll_llcp_write_apto (the latter checks it against
+	 * connInterval x (1 + connPeripheralLatency)). Required. */
+	uint8_t (*read_apto)(uint16_t handle, uint16_t *apto);
+	uint8_t (*write_apto)(uint16_t handle, uint16_t apto);
 };
 
 typedef void (*ll_hci_sink_t)(const uint8_t *h4, uint16_t len);
@@ -103,6 +110,10 @@ void ll_hci_evt_data_len_change(uint16_t handle, uint16_t max_tx_octets, uint16_
 				uint16_t max_rx_octets, uint16_t max_rx_time);
 /* LE PHY Update Complete (0x3E/0x0C, 7.7.65.12), LE event mask bit 11. */
 void ll_hci_evt_phy_update(uint16_t handle, uint8_t status, uint8_t tx_phy, uint8_t rx_phy);
+/* Authenticated Payload Timeout Expired (0x57, Vol 4 Part E 7.7.75):
+ * handle. Masked by Set Event Mask Page 2 (0x0C63) bit 23, which is 0 after
+ * init and Reset (7.3.69), so it is sent only once the host enabled it. */
+void ll_hci_evt_apto_expired(uint16_t handle);
 /* Host's Suggested Default Data Length (LE Write Suggested Default Data
  * Length, 27 / 328 after init and Reset): connInitialMaxTx{Octets,Time} for
  * new connections; the glue hands them to ll_llcp_set_data_len() on connect. */

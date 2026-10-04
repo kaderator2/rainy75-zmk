@@ -79,6 +79,7 @@
 #define OP_REJECT_IND        0x0D
 #define OP_CONN_PARAM_RSP    0x10
 #define OP_REJECT_EXT_IND    0x11
+#define OP_PING_REQ          0x12
 #define OP_PING_RSP          0x13
 #define OP_LENGTH_REQ        0x14
 #define OP_LENGTH_RSP        0x15
@@ -102,14 +103,21 @@
 #define LEN_FEATURE_RSP      9
 #define LEN_PHY_REQ          3
 #define LEN_PHY_UPDATE_IND   5
+#define LEN_PING             1    /* LL_PING_REQ / LL_PING_RSP: no CtrData (2.4.2.19/20) */
 
 #define RSP_TIMEOUT_TICKS    (40000000u * LL_TICKS_PER_US)
 #define RETRY_TICKS          (LL_LLCP_RETRY_MS * 1000u * LL_TICKS_PER_US)
 #define OWE_PDU_MAX          16   /* >= every control PDU we send (assert below) */
+/* authenticatedPayloadTO unit (10 ms) in ticks, and the longest stretch the
+ * timer is measured across before it is folded into apto_carry (the 32-bit
+ * stimer wraps after 268 s, the timeout reaches 655.35 s) */
+#define APTO_UNIT_TICKS      (10000u * LL_TICKS_PER_US)
+#define APTO_FOLD_TICKS      (1u << 30)
 /* The control PDUs we send (owed copies are kept whole): LL_ENC_RSP (13)
  * is the longest, then LL_LENGTH_REQ/_RSP and LL_FEATURE_RSP (9),
  * LL_VERSION_IND (6), LL_REJECT_EXT_IND / LL_PHY_RSP (3), LL_UNKNOWN_RSP /
- * LL_REJECT_IND / LL_TERMINATE_IND (2), LL_START_ENC_REQ/_RSP (1). */
+ * LL_REJECT_IND / LL_TERMINATE_IND (2), LL_START_ENC_REQ/_RSP and
+ * LL_PING_REQ/_RSP (1). */
 _Static_assert(OWE_PDU_MAX >= LEN_ENC_RSP && OWE_PDU_MAX >= LEN_LENGTH &&
 	       OWE_PDU_MAX >= LEN_FEATURE_RSP && OWE_PDU_MAX >= LEN_VERSION_IND,
 	       "OWE_PDU_MAX must hold every control PDU we send");
@@ -119,6 +127,7 @@ enum {
 	TMR_ENC,   /* encryption start: waits on the host's LTK / the central */
 	TMR_DLE,   /* our LL_LENGTH_REQ: waits on LL_LENGTH_RSP */
 	TMR_PHY,   /* our LL_PHY_RSP: waits on LL_PHY_UPDATE_IND */
+	TMR_PING,  /* our LL_PING_REQ: waits on LL_PING_RSP (slice 6d) */
 	TMR_N,
 };
 
@@ -163,6 +172,15 @@ static struct llcp_link {
 		uint8_t d[OWE_PDU_MAX];
 	} owe[LL_LLCP_OWE_N];
 	uint8_t owe_head, owe_n;
+	/* LE Ping (slice 6d): authenticatedPayloadTO in 10 ms units, the
+	 * connection's interval / latency for its lower bound, and the timer
+	 * TLE_Authenticated_Payload (5.4): elapsed = apto_carry + (now -
+	 * apto_mark), running while apto_on (the link encrypts) */
+	uint16_t apto;
+	uint16_t conn_interval, conn_latency;
+	bool apto_on;
+	uint32_t apto_mark;
+	uint64_t apto_carry;
 } links[LL_MAX_CONN];
 
 /* The link's TX limit (ll_dle_tx_limit). Caller holds ll_plat_tx_lock(). */
@@ -545,12 +563,47 @@ static void rx_length_rsp(uint8_t link, const uint8_t *p)
 	}
 }
 
+/* ---- LE Ping (5.1.8) ---- */
+
+/* Responder: at any time in the connection (5.1.8), encrypted like every
+ * PDU once the link encrypts; not inside the encryption start, where the
+ * central "shall not" start another procedure (5.1.3.1) and an answer would
+ * sit between the procedure's PDUs: dropped. */
+static void rx_ping_req(uint8_t link)
+{
+	static const uint8_t rsp[LEN_PING] = {OP_PING_RSP};
+	bool ok;
+
+	ll_plat_tx_lock();
+	ok = links[link].enc == ENC_IDLE;
+	ll_plat_tx_unlock();
+	if (ok) {
+		ctrl(link, rsp, sizeof(rsp));
+	}
+}
+
+/* The answer to our LL_PING_REQ (LL_PING_RSP, or LL_UNKNOWN_RSP /
+ * LL_REJECT_EXT_IND naming it) completes the procedure; an unsolicited one
+ * changes nothing. Its valid MIC restarts the timer via ll_llcp_rx_auth(). */
+static void ping_done(uint8_t link)
+{
+	ll_plat_tx_lock();
+	links[link].tmr_on[TMR_PING] = false;
+	ll_plat_tx_unlock();
+}
+
 /* LL_UNKNOWN_RSP / LL_REJECT_EXT_IND naming one of our requests: the
  * procedure ends without a change. */
 static void rx_proc_refused(uint8_t link, uint8_t op, bool unknown)
 {
 	struct llcp_link *s = &links[link];
 
+	if (op == OP_PING_REQ) {
+		/* the procedure may be used even if the peer lacks it (5.1.8):
+		 * this answer carries a MIC too, so it is complete */
+		ping_done(link);
+		return;
+	}
 	if (op != OP_LENGTH_REQ) {
 		return;
 	}
@@ -728,6 +781,10 @@ static bool enc_done_locked(uint8_t link)
 	s->enc = ENC_IDLE;
 	s->paused = false;
 	s->tmr_on[TMR_ENC] = false;
+	/* the link encrypts: TLE_Authenticated_Payload starts (5.4) */
+	s->apto_on = true;
+	s->apto_mark = ll_radio_now();
+	s->apto_carry = 0;
 	/* a LENGTH request the host made meanwhile */
 	dle_flush_locked(link);
 	return true;
@@ -845,6 +902,7 @@ static uint8_t expected_len(uint8_t op)
 	case OP_LENGTH_REQ:      return LEN_LENGTH;
 	case OP_PHY_REQ:         return LEN_PHY_REQ;
 	case OP_PHY_UPDATE_IND:  return LEN_PHY_UPDATE_IND;
+	case OP_PING_REQ:        return LEN_PING;
 	default:                 return 0;
 	}
 }
@@ -861,7 +919,7 @@ static bool ignored(uint8_t op)
 	case OP_REJECT_IND:
 	case OP_CONN_PARAM_RSP:
 	case OP_REJECT_EXT_IND:
-	case OP_PING_RSP:
+	case OP_PING_RSP:        /* of the right length: handled before */
 	case OP_LENGTH_RSP:
 	case OP_PHY_RSP:
 		return true;
@@ -887,6 +945,10 @@ void ll_llcp_rx(uint8_t link, const uint8_t *payload, uint8_t len)
 		rx_length_rsp(link, payload);
 		return;
 	}
+	if (op == OP_PING_RSP && len == LEN_PING) {
+		ping_done(link);
+		return;
+	}
 	if (op == OP_UNKNOWN_RSP && len == LEN_UNKNOWN_RSP) {
 		rx_proc_refused(link, payload[1], true);
 		return;
@@ -900,7 +962,7 @@ void ll_llcp_rx(uint8_t link, const uint8_t *payload, uint8_t len)
 	}
 	want = expected_len(op);
 	if (want == 0 || len != want) {
-		/* Unsupported (PING, PERIPHERAL_FEATURE, MIN_USED_CHANNELS,
+		/* Unsupported (PERIPHERAL_FEATURE, MIN_USED_CHANNELS,
 		 * CONN_PARAM, ...), or a known request whose length is not
 		 * exactly the specified one: LL_UNKNOWN_RSP, as Zephyr ll_sw
 		 * does for PDUs failing its exact-length validation. */
@@ -938,6 +1000,9 @@ void ll_llcp_rx(uint8_t link, const uint8_t *payload, uint8_t len)
 		break;
 	case OP_PHY_UPDATE_IND:
 		rx_phy_update_ind(link);
+		break;
+	case OP_PING_REQ:
+		rx_ping_req(link);
 		break;
 	default:
 		break;
@@ -1070,9 +1135,58 @@ void ll_llcp_retry(uint8_t link)
 	}
 }
 
+/* Ticks the link's TLE_Authenticated_Payload has run at now_tick (a
+ * now_tick before the mark counts as 0). Caller holds ll_plat_tx_lock(). */
+static uint64_t apto_elapsed(const struct llcp_link *s, uint32_t now_tick, uint32_t *d)
+{
+	uint32_t x = now_tick - s->apto_mark;
+
+	if ((int32_t)x < 0) {
+		x = 0;
+	}
+	*d = x;
+	return s->apto_carry + x;
+}
+
+static uint64_t apto_period(const struct llcp_link *s)
+{
+	return (uint64_t)s->apto * APTO_UNIT_TICKS;
+}
+
+/* The authenticated payload timeout (5.4) of a running timer: when it is
+ * reached, restart it and send LL_PING_REQ (5.1.8) unless ours waits;
+ * else fold long stretches into apto_carry. Returns true when it was
+ * reached (report to the host). Caller holds ll_plat_tx_lock(). */
+static bool apto_check_locked(uint8_t link, uint32_t now_tick)
+{
+	static const uint8_t req[LEN_PING] = {OP_PING_REQ};
+	struct llcp_link *s = &links[link];
+	uint32_t d;
+	uint64_t el;
+
+	if (!s->apto_on) {
+		return false;
+	}
+	el = apto_elapsed(s, now_tick, &d);
+	if (el < apto_period(s)) {
+		if (d >= APTO_FOLD_TICKS) {
+			s->apto_carry = el;
+			s->apto_mark = now_tick;
+		}
+		return false;
+	}
+	/* "The TLE_Authenticated_Payload Timer restarts after it is expired" */
+	s->apto_mark = now_tick;
+	s->apto_carry = 0;
+	if (!s->tmr_on[TMR_PING] && ctrl_send_locked(link, req, sizeof(req), POST_NONE) >= 0) {
+		timer_start(s, TMR_PING);   /* queued or owed: until the answer */
+	}
+	return true;
+}
+
 void ll_llcp_tick(uint32_t now_tick)
 {
-	bool expired[LL_MAX_CONN];
+	bool expired[LL_MAX_CONN], apto_fired[LL_MAX_CONN];
 
 	/* No ll_llcp_retry() here: the glue retries every link before its
 	 * host ACL at every pass, and owed PDUs never end a link. */
@@ -1094,12 +1208,17 @@ void ll_llcp_tick(uint32_t now_tick)
 			s->dle_pending = false;
 			s->dle_want = false;
 			s->owe_n = 0;
+			s->apto_on = false;
 		}
+		apto_fired[i] = !expired[i] && apto_check_locked(i, now_tick);
 	}
 	ll_plat_tx_unlock();
 	for (uint8_t i = 0; i < LL_MAX_CONN; i++) {
 		if (expired[i]) {
 			ll_conn_end(i, LL_ST_LMP_TIMEOUT);
+		}
+		if (apto_fired[i] && ops.apto_expired) {
+			ops.apto_expired(i);
 		}
 	}
 }
@@ -1124,6 +1243,21 @@ int32_t ll_llcp_timeout_ticks(uint32_t now_tick)
 			}
 			if (min < 0 || left < min) {
 				min = left;
+			}
+		}
+		/* the authenticated payload timeout (not a procedure: it only
+		 * asks for the wakeup), at most APTO_FOLD_TICKS ahead so the
+		 * tick folds the elapsed time before the stimer wraps */
+		if (s->apto_on) {
+			uint32_t d;
+			uint64_t el = apto_elapsed(s, now_tick, &d), per = apto_period(s);
+			uint64_t left = el >= per ? 0 : per - el;
+
+			if (left > APTO_FOLD_TICKS) {
+				left = APTO_FOLD_TICKS;
+			}
+			if (min < 0 || (int32_t)left < min) {
+				min = (int32_t)left;
 			}
 		}
 		/* owed PDUs: a retry wakeup within LL_LLCP_RETRY_MS */
@@ -1177,5 +1311,96 @@ void ll_llcp_reset(uint8_t link)
 	ll_plat_tx_lock();
 	memset(&links[link], 0, sizeof(links[link]));   /* also wipes the session key */
 	dle_init(&links[link]);
+	links[link].apto = LL_LLCP_APTO_DEFAULT;
 	ll_plat_tx_unlock();
+}
+
+/* ---- authenticated payload timeout (5.4, HCI 7.3.93 / 7.3.94) ---- */
+
+/* connInterval x (1 + connPeripheralLatency) in 10 ms units, rounded up
+ * (interval in 1.25 ms units: x / 8), at least 1, at most 0xFFFF */
+static uint16_t apto_min(uint16_t interval, uint16_t latency)
+{
+	uint32_t m = ((uint32_t)interval * (1u + latency) + 7u) / 8u;
+
+	return m == 0 ? 1 : (m > 0xFFFF ? 0xFFFF : (uint16_t)m);
+}
+
+void ll_llcp_rx_auth(uint8_t link)
+{
+	struct llcp_link *s;
+
+	if (link >= LL_MAX_CONN) {
+		return;
+	}
+	s = &links[link];
+	/* nothing to restart on an unencrypted link (the common case before
+	 * pairing): no mutex */
+	if (!*(volatile bool *)&s->apto_on) {
+		return;
+	}
+	ll_plat_tx_lock();
+	if (s->apto_on) {
+		s->apto_mark = ll_radio_now();
+		s->apto_carry = 0;
+	}
+	ll_plat_tx_unlock();
+}
+
+void ll_llcp_conn_params(uint8_t link, uint16_t interval, uint16_t latency)
+{
+	struct llcp_link *s;
+	uint16_t m;
+
+	if (link >= LL_MAX_CONN) {
+		return;
+	}
+	s = &links[link];
+	m = apto_min(interval, latency);
+	ll_plat_tx_lock();
+	s->conn_interval = interval;
+	s->conn_latency = latency;
+	/* keep authenticatedPayloadTO >= connInterval x (1 + latency) */
+	if (s->apto < m) {
+		s->apto = m;
+	}
+	ll_plat_tx_unlock();
+}
+
+uint8_t ll_llcp_read_apto(uint8_t link, uint16_t *apto)
+{
+	if (link >= LL_MAX_CONN || !ll_conn_active(link)) {
+		return LL_ST_UNKNOWN_CONN_ID;
+	}
+	ll_plat_tx_lock();
+	*apto = links[link].apto;
+	ll_plat_tx_unlock();
+	return LL_ST_SUCCESS;
+}
+
+uint8_t ll_llcp_write_apto(uint8_t link, uint16_t apto)
+{
+	struct llcp_link *s;
+	uint8_t st = LL_ST_SUCCESS;
+
+	if (link >= LL_MAX_CONN || !ll_conn_active(link)) {
+		return LL_ST_UNKNOWN_CONN_ID;
+	}
+	s = &links[link];
+	ll_plat_tx_lock();
+	/* apto_min() >= 1, so 0 is refused too */
+	if (apto < apto_min(s->conn_interval, s->conn_latency)) {
+		st = LL_ST_INVALID_PARAM;
+	} else {
+		s->apto = apto;
+		/* "Whenever the Host sets the authenticatedPayloadTO while the
+		 * timer TLE_Authenticated_Payload is running, the timer shall be
+		 * reset" */
+		if (s->apto_on) {
+			s->apto_mark = ll_radio_now();
+			s->apto_carry = 0;
+		}
+	}
+	ll_plat_tx_unlock();
+	return st;
 }

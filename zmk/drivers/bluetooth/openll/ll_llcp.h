@@ -55,6 +55,10 @@ struct ll_llcp_ops {
 	/* HCI LE Data Length Change: the link's effective values
 	 * (connEffectiveMax*, Vol 6 Part B 4.5.10) changed. Only on a change. */
 	void (*data_len_change)(uint8_t link, const struct ll_llcp_dle *eff);
+	/* HCI Authenticated Payload Timeout Expired (slice 6d): the link's
+	 * authenticatedPayloadTO passed without a packet with a valid MIC.
+	 * From ll_llcp_tick() (controller thread). */
+	void (*apto_expired)(uint8_t link);
 };
 
 /* Owed control PDUs (slice 7). A control PDU we must send (a response, our
@@ -93,10 +97,11 @@ uint8_t ll_llcp_ltk_neg_reply(uint8_t link);
 uint8_t ll_llcp_terminate(uint8_t link, uint8_t reason);
 /* Procedure response timeout (Vol 6 Part B 5.2), per link and procedure
  * (encryption start, our LENGTH request, the PHY update after our
- * LL_PHY_RSP): 40 s from the last LL control PDU the procedure queued while
- * it waits on the central (or on the host's LTK), then
- * ll_conn_end(LL_ST_LMP_TIMEOUT) of that link only (its owed PDUs are
- * dropped with it). Checks all links. Call from the controller thread with
+ * LL_PHY_RSP, our LL_PING_REQ): 40 s from the last LL control PDU the
+ * procedure queued while it waits on the central (or on the host's LTK),
+ * then ll_conn_end(LL_ST_LMP_TIMEOUT) of that link only (its owed PDUs are
+ * dropped with it). Also the authenticated payload timeout (slice 6d,
+ * see below): ops.apto_expired and LL_PING_REQ. Checks all links. Call from the controller thread with
  * the stimer tick when ll_llcp_timeout_ticks() says it is due (calling it
  * earlier or more often is harmless). */
 void ll_llcp_tick(uint32_t now_tick);
@@ -106,7 +111,9 @@ void ll_llcp_tick(uint32_t now_tick);
  * its host ACL, at every wakeup. No-op for an out-of-range link or when
  * nothing is owed. */
 void ll_llcp_retry(uint8_t link);
-/* Ticks until the earliest running per-link procedure response timer
+/* Ticks until the earliest running per-link procedure response timer or
+ * authenticated payload timer (slice 6d; at most 2^30 ticks ahead, so a
+ * timeout longer than the 32-bit stimer period is measured in steps)
  * expires at now_tick (0 when one is due), at most LL_LLCP_RETRY_MS while
  * a link owes control PDUs (retry wakeup), or -1 while none is running.
  * The controller thread arms its wakeup for ll_llcp_tick() from this, so
@@ -116,7 +123,9 @@ int32_t ll_llcp_timeout_ticks(uint32_t now_tick);
  * procedure of the link waits on the host or the central (encryption
  * start: LL_ENC_RSP queued until our LL_START_ENC_RSP is queued; our
  * LL_LENGTH_REQ until LL_LENGTH_RSP; our LL_PHY_RSP until
- * LL_PHY_UPDATE_IND), and while the link owes a control PDU. Reads
+ * LL_PHY_UPDATE_IND; our LL_PING_REQ until its answer, slice 6d; not the
+ * authenticated payload timer itself), and while the link owes a control
+ * PDU. Reads
  * the procedure state without ll_plat_tx_lock(): ISR-safe, never blocks; a
  * stale answer costs at most one skip window. False for an out-of-range
  * link. */
@@ -156,6 +165,42 @@ void ll_llcp_get_dle(uint8_t link, struct ll_llcp_dle *out);
  * in that direction"); nothing goes to the host (no change, not host
  * initiated). HCI LE Read PHY / LE Set PHY are answered by the glue
  * (always 1M). */
+
+/* LE Ping and the authenticated payload timeout (slice 6d; Vol 6 Part B
+ * 5.1.8, 5.4; HCI Vol 4 Part E 7.3.93 / 7.3.94, 7.7.75), per link.
+ * Responder: LL_PING_REQ is answered with LL_PING_RSP at any time in the
+ * connection (5.1.8), except inside the encryption start (5.1.3.1: no
+ * other procedure's PDU; such a request is dropped).
+ * Timer: authenticatedPayloadTO (10 ms units, LL_LLCP_APTO_DEFAULT for a
+ * new connection) runs only while the link is encrypted, from the end of
+ * the encryption start; ll_llcp_rx_auth() restarts it, so does a write.
+ * When it reaches the timeout: ops.apto_expired, the timer restarts, and
+ * LL_PING_REQ (encrypted) goes out unless ours is still waiting; the
+ * central's answer (LL_PING_RSP, or LL_UNKNOWN_RSP naming 0x12: both carry
+ * a MIC) restarts the timer. While our LL_PING_REQ waits for its answer
+ * the 40 s response timer runs and ll_llcp_busy() is true. The timer
+ * itself is not busy: it only arms the wakeup via ll_llcp_timeout_ticks(),
+ * so an idle encrypted link costs at most one ping per timeout. */
+#ifndef LL_LLCP_APTO_DEFAULT
+#define LL_LLCP_APTO_DEFAULT    3000   /* 30 s (5.4); host tests / device tests may override */
+#endif
+/* A packet with a valid MIC arrived on the link (the glue calls it after
+ * ll_rxq delivered non-empty PDUs; ll_rxq decrypts every non-empty PDU
+ * once the link encrypts and never delivers a retransmission): restarts
+ * the timer while it runs, else nothing. Thread. */
+void ll_llcp_rx_auth(uint8_t link);
+/* The link's connInterval (1.25 ms units) and connPeripheralLatency, at
+ * connect and after every update (glue). A timeout below connInterval x
+ * (1 + latency) (HCI 7.3.94) is raised to it, so the rule holds after an
+ * update too. Thread. */
+void ll_llcp_conn_params(uint8_t link, uint16_t interval, uint16_t latency);
+/* HCI Read / Write Authenticated Payload Timeout of the link (10 ms
+ * units). Read returns LL_ST_SUCCESS, or LL_ST_UNKNOWN_CONN_ID (link out
+ * of range or not connected). Write: LL_ST_INVALID_PARAM for 0 or a value
+ * below connInterval x (1 + latency) (x 1.25 ms / 10 ms: apto x 8 >=
+ * interval x (1 + latency)); it restarts a running timer. Thread. */
+uint8_t ll_llcp_read_apto(uint8_t link, uint16_t *apto);
+uint8_t ll_llcp_write_apto(uint8_t link, uint16_t apto);
 
 /* Encrypt (when the link is encrypted) and queue one data PDU on the link:
  * ll_txq_push(link, ...) with ctrl_opcode = payload[0] for LL_TXQ_CTRL,

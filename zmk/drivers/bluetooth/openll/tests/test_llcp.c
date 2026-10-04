@@ -32,6 +32,8 @@
 
 #define T(us)       ((uint32_t)(us) * LL_TICKS_PER_US)
 #define TIMEOUT_US  40000000u
+/* slice 6d: authenticatedPayloadTO in ticks (v <= 26843 fits 32 bits) */
+#define APTO_T(v)   ((uint32_t)(v) * 10000u * LL_TICKS_PER_US)
 
 void aes_ref_encrypt(const uint8_t key[16], const uint8_t in[16], uint8_t out[16]);
 
@@ -285,8 +287,21 @@ static void on_data_len_change(uint8_t link, const struct ll_llcp_dle *eff)
 	dlcl[link].eff = *eff;
 }
 
+/* Authenticated Payload Timeout Expired (slice 6d), per link */
+static int aptol[LL_MAX_CONN];
+#define apto_ev (aptol[L])
+
+static void on_apto_expired(uint8_t link)
+{
+	CHECK(locks == 0);
+	CHECK(tx_locks == 0);
+	CHECK(link < LL_MAX_CONN);
+	aptol[link]++;
+}
+
 static const struct ll_llcp_ops ops = {.ltk_req = on_ltk_req, .enc_change = on_enc_change,
-				       .data_len_change = on_data_len_change};
+				       .data_len_change = on_data_len_change,
+				       .apto_expired = on_apto_expired};
 
 /* ---------------- helpers ---------------- */
 
@@ -296,6 +311,7 @@ static void fresh(void)
 	memset(cnl, 0, sizeof(cnl));
 	memset(hcil, 0, sizeof(hcil));
 	memset(dlcl, 0, sizeof(dlcl));
+	memset(aptol, 0, sizeof(aptol));
 	memset(dtl, 0, sizeof(dtl));
 	memset(&kk, 0, sizeof(kk));
 	memset(rxq_crypt_l, 0, sizeof(rxq_crypt_l));
@@ -387,11 +403,11 @@ static void single_link_suite(void)
 	features(0xFF);
 	{
 		/* ours: LE Encryption (bit 0) + Extended Reject Indication (bit 2)
-		 * + LE Data Packet Length Extension (bit 5); byte 1 is ours:
-		 * CSA#2 (bit 14) */
-		static const uint8_t exp[9] = {0x09, 0x25, 0x40, 0, 0, 0, 0, 0, 0};
+		 * + LE Ping (bit 4, slice 6d) + LE Data Packet Length Extension
+		 * (bit 5); byte 1 is ours: CSA#2 (bit 14) */
+		static const uint8_t exp[9] = {0x09, 0x35, 0x40, 0, 0, 0, 0, 0, 0};
 
-		CHECK(LL_FEATURES_LOW == 0x25);
+		CHECK(LL_FEATURES_LOW == 0x35);
 		CHECK(tx.n == 1);
 		CHECK(last_is(exp, 9));
 	}
@@ -430,9 +446,10 @@ static void single_link_suite(void)
 	{
 		/* LL_LENGTH_REQ (0x14), LL_PHY_REQ (0x16) and LL_PHY_UPDATE_IND
 		 * (0x18) are answered since slice 6b Task 3 (dle_phy_suite) */
-		static const uint8_t ops_unk[] = {0x19, 0x1A, 0x12, 0x0E, 0x0F, 0x04, 0x05,
+		/* LL_PING_REQ (0x12) is answered since slice 6d (ping_suite) */
+		static const uint8_t ops_unk[] = {0x19, 0x1A, 0x0E, 0x0F, 0x04, 0x05,
 						  0x1F, 0x20, 0xFF};
-		static const uint8_t lens[] = {3, 1, 1, 9, 24, 13, 1, 5, 1, 1};
+		static const uint8_t lens[] = {3, 1, 9, 24, 13, 1, 5, 1, 1};
 
 		for (unsigned int i = 0; i < sizeof(ops_unk); i++) {
 			uint8_t pdu[27] = {0};
@@ -653,12 +670,17 @@ static void single_link_suite(void)
 		CHECK(tx.p[3].len == 31 && memcmp(tx.p[3].d, data2_air, 31) == 0);
 		CHECK(rxq_crypt->tx_ctr == 2);
 
-		/* a second START_ENC_RSP is ignored; no timeout fires later */
+		/* a second START_ENC_RSP is ignored; no timeout fires later
+		 * (the central's packets keep the slice 6d payload timer from
+		 * expiring) */
 		rx(buf, 1);
 		CHECK(tx.n == 4 && hci.enc_change == 1);
-		now += T(TIMEOUT_US) * 2;
-		ll_llcp_tick(now);
-		CHECK(cn.end_calls == 0);
+		for (int k = 0; k < 4; k++) {
+			now += T(TIMEOUT_US) / 2;
+			ll_llcp_rx_auth(L);
+			ll_llcp_tick(now);
+		}
+		CHECK(cn.end_calls == 0 && tx.n == 4);
 
 		/* responses on an encrypted link are encrypted too */
 		{
@@ -1782,7 +1804,7 @@ static void test_routing_per_link(void)
 
 static const uint8_t vi_c[6] = {0x0C, 0x0A, 0x02, 0x00, 0x34, 0x12};
 static const uint8_t vi_ours[6] = {0x0C, 0x09, 0xFF, 0xFF, 0x01, 0x00};
-static const uint8_t feat_ours[9] = {0x09, 0x25, 0x40, 0, 0, 0, 0, 0, 0};
+static const uint8_t feat_ours[9] = {0x09, 0x35, 0x40, 0, 0, 0, 0, 0, 0};
 
 /* push k is exactly the control PDU exp */
 static int push_is(int k, const uint8_t *exp, uint8_t len)
@@ -1913,7 +1935,8 @@ static void push_retry_suite(void)
 		ll_llcp_retry(L);
 		CHECK(tx.n == 3 && tx.p[2].len == 5 && memcmp(tx.p[2].d, rsp2_air, 5) == 0);
 		CHECK(hci.enc_change == 1 && hci.status == LL_ST_SUCCESS && hci.enabled);
-		CHECK(!ll_llcp_busy(L) && ll_llcp_timeout_ticks(now) == -1);
+		/* no procedure left; only the slice 6d payload timer asks for a wakeup */
+		CHECK(!ll_llcp_busy(L) && ll_llcp_timeout_ticks(now) == (int32_t)APTO_T(3000));
 		/* data resumes encrypted with counter 1 (Vol 6 Part C LL_DATA2) */
 		CHECK(ll_llcp_tx(L, LL_TXQ_ACL, LL_LLID_START, data2_clear, 27) == 0);
 		CHECK(tx.n == 4 && tx.p[3].len == 31 && memcmp(tx.p[3].d, data2_air, 31) == 0);
@@ -2286,6 +2309,312 @@ static void acl_fragments(void)
 	CHECK(locks == 0 && tx_locks == 0);
 }
 
+/* ---------------- LE Ping, authenticated payload timeout (slice 6d) ---------------- */
+
+static const uint8_t ping_req[1] = {0x12};
+static const uint8_t ping_rsp[1] = {0x13};
+
+/* the last push is our encrypted LL_PING_REQ (opcode + MIC) on link */
+static int last_is_ping_req(uint8_t link)
+{
+	return tx.n > 0 && tx.n <= MAX_PUSH && tx.p[tx.n - 1].link == link &&
+	       tx.p[tx.n - 1].kind == LL_TXQ_CTRL && tx.p[tx.n - 1].llid == LL_LLID_CTRL &&
+	       tx.p[tx.n - 1].op == 0x12 && tx.p[tx.n - 1].len == 1 + LL_MIC_LEN;
+}
+
+static void start_enc_l(uint8_t link)
+{
+	uint8_t req[23], buf[8];
+	int e0 = hcil[link].enc_change;
+
+	sample_rand();
+	build_enc_req(req);
+	rx_l(link, req, sizeof(req));
+	CHECK(ll_llcp_ltk_reply(link, ltk) == LL_ST_SUCCESS);
+	memcpy(buf, rsp1_air, 5);
+	CHECK(ll_crypt_decrypt(rxq_crypt_l[link], 0x0F, buf, 5) == 1);
+	rx_l(link, buf, 1);
+	CHECK(hcil[link].enc_change == e0 + 1);
+}
+
+static void ping_suite(void)
+{
+	uint16_t v;
+	uint32_t t0, t1;
+	int n0;
+
+	/* ---- responder, plaintext link (5.1.8: any time in the connection) ---- */
+	fresh();
+	rx(ping_req, 1);
+	CHECK(tx.n == 1 && last_is(ping_rsp, 1));
+	CHECK(!ll_llcp_busy(L) && ll_llcp_timeout_ticks(now) == -1);
+	{
+		const uint8_t bad[2] = {0x12, 0x00};
+		const uint8_t exp[2] = {0x07, 0x12};
+
+		rx(bad, 2);
+		CHECK(tx.n == 2 && last_is(exp, 2));
+	}
+	/* an LL_PING_RSP we did not ask for: dropped */
+	rx(ping_rsp, 1);
+	CHECK(tx.n == 2 && cn.end_calls == 0 && !ll_llcp_busy(L));
+	/* inside the encryption start: no answer (5.1.3.1) */
+	fresh();
+	{
+		uint8_t req[23];
+
+		sample_rand();
+		build_enc_req(req);
+		rx(req, sizeof(req));
+		n0 = tx.n;
+		rx(ping_req, 1);
+		CHECK(tx.n == n0);
+		CHECK(ll_llcp_ltk_reply(L, ltk) == LL_ST_SUCCESS);
+		n0 = tx.n;
+		rx(ping_req, 1);
+		CHECK(tx.n == n0);
+	}
+	/* encrypted link: the answer is encrypted */
+	fresh();
+	start_encryption();
+	rx(ping_req, 1);
+	CHECK(tx.p[tx.n - 1].op == 0x13 && tx.p[tx.n - 1].len == 1 + LL_MIC_LEN);
+	CHECK(tx.p[tx.n - 1].kind == LL_TXQ_CTRL && tx.p[tx.n - 1].link == L);
+
+	/* ---- the timer does not run while the link is unencrypted ---- */
+	fresh();
+	ll_llcp_conn_params(L, 24, 4);
+	features(0xFF);
+	CHECK(ll_llcp_read_apto(L, &v) == LL_ST_SUCCESS && v == 3000);
+	CHECK(ll_llcp_timeout_ticks(now) == -1);
+	n0 = tx.n;
+	ll_llcp_rx_auth(L);
+	ll_llcp_tick(now + APTO_T(3000));
+	ll_llcp_tick(now + APTO_T(3000) * 2);
+	CHECK(apto_ev == 0 && tx.n == n0 && !ll_llcp_busy(L));
+	/* nor during the encryption start: only its procedure timer */
+	{
+		uint8_t req[23];
+
+		sample_rand();
+		build_enc_req(req);
+		rx(req, sizeof(req));
+		CHECK(ll_llcp_ltk_reply(L, ltk) == LL_ST_SUCCESS);
+		CHECK(ll_llcp_timeout_ticks(now) == (int32_t)T(TIMEOUT_US));
+	}
+
+	/* ---- encrypted: 30 s from the end of the encryption start ---- */
+	fresh();
+	ll_llcp_conn_params(L, 24, 4);
+	start_encryption();
+	t0 = now;
+	CHECK(ll_llcp_timeout_ticks(t0) == (int32_t)APTO_T(3000));
+	CHECK(ll_llcp_timeout_ticks(t0 + 5) == (int32_t)APTO_T(3000) - 5);
+	CHECK(!ll_llcp_busy(L));              /* the timer is no procedure */
+	n0 = tx.n;
+	ll_llcp_tick(t0 + APTO_T(3000) - 1);
+	CHECK(apto_ev == 0 && tx.n == n0);
+	now = t0 + APTO_T(3000);
+	ll_llcp_tick(now);
+	CHECK(apto_ev == 1);
+	CHECK(tx.n == n0 + 1 && last_is_ping_req(L));
+	CHECK(kk.bad == 0 && kk.n_at_kick == tx.n);   /* kicked: leaves at the next event */
+	CHECK(ll_llcp_busy(L));               /* waits for LL_PING_RSP */
+	/* the timer restarted at the expiry (5.4); the 40 s timer runs too */
+	CHECK(ll_llcp_timeout_ticks(now) == (int32_t)APTO_T(3000));
+	ll_llcp_tick(now);
+	CHECK(apto_ev == 1 && tx.n == n0 + 1);
+	/* the answer completes it; the glue reports its valid MIC */
+	now += T(100000);
+	rx(ping_rsp, 1);
+	ll_llcp_rx_auth(L);
+	CHECK(!ll_llcp_busy(L) && cn.end_calls == 0);
+	CHECK(ll_llcp_timeout_ticks(now) == (int32_t)APTO_T(3000));
+	/* each packet with a valid MIC restarts it (also across the tick wrap) */
+	for (int k = 0; k < 12; k++) {
+		now += APTO_T(3000) - 1;
+		ll_llcp_tick(now);
+		ll_llcp_rx_auth(L);
+	}
+	CHECK(apto_ev == 1 && tx.n == n0 + 1 && !ll_llcp_busy(L));
+	CHECK(ll_llcp_timeout_ticks(now) == (int32_t)APTO_T(3000));
+	/* a central without LE Ping: LL_UNKNOWN_RSP(0x12) completes ours */
+	now += APTO_T(3000);
+	ll_llcp_tick(now);
+	CHECK(apto_ev == 2 && last_is_ping_req(L) && ll_llcp_busy(L));
+	{
+		const uint8_t unk[2] = {0x07, 0x12};
+
+		rx(unk, 2);
+	}
+	CHECK(!ll_llcp_busy(L) && cn.end_calls == 0);
+	/* no answer at all: the event repeats each timeout, one LL_PING_REQ
+	 * waits, and its 40 s response timer ends the link */
+	n0 = tx.n;
+	t0 = now;                             /* last restart: the expiry above */
+	now = t0 + APTO_T(3000);
+	ll_llcp_tick(now);
+	CHECK(apto_ev == 3 && tx.n == n0 + 1 && last_is_ping_req(L));
+	t1 = now;
+	now = t1 + APTO_T(3000);
+	ll_llcp_tick(now);
+	CHECK(apto_ev == 4 && tx.n == n0 + 1);   /* no second request */
+	CHECK(ll_llcp_timeout_ticks(now) == (int32_t)(T(TIMEOUT_US) - APTO_T(3000)));
+	ll_llcp_tick(t1 + T(TIMEOUT_US) - 1);
+	CHECK(cn.end_calls == 0);
+	ll_llcp_tick(t1 + T(TIMEOUT_US));
+	CHECK(cn.end_calls == 1 && cn.end_reason == LL_ST_LMP_TIMEOUT);
+	/* the lost link reports nothing more */
+	CHECK(ll_llcp_timeout_ticks(now) == -1 && !ll_llcp_busy(L));
+	ll_llcp_tick(t1 + T(TIMEOUT_US) + APTO_T(3000) * 2);
+	CHECK(apto_ev == 4 && tx.n == n0 + 1);
+
+	/* ---- a full backlog owes LL_PING_REQ (slice 7) ---- */
+	fresh();
+	ll_llcp_conn_params(L, 24, 4);
+	start_encryption();
+	t0 = now;
+	n0 = tx.n;
+	tx.fail = 1;
+	ll_llcp_tick(t0 + APTO_T(3000));
+	CHECK(apto_ev == 1 && tx.n == n0 && ll_llcp_busy(L));
+	ll_llcp_retry(L);
+	CHECK(tx.n == n0 + 1 && last_is_ping_req(L) && ll_llcp_busy(L));
+
+	/* ---- HCI Read / Write ---- */
+	fresh();
+	ll_llcp_conn_params(L, 24, 4);       /* 30 ms x 5 = 150 ms = 15 x 10 ms */
+	CHECK(ll_llcp_write_apto(L, 15) == LL_ST_SUCCESS);
+	CHECK(ll_llcp_read_apto(L, &v) == LL_ST_SUCCESS && v == 15);
+	CHECK(ll_llcp_write_apto(L, 14) == LL_ST_INVALID_PARAM);
+	CHECK(ll_llcp_write_apto(L, 0) == LL_ST_INVALID_PARAM);
+	CHECK(ll_llcp_read_apto(L, &v) == LL_ST_SUCCESS && v == 15);
+	CHECK(ll_llcp_write_apto(L, 0xFFFF) == LL_ST_SUCCESS);
+	CHECK(ll_llcp_read_apto(L, &v) == LL_ST_SUCCESS && v == 0xFFFF);
+	/* 7.5 ms x 1 = 0.75 x 10 ms: 1 is enough */
+	ll_llcp_conn_params(L, 6, 0);
+	CHECK(ll_llcp_write_apto(L, 1) == LL_ST_SUCCESS);
+	/* an update raises a timeout below the new minimum: 15 ms x 11 =
+	 * 165 ms -> 17 (rounded up); a later shorter interval keeps it */
+	ll_llcp_conn_params(L, 12, 10);
+	CHECK(ll_llcp_read_apto(L, &v) == LL_ST_SUCCESS && v == 17);
+	ll_llcp_conn_params(L, 6, 0);
+	CHECK(ll_llcp_read_apto(L, &v) == LL_ST_SUCCESS && v == 17);
+	/* saturates at the largest value */
+	ll_llcp_conn_params(L, 3200, 499);
+	CHECK(ll_llcp_read_apto(L, &v) == LL_ST_SUCCESS && v == 0xFFFF);
+	/* out of range or not connected */
+	CHECK(ll_llcp_read_apto(LL_MAX_CONN, &v) == LL_ST_UNKNOWN_CONN_ID);
+	CHECK(ll_llcp_write_apto(LL_MAX_CONN, 3000) == LL_ST_UNKNOWN_CONN_ID);
+	cn.active = false;
+	CHECK(ll_llcp_read_apto(L, &v) == LL_ST_UNKNOWN_CONN_ID);
+	CHECK(ll_llcp_write_apto(L, 3000) == LL_ST_UNKNOWN_CONN_ID);
+	cn.active = true;
+	/* a new connection: the default again */
+	ll_llcp_reset(L);
+	CHECK(ll_llcp_read_apto(L, &v) == LL_ST_SUCCESS && v == 3000);
+
+	/* ---- a write restarts the running timer with the new value ---- */
+	fresh();
+	ll_llcp_conn_params(L, 24, 4);
+	start_encryption();
+	t0 = now;
+	now = t0 + APTO_T(2000);
+	CHECK(ll_llcp_write_apto(L, 500) == LL_ST_SUCCESS);
+	CHECK(ll_llcp_timeout_ticks(now) == (int32_t)APTO_T(500));
+	ll_llcp_tick(now + APTO_T(500) - 1);
+	CHECK(apto_ev == 0);
+	ll_llcp_tick(now + APTO_T(500));
+	CHECK(apto_ev == 1 && last_is_ping_req(L));
+	/* written before the encryption: used from its end */
+	fresh();
+	ll_llcp_conn_params(L, 24, 4);
+	CHECK(ll_llcp_write_apto(L, 100) == LL_ST_SUCCESS);
+	CHECK(ll_llcp_timeout_ticks(now) == -1);
+	start_encryption();
+	CHECK(ll_llcp_timeout_ticks(now) == (int32_t)APTO_T(100));
+
+	/* ---- the longest timeout (655.35 s) spans several 32-bit tick wraps:
+	 * the wakeup is capped so the controller never misses one ---- */
+	fresh();
+	ll_llcp_conn_params(L, 24, 4);
+	CHECK(ll_llcp_write_apto(L, 0xFFFF) == LL_ST_SUCCESS);
+	start_encryption();
+	{
+		const uint64_t due = (uint64_t)0xFFFF * 10000u * LL_TICKS_PER_US;
+		uint64_t at = 0;
+		uint32_t base = now;
+		int wakes = 0;
+
+		while (apto_ev == 0 && wakes < 100) {
+			int32_t left = ll_llcp_timeout_ticks(base + (uint32_t)at);
+
+			CHECK(left > 0 && left <= (int32_t)(1u << 30));
+			if (left <= 0) {
+				break;
+			}
+			if (at + (uint64_t)left == due) {
+				ll_llcp_tick(base + (uint32_t)(due - 1));
+				CHECK(apto_ev == 0);
+			}
+			at += (uint64_t)left;
+			ll_llcp_tick(base + (uint32_t)at);
+			wakes++;
+		}
+		CHECK(apto_ev == 1 && at == due && wakes >= 10 && wakes <= 12);
+	}
+	CHECK(locks == 0 && tx_locks == 0);
+}
+
+/* Per link: each link's own timer, value and ping */
+static void test_ping_per_link(void)
+{
+	const uint8_t a = 0, b = (uint8_t)(LL_MAX_CONN - 1);
+	uint32_t ta, tb;
+	uint16_t v;
+
+	if (LL_MAX_CONN < 2) {
+		return;
+	}
+	fresh();
+	ll_llcp_conn_params(a, 24, 4);
+	ll_llcp_conn_params(b, 24, 4);
+	start_enc_l(a);
+	ta = now;
+	now += T(1000000);
+	start_enc_l(b);
+	tb = now;
+	/* the earliest one */
+	CHECK(ll_llcp_timeout_ticks(tb) == (int32_t)(APTO_T(3000) - T(1000000)));
+	/* a's packet restarts a only: b is now the earliest */
+	now = ta + T(2000000);
+	ll_llcp_rx_auth(a);
+	CHECK(ll_llcp_timeout_ticks(now) == (int32_t)(APTO_T(3000) - T(1000000)));
+	ll_llcp_tick(tb + APTO_T(3000));
+	CHECK(aptol[b] == 1 && aptol[a] == 0 && last_is_ping_req(b));
+	CHECK(ll_llcp_busy(b) && !ll_llcp_busy(a));
+	/* values and parameters per link */
+	CHECK(ll_llcp_write_apto(b, 100) == LL_ST_SUCCESS);
+	CHECK(ll_llcp_read_apto(a, &v) == LL_ST_SUCCESS && v == 3000);
+	ll_llcp_conn_params(a, 400, 30);     /* 500 ms x 31 = 15.5 s: a keeps 30 s */
+	CHECK(ll_llcp_read_apto(a, &v) == LL_ST_SUCCESS && v == 3000);
+	CHECK(ll_llcp_read_apto(b, &v) == LL_ST_SUCCESS && v == 100);
+	ll_llcp_conn_params(b, 400, 30);
+	CHECK(ll_llcp_read_apto(b, &v) == LL_ST_SUCCESS && v == 1550);
+	CHECK(ll_llcp_read_apto(a, &v) == LL_ST_SUCCESS && v == 3000);
+	/* b ends; a goes on */
+	ll_llcp_reset(b);
+	CHECK(!ll_llcp_busy(b));
+	CHECK(ll_llcp_read_apto(b, &v) == LL_ST_SUCCESS && v == 3000);
+	now = ta + T(2000000) + APTO_T(3000);
+	ll_llcp_tick(now);
+	CHECK(aptol[a] == 1 && last_is_ping_req(a) && aptol[b] == 1);
+	/* b, unencrypted now, never expires */
+	ll_llcp_tick(now + APTO_T(3000) * 3);
+	CHECK(aptol[b] == 1);
+	CHECK(locks == 0 && tx_locks == 0);
+}
+
 int main(void)
 {
 	for (int k = 0; k < 2; k++) {
@@ -2298,6 +2627,7 @@ int main(void)
 		phy_procedure();
 		push_retry_suite();
 		push_retry_dle_phy();
+		ping_suite();
 	}
 	L = 0;
 	dle_bounds();
@@ -2307,6 +2637,7 @@ int main(void)
 	test_link_end_isolated();
 	test_timeouts_per_link();
 	test_routing_per_link();
+	test_ping_per_link();
 	CHECK(locks == 0 && tx_locks == 0);
 	DONE();
 }

@@ -14,6 +14,9 @@
 #define OP_SET_EVENT_MASK        OP(0x03, 0x0001)
 #define OP_RESET                 OP(0x03, 0x0003)
 #define OP_HOST_NUM_COMPLETED    OP(0x03, 0x0035)
+#define OP_SET_EVENT_MASK_PAGE_2 OP(0x03, 0x0063)
+#define OP_READ_AUTH_PAYLOAD_TO  OP(0x03, 0x007B)
+#define OP_WRITE_AUTH_PAYLOAD_TO OP(0x03, 0x007C)
 #define OP_READ_LOCAL_VERSION    OP(0x04, 0x0001)
 #define OP_READ_LOCAL_CMDS       OP(0x04, 0x0002)
 #define OP_READ_LOCAL_FEATURES   OP(0x04, 0x0003)
@@ -44,6 +47,7 @@
 #define EVT_CMD_STATUS           0x0F
 #define EVT_NUM_COMPLETED        0x13
 #define EVT_LE_META              0x3E
+#define EVT_AUTH_PAYLOAD_TO_EXP  0x57
 #define SUBEVT_CONN_COMPLETE     0x01
 #define SUBEVT_CONN_UPDATE       0x03
 #define SUBEVT_LTK_REQ           0x05
@@ -57,6 +61,9 @@
 #define MASK_LE_META             (1ULL << 61)
 #define EVENT_MASK_DEFAULT       0x00001FFFFFFFFFFFULL
 #define LE_EVENT_MASK_DEFAULT    0x000000000000001FULL
+/* Event Mask Page 2 (7.3.69): all 0 by default; bit 23 Authenticated
+ * Payload Timeout Expired */
+#define MASK2_AUTH_PAYLOAD_TO    (1ULL << 23)
 
 #define HCI_ROLE_PERIPHERAL      0x01
 #define ACL_PB_FIRST_NONFLUSH    0x0
@@ -71,6 +78,7 @@ static const uint8_t supported_cmds[][2] = {
 	{14, 3}, /* Read Local Version Information */
 	{14, 5}, /* Read Local Supported Features */
 	{15, 1}, /* Read BD_ADDR */
+	{22, 2}, /* Set Event Mask Page 2 (slice 6d) */
 	{25, 0}, /* LE Set Event Mask */
 	{25, 1}, /* LE Read Buffer Size */
 	{25, 2}, /* LE Read Local Supported Features */
@@ -82,6 +90,8 @@ static const uint8_t supported_cmds[][2] = {
 	{27, 7}, /* LE Rand */
 	{28, 1}, /* LE Long Term Key Request Reply */
 	{28, 2}, /* LE Long Term Key Request Negative Reply */
+	{32, 4}, /* Read Authenticated Payload Timeout (slice 6d) */
+	{32, 5}, /* Write Authenticated Payload Timeout (slice 6d) */
 	{33, 6}, /* LE Set Data Length */
 	{33, 7}, /* LE Read Suggested Default Data Length */
 	{34, 0}, /* LE Write Suggested Default Data Length */
@@ -101,6 +111,7 @@ static const struct ll_hci_ops *hci_ops;
 static ll_hci_sink_t hci_sink;
 static uint64_t event_mask = EVENT_MASK_DEFAULT;
 static uint64_t le_event_mask = LE_EVENT_MASK_DEFAULT;
+static uint64_t event_mask2;
 /* Host suggestions for new connections (7.8.35) and default PHYs (7.8.48);
  * the PHY preference is stored only (1M is the one PHY we have). */
 static uint16_t def_tx_octets = LL_DLE_MIN_OCTETS, def_tx_time = LL_DLE_MIN_TIME;
@@ -110,6 +121,7 @@ static void masks_default(void)
 {
 	event_mask = EVENT_MASK_DEFAULT;
 	le_event_mask = LE_EVENT_MASK_DEFAULT;
+	event_mask2 = 0;
 	def_tx_octets = LL_DLE_MIN_OCTETS;
 	def_tx_time = LL_DLE_MIN_TIME;
 	def_phy[0] = 0x00;
@@ -130,6 +142,7 @@ void ll_hci_init(const struct ll_hci_ops *ops, ll_hci_sink_t sink)
 	assert(ops != NULL && ops->handle_valid != NULL);
 	assert(ops->set_data_len != NULL && ops->read_phy != NULL && ops->set_phy != NULL);
 	assert(ops->set_random_addr != NULL);
+	assert(ops->read_apto != NULL && ops->write_apto != NULL);
 	hci_ops = ops;
 	hci_sink = sink;
 	masks_default();
@@ -241,6 +254,38 @@ static void set_data_len(uint16_t op, const uint8_t *p, uint8_t plen)
 		ret[0] = hci_ops->set_data_len(h, ll_get_le16(&p[2]), ll_get_le16(&p[4]));
 	}
 	cmd_complete(op, ret, 3);
+}
+
+/* Read Authenticated Payload Timeout (7.3.93): Command Complete (status,
+ * handle, timeout); Write (7.3.94): (status, handle), 0x0001..0xFFFF, the
+ * connInterval x (1 + latency) rule is the op's (ll_llcp_write_apto). */
+static void auth_payload_to(uint16_t op, const uint8_t *p, uint8_t plen)
+{
+	uint8_t ret[5] = {0};
+	uint16_t h, v = 0;
+	bool wr = op == OP_WRITE_AUTH_PAYLOAD_TO;
+
+	if (plen != (wr ? 4 : 2)) {
+		status_only(op, LL_ST_INVALID_PARAM);
+		return;
+	}
+	h = ll_get_le16(p);
+	memcpy(&ret[1], p, 2);
+	if (wr && ll_get_le16(&p[2]) == 0) {
+		ret[0] = LL_ST_INVALID_PARAM;
+	} else if (!hci_ops->handle_valid(h)) {
+		ret[0] = LL_ST_UNKNOWN_CONN_ID;
+	} else if (wr) {
+		ret[0] = hci_ops->write_apto(h, ll_get_le16(&p[2]));
+	} else {
+		ret[0] = hci_ops->read_apto(h, &v);
+	}
+	if (wr) {
+		cmd_complete(op, ret, 3);
+	} else {
+		ll_put_le16(&ret[3], ret[0] == LL_ST_SUCCESS ? v : 0);
+		cmd_complete(op, ret, 5);
+	}
 }
 
 /* LE Read PHY: Command Complete (status, handle, TX_PHY, RX_PHY) */
@@ -383,19 +428,27 @@ void ll_hci_cmd(const uint8_t *cmd, uint16_t len)
 		break;
 	case OP_SET_EVENT_MASK:
 	case OP_LE_SET_EVENT_MASK:
+	case OP_SET_EVENT_MASK_PAGE_2:
 		if (plen != 8) {
 			status_only(op, LL_ST_INVALID_PARAM);
 			break;
 		}
 		if (op == OP_SET_EVENT_MASK) {
 			event_mask = get_le64(p);
-		} else {
+		} else if (op == OP_LE_SET_EVENT_MASK) {
 			le_event_mask = get_le64(p);
+		} else {
+			/* bits of events we do not send act as 0 (7.3.69) */
+			event_mask2 = get_le64(p);
 		}
 		status_only(op, LL_ST_SUCCESS);
 		break;
 	case OP_DISCONNECT:
 		disconnect(op, p, plen);
+		break;
+	case OP_READ_AUTH_PAYLOAD_TO:
+	case OP_WRITE_AUTH_PAYLOAD_TO:
+		auth_payload_to(op, p, plen);
 		break;
 	case OP_LE_LTK_REPLY:
 	case OP_LE_LTK_NEG_REPLY:
@@ -612,6 +665,17 @@ void ll_hci_evt_enc_change(uint16_t handle, uint8_t status, bool enabled)
 	ll_put_le16(&p[1], handle);
 	p[3] = enabled ? 0x01 : 0x00; /* 0x01: on, AES-CCM for LE */
 	send_evt(EVT_ENC_CHANGE, p, sizeof(p));
+}
+
+void ll_hci_evt_apto_expired(uint16_t handle)
+{
+	uint8_t p[2];
+
+	if (!(event_mask2 & MASK2_AUTH_PAYLOAD_TO)) {
+		return;
+	}
+	ll_put_le16(p, handle);
+	send_evt(EVT_AUTH_PAYLOAD_TO_EXP, p, sizeof(p));
 }
 
 void ll_hci_evt_conn_update(uint16_t handle, const struct ll_conn_params *prm)

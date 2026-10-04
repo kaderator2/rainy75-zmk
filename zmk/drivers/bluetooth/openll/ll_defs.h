@@ -73,8 +73,9 @@ _Static_assert(LL_MAX_CONN >= 1 && LL_MAX_CONN <= 5, "LL_MAX_CONN must be 1..5")
  * Used by LL_FEATURE_RSP and HCI LE Read Local Supported Features. */
 #define LL_FEAT_LE_ENC        0x01   /* bit 0: LE Encryption */
 #define LL_FEAT_EXT_REJ_IND   0x04   /* bit 2: Extended Reject Indication */
+#define LL_FEAT_LE_PING       0x10   /* bit 4: LE Ping (slice 6d; "O" to the peer, Table 4.7) */
 #define LL_FEAT_DLE           0x20   /* bit 5: LE Data Packet Length Extension */
-#define LL_FEATURES_LOW       (LL_FEAT_LE_ENC | LL_FEAT_EXT_REJ_IND | LL_FEAT_DLE)
+#define LL_FEATURES_LOW       (LL_FEAT_LE_ENC | LL_FEAT_EXT_REJ_IND | LL_FEAT_LE_PING | LL_FEAT_DLE)
 /* byte 1 of the feature set (LL_FEATURE_RSP sends our own byte 1, HCI LE
  * Read Local Supported Features reports it) */
 #define LL_FEAT1_CSA2         0x40   /* bit 14: Channel Selection Algorithm #2 */

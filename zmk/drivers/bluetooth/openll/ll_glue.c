@@ -31,8 +31,10 @@
  *
  * The controller thread sleeps until something happens (K_FOREVER): the
  * radio/stimer ISRs, the HCI thread and two timers wake it. The LLCP
- * response timer (llcp_tmr) runs only while an LL control procedure is
- * pending; the stats timer only with CONFIG_BT_HCI_B91_OPENLL_STATS_LOG.
+ * timer (llcp_tmr) runs only while an LL control procedure is pending or
+ * an encrypted link's authenticated payload timeout (slice 6d, LE Ping)
+ * runs, whose expiry wakes it at most once per timeout; the stats timer
+ * only with CONFIG_BT_HCI_B91_OPENLL_STATS_LOG.
  * Host ACL held back (-ENOMEM: TX backlog full; -EAGAIN: encryption start
  * pauses data, or the link owes control PDUs) is retried on the wakeup that
  * frees it: an ll_txq ack (txq_done), the end of the procedure
@@ -115,10 +117,11 @@ static char __aligned(4) acl_q_buf[LL_MAX_CONN][ACL_Q_DEPTH * sizeof(struct acl_
 
 static K_SEM_DEFINE(wake, 0, 1);
 
-/* LLCP procedure response timeout (40 s, ll_llcp_tick) and the retry of
- * owed control PDUs (LL_LLCP_RETRY_MS): armed by the controller thread from
- * ll_llcp_timeout_ticks() only while a procedure is pending or a PDU is
- * owed; the expiry only wakes the controller thread. */
+/* LLCP procedure response timeout (40 s, ll_llcp_tick), the retry of
+ * owed control PDUs (LL_LLCP_RETRY_MS) and the authenticated payload
+ * timeout of encrypted links (slice 6d): armed by the controller thread
+ * from ll_llcp_timeout_ticks() only while one of them runs; the expiry
+ * only wakes the controller thread. */
 static void llcp_tmr_fn(struct k_work *work)
 {
 	ARG_UNUSED(work);
@@ -193,6 +196,7 @@ static atomic_t cnt_tx_acked, cnt_acl_in, cnt_acl_out, cnt_acl_drop, cnt_evt_dro
 static atomic_t cnt_acl_frag;           /* host ACL packets sent in more than one PDU */
 static atomic_t cnt_guard_escalations;
 static atomic_t cnt_wakeups;             /* controller thread passes (power counter) */
+static atomic_t cnt_apto;                /* authenticated payload timeouts (our LL_PING_REQs) */
 static uint32_t lock_depth, lock_t0, lock_max_ticks, acl_tx_lock_max_ticks, aes_max_ticks;
 static volatile bool in_acl_tx;          /* controller thread is inside ll_llcp_tx() for ACL */
 static bool aes_reversed;                /* hal AES needs reversed byte order (self-test) */
@@ -528,10 +532,23 @@ static void llcp_data_len_change(uint8_t link, const struct ll_llcp_dle *eff)
 	}
 }
 
+/* Controller thread (ll_llcp_tick): the link's authenticated payload
+ * timeout passed; ll_llcp has queued LL_PING_REQ. The event goes out only
+ * if the host enabled it (Event Mask Page 2 bit 23, ll_hci), and only
+ * while the host knows the link. */
+static void llcp_apto_expired(uint8_t link)
+{
+	atomic_inc(&cnt_apto);
+	if (ll_credit_up(link) && !pend_test(link, PEND_DISCONNECTED)) {
+		ll_hci_evt_apto_expired(link);
+	}
+}
+
 static const struct ll_llcp_ops llcp_ops = {
 	.ltk_req = llcp_ltk_req,
 	.enc_change = llcp_enc_change,
 	.data_len_change = llcp_data_len_change,
+	.apto_expired = llcp_apto_expired,
 };
 
 /* ---- HCI ops ---- */
@@ -665,6 +682,21 @@ static uint8_t hci_set_data_len(uint16_t handle, uint16_t tx_octets, uint16_t tx
 	return st;
 }
 
+/* Slice 6d: Read / Write Authenticated Payload Timeout. A write restarts
+ * the timer (possibly shorter): wake the controller thread to re-arm it. */
+static uint8_t hci_read_apto(uint16_t handle, uint16_t *apto)
+{
+	return ll_llcp_read_apto((uint8_t)handle, apto);
+}
+
+static uint8_t hci_write_apto(uint16_t handle, uint16_t apto)
+{
+	uint8_t st = ll_llcp_write_apto((uint8_t)handle, apto);
+
+	k_sem_give(&wake);
+	return st;
+}
+
 /* 1M only (slice 6b): both directions are always LE 1M */
 static uint8_t hci_read_phy(uint16_t handle, uint8_t *tx_phy, uint8_t *rx_phy)
 {
@@ -716,6 +748,8 @@ static const struct ll_hci_ops hci_ops = {
 	/* Slice 6c: host-based privacy (Zephyr sets its RPA with 0x2005,
 	 * after stopping advertising when it rotates it) */
 	.set_random_addr = ll_adv_set_random_addr,
+	.read_apto = hci_read_apto,
+	.write_apto = hci_write_apto,
 };
 
 /* ---- controller thread ---- */
@@ -773,6 +807,8 @@ static void handle_connected(uint8_t link)
 
 	mic_failed[link] = false;
 	atomic_clear_bit(&dle_pend, link);
+	/* the lower bound of the authenticated payload timeout (slice 6d) */
+	ll_llcp_conn_params(link, ci.interval, ci.latency);
 	/* new generation, up, no credit of an earlier connection (ll_credit) */
 	ll_credit_open(link);
 	/* ci (also kept by ll_conn for the link) records the local address
@@ -813,6 +849,7 @@ static void handle_updated(uint8_t link)
 	ll_plat_unlock(key);
 	LOG_INF("connection update (handle %u): interval %u latency %u timeout %u", link,
 		p.interval, p.latency, p.timeout);
+	ll_llcp_conn_params(link, p.interval, p.latency);
 	if (ll_credit_up(link) && !pend_test(link, PEND_DISCONNECTED)) {
 		ll_hci_evt_conn_update(link, &p);
 	}
@@ -870,14 +907,11 @@ static void flush_dle(uint8_t link)
 /* Received PDUs: LLID 3 to ll_llcp, LLID 1/2 to the host. The PDU and the
  * H4 packet (up to 257 + 256 bytes with long PDUs) are static: controller
  * thread only, so they stay off its stack. */
-static void handle_rx(uint8_t link)
+static void handle_rx_pdus(uint8_t link, bool *got)
 {
 	static struct ll_rx_pdu pdu;
 	static uint8_t h4[LL_HCI_ACL_MAX];
 
-	if (!ll_credit_up(link)) {
-		return;
-	}
 	for (int i = 0; i < RX_BUDGET; i++) {
 		if (pend_test(link, PEND_DISCONNECTED)) {
 			return;   /* the link is gone; its ll_rxq is reset below */
@@ -897,6 +931,9 @@ static void handle_rx(uint8_t link)
 			ll_conn_end(link, LL_ST_MIC_FAILURE);
 			return;
 		}
+		/* non-empty and, once the link encrypts, decrypted with a
+		 * valid MIC (ll_rxq never delivers a retransmission) */
+		*got = true;
 		uint8_t llid = pdu.hdr0 & 0x03;
 
 		if (llid == LL_LLID_CTRL) {
@@ -913,6 +950,21 @@ static void handle_rx(uint8_t link)
 		}
 	}
 	k_sem_give(&wake);   /* budget used up: continue on the next pass */
+}
+
+static void handle_rx(uint8_t link)
+{
+	bool got = false;
+
+	if (!ll_credit_up(link)) {
+		return;
+	}
+	handle_rx_pdus(link, &got);
+	if (got) {
+		/* slice 6d: restarts the authenticated payload timer (a no-op
+		 * while the link is unencrypted) */
+		ll_llcp_rx_auth(link);
+	}
 }
 
 static void acl_free(struct acl_item *it)
@@ -1090,9 +1142,9 @@ static void report_stats(struct ll_radio_stats *last, struct ll_conn_stats *last
 			cs.first_bad, cs.first_nodata, cs.first_outside, st.rx_ptr_skip,
 			st.rx_wptr_max, st.fst_capped,
 			(uint32_t)atomic_get(&cnt_guard_escalations), st.holds);
-		LOG_INF("conn: latency planned %u listened %u skipped %u kicks %u coll %u links %u",
+		LOG_INF("conn: latency planned %u listened %u skipped %u kicks %u coll %u links %u apto %u",
 			cs.planned, cs.listened, cs.skipped, cs.kicks, cs.collisions,
-			ll_conn_count());
+			ll_conn_count(), (uint32_t)atomic_get(&cnt_apto));
 		LOG_INF("adv: events %u slid %u dropped %u cut %u stuck %u adv_guard %u",
 			as.events, as.slid, as.dropped, as.cut, as.stuck, st.adv_guard);
 		LOG_INF("conn: acl in %u out %u drop %u frag %u evt_drop %u lock max %u us acl_tx %u us aes %u us",

@@ -79,6 +79,18 @@ static uint8_t set_random_addr(const uint8_t a[6])
 	rnd_addr_calls++; memcpy(got_rnd_addr, a, 6); return next_status;
 }
 
+/* slice 6d */
+static int rapto_calls, wapto_calls;
+static uint16_t rapto_val = 0x0BB8, wapto_val;
+static uint8_t read_apto(uint16_t h, uint16_t *v)
+{
+	rapto_calls++; got_handle = h; *v = rapto_val; return next_status;
+}
+static uint8_t write_apto(uint16_t h, uint16_t v)
+{
+	wapto_calls++; got_handle = h; wapto_val = v; return next_status;
+}
+
 static const struct ll_hci_ops ops = {
 	.get_bd_addr = get_addr, .rand = rnd, .reset = reset,
 	.adv_set_params = set_params, .adv_set_data = set_data,
@@ -87,6 +99,7 @@ static const struct ll_hci_ops ops = {
 	.handle_valid = handle_valid,
 	.set_data_len = set_data_len, .read_phy = read_phy, .set_phy = set_phy,
 	.set_random_addr = set_random_addr,
+	.read_apto = read_apto, .write_apto = write_apto,
 };
 
 static void cmd(uint16_t op, const uint8_t *p, uint8_t plen)
@@ -848,13 +861,11 @@ static void test_dle_phy_cmds(void)
 }
 
 /* ll_hci_init without handle_valid fails loudly (assert -> abort) */
-static void test_init_requires_handle_valid(void)
+static void init_must_abort(struct ll_hci_ops bad)
 {
-	struct ll_hci_ops bad = ops;
 	pid_t pid;
 	int st = 0;
 
-	bad.handle_valid = NULL;
 	fflush(stdout);
 	pid = fork();
 	if (pid == 0) {
@@ -867,6 +878,21 @@ static void test_init_requires_handle_valid(void)
 	}
 	CHECK(pid > 0 && waitpid(pid, &st, 0) == pid);
 	CHECK(WIFSIGNALED(st) && WTERMSIG(st) == SIGABRT);
+}
+
+static void test_init_requires_handle_valid(void)
+{
+	struct ll_hci_ops bad = ops;
+
+	bad.handle_valid = NULL;
+	init_must_abort(bad);
+	/* slice 6d: the Authenticated Payload Timeout ops are required too */
+	bad = ops;
+	bad.read_apto = NULL;
+	init_must_abort(bad);
+	bad = ops;
+	bad.write_apto = NULL;
+	init_must_abort(bad);
 }
 
 /* LE Set Random Address (0x2005, Vol 4 Part E 7.8.4): 6 octets, the
@@ -927,6 +953,135 @@ static void test_host_ncp(void)
 	cmd(0x1002, NULL, 0);
 	CHECK(is_cc(0x1002, LL_ST_SUCCESS));
 	CHECK((evt[7 + 10] & 0xE0) == 0);
+}
+
+/* Slice 6d: Read / Write Authenticated Payload Timeout (0x0C7B / 0x0C7C,
+ * Vol 4 Part E 7.3.93 / 7.3.94), Set Event Mask Page 2 (0x0C63, 7.3.69) and
+ * Authenticated Payload Timeout Expired (0x57, 7.7.75, page 2 bit 23) */
+static void test_apto_cmds(void)
+{
+	const uint16_t last = LL_MAX_CONN - 1;
+	uint8_t p[4], m[8];
+	int u0 = unknown_calls;
+
+	valid_mask = (1u << LL_MAX_CONN) - 1u;
+	next_status = LL_ST_SUCCESS;
+
+	/* Read: Command Complete (status, handle, timeout) */
+	ll_put_le16(p, last);
+	rapto_calls = 0;
+	rapto_val = 0x0BB8;
+	cmd(0x0C7B, p, 2);
+	CHECK(is_cc(0x0C7B, LL_ST_SUCCESS) && evt_len == 11);
+	CHECK(ll_get_le16(&evt[7]) == last && ll_get_le16(&evt[9]) == 0x0BB8);
+	CHECK(rapto_calls == 1 && got_handle == last);
+	rapto_val = 0xFFFF;
+	cmd(0x0C7B, p, 2);
+	CHECK(is_cc(0x0C7B, LL_ST_SUCCESS) && ll_get_le16(&evt[9]) == 0xFFFF);
+	/* unknown handle: 0x02 with the handle, op not called */
+	ll_put_le16(p, LL_MAX_CONN);
+	cmd(0x0C7B, p, 2);
+	CHECK(is_cc(0x0C7B, LL_ST_UNKNOWN_CONN_ID) && evt_len == 11);
+	CHECK(ll_get_le16(&evt[7]) == LL_MAX_CONN && rapto_calls == 2);
+	valid_mask &= ~(1u << last);
+	ll_put_le16(p, last);
+	cmd(0x0C7B, p, 2);
+	CHECK(is_cc(0x0C7B, LL_ST_UNKNOWN_CONN_ID) && rapto_calls == 2);
+	valid_mask = (1u << LL_MAX_CONN) - 1u;
+	/* wrong length */
+	cmd(0x0C7B, p, 3);
+	CHECK(is_cc(0x0C7B, LL_ST_INVALID_PARAM) && rapto_calls == 2);
+
+	/* Write: Command Complete (status, handle); 0x0001..0xFFFF */
+	wapto_calls = 0;
+	ll_put_le16(p, last);
+	ll_put_le16(&p[2], 0x0001);
+	cmd(0x0C7C, p, 4);
+	CHECK(is_cc(0x0C7C, LL_ST_SUCCESS) && evt_len == 9 && ll_get_le16(&evt[7]) == last);
+	CHECK(wapto_calls == 1 && got_handle == last && wapto_val == 0x0001);
+	ll_put_le16(&p[2], 0xFFFF);
+	cmd(0x0C7C, p, 4);
+	CHECK(is_cc(0x0C7C, LL_ST_SUCCESS) && wapto_calls == 2 && wapto_val == 0xFFFF);
+	/* 0 is out of range: Invalid HCI Command Parameters, op not called */
+	ll_put_le16(&p[2], 0);
+	cmd(0x0C7C, p, 4);
+	CHECK(is_cc(0x0C7C, LL_ST_INVALID_PARAM) && evt_len == 9);
+	CHECK(ll_get_le16(&evt[7]) == last && wapto_calls == 2);
+	/* the op's status (below connInterval x (1 + latency)) reaches the host */
+	ll_put_le16(&p[2], 5);
+	next_status = LL_ST_INVALID_PARAM;
+	cmd(0x0C7C, p, 4);
+	CHECK(is_cc(0x0C7C, LL_ST_INVALID_PARAM) && wapto_calls == 3);
+	next_status = LL_ST_SUCCESS;
+	/* unknown handle */
+	ll_put_le16(p, LL_MAX_CONN);
+	ll_put_le16(&p[2], 3000);
+	cmd(0x0C7C, p, 4);
+	CHECK(is_cc(0x0C7C, LL_ST_UNKNOWN_CONN_ID) && ll_get_le16(&evt[7]) == LL_MAX_CONN);
+	CHECK(wapto_calls == 3);
+	/* wrong length */
+	ll_put_le16(p, last);
+	cmd(0x0C7C, p, 3);
+	CHECK(is_cc(0x0C7C, LL_ST_INVALID_PARAM) && wapto_calls == 3);
+	CHECK(unknown_calls == u0);
+
+	/* Supported Commands (6.27): octet 22 bit 2 Set Event Mask Page 2,
+	 * octet 32 bit 4 Read / bit 5 Write Authenticated Payload Timeout */
+	cmd(0x1002, NULL, 0);
+	CHECK(is_cc(0x1002, LL_ST_SUCCESS));
+	CHECK(evt[7 + 22] & 0x04);
+	CHECK(evt[7 + 32] & 0x10);
+	CHECK(evt[7 + 32] & 0x20);
+
+	/* the event is off by default (page 2 = 0 after Reset) */
+	cmd(0x0C03, NULL, 0);
+	all_events_on();
+	evt_len = 0;
+	ll_hci_evt_apto_expired(last);
+	CHECK(evt_len == 0);
+	/* Set Event Mask Page 2: bit 23 enables it */
+	memset(m, 0, 8);
+	m[2] = 0x80;
+	cmd(0x0C63, m, 8);
+	CHECK(is_cc(0x0C63, LL_ST_SUCCESS) && evt_len == 7);
+	evt_len = 0;
+	ll_hci_evt_apto_expired(last);
+	{
+		const uint8_t e[] = {0x04, 0x57, 2, (uint8_t)last, 0x00};
+
+		CHECK(evt_len == sizeof(e) && memcmp(evt, e, sizeof(e)) == 0);
+	}
+	/* page 1 does not mask it */
+	memset(m, 0, 8);
+	cmd(0x0C01, m, 8);
+	evt_len = 0;
+	ll_hci_evt_apto_expired(0);
+	CHECK(evt_len == 5 && evt[1] == 0x57 && evt[3] == 0);
+	all_events_on();
+	/* other page 2 bits do not enable it */
+	memset(m, 0xFF, 8);
+	m[2] = 0x7F;
+	cmd(0x0C63, m, 8);
+	CHECK(is_cc(0x0C63, LL_ST_SUCCESS));
+	evt_len = 0;
+	ll_hci_evt_apto_expired(last);
+	CHECK(evt_len == 0);
+	/* wrong length: refused, mask unchanged */
+	m[2] = 0x80;
+	cmd(0x0C63, m, 7);
+	CHECK(is_cc(0x0C63, LL_ST_INVALID_PARAM));
+	evt_len = 0;
+	ll_hci_evt_apto_expired(last);
+	CHECK(evt_len == 0);
+	/* Reset clears page 2 again */
+	cmd(0x0C63, m, 8);
+	cmd(0x0C03, NULL, 0);
+	all_events_on();
+	evt_len = 0;
+	ll_hci_evt_apto_expired(last);
+	CHECK(evt_len == 0);
+	CHECK(unknown_calls == u0);
+	valid_mask = 0x1;
 }
 
 int main(void)
@@ -1009,7 +1164,8 @@ int main(void)
 	CHECK(is_cc(0x2003, LL_ST_SUCCESS));
 	CHECK(evt_len == 7 + 8);
 	/* + bit 5 LE Data Packet Length Extension (slice 6b Task 3); no 2M (bit 8) */
-	CHECK(evt[7] == LL_FEATURES_LOW && evt[7] == 0x25);
+	/* + bit 4 LE Ping (slice 6d) */
+	CHECK(evt[7] == LL_FEATURES_LOW && evt[7] == 0x35);
 	CHECK(!(evt[8] & 0x01));
 	/* byte 1: bit 14 Channel Selection Algorithm #2 (Vol 6 Part B 4.6) */
 	CHECK(evt[8] == LL_FEATURES_BYTE1 && evt[8] == 0x40);
@@ -1094,6 +1250,7 @@ int main(void)
 	test_dle_phy_cmds();
 	test_set_random_addr();
 	test_host_ncp();
+	test_apto_cmds();
 
 	DONE();
 }
