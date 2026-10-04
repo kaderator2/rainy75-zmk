@@ -881,8 +881,12 @@ int ll_conn_start(const struct ll_connect_ind *ci, uint32_t connect_ind_end_tick
 }
 
 /* 0, or LL_ST_INSTANT_PASSED (connection ending). With a latency skip
- * planned, an instant for a skipped event whose alarm time has gone by is
- * passed too (that event can no longer be listened to). */
+ * planned, an instant for a skipped event whose anchor has gone by is
+ * passed too (slice 7: the anchor, not the alarm time). A skipped instant
+ * event whose alarm time is gone but whose anchor is not is still
+ * honoured: instant_replan() plans it with a late alarm, prepare() issues
+ * it if there is time left (LL_CONN_MIN_PREP_US), else it is a late miss;
+ * either way the instant is applied when the event is planned. */
 static int check_instant(struct ll_link *c, uint16_t instant)
 {
 	uint16_t cur = c->planned ? c->skip_base : c->counter;
@@ -892,7 +896,8 @@ static int check_instant(struct ll_link *c, uint16_t instant)
 	 * issued with the old values, so the instant cannot be honoured any
 	 * more; treat it like a passed instant. */
 	if (d > INSTANT_PAST || (d == 0 && c->in_event) ||
-	    (c->planned && d < c->skip_n && d < first_reachable(c))) {
+	    (c->planned && d < c->skip_n &&
+	     (int32_t)(anchor_of(c, instant) - ll_radio_now()) <= 0)) {
 		request_end(c, LL_ST_INSTANT_PASSED);
 		return LL_ST_INSTANT_PASSED;
 	}
@@ -901,8 +906,9 @@ static int check_instant(struct ll_link *c, uint16_t instant)
 
 /* A new instant for the planned event or one of the skipped events before
  * it: re-plan to the first reachable event of the window, or to the
- * instant if that comes first (check_instant() passed, so the instant is
- * not before the first reachable event). A target before the instant
+ * instant if that comes first (check_instant() passed, so the instant's
+ * anchor is still ahead; when its alarm time is gone too, the instant
+ * event is planned with an alarm in the past). A target before the instant
  * applies no instant there, and plan() refuses to skip while the instant
  * lies within the latency window, so every event up to and including the
  * instant is listened to. Re-planning to the instant itself would leave

@@ -164,8 +164,9 @@ int ll_conn_start(const struct ll_connect_ind *ci, uint32_t connect_ind_end_tick
 void ll_conn_radio_evt(enum ll_radio_evt evt, const uint8_t *pdu, uint8_t len, uint32_t tick);
 /* Schedule LL_CONNECTION_UPDATE_IND / LL_CHANNEL_MAP_IND parameters for the
  * event with counter == instant. Return 0, or LL_ST_INSTANT_PASSED when
- * (instant - counter) mod 65536 > 32767, or when instant is the event
- * already on air (the connection is then terminated with 0x28). Without an
+ * (instant - counter) mod 65536 > 32767, when instant is the event
+ * already on air, or when it is a skipped event whose anchor has passed
+ * (the connection is then terminated with 0x28). Without an
  * active connection: LL_ST_DISALLOWED. ll_conn_update_at checks the
  * parameters first (interval 6..3200, latency <= 499, timeout 10..3200 and
  * > (1 + latency) * interval * 2, WinSize 1..min(8, interval - 1), WinOffset
@@ -199,8 +200,10 @@ void ll_conn_release(uint8_t link);
  * if any). Instants are relative to this. While a latency skip is planned
  * this is the first skipped event (conservative: an instant for a skipped
  * event re-plans the listen to the first reachable event, or to the
- * instant if that comes first, and is passed if the instant event is no
- * longer reachable). After a re-plan (kick, instant, or a yield to the
+ * instant if that comes first, and is passed only once the instant
+ * event's anchor has gone by; slice 7: an instant event whose alarm time
+ * is gone but not its anchor is planned late, issued if it can still be
+ * prepared, else a late miss, and the instant is applied). After a re-plan (kick, instant, or a yield to the
  * arbiter) it is the planned event, so an instant for an earlier event is
  * treated as passed (0x28); a conforming central never sends one (the
  * instant is >= 6 events after the PDU, which arrives in a listened event;

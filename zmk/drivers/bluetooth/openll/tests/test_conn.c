@@ -2592,6 +2592,96 @@ static void test_latency_holdoff_per_link(void)
 	}
 }
 
+/* Slice 7: "instant passed" is judged by the instant event's anchor, not
+ * by its alarm. An instant for a skipped event whose alarm time has gone
+ * by but whose anchor has not is still honoured: the event is planned with
+ * a late alarm and issued if there is still time to prepare it (else it
+ * counts as a late miss), the instant is applied, the link lives on. Once
+ * the anchor has passed, it is 0x28 as before. */
+static void test_instant_alarm_passed_anchor_not(void)
+{
+	struct ll_conn_params p24 = {.interval = 24, .latency = 0, .timeout = 400};
+	struct ll_conn_stats s0, s1;
+	struct ll_csa1 ref;
+	uint32_t a0;
+	int ev;
+
+	/* inside the alarm lead of EV(3): still issued, with the new map */
+	a0 = start_lat(4, 400, &ref, false);
+	now = open_at(a0, 3) - T(LL_CONN_ARM_LEAD_US) + T(100);
+	CHECK(ll_conn_chmap_at(0, EV(3), no0to9) == 0);
+	CHECK(ll_conn_active(0) && cbs.disconnected == 0);
+	ev = rad.events;
+	fire_alarm();
+	CHECK(rad.events == ev + 1);
+	CHECK(ll_conn_event_counter(0) == EV(3));
+	CHECK(rad.open == open_at(a0, 3));
+	(void)ref_skip(&ref, 2);
+	ll_csa1_set_map(&ref, no0to9);
+	CHECK(rad.ch == ll_csa1_next(&ref));
+	rx(a0 + T(45000), 0x01, 0);
+	done(1);
+	CHECK(ll_conn_active(0));
+	fire_alarm();
+	CHECK(ll_conn_event_counter(0) > EV(3) && rad.ch >= 10);
+	done(0);
+	ll_conn_end(0, LL_ST_REMOTE_TERM);
+
+	/* closer than LL_CONN_MIN_PREP_US to EV(3)'s RX: a late miss, but the
+	 * map is applied and the link follows on */
+	a0 = start_lat(4, 400, &ref, false);
+	ll_conn_get_stats(0, &s0);
+	now = open_at(a0, 3) - T(LL_CONN_MIN_PREP_US) + T(10);
+	CHECK(ll_conn_chmap_at(0, EV(3), no0to9) == 0);
+	ev = rad.events;
+	fire_alarm();
+	CHECK(rad.events == ev);
+	ll_conn_get_stats(0, &s1);
+	CHECK(s1.late - s0.late == 1);
+	CHECK(ll_conn_active(0));
+	fire_alarm();
+	CHECK(rad.events == ev + 1);
+	CHECK(ll_conn_event_counter(0) == EV(4));
+	CHECK(rad.open == open_at(a0, 4));
+	(void)ref_skip(&ref, 2);
+	ll_csa1_set_map(&ref, no0to9);
+	(void)ll_csa1_next(&ref);
+	CHECK(rad.ch == ll_csa1_next(&ref));
+	done(0);
+	CHECK(ll_conn_active(0));
+	ll_conn_end(0, LL_ST_REMOTE_TERM);
+
+	/* a connection update for EV(3) inside its alarm lead: the transmit
+	 * window event of the instant is issued (old anchor + 0, 1.25 ms;
+	 * widening 300 ppm over 46.25 ms: 13.875 -> 14 + 16 = 30 us) */
+	a0 = start_lat(4, 400, &ref, false);
+	now = open_at(a0, 3) - T(LL_CONN_ARM_LEAD_US) + T(100);   /* old timing's alarm */
+	CHECK(ll_conn_update_at(0, EV(3), 1, 0, &p24) == 0);
+	ev = rad.events;
+	fire_alarm();
+	CHECK(rad.events == ev + 1 && cbs.updated == 1);
+	CHECK(ll_conn_event_counter(0) == EV(3));
+	CHECK(rad.open == a0 + T(45000) - T(30 + LL_CONN_WIN_MARGIN_US));
+	rx(a0 + T(45000) + T(200), 0x01, 0);
+	done(1);
+	CHECK(ll_conn_active(0));
+	ll_conn_end(0, LL_ST_REMOTE_TERM);
+
+	/* the anchor of EV(3) one tick ahead: not passed (a late miss) */
+	a0 = start_lat(4, 400, &ref, false);
+	now = a0 + T(45000) - 1;
+	CHECK(ll_conn_chmap_at(0, EV(3), no0to9) == 0);
+	CHECK(ll_conn_active(0));
+	ll_conn_end(0, LL_ST_REMOTE_TERM);
+
+	/* the anchor of EV(3) reached: passed, 0x28 */
+	a0 = start_lat(4, 400, &ref, false);
+	now = a0 + T(45000);
+	CHECK(ll_conn_chmap_at(0, EV(3), no0to9) == LL_ST_INSTANT_PASSED);
+	CHECK(!ll_conn_active(0) && cbs.disconnected == 1);
+	CHECK(cbs.reason == LL_ST_INSTANT_PASSED);
+}
+
 int main(void)
 {
 	test_first_events();
@@ -2642,5 +2732,6 @@ int main(void)
 	test_csa2_yield();
 	test_latency_holdoff();
 	test_latency_holdoff_per_link();
+	test_instant_alarm_passed_anchor_not();
 	DONE();
 }
