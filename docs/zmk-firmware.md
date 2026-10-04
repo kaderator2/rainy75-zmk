@@ -980,7 +980,15 @@ patches/
     0002-zmk-recover-a-dead-USB-bus-while-suspended-no-VBUS-d.patch
     0003-zmk-don-t-re-attach-USB-during-the-host-s-HID-bind-w.patch
     0004-zmk-drive-USB-remote-wakeup-from-the-HID-send-path.patch
+    0005-zmk-start-BLE-advertising-from-the-workqueue-after-s.patch
 ```
+
+`zmk-src/0005` is needed for `--privacy`: ZMK started advertising inside the
+settings commit (settings lock held), while the host had queued storing the
+newly generated IRK on the system workqueue, which also transmits the HCI
+commands. The two waited on each other until the HCI command timeout
+asserted; the MCUboot test image then reverted, and the previous image went
+on advertising the public address.
 
 ### Zephyr (4 files, 9 patches)
 
