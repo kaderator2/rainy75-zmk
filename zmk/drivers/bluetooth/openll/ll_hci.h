@@ -74,6 +74,9 @@ struct ll_hci_ops {
 	 * the 7.8.31 ranges, Interval_Min <= Interval_Max, the timeout rule
 	 * (Timeout x 10 ms > (1 + Max_Latency) x Interval_Max x 1.25 ms x 2) and
 	 * Min_CE_Length <= Max_CE_Length; the Negative Reply's reason nonzero.
+	 * A Reply that fails the checks (0x12) on a valid handle calls
+	 * conn_param_neg_reply(handle, 0x3B), so the request is rejected on
+	 * air instead of waiting for the 40 s timer.
 	 * ll_llcp_conn_param_reply / _neg_reply. Required. */
 	uint8_t (*conn_param_reply)(uint16_t handle, uint16_t interval_min, uint16_t interval_max,
 				    uint16_t latency, uint16_t timeout);

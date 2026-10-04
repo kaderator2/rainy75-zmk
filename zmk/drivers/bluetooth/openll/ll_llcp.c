@@ -117,7 +117,8 @@
 #define APTO_FOLD_TICKS      (1u << 30)
 /* The control PDUs we send (owed copies are kept whole):
  * LL_CONNECTION_PARAM_RSP (24, slice 6d Task 2) is the longest, then
- * LL_ENC_RSP (13), LL_LENGTH_REQ/_RSP and LL_FEATURE_RSP (9), LL_VERSION_IND (6), LL_REJECT_EXT_IND / LL_PHY_RSP (3), LL_UNKNOWN_RSP /
+ * LL_ENC_RSP (13), LL_LENGTH_REQ/_RSP and LL_FEATURE_RSP (9),
+ * LL_VERSION_IND (6), LL_REJECT_EXT_IND / LL_PHY_RSP (3), LL_UNKNOWN_RSP /
  * LL_REJECT_IND / LL_TERMINATE_IND (2), LL_START_ENC_REQ/_RSP and
  * LL_PING_REQ/_RSP (1). */
 _Static_assert(OWE_PDU_MAX >= LEN_CONN_PARAM && OWE_PDU_MAX >= LEN_ENC_RSP &&
@@ -609,7 +610,8 @@ static void rx_length_rsp(uint8_t link, const uint8_t *p)
  *    indicated and the Link Layer accepts it with the central's values (the
  *    host gave us no ranges, 5.1.7.2 "proceed as if the Host has
  *    accepted"). Reply -> LL_CONNECTION_PARAM_RSP with the host's values;
- *    Negative Reply -> LL_REJECT_EXT_IND with the host's reason.
+ *    Negative Reply (or a Reply the HCI layer refused) ->
+ *    LL_REJECT_EXT_IND 0x3B (Unacceptable Connection Parameters).
  * Our RSP (2.4.2.17, filled as 5.1.7.1 says for the request): the values,
  * PreferredPeriodicity = the central's when 1..Interval_Max, else 1 when
  * the interval is a range (it "shall" be nonzero then; 1 = any multiple
@@ -754,10 +756,15 @@ uint8_t ll_llcp_conn_param_neg_reply(uint8_t link, uint8_t reason)
 	s = &links[link];
 	ll_plat_tx_lock();
 	if (s->cpr == CPR_WAIT_HOST) {
-		/* complete once the reject is queued (5.1.7.2: on its ack) */
+		/* complete once the reject is queued (5.1.7.2: on its ack).
+		 * "If the Host rejects this request, then the device shall
+		 * issue an LL_REJECT_EXT_IND PDU with the ErrorCode set to
+		 * Unacceptable Connection Parameters (0x3B)", whatever Reason
+		 * the host gave (7.8.32 lists 0x3B only; Zephyr sends 0x1E) */
+		(void)reason;
 		s->cpr = CPR_IDLE;
 		s->tmr_on[TMR_CPR] = false;
-		reject_ext_locked(link, OP_CONN_PARAM_REQ, reason);
+		reject_ext_locked(link, OP_CONN_PARAM_REQ, LL_ST_UNACCEPT_CONN_PARAM);
 		st = LL_ST_SUCCESS;
 	}
 	ll_plat_tx_unlock();
@@ -1627,4 +1634,3 @@ uint8_t ll_llcp_write_apto(uint8_t link, uint16_t apto)
 	ll_plat_tx_unlock();
 	return st;
 }
-

@@ -305,9 +305,11 @@ static void auth_payload_to(uint16_t op, const uint8_t *p, uint8_t plen)
  * (7.8.32): Command Complete (status, handle). The values are checked
  * before the handle, as in LE Set Data Length. Timeout x 10 ms > (1 +
  * Max_Latency) x Interval_Max x 1.25 ms x 2 (no subrating) is Timeout x 4 >
- * (1 + Max_Latency) x Interval_Max. The Negative Reply's Reason is passed
- * on as the LL_REJECT_EXT_IND ErrorCode: 7.8.32 lists 0x3B only, Zephyr
- * sends 0x1E; 0x00 (no error) is refused. */
+ * (1 + Max_Latency) x Interval_Max. A Reply that fails these checks (0x12)
+ * on a valid handle also rejects the request (the Negative Reply op with
+ * 0x3B), so it does not wait on the host until the 40 s timeout. The
+ * Negative Reply accepts any nonzero Reason (7.8.32 lists 0x3B only,
+ * Zephyr sends 0x1E); on air it is always 0x3B (ll_llcp). */
 static void conn_param_reply(uint16_t op, const uint8_t *p, uint8_t plen)
 {
 	uint8_t ret[3];
@@ -328,6 +330,13 @@ static void conn_param_reply(uint16_t op, const uint8_t *p, uint8_t plen)
 		    to > HCI_SUP_TIMEOUT_MAX || (uint32_t)to * 4u <= (1u + lat) * (uint32_t)imax ||
 		    ll_get_le16(&p[10]) > ll_get_le16(&p[12])) {
 			ret[0] = LL_ST_INVALID_PARAM;
+			/* the request would wait on the host until the 40 s
+			 * timer ends the link: reject it on air instead (the
+			 * op sends LL_REJECT_EXT_IND 0x3B and ends the
+			 * procedure; its status does not matter here) */
+			if (hci_ops->handle_valid(h)) {
+				(void)hci_ops->conn_param_neg_reply(h, LL_ST_UNACCEPT_CONN_PARAM);
+			}
 		} else if (!hci_ops->handle_valid(h)) {
 			ret[0] = LL_ST_UNKNOWN_CONN_ID;
 		} else {
@@ -873,4 +882,3 @@ uint8_t ll_hci_acl_fragment(const struct ll_hci_acl_pdu *in, uint8_t frag_max,
 	}
 	return n;
 }
-

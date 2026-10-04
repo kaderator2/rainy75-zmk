@@ -2770,11 +2770,16 @@ static void cpr_suite(void)
 	CHECK(ll_llcp_conn_param_neg_reply(L, 0x3B) == LL_ST_DISALLOWED);
 	CHECK(cpr_reply(6, 12, 30, 400) == LL_ST_DISALLOWED);
 	CHECK(tx.n == 1);
-	/* Zephyr rejects with Invalid LL Parameters: passed on as given */
+	/* Zephyr rejects with Invalid LL Parameters: on air it is still 0x3B
+	 * (5.1.7.2), as for any other reason */
 	rx_cpr(6, 12, 30, 400, 0, 0);
 	CHECK(ll_llcp_conn_param_neg_reply(L, LL_ST_INVALID_LL_PARAM) == LL_ST_SUCCESS);
-	CHECK(tx.n == 2 && last_is_rej_ext(0x0F, 0x1E));
-	CHECK(cpr_ev.calls == 2);
+	CHECK(tx.n == 2 && last_is_rej_ext(0x0F, 0x3B));
+	rx_cpr(6, 12, 30, 400, 0, 0);
+	CHECK(ll_llcp_conn_param_neg_reply(L, 0x12) == LL_ST_SUCCESS);
+	CHECK(tx.n == 3 && last_is_rej_ext(0x0F, 0x3B));
+	CHECK(!ll_llcp_busy(L));
+	CHECK(cpr_ev.calls == 3);
 
 	/* ---- invalid parameters: LL_REJECT_EXT_IND(0x1E), the host is not
 	 * asked, nothing waits ---- */

@@ -1167,13 +1167,29 @@ static void test_cpr_cmds(void)
 			{6, 12, 0, 400, 2, 1},     /* Min_CE_Length > Max_CE_Length */
 		};
 
+		/* the request must not wait on the host until the 40 s timer:
+		 * a refused Reply rejects it on air (Negative Reply op, 0x3B);
+		 * the op's own status does not change the 0x12 */
+		next_status = LL_ST_DISALLOWED;
 		for (unsigned int i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+			cpr_neg_calls = 0;
+			got_handle = 0xFFFF;
 			cpr_cmd(last, bad[i][0], bad[i][1], bad[i][2], bad[i][3], bad[i][4],
 				bad[i][5], 14);
 			CHECK(is_cc(0x2020, LL_ST_INVALID_PARAM) && evt_len == 9);
 			CHECK(ll_get_le16(&evt[7]) == last);
+			CHECK(cpr_neg_calls == 1 && got_handle == last && cpr_reason == 0x3B);
 		}
+		next_status = LL_ST_SUCCESS;
 		CHECK(cpr_calls == 5);
+		/* ... but not for a handle that is no link */
+		cpr_neg_calls = 0;
+		cpr_cmd(LL_MAX_CONN, 5, 12, 0, 400, 0, 0, 14);
+		CHECK(is_cc(0x2020, LL_ST_INVALID_PARAM) && cpr_neg_calls == 0);
+		/* nor for a wrong length */
+		cpr_cmd(last, 5, 12, 0, 400, 0, 0, 13);
+		CHECK(is_cc(0x2020, LL_ST_INVALID_PARAM) && cpr_neg_calls == 0);
+		cpr_neg_calls = 0;
 	}
 	/* unknown handle */
 	cpr_cmd(LL_MAX_CONN, 6, 12, 30, 400, 0, 0, 14);
@@ -1183,7 +1199,8 @@ static void test_cpr_cmds(void)
 	cpr_cmd(last, 6, 12, 30, 400, 0, 0, 13);
 	CHECK(is_cc(0x2020, LL_ST_INVALID_PARAM) && evt_len == 7 && cpr_calls == 5);
 
-	/* Negative Reply: the reason passed on (0x3B, or Zephyr's 0x1E) */
+	/* Negative Reply: any nonzero reason accepted (0x3B, or Zephyr's 0x1E);
+	 * ll_llcp puts 0x3B on air */
 	ll_put_le16(n, last);
 	n[2] = 0x3B;
 	cmd(0x2021, n, 3);

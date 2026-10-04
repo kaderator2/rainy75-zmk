@@ -219,7 +219,9 @@ uint8_t ll_llcp_write_apto(uint8_t link, uint16_t apto);
 
 /* Connection Parameters Request procedure, responder (slice 6d Task 2;
  * Vol 6 Part B 5.1.7, 5.3; HCI 7.7.65.6, 7.8.31, 7.8.32), per link. See
- * ll_llcp.c for the rules. Reply / Negative Reply return LL_ST_SUCCESS,
+ * ll_llcp.c for the rules. The Negative Reply sends LL_REJECT_EXT_IND with
+ * 0x3B (Unacceptable Connection Parameters, 5.1.7.2) whatever the reason.
+ * Reply / Negative Reply return LL_ST_SUCCESS,
  * LL_ST_UNKNOWN_CONN_ID (link out of range or not connected) or
  * LL_ST_DISALLOWED (no request waits on the host). The HCI layer checked
  * the parameters (Reply: ranges and the timeout rule; Negative Reply: a
