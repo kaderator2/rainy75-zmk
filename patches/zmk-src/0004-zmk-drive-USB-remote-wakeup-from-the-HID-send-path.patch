@@ -1,4 +1,4 @@
-From 286b7abc437c782f8d7725f21004c81da1b7d6ef Mon Sep 17 00:00:00 2001
+From c1dc5a085565d1f798509192dc958d6553439bc6 Mon Sep 17 00:00:00 2001
 From: scholzri <33288574+scholzri@users.noreply.github.com>
 Date: Sat, 25 Jul 2026 13:17:28 +0200
 Subject: [PATCH] zmk: drive USB remote wakeup from the HID send path
@@ -37,10 +37,10 @@ unchanged kernel device number.
 
 Signed-off-by: Richard Scholz <33288574+scholzri@users.noreply.github.com>
 ---
- app/include/zmk/usb.h |  9 ++++---
- app/src/usb.c         | 63 ++++++++++++++++++++++++++++++++++++++++---
- app/src/usb_hid.c     | 13 ++++-----
- 3 files changed, 71 insertions(+), 14 deletions(-)
+ app/include/zmk/usb.h |  9 +++---
+ app/src/usb.c         | 65 +++++++++++++++++++++++++++++++++++++++----
+ app/src/usb_hid.c     | 13 +++++----
+ 3 files changed, 72 insertions(+), 15 deletions(-)
 
 diff --git a/app/include/zmk/usb.h b/app/include/zmk/usb.h
 index 186243cb..61dc15a1 100644
@@ -60,7 +60,7 @@ index 186243cb..61dc15a1 100644
 +// request's result (0, or a negative errno when the host cannot be resumed).
 +int zmk_usb_user_activity_while_suspended(void);
 diff --git a/app/src/usb.c b/app/src/usb.c
-index 13e7b46e..fc570f07 100644
+index 13e7b46e..bd31f31b 100644
 --- a/app/src/usb.c
 +++ b/app/src/usb.c
 @@ -127,17 +127,72 @@ static bool user_wake_pending;
@@ -140,6 +140,15 @@ index 13e7b46e..fc570f07 100644
  }
  
  // Uptime of the last re-attach cycle (also stamped on entering host-asleep
+@@ -249,7 +304,7 @@ static void usb_reattach_work_cb(struct k_work *work) {
+ }
+ #else
+ void zmk_usb_report_send_result(bool ok) { ARG_UNUSED(ok); }
+-void zmk_usb_user_activity_while_suspended(void) {}
++int zmk_usb_user_activity_while_suspended(void) { return -ENOTSUP; }
+ #endif // CONFIG_ZMK_USB_SUSPEND_REATTACH
+ 
+ void usb_status_cb(enum usb_dc_status_code status, const uint8_t *params) {
 diff --git a/app/src/usb_hid.c b/app/src/usb_hid.c
 index b4eab790..662b92a7 100644
 --- a/app/src/usb_hid.c
