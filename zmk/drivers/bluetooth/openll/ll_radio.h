@@ -32,7 +32,10 @@ enum ll_radio_evt {
  *   len is 16 bits: slice 6b), end_tick = stimer
  *   tick at the END OF THE ACCESS ADDRESS (RX DMA trailer timestamp), used
  *   for anchor re-sync. Reported once per CRC-valid packet, in order; pdu is
- *   only valid during the callback.
+ *   only valid during the callback. Slice 6b Task 4 review: the connection
+ *   RX callbacks run once our response has started (the event's first
+ *   packet after a CPU hold in its RX IRQ, later ones from the TX IRQ or
+ *   the event's end), never during the RX -> TX turnaround (ll_radio.c).
  * - LL_RADIO_CONN_RX_CRC_ERR: a packet with a bad CRC (also counted in
  *   ll_radio_stats.rx_crc); pdu = NULL, len = 0, end_tick = its RX DMA
  *   timestamp. Reported in packet order with the CONN_RX callbacks, so the
@@ -42,9 +45,9 @@ enum ll_radio_evt {
  *   any entry of the event: the hardware received a CRC-valid packet it
  *   does not deliver, in practice the central's retransmission of a packet
  *   we already have (acked via NESN, not written to the RX FIFO). pdu =
- *   NULL, len = 0, end_tick = stimer tick at the IRQ. Like CONN_RX_CRC_ERR
- *   it tells the receiver that the event's first packet (the anchor) has
- *   passed, so a later chained packet does not re-anchor.
+ *   NULL, len = 0, end_tick = stimer tick when it is reported. Like
+ *   CONN_RX_CRC_ERR it tells the receiver that the event's first packet (the
+ *   anchor) has passed, so a later chained packet does not re-anchor.
  * - LL_RADIO_CONN_DONE: pdu = NULL, len = number of CRC-valid packets
  *   received in this event (0: first-RX timeout, nothing received),
  *   end_tick = stimer tick when the event ended. Exactly one per
@@ -162,6 +165,7 @@ struct ll_radio_stats {
 	uint32_t rx_ptr_odd;    /* RX IRQ without a new RX DMA ring entry, or ring overrun */
 	uint32_t rx_ptr_skip;   /* hw rx wptr jumped by more than the ring: entries skipped */
 	uint32_t fst_capped;    /* events whose RX window exceeded the 12-bit rx_timeout */
+	uint32_t holds;         /* first RX IRQs that held the CPU until our TX started */
 	uint8_t rx_wptr_max;    /* largest raw hw rx wptr seen (its counter width) */
 	/* First-exchange T_IFS from the TX timestamp (us, rounded) */
 	uint32_t tifs_le150;

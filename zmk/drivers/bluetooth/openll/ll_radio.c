@@ -46,6 +46,8 @@
 #include <zephyr/irq.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/sys/atomic.h>
+#include <zephyr/arch/riscv/csr.h>
+#include <zephyr/devicetree.h>
 #include "types.h"            /* u8/u16 used by ext_rf.h */
 #include "rf.h"
 #include "dma.h"
@@ -112,6 +114,9 @@ LOG_MODULE_DECLARE(openll, CONFIG_BT_HCI_DRIVER_LOG_LEVEL);
  * byte (the RX timestamp marks the end of the access address). */
 #define REG_TX_TIMESTAMP       0x80140850
 #define TIFS_CORR_TICKS        (27 * LL_TICKS_PER_US / 2)   /* 13.5 us */
+/* A response follows the central packet after T_IFS (150 us, the hardware
+ * turnaround); a larger estimate belongs to a later TX of the event. */
+#define TIFS_MAX_US            200
 #define CONN_IRQ_MASK          (FLD_RF_IRQ_RX | FLD_RF_IRQ_TX | FLD_RF_IRQ_RX_TIMEOUT | \
 				FLD_RF_IRQ_FIRST_TIMEOUT | FLD_RF_IRQ_CMD_DONE | \
 				FLD_RF_IRQ_FSM_TIMEOUT)
@@ -166,6 +171,7 @@ static struct {
 	 * (non-first) packet: benign, ll_conn only skips one re-anchor and
 	 * the T_IFS estimate skips that event (n_any != 1). */
 	uint8_t n_any;
+	bool nodata;            /* NODATA noted by the RX IRQ, reported by the next drain */
 	bool first_valid;       /* the event's first packet had a valid CRC */
 	uint32_t first_ts;
 	uint8_t first_len;
@@ -178,7 +184,7 @@ static struct ll_radio_mode rm;
 static atomic_t cnt_tx2rx, cnt_rx_ok, cnt_rx_crc, cnt_rx_timeout, cnt_rsp_tx, cnt_rsp_late;
 static atomic_t cnt_conn_events, cnt_conn_rx, cnt_conn_tx, cnt_conn_fto, cnt_conn_guard;
 static atomic_t cnt_rx_ptr_odd, cnt_tifs_le150, cnt_tifs_151_152, cnt_tifs_gt152, cnt_restores;
-static atomic_t cnt_rx_ptr_skip, cnt_fst_capped;
+static atomic_t cnt_rx_ptr_skip, cnt_fst_capped, cnt_holds;
 static uint8_t rx_wptr_max;      /* largest raw hardware rx wptr seen */
 static uint8_t guard_streak;     /* consecutive guard-ended events without a valid packet */
 static uint16_t restore_ptrs_before, restore_ptrs_after;
@@ -253,22 +259,107 @@ static void adv_isr(uint16_t st)
 
 /* ---- connection mode ISR ---- */
 
-/* RX IRQ: deliver every new RX DMA ring entry. The DMA writes entry
- * (rx wptr & 3) and advances the hardware wptr, so all entries between our
- * read index and the hardware wptr are new (normally exactly one; more if
- * the ISR was late). Each packet is handed to the callback (ll_conn copies
- * it into ll_rxq) before the ISR returns, i.e. long before the DMA wraps
- * around to its entry again (4 packets later, >= 4 * 230 us).
- * The hardware writes only new packets: a retransmission of the central
- * (its SN is not our NESN init) is acked but not written, so its RX IRQ
- * finds no new entry (counted in rx_ptr_odd; Task 10 device + sniffer).
- * When that is the event's first packet it was the anchor packet, and it
- * is reported as LL_RADIO_CONN_RX_NODATA so a chained packet does not
+/* CPU activity during the hardware RX -> TX turnaround moves our TX later
+ * (slice 6b Task 4 review). First-exchange T_IFS above 152 us on the
+ * device (TX timestamp monitor), central 251 B / 2120 us, fread + large
+ * SMP echoes, 7.5 ms interval:
+ * - RX processing in the RX IRQ (ll_conn, the copy of up to 257 bytes into
+ *   ll_rxq, the RX wake), as up to 0e2ac5d: 4..6 %;
+ * - the same processing after our TX had started (busy wait first): 0.4 %;
+ *   reading and clearing the IRQ status and reading the wptr in the
+ *   turnaround were harmless;
+ * - processing moved to the TX IRQ: 2.6..3.9 %, the rest from threads that
+ *   run on through the turnaround (decryption, copies, the host stack):
+ *   with the RX IRQ interrupting the idle thread every first exchange was
+ *   at <= 150 us, with a thread interrupted 4..9 % were above 152 us;
+ * - both (below): 0.2..0.3 % (0.5 % with 251 B / 415 us both ways).
+ * So the RX IRQ of the event's first packet holds the CPU until our
+ * response has started (hold_turnaround) and only then delivers it, and
+ * the RX IRQ of a later packet does no processing: those RX DMA ring
+ * entries are delivered from the TX IRQ of our response (or the end IRQs),
+ * long before the DMA wraps around to the entry again (4 packets later,
+ * >= 4 * 230 us). Moving the DMA buffers from DLM to ILM
+ * did not help (3.1 % with the processing at the TX IRQ).
+ *
+ * The DMA writes entry (rx wptr & 3) and advances the hardware wptr, so all
+ * entries between our read index and the hardware wptr are new (normally
+ * exactly one; more if the ISR was late). The hardware writes only new
+ * packets: a retransmission of the central (its SN is not our NESN init) is
+ * acked but not written, so its RX IRQ finds no new entry (counted in
+ * rx_ptr_odd; Task 10 device + sniffer). When that is the event's first
+ * packet it was the anchor packet, and it is reported (at the next
+ * drain) as LL_RADIO_CONN_RX_NODATA so a chained packet does not
  * re-anchor. The rx rptr is not written: advertising (one entry, mask 0)
- * never touched it either and kept receiving (Task 9: no FIFO-full rule).
- * Also called (rx_irq false) when the event ends, in case the wptr
- * advanced after an RX IRQ was handled. */
-static void conn_rx(bool rx_irq)
+ * never touched it either and kept receiving (Task 9: no FIFO-full rule). */
+
+/* The CPU hold: a busy wait on the CPU cycle counter (a CSR, no bus
+ * access) until HOLD_TO_US after the end of the central's packet, i.e.
+ * until our response (T_IFS 150 us) has started, at most HOLD_MAX_US. Only
+ * for the event's first packet (the chained exchanges are not held); it
+ * costs up to about 160 us of CPU per event with a received packet (about
+ * 2 % at a 7.5 ms interval under load, nothing in skipped events). */
+#define CPU_HZ        DT_PROP(DT_PATH(cpus, cpu_0), clock_frequency)
+#define CYC_PER_TICK  (CPU_HZ / (LL_TICKS_PER_US * 1000000))
+BUILD_ASSERT(CYC_PER_TICK >= 1 && CPU_HZ % (LL_TICKS_PER_US * 1000000) == 0,
+	     "CPU clock: a whole number of cycles per stimer tick");
+#define HOLD_TO_US    170
+#define HOLD_MAX_US   200
+
+static bool hold_turnaround(const uint8_t *p)
+{
+	uint8_t plen = p[DMA_RFRX_OFFSET_RFLEN];
+	uint32_t ts = ll_get_le32(&p[DMA_RFRX_OFFSET_TIME_STAMP(p)]);
+	int32_t left = (int32_t)(ts + RX_TS_TO_END_TICKS(plen) + HOLD_TO_US * LL_TICKS_PER_US -
+				 ll_radio_now());
+	uint32_t c0, n;
+
+	if (left > HOLD_MAX_US * LL_TICKS_PER_US) {
+		return false;   /* a bogus timestamp */
+	}
+	if (left <= 0) {
+		return true;    /* our TX has started already (late IRQ) */
+	}
+	atomic_inc(&cnt_holds);
+	c0 = csr_read(mcycle);
+	n = (uint32_t)left * CYC_PER_TICK;
+	while (csr_read(mcycle) - c0 < n) {
+	}
+	return true;
+}
+
+static void conn_rx_drain(void);
+
+/* RX IRQ: the anchor check above (one register read) and, for the event's
+ * first packet (CRC-valid, the only new entry), the CPU hold, after which
+ * the packet is delivered at once (our TX has started; waiting for the TX
+ * IRQ would delay it by up to a 2120 us response). Otherwise no
+ * processing. */
+static void conn_rx_irq(void)
+{
+	uint8_t hw = rf_get_rx_wptr() & RX_WPTR_MASK;
+
+	if (hw != cn.rx_sw) {
+		if (cn.n_any == 0 && hw == ((cn.rx_sw + 1) & RX_WPTR_MASK)) {
+			uint8_t *p = rx_entry(cn.rx_sw);
+
+			if (RF_BLE_PACKET_VALIDITY_CHECK(p) && hold_turnaround(p)) {
+				conn_rx_drain();
+			}
+		}
+		return;   /* entries waiting for the drain */
+	}
+	atomic_inc(&cnt_rx_ptr_odd);   /* RX IRQ without a new entry */
+	if (cn.n_any == 0) {
+		cn.n_any++;   /* the anchor packet, reported by the next drain */
+		cn.nodata = true;
+	}
+}
+
+/* TX IRQ, end IRQs and the guard: deliver the anchor retransmission noted
+ * by conn_rx_irq(), then every new RX DMA ring entry, in packet order. Each
+ * packet is handed to the callback (ll_conn copies it into ll_rxq) before
+ * the ISR returns. */
+static void conn_rx_drain(void)
 {
 	uint8_t raw = rf_get_rx_wptr();
 	uint8_t hw = raw & RX_WPTR_MASK;
@@ -277,14 +368,11 @@ static void conn_rx(bool rx_irq)
 	if (raw > rx_wptr_max) {
 		rx_wptr_max = raw;   /* counter width check (31 = 5 bits) */
 	}
+	if (cn.nodata) {
+		cn.nodata = false;
+		radio_cb(LL_RADIO_CONN_RX_NODATA, NULL, 0, ll_radio_now());
+	}
 	if (n == 0) {
-		if (rx_irq) {
-			atomic_inc(&cnt_rx_ptr_odd);   /* RX IRQ without a new entry */
-			if (cn.n_any == 0) {
-				cn.n_any++;   /* the anchor packet, see above */
-				radio_cb(LL_RADIO_CONN_RX_NODATA, NULL, 0, ll_radio_now());
-			}
-		}
 		return;
 	}
 	if (n > RING_N) {
@@ -343,6 +431,12 @@ static void conn_tx(void)
 		       (int32_t)cn.first_len * 8 * LL_TICKS_PER_US + TIFS_CORR_TICKS;
 	int32_t us = (tifs + LL_TICKS_PER_US / 2) / LL_TICKS_PER_US;
 
+	if (us > TIFS_MAX_US) {
+		/* not the response to the first packet: the TX IRQ of a long
+		 * response handled after the next TX latched its timestamp
+		 * (about 2.5 ms, seen once the drain moved to the TX IRQ) */
+		return;
+	}
 	if (us <= 150) {
 		atomic_inc(&cnt_tifs_le150);
 	} else if (us <= 152) {
@@ -376,7 +470,7 @@ static void conn_guard(void)
 	atomic_inc(&cnt_conn_guard);
 	rf_set_tx_rx_off_auto_mode();
 	rf_clr_irq_status(FLD_RF_IRQ_ALL);
-	conn_rx(false);
+	conn_rx_drain();
 	if (cn.n_valid != 0) {
 		guard_streak = 0;
 	} else if (guard_streak < UINT8_MAX) {
@@ -391,9 +485,11 @@ static void conn_isr(uint16_t st)
 		return;   /* stale IRQ after the event was ended (guard or earlier IRQ) */
 	}
 	if (st & FLD_RF_IRQ_RX) {
-		conn_rx(true);
+		conn_rx_irq();
 	}
 	if (st & FLD_RF_IRQ_TX) {
+		/* our response is on air: now the packet(s) it answered */
+		conn_rx_drain();
 		conn_tx();
 	}
 	if (st & CONN_END_IRQS) {
@@ -402,7 +498,7 @@ static void conn_isr(uint16_t st)
 		}
 		ll_sched_guard_cancel();
 		guard_streak = 0;
-		conn_rx(false);
+		conn_rx_drain();
 		conn_done();
 	}
 }
@@ -541,6 +637,7 @@ void ll_radio_get_stats(struct ll_radio_stats *s)
 	s->adv_guard = (uint32_t)atomic_get(&cnt_adv_guard);
 	s->rx_ptr_skip = (uint32_t)atomic_get(&cnt_rx_ptr_skip);
 	s->fst_capped = (uint32_t)atomic_get(&cnt_fst_capped);
+	s->holds = (uint32_t)atomic_get(&cnt_holds);
 	s->rx_wptr_max = rx_wptr_max;
 	s->restore_ptrs_before = restore_ptrs_before;
 	s->restore_ptrs_after = restore_ptrs_after;
@@ -693,6 +790,7 @@ void ll_radio_conn_event(uint8_t ch, uint32_t open_tick, uint32_t first_timeout_
 	cn.evt_open = true;
 	cn.n_valid = 0;
 	cn.n_any = 0;
+	cn.nodata = false;
 	cn.first_valid = false;
 	cn.tx_seen = false;
 	atomic_inc(&cnt_conn_events);

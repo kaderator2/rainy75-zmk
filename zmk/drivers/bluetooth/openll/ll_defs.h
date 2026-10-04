@@ -100,7 +100,11 @@ _Static_assert(LL_MAX_CONN >= 1 && LL_MAX_CONN <= 5, "LL_MAX_CONN must be 1..5")
 #ifndef LL_DLE_SUPP_OCTETS
 #define LL_DLE_SUPP_OCTETS    (LL_DATA_PDU_MAX < LL_DLE_MAX_OCTETS ? LL_DATA_PDU_MAX : LL_DLE_MAX_OCTETS)
 #endif
+/* Overridable for device tests (e.g. -DLL_DLE_SUPP_TIME=415: every link then
+ * runs at 251 B / 415 us both ways, as with a central that limits Time) */
+#ifndef LL_DLE_SUPP_TIME
 #define LL_DLE_SUPP_TIME      LL_DLE_TIME_1M(LL_DLE_SUPP_OCTETS)
+#endif
 _Static_assert(LL_DLE_SUPP_OCTETS >= LL_DLE_MIN_OCTETS && LL_DLE_SUPP_OCTETS <= LL_DLE_MAX_OCTETS,
 	       "LL_DLE_SUPP_OCTETS must be 27..251");
 
