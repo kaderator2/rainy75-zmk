@@ -23,7 +23,7 @@ config BT_HCI_B91_RX_PRIO
 choice BT_HCI_B91_CONTROLLER
 	prompt "B91 BLE controller implementation"
 	depends on BT_HCI_B91
-	default BT_HCI_B91_CTLR_BLOB
+	default BT_HCI_B91_CTLR_OPEN
 
 config BT_HCI_B91_CTLR_BLOB
 	bool "Telink binary controller (liblt_9518_zephyr.a)"
@@ -32,7 +32,7 @@ config BT_HCI_B91_CTLR_BLOB
 	  feature set, but the resulting image may not be redistributed.
 
 config BT_HCI_B91_CTLR_OPEN
-	bool "Open-source link layer (experimental)"
+	bool "Open-source link layer (default)"
 	help
 	  Our own peripheral-only link layer on hal_telink rf.c: legacy
 	  advertising, one connection (CSA#1, 1M PHY, peripheral latency),

@@ -1,6 +1,6 @@
 #!/bin/bash
 # Build ZMK firmware for Rainy 75 Pro
-# Usage: ./build.sh [-p] [-v] [-m] [-c] [-o] [-b] [-a] (--iso | --ansi) [--openll [--privacy]]
+# Usage: ./build.sh [-p] [-v] [-m] [-c] [-o] [-b] [-a] (--iso | --ansi) [--blob | --privacy]
 #   -p  pristine build (clean rebuild)
 #   -v  verbose output
 #   -m  build MCUboot bootloader
@@ -10,9 +10,11 @@
 #   -a  all: MCUboot + app + combined + OTA + bridge
 #   --iso / --ansi   physical layout, REQUIRED for any app build (no default)
 #                    e.g. ./build.sh -pa --iso   or   ./build.sh -pa --ansi
-#   --openll  use the open BLE link layer instead of the Telink blob (issue #13)
-#   --privacy with --openll only: resolvable private address (BT_PRIVACY). Every
-#             host must be paired again; the blob does not support it.
+#   (default) the open BLE link layer (issue #13), no binary blob is fetched or linked
+#   --blob    opt in to the proprietary Telink BLE blob instead (fetched on demand)
+#   --openll  accepted no-op alias (the open controller is the default)
+#   --privacy resolvable private address (BT_PRIVACY), open controller only. Every
+#             host must be paired again; refused with --blob.
 
 set -e
 
@@ -31,8 +33,8 @@ BUILD_APP=1
 LAYOUT=""             # "iso" or "ansi" — REQUIRED for app builds, no default
 ANSI_DTFLAG=""        # set when LAYOUT=ansi
 APP_CONF="$(pwd)/conf/app.conf"
-USE_OPENLL=0          # set by --openll
-USE_PRIVACY=0         # set by --privacy (needs --openll)
+USE_BLOB=0            # set by --blob (default: open controller)
+USE_PRIVACY=0         # set by --privacy (refused with --blob)
 
 # ── Apply upstream patches if needed ──────────────────────────
 #
@@ -84,12 +86,13 @@ ARGS=(); for a in "$@"; do case "$a" in
     --iso)    ARGS+=("-I");;
     --ansi)   ARGS+=("-A");;
     --openll) ARGS+=("-O");;
+    --blob)   ARGS+=("-B");;
     --privacy) ARGS+=("-Y");;
     *)        ARGS+=("$a");;
 esac; done
 set -- "${ARGS[@]}"
 
-while getopts "pvmcobaIAOY" opt; do
+while getopts "pvmcobaIAOYB" opt; do
     case $opt in
         p) PRISTINE="-p" ;;
         v) VERBOSE_CMAKE="-DCMAKE_VERBOSE_MAKEFILE=ON" ;;
@@ -100,9 +103,10 @@ while getopts "pvmcobaIAOY" opt; do
         a) BUILD_MCUBOOT=1; BUILD_COMBINED=1; BUILD_OTA=1; BUILD_BRIDGE=1; BUILD_APP=1 ;;
         I) [ "$LAYOUT" = ansi ] && { echo "Error: --iso and --ansi are mutually exclusive" >&2; exit 1; }; LAYOUT="iso" ;;
         A) [ "$LAYOUT" = iso  ] && { echo "Error: --iso and --ansi are mutually exclusive" >&2; exit 1; }; LAYOUT="ansi"; ANSI_DTFLAG="-DDTS_EXTRA_CPPFLAGS=-DRAINY75_ANSI -DCONFIG_RAINY_RGB_ANSI_LEDMAP=y" ;;
-        O) APP_CONF="$APP_CONF;$(pwd)/conf/openll.conf"; USE_OPENLL=1 ;;
+        O) echo "Note: --openll is a no-op, the open controller is the default." >&2 ;;
+        B) USE_BLOB=1 ;;
         Y) USE_PRIVACY=1 ;;
-        *) echo "Usage: $0 [-p] [-v] [-m] [-c] [-o] [-b] [-a] (--iso | --ansi) [--openll [--privacy]]"; exit 1 ;;
+        *) echo "Usage: $0 [-p] [-v] [-m] [-c] [-o] [-b] [-a] (--iso | --ansi) [--blob | --privacy]"; exit 1 ;;
     esac
 done
 
@@ -115,21 +119,24 @@ if [ "$BUILD_APP" -eq 1 ] && [ -z "$LAYOUT" ]; then
     exit 1
 fi
 
-# --privacy needs the open controller: the Telink blob has no LE Set Random
-# Address, so BT_PRIVACY hangs bt_enable() there.
-if [ "$USE_PRIVACY" -eq 1 ]; then
-    if [ "$USE_OPENLL" -eq 0 ]; then
-        echo "Error: --privacy requires --openll (the Telink blob does not support" >&2
-        echo "       LE Set Random Address). Use: ./build.sh --iso --openll --privacy" >&2
+# The open controller is the default: conf/openll.conf (controller choice, power
+# counters, long-PDU buffers) is part of its configuration. --blob keeps the
+# blob build exactly as before (no openll.conf, blob selected explicitly).
+if [ "$USE_BLOB" -eq 1 ]; then
+    if [ "$USE_PRIVACY" -eq 1 ]; then
+        echo "Error: --privacy cannot be combined with --blob (the Telink blob does not" >&2
+        echo "       support LE Set Random Address). Drop --blob to use the open controller." >&2
         exit 1
     fi
-    APP_CONF="$APP_CONF;$(pwd)/conf/privacy.conf"
+    APP_CONF="$APP_CONF;$(pwd)/conf/blob.conf"
+else
+    APP_CONF="$APP_CONF;$(pwd)/conf/openll.conf"
+    [ "$USE_PRIVACY" -eq 1 ] && APP_CONF="$APP_CONF;$(pwd)/conf/privacy.conf"
 fi
 
-# ── Fetch the (non-redistributable) Telink BLE blob if missing ──
-# Only the default app build links it. MCUboot, the bridge (CONFIG_BT=n) and
-# an --openll app build do not.
-if [ "$BUILD_APP" -eq 1 ] && [ "$USE_OPENLL" -eq 0 ]; then
+# ── Fetch the (non-redistributable) Telink BLE blob, only for --blob ──
+# MCUboot, the bridge (CONFIG_BT=n) and the default open app build do not link it.
+if [ "$BUILD_APP" -eq 1 ] && [ "$USE_BLOB" -eq 1 ]; then
     ./fetch_ble_blob.sh
 fi
 
