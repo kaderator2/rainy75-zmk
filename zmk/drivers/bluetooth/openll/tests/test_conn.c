@@ -2686,6 +2686,154 @@ static void test_instant_alarm_passed_anchor_not(void)
 	CHECK(cbs.reason == LL_ST_INSTANT_PASSED);
 }
 
+/* Review fix: the holdoff is decided once per link. A link far beyond the
+ * 32-bit tick wrap of its age (2^31 ticks = 134.2 s at 16 MHz, 2^32 =
+ * 268.4 s) still skips: every listened event after the holdoff is 5 events
+ * after the previous one, up to 290 s. */
+static void test_latency_holdoff_long_link(void)
+{
+	struct ll_csa1 ref;
+	uint32_t a = start_lat(4, 400, &ref, false);
+	uint64_t up_us = 0;
+	int gaps_bad = 0, listened = 0;
+	uint16_t last = e0;
+
+	while (up_us < 290000000ull && ll_conn_active(0)) {
+		uint16_t e;
+
+		fire_alarm();
+		e = ll_conn_event_counter(0);
+		if ((uint16_t)(e - last) != 5) {
+			gaps_bad++;
+		}
+		a += T(15000) * (uint16_t)(e - last);
+		last = e;
+		listened++;
+		rx(a, 0x01, 0);
+		done(1);
+		up_us = (uint64_t)listened * 75000u;   /* time since the holdoff */
+	}
+	CHECK(ll_conn_active(0));
+	CHECK(gaps_bad == 0);
+	CHECK(listened > 3800);   /* 290 s / 75 ms */
+	ll_conn_end(0, LL_ST_REMOTE_TERM);
+
+	/* latency 0 for 200 s (age wrapped negative at 134 s), then an update
+	 * to latency 4: it skips at once after the instant */
+	{
+		struct ll_conn_params p4 = {.interval = 12, .latency = 4, .timeout = 400};
+		uint16_t inst;
+		uint32_t ws;
+
+		a = start_lat(0, 400, &ref, false);
+		for (uint32_t k = 0; k < 200000u / 15u; k++) {
+			fire_alarm();
+			CHECK(ll_conn_event_counter(0) == (uint16_t)(e0 + 1 + k));
+			a += T(15000);
+			rx(a, 0x01, 0);
+			done(1);
+		}
+		inst = (uint16_t)(ll_conn_event_counter(0) + 6);
+		CHECK(ll_conn_update_at(0, inst, 1, 0, &p4) == 0);
+		while (ll_conn_event_counter(0) != inst) {
+			fire_alarm();
+			a += T(15000);
+			rx(a, 0x01, 0);
+			done(1);
+		}
+		/* the instant event: transmit window at the old anchor + 0 */
+		fire_alarm();
+		CHECK(cbs.p.latency == 4);
+		ws = a + T(15000) + T(100);
+		rx(ws, 0x01, 0);
+		done(1);
+		fire_alarm();
+		CHECK(ll_conn_event_counter(0) == (uint16_t)(inst + 5));
+		CHECK(rad.open == open_at(ws, 5));
+		done(0);
+		ll_conn_end(0, LL_ST_REMOTE_TERM);
+	}
+}
+
+/* Review minor: a skipped instant event whose alarm time is gone is planned
+ * late; when another link's event is running then, the arbiter refuses it
+ * and the link yields it (and the next ones) instead of ending with 0x28:
+ * the instant is applied, the link lives on. Link 0 (latency 4) and link 1
+ * (latency 0), anchors 7.5 ms apart. */
+static void test_instant_late_refused_by_arbiter(void)
+{
+	struct ll_connect_ind ci0 = mk_ci_link(0), ci1 = mk_ci_link(1);
+	const uint32_t t0 = 1000000;
+	struct ll_conn_stats sa, sb;
+	int last0 = -1, guard = 0;
+	bool skipping = false;
+	uint32_t sk0;
+
+	if (LL_MAX_CONN < 2) {
+		return;
+	}
+	reset_all(false);
+	ci0.latency = 4;
+	CHECK(ll_conn_start(&ci0, t0) == 0);
+	CHECK(ll_conn_start(&ci1, t0 + T(7500)) == 1);
+	ll_conn_get_stats(0, &sa);
+	sk0 = sa.skipped;
+	/* drive both links until link 0 has just planned a skip */
+	while (!skipping && guard++ < 1000) {
+		uint32_t anchor;
+		int e;
+
+		fire_alarm();
+		anchor = rad.open + T((rad.fst - LL_CONN_SYNC_US) / 2);
+		if (rad.aa == ci0.aa) {
+			e = ll_conn_event_counter(0);
+			last0 = e;
+		}
+		rx(anchor, 0x01, 0);
+		done(1);
+		if (rad.aa == ci0.aa) {
+			struct ll_conn_stats st;
+
+			ll_conn_get_stats(0, &st);
+			/* a skip from last0 + 1 is planned (counted at planning) */
+			skipping = st.skipped != sk0;
+		}
+	}
+	CHECK(skipping);
+	{
+		uint16_t inst = (uint16_t)(last0 + 1);
+		uint32_t a0 = rad.open + T((rad.fst - LL_CONN_SYNC_US) / 2);   /* last0 anchor */
+		uint32_t open1 = a0 + T(15000) - T(widen(300, 15000) + LL_CONN_RX_MARGIN_US);
+
+		/* link 1's event starts and runs (its cap covers inst's span) */
+		fire_alarm();
+		CHECK(rad.aa == ci1.aa);
+		ll_conn_get_stats(0, &sa);
+		/* inside inst's alarm lead, its anchor ahead: not passed */
+		now = open1 - T(LL_CONN_ARM_LEAD_US) + T(100);
+		CHECK(ll_conn_chmap_at(0, inst, no0to9) == 0);
+		CHECK(ll_conn_active(0) && cbs.disconnected == 0);
+		ll_conn_get_stats(0, &sb);
+		CHECK(sb.collisions - sa.collisions >= 1);   /* inst yielded */
+		/* link 1's event ends, link 0 follows on with the new map */
+		rx(rad.open + T((rad.fst - LL_CONN_SYNC_US) / 2), 0x01, 0);
+		done(1);
+		fire_alarm();
+		while (rad.aa == ci1.aa) {   /* link 1's next event comes first */
+			rx(rad.open + T((rad.fst - LL_CONN_SYNC_US) / 2), 0x01, 0);
+			done(1);
+			fire_alarm();
+		}
+		CHECK(rad.aa == ci0.aa);
+		CHECK((uint16_t)(ll_conn_event_counter(0) - inst) >= 1);
+		CHECK(rad.ch >= 10);   /* no0to9 is in force */
+		done(0);
+		CHECK(ll_conn_active(0) && ll_conn_active(1));
+	}
+	ll_conn_end(0, LL_ST_REMOTE_TERM);
+	ll_conn_end(1, LL_ST_REMOTE_TERM);
+}
+
 int main(void)
 {
 	test_first_events();
@@ -2737,5 +2885,7 @@ int main(void)
 	test_latency_holdoff();
 	test_latency_holdoff_per_link();
 	test_instant_alarm_passed_anchor_not();
+	test_latency_holdoff_long_link();
+	test_instant_late_refused_by_arbiter();
 	DONE();
 }

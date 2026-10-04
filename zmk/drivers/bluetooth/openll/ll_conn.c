@@ -95,6 +95,7 @@ struct ll_link {
 	bool rx_this_event;   /* a CRC-valid packet was received in this event */
 	bool first_seen;      /* the event's first packet (valid or not) was seen */
 	bool anchored;        /* the last closed event re-anchored (latency rule) */
+	bool holdoff_done;    /* LL_CONN_LATENCY_HOLDOFF_MS has passed (latched, see skip_count) */
 	struct ll_connect_ind ci;
 	struct ll_conn_params p;
 	uint32_t interval_ticks;
@@ -320,18 +321,25 @@ static uint16_t skip_count(struct ll_link *c)
 	uint32_t deadline;
 	int32_t room;
 
+	/* holdoff after connect: the first candidate's anchor must lie at
+	 * least LL_CONN_LATENCY_HOLDOFF_MS after the connection start. Latched
+	 * once passed: the 32-bit tick age wraps negative after 134 s, so it
+	 * must never be tested again on a long link. Tested first, at
+	 * every plan, so it latches within an event of the first second even
+	 * while latency is 0 (an update to latency > 0 may come much later). */
+	if (!c->holdoff_done) {
+		if ((int32_t)(anchor_of(c, c->counter) - c->start_tick) <
+		    (int32_t)US(LL_CONN_LATENCY_HOLDOFF_MS * 1000u)) {
+			return 0;
+		}
+		c->holdoff_done = true;
+	}
 	if (n == 0 || !c->anchored || c->term_local || ll_txq_backlog(c->id) != 0 ||
 	    (ops.busy && ops.busy(c->id))) {
 		return 0;
 	}
 	if (instant_within(c, c->chm_pending, c->chm_instant, n) ||
 	    instant_within(c, c->upd_pending, c->upd_instant, n)) {
-		return 0;
-	}
-	/* holdoff after connect: the first candidate's anchor must lie at
-	 * least LL_CONN_LATENCY_HOLDOFF_MS after the connection start */
-	if ((int32_t)(anchor_of(c, c->counter) - c->start_tick) <
-	    (int32_t)US(LL_CONN_LATENCY_HOLDOFF_MS * 1000u)) {
 		return 0;
 	}
 	/* supervision: listened anchor <= last RX + timeout - 2 * interval */
