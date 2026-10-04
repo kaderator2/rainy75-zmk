@@ -33,9 +33,12 @@
  *  - ll_txq_backlog(link) == 0 (nothing queued, nothing unacked);
  *  - ops.busy(link) is false (no LLCP procedure waiting) and no local
  *    termination is running;
- *  - no channel map / connection update instant is pending in the
- *    candidate window [next, next + latency] (the instant event is always
- *    listened to, so no skip at all until it was);
+ *  - no connection update instant is pending in the candidate window
+ *    [next, next + latency] (no skip at all until it was listened to);
+ *    a channel map instant in the window ends the skip at the instant
+ *    event, which is listened to (the map only changes the channel, so
+ *    the events before it are skipped with the old map; a re-plan to an
+ *    earlier event of the window makes the instant pending again);
  *  - the event just closed re-anchored (its first packet was received in
  *    the RX window): never skip after a miss, a late alarm or a first
  *    packet that was not the anchor;
@@ -218,8 +221,9 @@ uint16_t ll_conn_event_counter(uint8_t link);
  * No-op without a connection, during an event (the next plan sees the
  * backlog) or when that event is already the planned one. An instant in
  * the skip window re-plans to the first reachable event (see
- * ll_conn_event_counter), and no skip is planned while an instant is
- * pending within the latency window, so a kick never waits for an instant.
+ * ll_conn_event_counter); no skip is planned while an update instant is
+ * pending within the latency window, and a listen planned at a map instant
+ * can still be pulled earlier, so a kick never waits for an instant.
  * ISR-safe; takes ll_plat_lock(). */
 void ll_conn_kick(uint8_t link);
 

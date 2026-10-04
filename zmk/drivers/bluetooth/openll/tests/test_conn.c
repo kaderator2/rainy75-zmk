@@ -1437,14 +1437,20 @@ static void test_latency_no_skip_unsynced(void)
 	ll_conn_end(0, LL_ST_REMOTE_TERM);
 }
 
-/* A pending instant in or right after the skip window: no skip until the
- * instant event was listened to (it is applied there), then skipping
- * resumes with the new map. */
+/* A pending channel map instant in or right after the skip window: the
+ * skip ends at the instant event, which is listened to with the new map
+ * (debug 2026-10-04: listening to every event before it cost about five
+ * extra listens per LL_CHANNEL_MAP_IND, and a central with adaptive
+ * frequency hopping sends one every few seconds), then skipping resumes.
+ * A connection update instant still stops the skip until it was listened
+ * to (test_latency_instant_replan_reachable). */
 static void test_latency_instant_pending(void)
 {
+	struct ll_conn_stats s0, s1;
 	struct ll_csa1 ref;
 	uint32_t a;
 
+	ll_conn_get_stats(0, &s0);
 	a = start_lat(4, 400, &ref, false);
 	/* LL_CHANNEL_MAP_IND received in event EV(5), instant EV(8) */
 	fire_alarm();
@@ -1454,18 +1460,17 @@ static void test_latency_instant_pending(void)
 	rx(a, 0x01, 0);
 	CHECK(ll_conn_chmap_at(0, EV(8), no0to9) == 0);
 	done(1);
-	for (uint16_t e = 6; e <= 8; e++) {
-		if (e == 8) {
-			ll_csa1_set_map(&ref, no0to9);
-		}
-		fire_alarm();
-		CHECK(ll_conn_event_counter(0) == EV(e));
-		CHECK(rad.open == open_at(a, 1));
-		CHECK(rad.ch == ll_csa1_next(&ref));
-		a += T(15000);
-		rx(a, 0x01, 0);
-		done(1);
-	}
+	/* EV(6), EV(7) skipped with the old map, EV(8) listened, new map */
+	fire_alarm();
+	CHECK(ll_conn_event_counter(0) == EV(8));
+	CHECK(rad.open == open_at(a, 3));
+	(void)ref_skip(&ref, 2);
+	ll_csa1_set_map(&ref, no0to9);
+	CHECK(rad.ch == ll_csa1_next(&ref));
+	CHECK(rad.ch >= 10);
+	a += T(45000);
+	rx(a, 0x01, 0);
+	done(1);
 	/* instant passed: skip again (EV(9..12)), listen at EV(13) */
 	fire_alarm();
 	CHECK(ll_conn_event_counter(0) == EV(13));
@@ -1473,19 +1478,127 @@ static void test_latency_instant_pending(void)
 	CHECK(rad.ch == ref_skip(&ref, 5));
 	CHECK(rad.ch >= 10);
 	done(0);
+	ll_conn_get_stats(0, &s1);
+	/* EV(1..4), EV(6..7), EV(9..12) */
+	CHECK(s1.skipped - s0.skipped == 10);
 	ll_conn_end(0, LL_ST_REMOTE_TERM);
 
-	/* an instant exactly at the end of the window (EV(10)) also blocks */
+	/* an instant exactly at the end of the window (EV(10)): the whole
+	 * window is skipped, EV(10) is listened to with the new map */
 	a = start_lat(4, 400, &ref, false);
 	fire_alarm();
 	CHECK(ll_conn_event_counter(0) == EV(5));
+	CHECK(rad.ch == ref_skip(&ref, 5));
 	a += T(75000);
 	rx(a, 0x01, 0);
 	CHECK(ll_conn_chmap_at(0, EV(10), no0to9) == 0);
 	done(1);
 	fire_alarm();
+	CHECK(ll_conn_event_counter(0) == EV(10));
+	CHECK(rad.open == open_at(a, 5));
+	(void)ref_skip(&ref, 4);
+	ll_csa1_set_map(&ref, no0to9);
+	CHECK(rad.ch == ll_csa1_next(&ref));
+	done(0);
+	ll_conn_end(0, LL_ST_REMOTE_TERM);
+
+	/* an instant beyond the window (EV(12)): a full skip to EV(10), then
+	 * EV(11) skipped and EV(12) listened to with the new map */
+	a = start_lat(4, 400, &ref, false);
+	fire_alarm();
+	CHECK(ll_conn_event_counter(0) == EV(5));
+	CHECK(rad.ch == ref_skip(&ref, 5));
+	a += T(75000);
+	rx(a, 0x01, 0);
+	CHECK(ll_conn_chmap_at(0, EV(12), no0to9) == 0);
+	done(1);
+	fire_alarm();
+	CHECK(ll_conn_event_counter(0) == EV(10));
+	CHECK(rad.ch == ref_skip(&ref, 5));
+	a += T(75000);
+	rx(a, 0x01, 0);
+	done(1);
+	fire_alarm();
+	CHECK(ll_conn_event_counter(0) == EV(12));
+	CHECK(rad.open == open_at(a, 2));
+	(void)ref_skip(&ref, 1);
+	ll_csa1_set_map(&ref, no0to9);
+	CHECK(rad.ch == ll_csa1_next(&ref));
+	done(0);
+	ll_conn_end(0, LL_ST_REMOTE_TERM);
+}
+
+/* The listen planned at a channel map instant with events skipped before
+ * it: a kick (or a dodge) to an earlier event of the window must not lose
+ * the instant. The earlier event uses the old map, the instant event is
+ * then planned again with the new one. */
+static void test_latency_chm_instant_kick(void)
+{
+	struct ll_csa1 ref;
+	uint32_t a;
+
+	a = start_lat(4, 400, &ref, false);
+	fire_alarm();
+	CHECK(ll_conn_event_counter(0) == EV(5));
+	CHECK(rad.ch == ref_skip(&ref, 5));
+	a += T(75000);
+	rx(a, 0x01, 0);
+	CHECK(ll_conn_chmap_at(0, EV(9), no0to9) == 0);
+	done(1);
+	/* the listen at the instant EV(9) is planned; data queued: EV(6) */
+	ll_conn_kick(0);
+	fire_alarm();
 	CHECK(ll_conn_event_counter(0) == EV(6));
 	CHECK(rad.open == open_at(a, 1));
+	CHECK(rad.ch == ll_csa1_next(&ref));
+	a += T(15000);
+	rx(a, 0x01, 0);
+	done(1);
+	/* EV(7), EV(8) skipped (old map), EV(9) with the new map */
+	fire_alarm();
+	CHECK(ll_conn_event_counter(0) == EV(9));
+	CHECK(rad.open == open_at(a, 3));
+	(void)ref_skip(&ref, 2);
+	ll_csa1_set_map(&ref, no0to9);
+	CHECK(rad.ch == ll_csa1_next(&ref));
+	a += T(45000);
+	rx(a, 0x01, 0);
+	done(1);
+	/* the map stays: EV(14) */
+	fire_alarm();
+	CHECK(ll_conn_event_counter(0) == EV(14));
+	CHECK(rad.ch == ref_skip(&ref, 5));
+	CHECK(rad.ch >= 10);
+	done(0);
+	ll_conn_end(0, LL_ST_REMOTE_TERM);
+
+	/* kick into the window twice before the instant event: EV(6) is
+	 * gone already, the kick lands on EV(7) (old map), the instant EV(9)
+	 * follows with the new map */
+	a = start_lat(4, 400, &ref, false);
+	fire_alarm();
+	CHECK(ll_conn_event_counter(0) == EV(5));
+	CHECK(rad.ch == ref_skip(&ref, 5));
+	a += T(75000);
+	rx(a, 0x01, 0);
+	CHECK(ll_conn_chmap_at(0, EV(9), no0to9) == 0);
+	done(1);
+	now = a + T(16000);
+	ll_conn_kick(0);
+	ll_conn_kick(0);
+	fire_alarm();
+	CHECK(ll_conn_event_counter(0) == EV(7));
+	CHECK(rad.open == open_at(a, 2));
+	CHECK(rad.ch == ref_skip(&ref, 2));
+	a += T(30000);
+	rx(a, 0x01, 0);
+	done(1);
+	fire_alarm();
+	CHECK(ll_conn_event_counter(0) == EV(9));
+	CHECK(rad.open == open_at(a, 2));
+	(void)ref_skip(&ref, 1);
+	ll_csa1_set_map(&ref, no0to9);
+	CHECK(rad.ch == ll_csa1_next(&ref));
 	done(0);
 	ll_conn_end(0, LL_ST_REMOTE_TERM);
 }
@@ -1801,26 +1914,29 @@ static void test_latency_instant_replan_reachable(void)
 	int cancels;
 
 	/* channel map instant 4 while the skip to event 5 is planned:
-	 * listen at event 1 (old map), 2, 3, then 4 with the new map */
+	 * listen at event 1 (old map), skip 2 and 3, then 4 with the new map */
 	ll_conn_get_stats(0, &s0);
 	a0 = start_lat(4, 400, &ref, false);
 	CHECK(ll_conn_chmap_at(0, EV(4), no0to9) == 0);
 	cancels = sch.cancels;
 	ll_conn_kick(0);   /* already the next event: no-op */
 	CHECK(sch.cancels == cancels);
-	a = a0;
-	for (uint16_t e = 1; e <= 4; e++) {
-		fire_alarm();
-		CHECK(ll_conn_event_counter(0) == EV(e));
-		CHECK(rad.open == open_at(a, 1));
-		if (e == 4) {
-			ll_csa1_set_map(&ref, no0to9);
-		}
-		CHECK(rad.ch == ll_csa1_next(&ref));
-		a += T(15000);
-		rx(a, 0x01, 0);
-		done(1);
-	}
+	fire_alarm();
+	CHECK(ll_conn_event_counter(0) == EV(1));
+	CHECK(rad.open == open_at(a0, 1));
+	CHECK(rad.ch == ll_csa1_next(&ref));
+	a = a0 + T(15000);
+	rx(a, 0x01, 0);
+	done(1);
+	fire_alarm();
+	CHECK(ll_conn_event_counter(0) == EV(4));
+	CHECK(rad.open == open_at(a, 3));
+	(void)ref_skip(&ref, 2);
+	ll_csa1_set_map(&ref, no0to9);
+	CHECK(rad.ch == ll_csa1_next(&ref));
+	a += T(45000);
+	rx(a, 0x01, 0);
+	done(1);
 	CHECK(rad.ch >= 10);
 	/* instant passed: skipping resumes (events 5..8, listen at 9) */
 	fire_alarm();
@@ -1829,7 +1945,7 @@ static void test_latency_instant_replan_reachable(void)
 	CHECK(rad.ch == ref_skip(&ref, 5));
 	done(0);
 	ll_conn_get_stats(0, &s1);
-	CHECK(s1.skipped - s0.skipped == 4);   /* events 5..8 only */
+	CHECK(s1.skipped - s0.skipped == 6);   /* events 2, 3, 5..8 */
 	ll_conn_end(0, LL_ST_REMOTE_TERM);
 
 	/* event 1 already gone: the re-plan lands on event 2, and queued data
@@ -2326,15 +2442,17 @@ static void test_csa2_latency(void)
 	rx(a1 + T(15000), 0x01, 0);
 	done(1);
 	a1 += T(15000);
-	/* a channel map instant at event 9: the events up to the instant are
-	 * listened to (no skip over an instant), event 9 and later use the
-	 * new map, then skipping resumes (14) */
+	/* a channel map instant at event 9 inside the planned window: the
+	 * listen moves to the first reachable event 7 (old map), event 8 is
+	 * skipped, event 9 is listened to with the new map, then skipping
+	 * resumes (14) */
 	CHECK(ll_conn_chmap_at(0, EV(9), nine) == 0);
-	for (uint16_t k = 7; k <= 9; k++) {
+	for (uint16_t k = 7; k <= 9; k += 2) {
 		fire_alarm();
 		CHECK(ll_conn_event_counter(0) == EV(k));
 		CHECK(rad.ch == csa2_ch(CSA2_CHID, EV(k), k >= 9 ? nine : all37));
-		a1 += T(15000);
+		CHECK(rad.open == open_at(a1, k == 7 ? 1 : 2));
+		a1 += T(k == 7 ? 15000 : 30000);
 		rx(a1, 0x01, 0);
 		done(1);
 	}
@@ -2866,6 +2984,7 @@ int main(void)
 	test_latency_refused_busy_term();
 	test_latency_no_skip_unsynced();
 	test_latency_instant_pending();
+	test_latency_chm_instant_kick();
 	test_latency_instant_in_window();
 	test_latency_supervision();
 	test_kick();

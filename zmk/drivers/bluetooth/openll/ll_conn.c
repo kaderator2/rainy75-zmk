@@ -140,6 +140,11 @@ struct ll_link {
 	bool chm_pending;
 	uint16_t chm_instant;
 	uint8_t chm[5];
+	/* the map instant was applied at the planned event of a skip window
+	 * (skip_n > 0, see skip_count): csa_base still holds the old map, so a
+	 * re-plan to another event of the window first makes it pending again
+	 * (chm_repend) and the instant is applied again only at its own event */
+	bool chm_win;
 	/* termination */
 	bool term_local;
 	bool term_acked;
@@ -279,10 +284,12 @@ static uint32_t open_of(const struct ll_link *c, uint16_t counter, uint32_t *wid
 static void plan_event(struct ll_link *c)
 {
 	uint32_t widen, margin;
+	bool chm_due = c->chm_pending && c->chm_instant == c->counter;
 
 	if (apply_instants(c)) {
 		c->inst_evt = true;
 		c->inst_counter = c->counter;
+		c->chm_win = chm_due && c->skip_n > 0;
 	} else if (c->inst_evt && c->inst_counter != c->counter) {
 		/* planned past the instant event (re-plans never go back
 		 * before it, see replan_to): forget it, so a counter wrap
@@ -305,6 +312,17 @@ static void plan_event(struct ll_link *c)
 	margin = c->win_us ? LL_CONN_WIN_MARGIN_US : LL_CONN_RX_MARGIN_US;
 	c->fst_us = c->win_us + 2u * (widen + margin) + LL_CONN_SYNC_US;
 	c->planned = true;
+}
+
+/* Before re-planning to another event of the window (set_window,
+ * replan_to): a map instant applied at the planned event is pending again,
+ * as csa_base (restored next) holds the map before it. */
+static void chm_repend(struct ll_link *c)
+{
+	if (c->chm_win) {
+		c->chm_win = false;
+		c->chm_pending = true;
+	}
 }
 
 /* An instant in [counter, counter + n]: its event must be listened to. */
@@ -338,9 +356,12 @@ static uint16_t skip_count(struct ll_link *c)
 	    (ops.busy && ops.busy(c->id))) {
 		return 0;
 	}
-	if (instant_within(c, c->chm_pending, c->chm_instant, n) ||
-	    instant_within(c, c->upd_pending, c->upd_instant, n)) {
+	if (instant_within(c, c->upd_pending, c->upd_instant, n)) {
 		return 0;
+	}
+	if (instant_within(c, c->chm_pending, c->chm_instant, n)) {
+		/* listen at the map instant, skip the events before it */
+		n = (uint16_t)(c->chm_instant - c->counter);
 	}
 	/* supervision: listened anchor <= last RX + timeout - 2 * interval */
 	deadline = c->sup_tick + c->sup_ticks - 2u * c->interval_ticks;
@@ -412,6 +433,7 @@ static int request(struct ll_link *c)
  * idempotent here). Not requested yet. */
 static void set_window(struct ll_link *c, uint16_t k)
 {
+	chm_repend(c);
 	c->csa = c->csa_base;
 	for (uint16_t i = 0; i < k; i++) {
 		(void)ll_csa1_next(&c->csa);
@@ -425,6 +447,7 @@ static void set_window(struct ll_link *c, uint16_t k)
  * yield or a kick, see replan_to(). */
 static void rebase(struct ll_link *c)
 {
+	c->chm_win = false;
 	c->skip_base = c->counter;
 	c->skip_n = 0;
 	c->csa_base = c->csa_evt;
@@ -447,6 +470,7 @@ static void yield_on(struct ll_link *c, bool commit)
 			ll_plat_unlock(key);
 		}
 		commit = true;
+		c->chm_win = false;
 		c->counter++;
 		c->skip_base = c->counter;
 		c->skip_n = 0;
@@ -491,8 +515,10 @@ static void place_latest(struct ll_link *c, uint16_t lo, uint16_t hi)
 /* Plan the next event, skipping idle events where allowed. */
 static void plan(struct ll_link *c)
 {
-	uint16_t n = skip_count(c);
+	uint16_t n;
 
+	c->chm_win = false;
+	n = skip_count(c);
 	c->skip_base = c->counter;
 	c->csa_base = c->csa;
 	c->skip_n = n;
@@ -507,12 +533,16 @@ static void plan(struct ll_link *c)
  * target is the new skip base with skip_n = 0: the instants applied at it
  * changed the timing and the map, so no later re-plan may go back to an
  * earlier event (csa_base is the state after them, see plan_event). This
- * keeps the invariant that skip_n > 0 only while no instant is applied at
- * the planned event, which ll_conn_kick() / first_reachable() rely on. */
+ * keeps the invariant that skip_n > 0 only while no timing instant is
+ * applied at the planned event, which ll_conn_kick() / first_reachable()
+ * rely on; the one exception, a map instant at the planned event of a
+ * window (skip_count), changes no timing and is made pending again by
+ * chm_repend() before any re-plan inside the window. */
 static void replan_to(struct ll_link *c, uint16_t target)
 {
 	uint16_t k = (uint16_t)(target - c->skip_base);
 
+	chm_repend(c);
 	c->planned = false;
 	c->csa = c->csa_base;
 	for (uint16_t i = 0; i < k; i++) {
@@ -529,9 +559,10 @@ static void replan_to(struct ll_link *c, uint16_t target)
  * alarm (LL_CONN_ARM_LEAD_US before its RX opens) is still ahead; skip_n
  * if none before the planned one is. Caller holds the lock, c->planned.
  * Only meaningful with skip_n > 0, i.e. on pre-instant timing state: plan()
- * never skips with an instant pending in the window and replan_to() sets
- * skip_n = 0 once it applied one, so the timing and map used here are
- * those of every event in [skip_base, counter]. */
+ * never skips with an update instant pending in the window (a map instant
+ * may end it, but changes no timing) and replan_to() sets skip_n = 0 once
+ * it applied one, so the timing used here is that of every event in
+ * [skip_base, counter]. */
 static uint16_t first_reachable(const struct ll_link *c)
 {
 	uint32_t now = ll_radio_now();
@@ -917,11 +948,11 @@ static int check_instant(struct ll_link *c, uint16_t instant)
  * instant if that comes first (check_instant() passed, so the instant's
  * anchor is still ahead; when its alarm time is gone too, the instant
  * event is planned with an alarm in the past). A target before the instant
- * applies no instant there, and plan() refuses to skip while the instant
- * lies within the latency window, so every event up to and including the
- * instant is listened to. Re-planning to the instant itself would leave
- * skip_n = 0 at the instant event, so a kick in between could not pull the
- * listen earlier and TX would wait for the instant. */
+ * applies no instant there; from it plan() listens to every event up to an
+ * update instant, or skips to a map instant (skip_count). Re-planning to
+ * the instant itself would leave skip_n = 0 at the instant event, so a
+ * kick in between could not pull the listen earlier and TX would wait for
+ * the instant. */
 static void instant_replan(struct ll_link *c, uint16_t instant)
 {
 	uint16_t d = (uint16_t)(instant - c->skip_base);
