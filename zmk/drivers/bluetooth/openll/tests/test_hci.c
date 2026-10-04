@@ -795,6 +795,40 @@ static void test_set_random_addr(void)
 	CHECK(unknown_calls == u0);
 }
 
+/* Slice 7: Host Number Of Completed Packets (0x0C35). Zephyr's host with
+ * CONFIG_BT_HCI_ACL_FLOW_CONTROL sends one per received ACL packet even when
+ * it could not enable flow control, and logs "Unexpected
+ * HOST_NUM_COMPLETED_PACKETS" for any Command Complete. Host flow control is
+ * not supported, so the command is a silent no-op: no event at all, not an
+ * unknown opcode, whatever the parameters. */
+static void test_host_ncp(void)
+{
+	static const uint8_t one[5] = {0x01, 0x00, 0x00, 0x01, 0x00};
+	static const uint8_t two[9] = {0x02, 0x00, 0x00, 0x03, 0x00, 0x01, 0x00, 0x01, 0x00};
+	int u0 = unknown_calls, e0 = evt_count;
+
+	cmd(0x0C35, one, sizeof(one));
+	CHECK(evt_len == 0 && evt_count == e0);
+	cmd(0x0C35, two, sizeof(two));
+	CHECK(evt_len == 0 && evt_count == e0);
+	/* malformed or for a handle that is no link: still nothing */
+	cmd(0x0C35, one, 3);
+	CHECK(evt_len == 0 && evt_count == e0);
+	cmd(0x0C35, NULL, 0);
+	CHECK(evt_len == 0 && evt_count == e0);
+	CHECK(unknown_calls == u0);
+	/* the next command is answered normally (ncmd untouched) */
+	cmd(0x1001, NULL, 0);
+	CHECK(is_cc(0x1001, LL_ST_SUCCESS));
+	/* consistent with Read Local Supported Commands: none of the host flow
+	 * control commands is advertised (octet 10 bit 5 Set Controller To
+	 * Host Flow Control, which Zephyr checks before enabling it, bit 6
+	 * Host Buffer Size, bit 7 Host Number Of Completed Packets) */
+	cmd(0x1002, NULL, 0);
+	CHECK(is_cc(0x1002, LL_ST_SUCCESS));
+	CHECK((evt[7 + 10] & 0xE0) == 0);
+}
+
 int main(void)
 {
 	test_init_requires_handle_valid();
@@ -957,6 +991,7 @@ int main(void)
 	test_handles();
 	test_dle_phy_cmds();
 	test_set_random_addr();
+	test_host_ncp();
 
 	DONE();
 }

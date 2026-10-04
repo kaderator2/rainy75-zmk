@@ -13,6 +13,7 @@
 #define OP_DISCONNECT            OP(0x01, 0x0006)
 #define OP_SET_EVENT_MASK        OP(0x03, 0x0001)
 #define OP_RESET                 OP(0x03, 0x0003)
+#define OP_HOST_NUM_COMPLETED    OP(0x03, 0x0035)
 #define OP_READ_LOCAL_VERSION    OP(0x04, 0x0001)
 #define OP_READ_LOCAL_CMDS       OP(0x04, 0x0002)
 #define OP_READ_LOCAL_FEATURES   OP(0x04, 0x0003)
@@ -358,6 +359,16 @@ void ll_hci_cmd(const uint8_t *cmd, uint16_t len)
 	op = ll_get_le16(cmd);
 	plen = cmd[2];
 	p = &cmd[3];
+	if (op == OP_HOST_NUM_COMPLETED) {
+		/* Host Number Of Completed Packets (7.3.40): no event in normal
+		 * operation. Host flow control is not supported (Read Local
+		 * Supported Commands has no Set Controller To Host Flow Control,
+		 * octet 10 bit 5, so Zephyr never enables it), but Zephyr with
+		 * CONFIG_BT_HCI_ACL_FLOW_CONTROL still sends one per received ACL
+		 * packet and logs any Command Complete for it as unexpected. A
+		 * silent no-op, whatever the parameters. */
+		return;
+	}
 	if (plen != len - 3) {
 		status_only(op, LL_ST_INVALID_PARAM);
 		return;
