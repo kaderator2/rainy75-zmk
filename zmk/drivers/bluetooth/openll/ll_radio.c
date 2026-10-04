@@ -31,13 +31,6 @@
  * - Per event: channel, AA, CRC, TX settle 86 us, first-RX timeout, command
  *   schedule tick = RX open - 80 us RX settle, ll_cmd = BRX (0x82). The SN
  *   init bit is programmed by ll_txq before every BRX.
- * - Slice 7 Task 2: the connection-mode registers (conn_regs) and the
- *   AA/CRC are written only when they changed (ll_radio_cache.h, host-
- *   tested). Every other writer of those registers (adv channel, adv TX,
- *   adv_enter, baseband restore, connection setup, quiesce, init) notes
- *   itself, so the next connection event writes them again. The slice 6a
- *   per-event rewrite moved about 10 % of the first exchanges from <= 150
- *   to 151-152 us T_IFS.
  * - The event ends with CMD_DONE, FIRST_TIMEOUT (nothing received) or
  *   RX_TIMEOUT; a guard alarm on the stimer ends it if none of them comes.
  */
@@ -55,7 +48,6 @@
 #include "ll_defs.h"
 #include "ll_radio.h"
 #include "ll_radio_mode.h"
-#include "ll_radio_cache.h"
 #include "ll_sched.h"
 
 LOG_MODULE_DECLARE(openll, CONFIG_BT_HCI_DRIVER_LOG_LEVEL);
@@ -169,8 +161,6 @@ static struct {
 /* Adv snapshot of ll_ctrl_1 / rxtcrcpkt and "connection setup done"
  * (ll_radio_mode.h, host-tested). */
 static struct ll_radio_mode rm;
-/* Which per-event connection registers hold their values already. */
-static struct ll_radio_cache rc;
 
 static atomic_t cnt_tx2rx, cnt_rx_ok, cnt_rx_crc, cnt_rx_timeout, cnt_rsp_tx, cnt_rsp_late;
 static atomic_t cnt_conn_events, cnt_conn_rx, cnt_conn_tx, cnt_conn_fto, cnt_conn_guard;
@@ -440,8 +430,6 @@ int ll_radio_init(ll_radio_cb_t cb)
 	radio_cb = cb;
 	mode = MODE_ADV;
 	ll_radio_mode_reset(&rm);
-	ll_radio_cache_reset(&rc);
-	ll_radio_cache_note(&rc, LL_RADIO_W_INIT);
 	hw_init_adv(true);
 	cn.rx_sw = rf_get_rx_wptr() & RX_WPTR_MASK;
 	IRQ_CONNECT(RF_IRQ, 1, rf_isr, NULL, 0);
@@ -456,7 +444,6 @@ uint32_t ll_radio_now(void)
 
 void ll_radio_set_adv_channel(uint8_t ch)
 {
-	ll_radio_cache_note(&rc, LL_RADIO_W_ADV_CHANNEL);
 	rf_set_tx_rx_off_auto_mode();
 	rf_set_ble_chn(ch);          /* also sets the whitening seed */
 	rf_set_ble_access_code_adv();
@@ -490,7 +477,6 @@ void ll_radio_tx_then_rx(const uint8_t *pdu, uint8_t len, uint32_t start_tick,
 	rf_tx_settle_us(TX_SETTLE_ADV_US);
 	rf_ble_set_rx_timeout(rx_window_us);
 	atomic_inc(&cnt_tx2rx);
-	ll_radio_cache_note(&rc, LL_RADIO_W_ADV_TX);   /* DMA0 source */
 	adv_open = true;
 	rf_start_stx2rx(tx_buf, start_tick);
 	ll_sched_guard_at(start_tick + ADV_GUARD_US * LL_TICKS_PER_US, adv_guard);
@@ -514,7 +500,6 @@ bool ll_radio_tx_rsp_at(uint32_t tick)
 	rsp_in_flight = true;
 	rf_tx_settle_us(TX_SETTLE_RSP_US);
 	atomic_inc(&cnt_rsp_tx);
-	ll_radio_cache_note(&rc, LL_RADIO_W_ADV_TX);   /* DMA0 source */
 	adv_open = true;
 	rf_start_stx(rsp_buf, trigger_tick);
 	ll_sched_guard_at(trigger_tick + ADV_RSP_GUARD_US * LL_TICKS_PER_US, adv_guard);
@@ -557,7 +542,6 @@ void ll_radio_stop(void)
 void ll_radio_quiesce(void)
 {
 	ll_radio_stop();
-	ll_radio_cache_note(&rc, LL_RADIO_W_QUIESCE);
 	rf_clr_irq_mask(FLD_RF_IRQ_ALL);
 	rf_clr_irq_status(FLD_RF_IRQ_ALL);
 	irq_disable(RF_IRQ);
@@ -572,14 +556,9 @@ static uint8_t *ring_entry(uint8_t idx)
 
 /* The connection values of the registers that an advertising event (or
  * ll_radio_adv_restore) changes. The SN/NESN init bits of ll_ctrl_1 are
- * kept: ll_txq programs them per event for the link (before or after this).
- * Skipped while they hold the connection values (ll_radio_cache.h); mode
- * is checked as well, so a missed invalidation in adv mode still writes. */
+ * kept: ll_txq programs them per event for the link (before or after this). */
 static void conn_regs(void)
 {
-	if (!ll_radio_cache_conn_regs(&rc) && mode == MODE_CONN) {
-		return;
-	}
 	reg_rf_rxtcrcpkt = rm.adv_rxtcrc | FLD_RF_EN_TS_TX;   /* T_IFS monitor */
 	reg_rf_ll_ctrl_1 = (rm.adv_ctrl1 & ~(FLD_RF_BRX_SN_INIT | FLD_RF_BRX_NESN_INIT)) |
 			   (reg_rf_ll_ctrl_1 & (FLD_RF_BRX_SN_INIT | FLD_RF_BRX_NESN_INIT)) |
@@ -598,9 +577,6 @@ void ll_radio_conn_init(void)
 	static const uint8_t empty_pdu[2] = {LL_LLID_CONT, 0};
 	unsigned int key = irq_lock();
 
-	/* A new link: rewrite everything at its first event (also when the
-	 * setup below is a no-op; costs one rewrite per connection). */
-	ll_radio_cache_note(&rc, LL_RADIO_W_CONN_INIT);
 	/* Done since the last ll_radio_adv_restore() (an adv-guard restore
 	 * keeps it): other links may be live, possibly with an event on air,
 	 * so nothing here may touch the FSM, the SN/NESN state, the guard
@@ -637,14 +613,13 @@ void ll_radio_conn_select(uint32_t aa, uint32_t crc_init)
 	 * the hardware by ll_radio_conn_event() */
 	cn.aa_reg = __builtin_bswap32(aa);
 	cn.crc_init = crc_init;
-	conn_regs();   /* skipped when unchanged */
+	conn_regs();
 }
 
 void ll_radio_adv_enter(void)
 {
 	unsigned int key = irq_lock();
 
-	ll_radio_cache_note(&rc, LL_RADIO_W_ADV_ENTER);
 	rf_set_tx_rx_off_auto_mode();
 	cn.evt_open = false;
 	rsp_in_flight = false;
@@ -682,10 +657,8 @@ void ll_radio_conn_event(uint8_t ch, uint32_t open_tick, uint32_t first_timeout_
 
 	rf_set_tx_rx_off_auto_mode();
 	rf_set_ble_chn((signed char)ch);
-	if (ll_radio_cache_aa_crc(&rc, cn.aa_reg, cn.crc_init)) {
-		rf_set_ble_access_code_value(cn.aa_reg);
-		rf_set_ble_crc_value(cn.crc_init);
-	}
+	rf_set_ble_access_code_value(cn.aa_reg);
+	rf_set_ble_crc_value(cn.crc_init);
 	rf_tx_settle_us(TX_SETTLE_CONN_US);
 	/* rf_start_brx() would write 0x0fffffff to the first timeout: the
 	 * register sequence is done here with a bounded window instead.
@@ -722,13 +695,11 @@ uint8_t ll_radio_conn_guard_streak(void)
 
 void ll_radio_conn_set_sn_init(uint8_t sn)
 {
-	ll_radio_cache_note(&rc, LL_RADIO_W_SN_NESN);   /* not cached: no-op */
 	reg_rf_ll_ctrl_1 = (reg_rf_ll_ctrl_1 & ~FLD_RF_BRX_SN_INIT) | (sn ? FLD_RF_BRX_SN_INIT : 0);
 }
 
 void ll_radio_conn_set_nesn_init(uint8_t nesn)
 {
-	ll_radio_cache_note(&rc, LL_RADIO_W_SN_NESN);   /* not cached: no-op */
 	reg_rf_ll_ctrl_1 = (reg_rf_ll_ctrl_1 & ~FLD_RF_BRX_NESN_INIT) |
 			   (nesn ? FLD_RF_BRX_NESN_INIT : 0);
 }
@@ -792,7 +763,6 @@ static void baseband_restore(bool keep_conn)
 	cn.evt_open = false;
 	rf_set_tx_rx_off_auto_mode();
 	restore_ptrs_before = tx_ptrs();
-	ll_radio_cache_note(&rc, LL_RADIO_W_RESTORE);
 	rf_baseband_reset();
 	if (ll_radio_mode_restore(&rm, keep_conn, &c1, &rx)) {
 		reg_rf_ll_ctrl_1 = c1;

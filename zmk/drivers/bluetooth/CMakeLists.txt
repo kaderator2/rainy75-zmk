@@ -14,7 +14,6 @@ if(CONFIG_BT_HCI_B91_CTLR_OPEN)
     openll/ll_adv.c
     openll/ll_radio.c
     openll/ll_radio_mode.c
-    openll/ll_radio_cache.c
     openll/ll_sched.c
     openll/ll_arb.c
     openll/ll_csa1.c
