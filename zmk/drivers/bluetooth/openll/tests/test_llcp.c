@@ -98,6 +98,7 @@ static struct {
 		uint8_t d[40];
 	} p[MAX_PUSH];
 	int fail;   /* next pushes return -ENOMEM */
+	int ok_first;   /* ... after this many more successful pushes */
 } tx;
 
 int ll_txq_push(uint8_t link, enum ll_txq_kind kind, uint8_t llid, const uint8_t *payload,
@@ -108,7 +109,9 @@ int ll_txq_push(uint8_t link, enum ll_txq_kind kind, uint8_t llid, const uint8_t
 	 * counter order */
 	CHECK(locks > 0);
 	CHECK(tx_locks > 0);
-	if (tx.fail) {
+	if (tx.ok_first) {
+		tx.ok_first--;
+	} else if (tx.fail) {
 		tx.fail--;
 		return -ENOMEM;
 	}
@@ -782,11 +785,13 @@ static void single_link_suite(void)
 		CHECK(cn.end_calls == 1 && cn.end_reason == 0x13);
 	}
 
-	/* START_ENC_RSP push fails (backlog full): encryption not reported,
-	 * tx stays plaintext, the 40 s timer still ends the link */
+	/* START_ENC_RSP push fails with the owed queue full too (a backlog
+	 * merely full owes it, push_retry_suite): encryption not reported, tx
+	 * stays plaintext, the 40 s timer still ends the link */
 	fresh();
 	{
 		uint8_t req[23], buf[8];
+		static const uint8_t dummy[2] = {0x07, 0x00};
 
 		sample_rand();
 		build_enc_req(req);
@@ -794,31 +799,45 @@ static void single_link_suite(void)
 		CHECK(ll_llcp_ltk_reply(L, ltk) == LL_ST_SUCCESS);
 		memcpy(buf, rsp1_air, 5);
 		CHECK(ll_crypt_decrypt(rxq_crypt, 0x0F, buf, 5) == 1);
-		tx.fail = 1;
+		tx.fail = 1000;
+		for (int i = 0; i < LL_LLCP_OWE_N; i++) {
+			CHECK(ll_llcp_ctrl_tx(L, dummy, 2) == 0);
+		}
+		CHECK(ll_llcp_ctrl_tx(L, dummy, 2) == -ENOMEM);
 		rx(buf, 1);
 		CHECK(hci.enc_change == 0);
 		CHECK(!rxq_crypt->enc_tx && rxq_crypt->tx_ctr == 0);
+		/* the owed bound (2 s without progress) comes first: 0x22 */
 		ll_llcp_tick(now + T(TIMEOUT_US));
 		CHECK(cn.end_calls == 1 && cn.end_reason == LL_ST_LMP_TIMEOUT);
+		tx.fail = 0;
 	}
 
-	/* LL_ENC_RSP push fails (backlog full): the procedure cannot go on
-	 * (the central waits for LL_ENC_RSP), so no LTK request reaches the
-	 * host, nothing stays paused, and the link ends now (0x1F) instead of
-	 * after the 40 s response timer */
+	/* LL_ENC_RSP push fails with the owed queue full: the procedure cannot
+	 * go on (the central waits for LL_ENC_RSP), so no LTK request reaches
+	 * the host, nothing stays paused, and the link ends now (0x1F) instead
+	 * of after the 40 s response timer (a merely full backlog owes it:
+	 * push_retry_suite) */
 	fresh();
 	{
 		uint8_t req[23];
+		static const uint8_t dummy[2] = {0x07, 0x00};
 
 		sample_rand();
 		build_enc_req(req);
-		tx.fail = 1;
+		tx.fail = 1000;
+		for (int i = 0; i < LL_LLCP_OWE_N; i++) {
+			CHECK(ll_llcp_ctrl_tx(L, dummy, 2) == 0);
+		}
 		rx(req, sizeof(req));
 		CHECK(tx.n == 0);
 		CHECK(hci.ltk_req == 0);
 		CHECK(rxq_set_calls == 0);
 		CHECK(cn.end_calls == 1 && cn.end_reason == LL_ST_UNSPECIFIED);
 		CHECK(ll_llcp_ltk_reply(L, ltk) == LL_ST_DISALLOWED);
+		tx.fail = 0;
+		ll_llcp_retry(L);
+		CHECK(tx.n == LL_LLCP_OWE_N);
 		CHECK(ll_llcp_tx(L, LL_TXQ_ACL, LL_LLID_START, data2_clear, 27) == 0);
 		ll_llcp_tick(now + T(TIMEOUT_US));
 		CHECK(cn.end_calls == 1);
@@ -1208,10 +1227,25 @@ static void dle_initiator(void)
 	CHECK(cn.end_calls == 1 && cn.end_reason == LL_ST_LMP_TIMEOUT);
 	CHECK(!ll_llcp_busy(L) && ll_llcp_timeout_ticks(now) == -1);
 
-	/* backlog full: Memory Capacity Exceeded, nothing changed */
+	/* backlog and owed queue full: Memory Capacity Exceeded, nothing
+	 * changed (a merely full backlog owes the request:
+	 * push_retry_dle_phy) */
 	fresh();
-	tx.fail = 1;
-	CHECK(ll_llcp_set_data_len(L, 251, 2120) == 0x07);
+	{
+		static const uint8_t dummy[2] = {0x07, 0x00};
+
+		tx.fail = 1000;
+		for (int i = 0; i < LL_LLCP_OWE_N; i++) {
+			CHECK(ll_llcp_ctrl_tx(L, dummy, 2) == 0);
+		}
+		CHECK(ll_llcp_set_data_len(L, 251, 2120) == 0x07);
+		tx.fail = 0;
+		ll_llcp_retry(L);
+		CHECK(tx.n == LL_LLCP_OWE_N && !ll_llcp_busy(L));
+		tx.n = 0;
+		kk.calls = 0;
+		kk.n_at_kick = 0;
+	}
 	CHECK(tx.n == 0 && !ll_llcp_busy(L) && kk.calls == 0);
 	CHECK(eff_is(L, 27, 328, 27, 328));
 	/* our connMaxTx is still 27 / 328: the next LL_LENGTH_RSP says so */
@@ -1709,6 +1743,320 @@ static void test_routing_per_link(void)
 	}
 }
 
+/* ---------------- owed control PDUs (slice 7) ----------------
+ * A control PDU we must send whose push finds the TX backlog full is owed:
+ * the procedure state moves on as if it was queued, the PDU waits in the
+ * link's owed queue (in order; later control PDUs of the link queue behind
+ * it, host ACL waits with -EAGAIN) and ll_llcp_retry() pushes it from the
+ * controller thread. While something is owed ll_llcp_timeout_ticks() asks
+ * for a wakeup within LL_LLCP_RETRY_MS; no progress for
+ * LL_LLCP_RETRY_LIMIT_MS ends the link (0x22) at ll_llcp_tick(). */
+
+static const uint8_t vi_c[6] = {0x0C, 0x0A, 0x02, 0x00, 0x34, 0x12};
+static const uint8_t vi_ours[6] = {0x0C, 0x09, 0xFF, 0xFF, 0x01, 0x00};
+static const uint8_t feat_ours[9] = {0x09, 0x25, 0x40, 0, 0, 0, 0, 0, 0};
+
+/* push k is exactly the control PDU exp */
+static int push_is(int k, const uint8_t *exp, uint8_t len)
+{
+	return k < tx.n && tx.p[k].link == L && tx.p[k].kind == LL_TXQ_CTRL &&
+	       tx.p[k].llid == LL_LLID_CTRL && tx.p[k].len == len && tx.p[k].op == exp[0] &&
+	       memcmp(tx.p[k].d, exp, len) == 0;
+}
+
+static void push_retry_suite(void)
+{
+	const int32_t retry = (int32_t)T(LL_LLCP_RETRY_MS * 1000u);
+
+	/* a response (LL_FEATURE_RSP) is owed, pushed at the next retry */
+	fresh();
+	tx.fail = 1;
+	features(0xFF);
+	CHECK(tx.n == 0 && kk.calls == 0 && cn.end_calls == 0);
+	CHECK(ll_llcp_busy(L));
+	CHECK(ll_llcp_timeout_ticks(now) == retry);
+	ll_llcp_retry(L);
+	CHECK(tx.n == 1 && push_is(0, feat_ours, 9));
+	CHECK(kk.calls == 1 && kk.bad == 0);
+	CHECK(!ll_llcp_busy(L) && ll_llcp_timeout_ticks(now) == -1);
+	ll_llcp_retry(L);   /* nothing owed: nothing happens */
+	CHECK(tx.n == 1);
+
+	/* order: what comes later queues behind the owed PDU, host ACL waits */
+	fresh();
+	tx.fail = 1;
+	{
+		static const uint8_t unk[2] = {0x07, 0x19};
+		uint8_t pdu[3] = {0x19, 0, 0};
+
+		rx(pdu, 3);                            /* LL_UNKNOWN_RSP owed */
+		rx(vi_c, 6);                           /* LL_VERSION_IND behind it */
+		CHECK(tx.n == 0);
+		CHECK(ll_llcp_tx(L, LL_TXQ_ACL, LL_LLID_START, data2_clear, 27) == -EAGAIN);
+		/* still full at the first retry: nothing lost, still in order */
+		tx.fail = 1;
+		ll_llcp_retry(L);
+		CHECK(tx.n == 0);
+		ll_llcp_retry(L);
+		CHECK(tx.n == 2 && push_is(0, unk, 2) && push_is(1, vi_ours, 6));
+		CHECK(ll_llcp_tx(L, LL_TXQ_ACL, LL_LLID_START, data2_clear, 27) == 0);
+		rx(vi_c, 6);                           /* answered once per connection */
+		CHECK(tx.n == 3);
+	}
+
+	/* only the full queue's link waits: another link's ACL goes on */
+	if (LL_MAX_CONN > 1) {
+		uint8_t other = L == 0 ? 1 : 0;
+
+		fresh();
+		tx.fail = 1;
+		features(0xFF);
+		CHECK(ll_llcp_tx(other, LL_TXQ_ACL, LL_LLID_START, data2_clear, 27) == 0);
+		CHECK(!ll_llcp_busy(other));
+		ll_llcp_retry(other);
+		CHECK(tx.n == 1 && tx.p[0].link == other);
+		ll_llcp_retry(L);
+		CHECK(tx.n == 2 && push_is(1, feat_ours, 9));
+	}
+
+	/* LL_ENC_RSP owed: the procedure goes on (LTK request at once), the
+	 * host's LL_START_ENC_REQ queues behind it, both leave in order */
+	fresh();
+	{
+		uint8_t req[23], buf[8];
+		static const uint8_t ser[1] = {0x05};
+
+		sample_rand();
+		build_enc_req(req);
+		tx.fail = 1;
+		rx(req, sizeof(req));
+		CHECK(tx.n == 0 && cn.end_calls == 0);
+		CHECK(hci.ltk_req == 1 && rxq_crypt != NULL);
+		if (rxq_crypt == NULL) {
+			return;   /* the link ended: nothing more to check */
+		}
+		CHECK(ll_llcp_ltk_reply(L, ltk) == LL_ST_SUCCESS);
+		CHECK(tx.n == 0);
+		ll_llcp_retry(L);
+		CHECK(tx.n == 2 && tx.p[0].op == 0x04 && tx.p[0].len == 13);
+		CHECK(memcmp(&tx.p[0].d[1], skds, 8) == 0 && memcmp(&tx.p[0].d[9], ivs, 4) == 0);
+		CHECK(push_is(1, ser, 1));             /* plaintext */
+		memcpy(buf, rsp1_air, 5);
+		CHECK(ll_crypt_decrypt(rxq_crypt, 0x0F, buf, 5) == 1);
+		rx(buf, 1);
+		CHECK(tx.n == 3 && tx.p[2].len == 5 && memcmp(tx.p[2].d, rsp2_air, 5) == 0);
+		CHECK(hci.enc_change == 1 && hci.enabled);
+		CHECK(!ll_llcp_busy(L));
+	}
+
+	/* LL_START_ENC_REQ owed alone (HCI thread): pushed at the retry */
+	fresh();
+	{
+		uint8_t req[23];
+		static const uint8_t ser[1] = {0x05};
+
+		sample_rand();
+		build_enc_req(req);
+		rx(req, sizeof(req));
+		tx.fail = 1;
+		CHECK(ll_llcp_ltk_reply(L, ltk) == LL_ST_SUCCESS);
+		CHECK(tx.n == 1);
+		ll_llcp_retry(L);
+		CHECK(tx.n == 2 && push_is(1, ser, 1));
+	}
+
+	/* our encrypted LL_START_ENC_RSP owed: data stays paused, Encryption
+	 * Change only once it is queued (encrypted, counter 0) */
+	fresh();
+	{
+		uint8_t req[23], buf[8];
+
+		sample_rand();
+		build_enc_req(req);
+		rx(req, sizeof(req));
+		CHECK(ll_llcp_ltk_reply(L, ltk) == LL_ST_SUCCESS);
+		memcpy(buf, rsp1_air, 5);
+		CHECK(ll_crypt_decrypt(rxq_crypt, 0x0F, buf, 5) == 1);
+		tx.fail = 1;
+		rx(buf, 1);
+		CHECK(tx.n == 2 && hci.enc_change == 0 && ll_llcp_busy(L));
+		CHECK(rxq_crypt->tx_ctr == 0);
+		CHECK(ll_llcp_tx(L, LL_TXQ_ACL, LL_LLID_START, data2_clear, 27) == -EAGAIN);
+		ll_llcp_retry(L);
+		CHECK(tx.n == 3 && tx.p[2].len == 5 && memcmp(tx.p[2].d, rsp2_air, 5) == 0);
+		CHECK(hci.enc_change == 1 && hci.status == LL_ST_SUCCESS && hci.enabled);
+		CHECK(!ll_llcp_busy(L) && ll_llcp_timeout_ticks(now) == -1);
+		/* data resumes encrypted with counter 1 (Vol 6 Part C LL_DATA2) */
+		CHECK(ll_llcp_tx(L, LL_TXQ_ACL, LL_LLID_START, data2_clear, 27) == 0);
+		CHECK(tx.n == 4 && tx.p[3].len == 31 && memcmp(tx.p[3].d, data2_air, 31) == 0);
+	}
+
+	/* LL_TERMINATE_IND through ll_conn's ctrl_tx hook */
+	fresh();
+	{
+		static const uint8_t ti[2] = {0x02, 0x13};
+
+		tx.fail = 1;
+		CHECK(ll_llcp_ctrl_tx(L, ti, 2) == 0);
+		CHECK(tx.n == 0);
+		ll_llcp_retry(L);
+		CHECK(tx.n == 1 && push_is(0, ti, 2));
+	}
+
+	/* bounded: no progress for LL_LLCP_RETRY_LIMIT_MS ends the link with
+	 * 0x22 (instead of the 40 s procedure timeout or never) */
+	fresh();
+	{
+		uint32_t t0 = now;
+
+		tx.fail = 1000;
+		features(0xFF);
+		for (int i = 0; i < 10; i++) {
+			now += T(LL_LLCP_RETRY_MS * 1000u);
+			ll_llcp_retry(L);
+			CHECK(ll_llcp_timeout_ticks(now) <= retry);
+		}
+		ll_llcp_tick(t0 + T(LL_LLCP_RETRY_LIMIT_MS * 1000u) - 1);
+		CHECK(cn.end_calls == 0);
+		CHECK(ll_llcp_timeout_ticks(t0 + T(LL_LLCP_RETRY_LIMIT_MS * 1000u) - 1) == 1);
+		ll_llcp_tick(t0 + T(LL_LLCP_RETRY_LIMIT_MS * 1000u));
+		CHECK(cn.end_calls == 1 && cn.end_reason == LL_ST_LMP_TIMEOUT);
+		CHECK(!ll_llcp_busy(L) && ll_llcp_timeout_ticks(now) == -1);
+		tx.fail = 0;
+		ll_llcp_retry(L);
+		CHECK(tx.n == 0);
+	}
+	/* progress restarts the bound: one PDU out, the next one owed */
+	fresh();
+	{
+		uint32_t t0 = now;
+		uint8_t pdu[3] = {0x19, 0, 0};
+
+		tx.fail = 1;
+		features(0xFF);
+		rx(pdu, 3);
+		now = t0 + T(LL_LLCP_RETRY_LIMIT_MS * 1000u) - 10;
+		tx.ok_first = 1;
+		tx.fail = 1;
+		ll_llcp_retry(L);
+		CHECK(tx.n == 1);
+		tx.fail = 1000;
+		ll_llcp_tick(t0 + T(LL_LLCP_RETRY_LIMIT_MS * 1000u));
+		CHECK(cn.end_calls == 0);
+		ll_llcp_tick(now + T(LL_LLCP_RETRY_LIMIT_MS * 1000u));
+		CHECK(cn.end_calls == 1 && cn.end_reason == LL_ST_LMP_TIMEOUT);
+	}
+
+	/* the owed queue holds LL_LLCP_OWE_N PDUs; one more response is
+	 * dropped (the central's response timeout), an LL_ENC_REQ that cannot
+	 * even be owed ends the link (0x1F) as before */
+	fresh();
+	{
+		uint8_t pdu[3] = {0x19, 0, 0}, req[23];
+
+		tx.fail = 1000;
+		for (int i = 0; i < LL_LLCP_OWE_N + 1; i++) {
+			pdu[0] = (uint8_t)(0x19 + i);
+			rx(pdu, 3);
+		}
+		sample_rand();
+		build_enc_req(req);
+		rx(req, sizeof(req));
+		CHECK(hci.ltk_req == 0);
+		CHECK(cn.end_calls == 1 && cn.end_reason == LL_ST_UNSPECIFIED);
+		tx.fail = 0;
+		ll_llcp_retry(L);
+		CHECK(tx.n == LL_LLCP_OWE_N);
+		for (int i = 0; i < LL_LLCP_OWE_N; i++) {
+			CHECK(tx.p[i].op == 0x07 && tx.p[i].d[1] == 0x19 + i);
+		}
+	}
+
+	/* a new connection forgets what was owed */
+	fresh();
+	tx.fail = 1;
+	features(0xFF);
+	ll_llcp_reset(L);
+	ll_llcp_retry(L);
+	CHECK(tx.n == 0 && !ll_llcp_busy(L) && ll_llcp_timeout_ticks(now) == -1);
+}
+
+/* Data length and PHY PDUs owed (slice 7 / slice 6b Task 3 carry-over):
+ * a link never stays at the initial values because one push failed. */
+static void push_retry_dle_phy(void)
+{
+	uint8_t pdu[9];
+
+	/* LL_LENGTH_RSP owed: the central learns our values from it */
+	fresh();
+	length_pdu(pdu, 0x14, 251, 2120, 251, 2120);
+	tx.fail = 1;
+	rx(pdu, 9);
+	CHECK(tx.n == 0);
+	ll_llcp_retry(L);
+	CHECK(tx.n == 1 && last_length(0x15, SUP, SUPT, 27, 328));
+	CHECK(eff_is(L, 27, 328, SUP, SUPT));
+	/* the central knows our 27 / 328 now: nothing to send for them */
+	CHECK(ll_llcp_set_data_len(L, 27, 328) == LL_ST_SUCCESS);
+	CHECK(tx.n == 1);
+
+	/* LL_PHY_RSP owed: the 40 s timer runs from the request */
+	fresh();
+	{
+		static const uint8_t req[3] = {0x16, 0x03, 0x03};
+		static const uint8_t phy_rsp[3] = {0x17, 0x01, 0x01};
+		uint8_t ind[5] = {0x18, 0, 0, 0x34, 0x12};
+
+		tx.fail = 1;
+		rx(req, 3);
+		CHECK(tx.n == 0 && ll_llcp_busy(L));
+		ll_llcp_retry(L);
+		CHECK(tx.n == 1 && last_is(phy_rsp, 3));
+		CHECK(ll_llcp_timeout_ticks(now) == (int32_t)T(TIMEOUT_US));
+		rx(ind, 5);
+		CHECK(!ll_llcp_busy(L));
+	}
+
+	/* our own LL_LENGTH_REQ needs a supported maximum above 27 */
+	if (SUP == 27) {
+		return;
+	}
+	/* our LL_LENGTH_REQ (host or on-connect default) owed: accepted, the
+	 * procedure runs, the request leaves at the retry */
+	fresh();
+	tx.fail = 1;
+	CHECK(ll_llcp_set_data_len(L, 251, 2120) == LL_ST_SUCCESS);
+	CHECK(tx.n == 0 && ll_llcp_busy(L));
+	ll_llcp_retry(L);
+	CHECK(tx.n == 1 && last_length(0x14, SUP, SUPT, SUP, SUPT));
+	length_pdu(pdu, 0x15, 251, 2120, 251, 2120);
+	rx(pdu, 9);
+	CHECK(eff_is(L, SUP, SUPT, SUP, SUPT));
+	CHECK(!ll_llcp_busy(L));
+
+	/* deferred by the encryption start, then owed when it is sent right
+	 * after our LL_START_ENC_RSP */
+	fresh();
+	{
+		uint8_t req[23], buf[8];
+
+		sample_rand();
+		build_enc_req(req);
+		rx(req, sizeof(req));
+		CHECK(ll_llcp_set_data_len(L, 251, 2120) == LL_ST_SUCCESS);
+		CHECK(ll_llcp_ltk_reply(L, ltk) == LL_ST_SUCCESS);
+		memcpy(buf, rsp1_air, 5);
+		CHECK(ll_crypt_decrypt(rxq_crypt, 0x0F, buf, 5) == 1);
+		tx.ok_first = 1;   /* LL_START_ENC_RSP goes, LL_LENGTH_REQ does not */
+		tx.fail = 1;
+		rx(buf, 1);
+		CHECK(tx.n == 3 && hci.enc_change == 1);
+		CHECK(ll_llcp_busy(L));
+		ll_llcp_retry(L);
+		CHECK(tx.n == 4 && tx.p[3].op == 0x14 && tx.p[3].len == 9 + LL_MIC_LEN);
+	}
+}
+
 int main(void)
 {
 	for (int k = 0; k < 2; k++) {
@@ -1717,6 +2065,8 @@ int main(void)
 		dle_responder();
 		dle_initiator();
 		phy_procedure();
+		push_retry_suite();
+		push_retry_dle_phy();
 	}
 	L = 0;
 	dle_bounds();

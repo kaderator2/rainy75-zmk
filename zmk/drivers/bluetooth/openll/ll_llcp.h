@@ -57,6 +57,21 @@ struct ll_llcp_ops {
 	void (*data_len_change)(uint8_t link, const struct ll_llcp_dle *eff);
 };
 
+/* Owed control PDUs (slice 7). A control PDU we must send (a response, our
+ * own request, LL_TERMINATE_IND through ll_llcp_ctrl_tx) whose push finds
+ * the link's TX backlog full is owed: the procedure state moves on as if
+ * it was queued, the PDU waits in the link's owed queue (at most
+ * LL_LLCP_OWE_N, in order; later control PDUs of the link queue behind it
+ * and host ACL of the link gets -EAGAIN, so control PDUs take the next free
+ * slot) and ll_llcp_retry() pushes it. While a link owes a PDU,
+ * ll_llcp_timeout_ticks() asks for a wakeup within LL_LLCP_RETRY_MS, and
+ * ll_llcp_busy() is true. LL_LLCP_RETRY_LIMIT_MS without any owed PDU of
+ * the link queued (the central acks nothing) ends the link with 0x22 at
+ * ll_llcp_tick(). */
+#define LL_LLCP_OWE_N           4
+#define LL_LLCP_RETRY_MS        10
+#define LL_LLCP_RETRY_LIMIT_MS  2000
+
 /* Once at startup. ops is copied (members may be NULL). Resets all links. */
 void ll_llcp_init(const struct ll_llcp_ops *ops);
 /* Per connection (call when ll_conn reports CONNECTED or DISCONNECTED for
@@ -82,12 +97,21 @@ uint8_t ll_llcp_terminate(uint8_t link, uint8_t reason);
  * (encryption start, our LENGTH request, the PHY update after our
  * LL_PHY_RSP): 40 s from the last LL control PDU the procedure queued while
  * it waits on the central (or on the host's LTK), then
- * ll_conn_end(LL_ST_LMP_TIMEOUT) of that link only. Checks all links. Call from the controller thread with
+ * ll_conn_end(LL_ST_LMP_TIMEOUT) of that link only; the same for owed
+ * control PDUs without progress for LL_LLCP_RETRY_LIMIT_MS (it retries them
+ * first). Checks all links. Call from the controller thread with
  * the stimer tick when ll_llcp_timeout_ticks() says it is due (calling it
  * earlier or more often is harmless). */
 void ll_llcp_tick(uint32_t now_tick);
+/* Push the link's owed control PDUs, in order, until the backlog is full
+ * again (runs the steps that wait for them, e.g. Encryption Change after
+ * our LL_START_ENC_RSP). Controller thread: call it for every link before
+ * its host ACL, at every wakeup; ll_llcp_tick() also calls it for all
+ * links. No-op for an out-of-range link or when nothing is owed. */
+void ll_llcp_retry(uint8_t link);
 /* Ticks until the earliest running per-link procedure response timer
- * expires at now_tick (0 when one is due), or -1 while none is running.
+ * expires at now_tick (0 when one is due), at most LL_LLCP_RETRY_MS while
+ * a link owes control PDUs (retry wakeup), or -1 while none is running.
  * The controller thread arms its wakeup for ll_llcp_tick() from this, so
  * nothing polls while no procedure is pending. Thread. */
 int32_t ll_llcp_timeout_ticks(uint32_t now_tick);
@@ -95,7 +119,7 @@ int32_t ll_llcp_timeout_ticks(uint32_t now_tick);
  * procedure of the link waits on the host or the central (encryption
  * start: LL_ENC_RSP queued until our LL_START_ENC_RSP is queued; our
  * LL_LENGTH_REQ until LL_LENGTH_RSP; our LL_PHY_RSP until
- * LL_PHY_UPDATE_IND). Reads
+ * LL_PHY_UPDATE_IND), and while the link owes a control PDU. Reads
  * the procedure state without ll_plat_tx_lock(): ISR-safe, never blocks; a
  * stale answer costs at most one skip window. False for an out-of-range
  * link. */
@@ -116,7 +140,8 @@ bool ll_llcp_busy(uint8_t link);
  * Returns LL_ST_SUCCESS, LL_ST_UNKNOWN_CONN_ID (link out of range or not
  * connected), LL_ST_DISALLOWED (our procedure still runs),
  * LL_ST_UNSUPP_REMOTE (the central rejected LL_LENGTH_REQ before, or its
- * features lack DLE) or LL_ST_MEM_CAPACITY (backlog full, nothing changed).
+ * features lack DLE) or LL_ST_MEM_CAPACITY (backlog and owed queue full,
+ * nothing changed; a merely full backlog owes the request, slice 7).
  * Thread. */
 uint8_t ll_llcp_set_data_len(uint8_t link, uint16_t tx_octets, uint16_t tx_time);
 /* The link's effective values; 27 / 328 for a new connection and for an
@@ -136,13 +161,18 @@ void ll_llcp_get_dle(uint8_t link, struct ll_llcp_dle *out);
  * out-of-range link), -ENOMEM (backlog full, nothing queued,
  * counter unchanged) or, for LL_TXQ_ACL, -EAGAIN while the encryption
  * procedure pauses data PDUs (from LL_ENC_REQ until our LL_START_ENC_RSP
- * is queued, Vol 6 Part B 5.1.3.1; keep the PDU and retry later). After
+ * is queued, Vol 6 Part B 5.1.3.1) or the link owes control PDUs (slice
+ * 7); keep the PDU and retry later. After
  * a successful push it calls ll_conn_kick() (without ll_plat_lock() held),
  * so the PDU leaves at the next regular connection event even while
  * peripheral latency skips events. Thread. */
 int ll_llcp_tx(uint8_t link, enum ll_txq_kind kind, uint8_t llid, const uint8_t *payload,
 	       uint8_t len);
-/* ll_conn_ops.ctrl_tx hook: ll_llcp_tx(link, LL_TXQ_CTRL, LL_LLID_CTRL, ...). */
+/* ll_conn_ops.ctrl_tx hook: one of our control PDUs (opcode first),
+ * queued like ll_llcp_tx(link, LL_TXQ_CTRL, LL_LLID_CTRL, ...), or owed when
+ * the backlog is full or the link owes PDUs already (retried by
+ * ll_llcp_retry()). Returns 0 (queued or owed), -EINVAL, or -ENOMEM when
+ * the owed queue is full too (nothing kept). Thread. */
 int ll_llcp_ctrl_tx(uint8_t link, const uint8_t *payload, uint8_t len);
 
 #endif /* LL_LLCP_H_ */

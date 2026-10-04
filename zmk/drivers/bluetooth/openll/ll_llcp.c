@@ -38,6 +38,16 @@
  * Each procedure kind has its own 40 s response timer (TMR_ENC, TMR_DLE,
  * TMR_PHY): they can overlap (LENGTH has no instant, so it is compatible
  * with the others, 5.3), and one completing must not stop another's timer.
+ *
+ * Slice 7: every control PDU we must send goes through ctrl_send_locked().
+ * When the TX backlog is full it is owed (ll_llcp.h): the procedure moves
+ * on as if it was queued, the PDU waits in the link's owed FIFO, and
+ * ll_llcp_retry() pushes it from the controller thread. Later control PDUs
+ * of the link queue behind it (order kept) and the link's host ACL waits
+ * (-EAGAIN), so the encrypted LL_START_ENC_RSP still precedes the first
+ * encrypted data PDU; the only step that waits for an owed PDU is the end
+ * of the encryption start (POST_ENC_DONE). TMR_OWE bounds the time
+ * without progress (LL_LLCP_RETRY_LIMIT_MS).
  */
 #include <errno.h>
 #include <string.h>
@@ -91,13 +101,23 @@
 #define LEN_PHY_UPDATE_IND   5
 
 #define RSP_TIMEOUT_TICKS    (40000000u * LL_TICKS_PER_US)
+#define RETRY_TICKS          (LL_LLCP_RETRY_MS * 1000u * LL_TICKS_PER_US)
+#define RETRY_LIMIT_TICKS    (LL_LLCP_RETRY_LIMIT_MS * 1000u * LL_TICKS_PER_US)
+#define OWE_PDU_MAX          16   /* our longest control PDU: LL_ENC_RSP, 13 */
 
 /* per-link procedure response timers (Vol 6 Part B 5.2) */
 enum {
 	TMR_ENC,   /* encryption start: waits on the host's LTK / the central */
 	TMR_DLE,   /* our LL_LENGTH_REQ: waits on LL_LENGTH_RSP */
 	TMR_PHY,   /* our LL_PHY_RSP: waits on LL_PHY_UPDATE_IND */
+	TMR_OWE,   /* owed control PDUs: since the last progress (LL_LLCP_RETRY_LIMIT_MS) */
 	TMR_N,
+};
+
+/* what runs once an owed PDU is queued */
+enum owe_post {
+	POST_NONE,
+	POST_ENC_DONE,   /* our LL_START_ENC_RSP: the encryption start is complete */
 };
 
 enum enc_state {
@@ -128,6 +148,13 @@ static struct llcp_link {
 	bool dle_pending;     /* our LL_LENGTH_REQ queued, LL_LENGTH_RSP awaited */
 	bool dle_want;        /* own != told: send LL_LENGTH_REQ after the encryption start */
 	bool dle_unsupp;      /* the central answered LL_UNKNOWN_RSP to LL_LENGTH_REQ */
+	/* owed control PDUs (plaintext, FIFO from owe_head) */
+	struct {
+		uint8_t len;
+		uint8_t post;     /* enum owe_post */
+		uint8_t d[OWE_PDU_MAX];
+	} owe[LL_LLCP_OWE_N];
+	uint8_t owe_head, owe_n;
 } links[LL_MAX_CONN];
 
 /* Caller holds ll_plat_tx_lock(); link < LL_MAX_CONN. */
@@ -143,7 +170,7 @@ static int tx_locked(uint8_t link, enum ll_txq_kind kind, uint8_t llid, const ui
 	if (len == 0 || len > LL_DATA_PDU_MAX) {
 		return -EINVAL;
 	}
-	if (kind == LL_TXQ_ACL && s->paused) {
+	if (kind == LL_TXQ_ACL && (s->paused || s->owe_n != 0)) {
 		return -EAGAIN;
 	}
 	memcpy(buf, payload, len);
@@ -182,13 +209,23 @@ int ll_llcp_tx(uint8_t link, enum ll_txq_kind kind, uint8_t llid, const uint8_t 
 	return ret;
 }
 
+static int ctrl_send_locked(uint8_t link, const uint8_t *pdu, uint8_t len, enum owe_post post);
+
 int ll_llcp_ctrl_tx(uint8_t link, const uint8_t *payload, uint8_t len)
 {
-	return ll_llcp_tx(link, LL_TXQ_CTRL, LL_LLID_CTRL, payload, len);
+	int ret;
+
+	if (link >= LL_MAX_CONN) {
+		return -EINVAL;
+	}
+	ll_plat_tx_lock();
+	ret = ctrl_send_locked(link, payload, len, POST_NONE);
+	ll_plat_tx_unlock();
+	return ret < 0 ? ret : 0;
 }
 
-/* Responses are not retried when the backlog is full: the central's own
- * response timeout then ends the link. */
+/* Responses without a procedure state of ours (LL_UNKNOWN_RSP, rejects,
+ * LL_FEATURE_RSP): queued, or owed when the backlog is full. */
 static void ctrl(uint8_t link, const uint8_t *pdu, uint8_t len)
 {
 	(void)ll_llcp_ctrl_tx(link, pdu, len);
@@ -224,6 +261,39 @@ static void timer_start(struct llcp_link *s, unsigned int t)
 {
 	s->tmr_on[t] = true;
 	s->tmr_start[t] = ll_radio_now();
+}
+
+/* Queue one of our control PDUs (plaintext, opcode first), or owe it when
+ * the backlog is full or something is owed already (order). Returns 0
+ * (queued), 1 (owed: ll_llcp_retry() queues it, then runs post), or a
+ * negative errno (-EINVAL; -ENOMEM: backlog full and the owed queue too,
+ * nothing kept). post runs only for an owed PDU; for a PDU queued at once
+ * the caller does that step itself. Caller holds ll_plat_tx_lock(). */
+static int ctrl_send_locked(uint8_t link, const uint8_t *pdu, uint8_t len, enum owe_post post)
+{
+	struct llcp_link *s = &links[link];
+	int ret;
+
+	if (s->owe_n == 0) {
+		ret = tx_locked(link, LL_TXQ_CTRL, LL_LLID_CTRL, pdu, len);
+		if (ret != -ENOMEM) {
+			return ret;
+		}
+	}
+	if (len == 0 || len > OWE_PDU_MAX || s->owe_n >= LL_LLCP_OWE_N) {
+		return len == 0 || len > OWE_PDU_MAX ? -EINVAL : -ENOMEM;
+	}
+	{
+		uint8_t i = (uint8_t)((s->owe_head + s->owe_n) % LL_LLCP_OWE_N);
+
+		s->owe[i].len = len;
+		s->owe[i].post = (uint8_t)post;
+		memcpy(s->owe[i].d, pdu, len);
+	}
+	if (s->owe_n++ == 0) {
+		timer_start(s, TMR_OWE);   /* no progress since now */
+	}
+	return 1;
 }
 
 /* ---- data length (Vol 6 Part B 4.5.10, 5.1.9) ---- */
@@ -307,19 +377,22 @@ static int dle_send_req_locked(uint8_t link)
 	int ret;
 
 	dle_build(pdu, OP_LENGTH_REQ, &s->own);
-	ret = tx_locked(link, LL_TXQ_CTRL, LL_LLID_CTRL, pdu, sizeof(pdu));
-	if (ret == 0) {
-		s->told = s->own;
-		s->dle_pending = true;
-		s->dle_want = false;
-		timer_start(s, TMR_DLE);
+	ret = ctrl_send_locked(link, pdu, sizeof(pdu), POST_NONE);
+	if (ret < 0) {
+		return ret;
 	}
-	return ret;
+	/* queued or owed: the central gets these values */
+	s->told = s->own;
+	s->dle_pending = true;
+	s->dle_want = false;
+	timer_start(s, TMR_DLE);
+	return 0;
 }
 
 /* A request deferred by the encryption start leaves once the link is out
- * of it. A failed push (backlog full) is not retried: the central keeps
- * our previous values, which stay valid. Caller holds ll_plat_tx_lock(). */
+ * of it (owed when the backlog is full; only a full owed queue drops it,
+ * and the central then keeps our previous values, which stay valid).
+ * Caller holds ll_plat_tx_lock(). */
 static void dle_flush_locked(uint8_t link)
 {
 	struct llcp_link *s = &links[link];
@@ -354,7 +427,7 @@ static void rx_length_req(uint8_t link, const uint8_t *p)
 	changed = dle_eff_update(s);
 	eff = s->eff;
 	dle_build(rsp, OP_LENGTH_RSP, &s->own);
-	if (tx_locked(link, LL_TXQ_CTRL, LL_LLID_CTRL, rsp, sizeof(rsp)) == 0) {
+	if (ctrl_send_locked(link, rsp, sizeof(rsp), POST_NONE) >= 0) {
 		/* "use the response to communicate the changes" */
 		s->told = s->own;
 	}
@@ -444,8 +517,8 @@ uint8_t ll_llcp_set_data_len(uint8_t link, uint16_t tx_octets, uint16_t tx_time)
 		changed = dle_eff_update(s);
 		st = LL_ST_SUCCESS;
 	} else if (dle_send_req_locked(link) == 0) {
-		/* a lower connMaxTx applies at once, a higher one up to what
-		 * the central said it receives */
+		/* queued or owed. A lower connMaxTx applies at once, a higher
+		 * one up to what the central said it receives */
 		changed = dle_eff_update(s);
 		st = LL_ST_SUCCESS;
 	} else {
@@ -479,7 +552,7 @@ static void rx_phy_req(uint8_t link)
 	struct llcp_link *s = &links[link];
 
 	ll_plat_tx_lock();
-	if (tx_locked(link, LL_TXQ_CTRL, LL_LLID_CTRL, rsp, sizeof(rsp)) == 0) {
+	if (ctrl_send_locked(link, rsp, sizeof(rsp), POST_NONE) >= 0) {
 		timer_start(s, TMR_PHY);   /* until LL_PHY_UPDATE_IND */
 	}
 	ll_plat_tx_unlock();
@@ -523,18 +596,19 @@ static void rx_enc_req(uint8_t link, const uint8_t *p)
 		rsp[0] = OP_ENC_RSP;
 		memcpy(&rsp[1], s->skds, 8);
 		memcpy(&rsp[9], &s->crypt.iv[4], 4);
-		if (tx_locked(link, LL_TXQ_CTRL, LL_LLID_CTRL, rsp, sizeof(rsp)) == 0) {
+		if (ctrl_send_locked(link, rsp, sizeof(rsp), POST_NONE) >= 0) {
+			/* queued, or owed (it leaves before our
+			 * LL_START_ENC_REQ, which queues behind it) */
 			s->enc = ENC_WAIT_LTK;
 			s->paused = true;
 			timer_start(s, TMR_ENC);
 			sent = true;
 		} else {
-			/* backlog full: the central waits for LL_ENC_RSP and
-			 * pauses its data meanwhile, so the procedure cannot
-			 * complete. End the link now rather than leave the
-			 * host an LTK request for a procedure the central
-			 * never sees answered (the 40 s timer would end it
-			 * anyway). */
+			/* backlog and owed queue full: the central waits for
+			 * LL_ENC_RSP and pauses its data meanwhile, so the
+			 * procedure cannot complete. End the link now rather
+			 * than leave the host an LTK request for a procedure
+			 * the central never sees answered. */
 			memset(&s->crypt, 0, sizeof(s->crypt));
 		}
 	}
@@ -554,6 +628,21 @@ static void rx_enc_req(uint8_t link, const uint8_t *p)
 	}
 }
 
+/* Our LL_START_ENC_RSP is queued: the encryption start is complete, data
+ * PDUs resume. Returns true (report Encryption Change after unlocking).
+ * Caller holds ll_plat_tx_lock(). */
+static bool enc_done_locked(uint8_t link)
+{
+	struct llcp_link *s = &links[link];
+
+	s->enc = ENC_IDLE;
+	s->paused = false;
+	s->tmr_on[TMR_ENC] = false;
+	/* a LENGTH request the host made meanwhile */
+	dle_flush_locked(link);
+	return true;
+}
+
 static void rx_start_enc_rsp(uint8_t link)
 {
 	static const uint8_t rsp[1] = {OP_START_ENC_RSP};
@@ -561,20 +650,21 @@ static void rx_start_enc_rsp(uint8_t link)
 	bool done = false;
 
 	ll_plat_tx_lock();
-	if (s->enc == ENC_WAIT_START_RSP) {
+	if (s->enc == ENC_WAIT_START_RSP && !s->crypt.enc_tx) {
+		int r;
+
+		/* encrypted from this PDU on (also when it is owed: whatever
+		 * queues behind it is encrypted after it) */
 		s->crypt.enc_tx = true;
-		if (tx_locked(link, LL_TXQ_CTRL, LL_LLID_CTRL, rsp, sizeof(rsp)) == 0) {
-			s->enc = ENC_IDLE;
-			s->paused = false;
-			s->tmr_on[TMR_ENC] = false;
-			done = true;
-			/* a LENGTH request the host made meanwhile */
-			dle_flush_locked(link);
-		} else {
-			/* backlog full: stay in the procedure, the
-			 * response timer ends the link */
+		r = ctrl_send_locked(link, rsp, sizeof(rsp), POST_ENC_DONE);
+		if (r == 0) {
+			done = enc_done_locked(link);
+		} else if (r < 0) {
+			/* backlog and owed queue full: stay in the procedure,
+			 * the response timer ends the link */
 			s->crypt.enc_tx = false;
 		}
+		/* r == 1: ll_llcp_retry() completes it */
 	}
 	ll_plat_tx_unlock();
 	if (done && ops.enc_change) {
@@ -608,7 +698,7 @@ static void rx_version_ind(uint8_t link)
 
 	ll_plat_tx_lock();
 	/* answered once per connection (Vol 6 Part B 5.1.5) */
-	if (!s->version_sent && tx_locked(link, LL_TXQ_CTRL, LL_LLID_CTRL, rsp, sizeof(rsp)) == 0) {
+	if (!s->version_sent && ctrl_send_locked(link, rsp, sizeof(rsp), POST_NONE) >= 0) {
 		s->version_sent = true;
 	}
 	ll_plat_tx_unlock();
@@ -808,7 +898,9 @@ uint8_t ll_llcp_ltk_reply(uint8_t link, const uint8_t ltk[16])
 		ll_plat_unlock(key);
 		ll_crypt_wipe(sk, sizeof(sk));
 		s->enc = ENC_WAIT_START_RSP;
-		(void)tx_locked(link, LL_TXQ_CTRL, LL_LLID_CTRL, req, sizeof(req));
+		/* queued or owed (a full owed queue drops it: the response
+		 * timer then ends the link) */
+		(void)ctrl_send_locked(link, req, sizeof(req), POST_NONE);
 		timer_start(s, TMR_ENC);
 		st = LL_ST_SUCCESS;
 	}
@@ -853,10 +945,59 @@ uint8_t ll_llcp_terminate(uint8_t link, uint8_t reason)
 	return LL_ST_SUCCESS;
 }
 
+static uint32_t tmr_limit(unsigned int t)
+{
+	return t == TMR_OWE ? RETRY_LIMIT_TICKS : RSP_TIMEOUT_TICKS;
+}
+
+void ll_llcp_retry(uint8_t link)
+{
+	struct llcp_link *s;
+	bool enc_done = false;
+
+	if (link >= LL_MAX_CONN) {
+		return;
+	}
+	s = &links[link];
+	/* cheap check without the mutex (called for every link at every
+	 * pass): a PDU owed by the HCI thread right now is seen at the
+	 * wakeup that thread gives afterwards */
+	if (*(volatile uint8_t *)&s->owe_n == 0) {
+		return;
+	}
+	ll_plat_tx_lock();
+	while (s->owe_n != 0) {
+		uint8_t i = s->owe_head;
+
+		if (tx_locked(link, LL_TXQ_CTRL, LL_LLID_CTRL, s->owe[i].d, s->owe[i].len) != 0) {
+			break;   /* still full (-EINVAL cannot happen: checked when owed) */
+		}
+		s->owe_head = (uint8_t)((i + 1) % LL_LLCP_OWE_N);
+		s->owe_n--;
+		if (s->owe_n == 0) {
+			s->tmr_on[TMR_OWE] = false;
+		} else {
+			timer_start(s, TMR_OWE);   /* progress */
+		}
+		if (s->owe[i].post == POST_ENC_DONE) {
+			/* host ACL waited (-EAGAIN) while it was owed */
+			enc_done = enc_done_locked(link);
+		}
+	}
+	ll_plat_tx_unlock();
+	if (enc_done && ops.enc_change) {
+		ops.enc_change(link, LL_ST_SUCCESS, true);
+	}
+}
+
 void ll_llcp_tick(uint32_t now_tick)
 {
 	bool expired[LL_MAX_CONN];
 
+	/* what can leave now is not given up */
+	for (uint8_t i = 0; i < LL_MAX_CONN; i++) {
+		ll_llcp_retry(i);
+	}
 	ll_plat_tx_lock();
 	for (uint8_t i = 0; i < LL_MAX_CONN; i++) {
 		struct llcp_link *s = &links[i];
@@ -864,8 +1005,7 @@ void ll_llcp_tick(uint32_t now_tick)
 		expired[i] = false;
 		for (unsigned int t = 0; t < TMR_N; t++) {
 			expired[i] |= s->tmr_on[t] &&
-				      (int32_t)(now_tick - s->tmr_start[t]) >=
-					      (int32_t)RSP_TIMEOUT_TICKS;
+				      (int32_t)(now_tick - s->tmr_start[t]) >= (int32_t)tmr_limit(t);
 		}
 		if (expired[i]) {
 			/* the link is lost: every procedure on it ends */
@@ -874,6 +1014,7 @@ void ll_llcp_tick(uint32_t now_tick)
 			s->paused = false;
 			s->dle_pending = false;
 			s->dle_want = false;
+			s->owe_n = 0;
 		}
 	}
 	ll_plat_tx_unlock();
@@ -898,9 +1039,13 @@ int32_t ll_llcp_timeout_ticks(uint32_t now_tick)
 			if (!s->tmr_on[t]) {
 				continue;
 			}
-			left = (int32_t)RSP_TIMEOUT_TICKS - (int32_t)(now_tick - s->tmr_start[t]);
+			left = (int32_t)tmr_limit(t) - (int32_t)(now_tick - s->tmr_start[t]);
 			if (left < 0) {
 				left = 0;
+			}
+			if (t == TMR_OWE && left > (int32_t)RETRY_TICKS) {
+				/* owed PDUs: retry at least every LL_LLCP_RETRY_MS */
+				left = (int32_t)RETRY_TICKS;
 			}
 			if (min < 0 || left < min) {
 				min = left;

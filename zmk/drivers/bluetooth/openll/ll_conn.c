@@ -998,7 +998,8 @@ void ll_conn_terminate(uint8_t link, uint8_t reason)
 	if (!go) {
 		return;
 	}
-	/* A failed push is not retried: the timeout then ends the link. */
+	/* ll_llcp's hook owes the PDU when the backlog is full and retries it
+	 * (slice 7); the timeout still ends the link if it is never acked. */
 	if (ops.ctrl_tx) {
 		(void)ops.ctrl_tx(link, pdu, sizeof(pdu));
 	} else {

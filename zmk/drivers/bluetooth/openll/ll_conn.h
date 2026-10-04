@@ -130,7 +130,8 @@ struct ll_conn_ops {
 	 * ll_plat_lock() itself. Returns 0 or a negative errno. NULL: ll_conn
 	 * pushes the plaintext PDU itself (fine while unencrypted). The glue's
 	 * hook (ll_llcp_ctrl_tx) also takes the ll_plat_tx_lock() mutex, so it
-	 * may block: never call it from an ISR or with ll_plat_lock() held. */
+	 * may block: never call it from an ISR or with ll_plat_lock() held. It
+	 * owes the PDU when the backlog is full and retries it (slice 7). */
 	int (*ctrl_tx)(uint8_t link, const uint8_t *payload, uint8_t len);
 	/* Peripheral latency: true while an LL control procedure waits on us
 	 * or on the central (encryption start, a response not queued yet).

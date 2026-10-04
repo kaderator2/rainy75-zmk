@@ -34,10 +34,13 @@
  * response timer (llcp_tmr) runs only while an LL control procedure is
  * pending; the stats timer only with CONFIG_BT_HCI_B91_OPENLL_STATS_LOG.
  * Host ACL held back (-ENOMEM: TX backlog full; -EAGAIN: encryption start
- * pauses data) is retried on the wakeup that frees it: an ll_txq ack
- * (txq_done), the end of the procedure (LL_START_ENC_RSP received here,
- * the host's LTK negative reply, which wakes it, or the 40 s response
- * timeout, which ends the link) or the disconnect.
+ * pauses data, or the link owes control PDUs) is retried on the wakeup that
+ * frees it: an ll_txq ack (txq_done), the end of the procedure
+ * (LL_START_ENC_RSP received here, the host's LTK negative reply, which
+ * wakes it, or the 40 s response timeout, which ends the link) or the
+ * disconnect. Owed control PDUs (slice 7, ll_llcp.h) are retried before the
+ * link's host ACL at every pass (ll_llcp_retry), and llcp_tmr wakes the
+ * thread within LL_LLCP_RETRY_MS while one is owed.
  *
  * Toward the host, the controller thread delivers directly (after draining
  * the event queue first, so the order of everything it produced is kept);
@@ -107,9 +110,10 @@ static char __aligned(4) acl_q_buf[LL_MAX_CONN][ACL_Q_DEPTH * sizeof(struct acl_
 
 static K_SEM_DEFINE(wake, 0, 1);
 
-/* LLCP procedure response timeout (40 s, ll_llcp_tick): armed by the
- * controller thread from ll_llcp_timeout_ticks() only while a procedure is
- * pending; the expiry only wakes the controller thread. */
+/* LLCP procedure response timeout (40 s, ll_llcp_tick) and the retry of
+ * owed control PDUs (LL_LLCP_RETRY_MS): armed by the controller thread from
+ * ll_llcp_timeout_ticks() only while a procedure is pending or a PDU is
+ * owed; the expiry only wakes the controller thread. */
 static void llcp_tmr_fn(struct k_work *work)
 {
 	ARG_UNUSED(work);
@@ -574,15 +578,25 @@ static uint8_t ltk_neg_reply(uint16_t handle)
 	return st;
 }
 
-/* ll_hci validated the handle (handle_valid), so it is a link id */
+/* ll_hci validated the handle (handle_valid), so it is a link id. HCI
+ * thread: LL_TERMINATE_IND may be owed (backlog full, slice 7); wake the
+ * controller thread so it retries it and arms the retry timer. */
 static uint8_t hci_disconnect(uint16_t handle, uint8_t reason)
 {
-	return ll_llcp_terminate((uint8_t)handle, reason);
+	uint8_t st = ll_llcp_terminate((uint8_t)handle, reason);
+
+	k_sem_give(&wake);
+	return st;
 }
 
+/* HCI thread: LL_START_ENC_REQ may be owed, and the 40 s timer restarts;
+ * wake the controller thread (retry, timer). */
 static uint8_t ltk_reply(uint16_t handle, const uint8_t ltk[16])
 {
-	return ll_llcp_ltk_reply((uint8_t)handle, ltk);
+	uint8_t st = ll_llcp_ltk_reply((uint8_t)handle, ltk);
+
+	k_sem_give(&wake);
+	return st;
 }
 
 /* HCI thread: our LL_LENGTH_REQ may start the 40 s response timer, which
@@ -721,7 +735,10 @@ static void handle_connected(uint8_t link)
 		/* connInitialMaxTx* from the host's Suggested Default Data
 		 * Length (4.5.10 "For a new connection"); ll_llcp starts the
 		 * LENGTH procedure only when the central does not know our
-		 * values yet (never while LL_DLE_SUPP_OCTETS is 27) */
+		 * values yet (never while LL_DLE_SUPP_OCTETS is 27). A full
+		 * backlog owes LL_LENGTH_REQ (retried, slice 7); only a full
+		 * owed queue fails it (Memory Capacity, ignored: the link then
+		 * keeps 27 / 328, which stay valid) */
 		uint16_t def_oct, def_time;
 
 		ll_hci_default_data_len(&def_oct, &def_time);
@@ -1020,6 +1037,9 @@ static void ctrl_thread_fn(void *p1, void *p2, void *p3)
 			if (pend_test(i, PEND_UPDATED)) {
 				handle_updated(i);
 			}
+			/* owed control PDUs before host ACL (which waits for
+			 * them with -EAGAIN) */
+			ll_llcp_retry(i);
 			handle_acl_tx(i);
 			flush_nocp(i);
 			if (pend_test(i, PEND_DISCONNECTED)) {
