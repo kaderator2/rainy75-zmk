@@ -66,6 +66,10 @@ bool ll_rxq_isr_put(uint8_t link, const uint8_t *pdu, uint16_t len);
  * PDUs do not count, so the consumer is woken only when there is something
  * to deliver. */
 bool ll_rxq_isr_take_queued(void);
+/* ISR (producer side): true when the link's queue is at least half full,
+ * in entries or in bytes, so the consumer should drain it before the
+ * event ends (slice 6b Task 4: a long central burst). */
+bool ll_rxq_isr_half_full(uint8_t link);
 /* Thread: the link's next queued PDU, decrypted when the link's encryption
  * is on; call again after LL_RXQ_OK to continue draining. Single consumer. */
 enum ll_rxq_result ll_rxq_get(uint8_t link, struct ll_rx_pdu *out);

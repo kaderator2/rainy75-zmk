@@ -114,6 +114,32 @@ bool ll_rxq_isr_take_queued(void)
 	return r;
 }
 
+bool ll_rxq_isr_half_full(uint8_t link)
+{
+	const struct rxq_link *q;
+	uint8_t head, used;
+	uint32_t bytes;
+
+	if (link >= LL_MAX_CONN) {
+		return false;
+	}
+	q = &links[link];
+	head = q->head;
+	used = (uint8_t)(head - q->tail);
+	if (used == 0) {
+		return false;
+	}
+	{
+		const struct rxq_ent *o = &q->ent[ENT(q->tail)];
+		const struct rxq_ent *w = &q->ent[ENT(head - 1)];
+		uint32_t end = (uint32_t)w->off + ll_fifo_size(w->len);
+
+		/* the span from the oldest record to the end of the newest */
+		bytes = w->off >= o->off ? end - o->off : LL_RXQ_POOL_BYTES - o->off + end;
+	}
+	return 2u * used >= LL_RXQ_ENTRIES || 2u * bytes >= LL_RXQ_POOL_BYTES;
+}
+
 void ll_rxq_set_crypt(uint8_t link, struct ll_crypt *c)
 {
 	if (link < LL_MAX_CONN) {

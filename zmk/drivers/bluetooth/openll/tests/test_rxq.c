@@ -481,6 +481,39 @@ static void test_take_queued_any_link(void)
 /* A 251-octet encrypted PDU (255 bytes on air, the radio reports len 257)
  * is queued and decrypted whole; 255 unencrypted bytes too; a length the
  * header cannot carry is dropped. */
+/* Half full in entries or in bytes, per link. */
+static void test_half_full(void)
+{
+	struct ll_rx_pdu out;
+	uint8_t p[255] = {0};
+
+	reset_all();
+	CHECK(!ll_rxq_isr_half_full(L) && !ll_rxq_isr_half_full(LL_MAX_CONN));
+	for (int i = 0; i < LL_RXQ_ENTRIES / 2 - 1; i++) {
+		put(0x02, p, 3);
+	}
+	CHECK(!ll_rxq_isr_half_full(L));
+	put(0x01, NULL, 0);                     /* empty: no entry */
+	CHECK(!ll_rxq_isr_half_full(L));
+	put(0x02, p, 3);
+	CHECK(ll_rxq_isr_half_full(L));
+	CHECK(ll_rxq_get(L, &out) == LL_RXQ_OK);
+	CHECK(!ll_rxq_isr_half_full(L));
+	/* bytes: maximum PDUs fill half the area before half the entries */
+	reset_all();
+	for (int i = 0; i < LL_RXQ_POOL_BYTES / 2 / 256 - 1; i++) {
+		put(0x02, p, 255);
+	}
+	CHECK(!ll_rxq_isr_half_full(L));
+	put(0x02, p, 255);
+	CHECK(ll_rxq_isr_half_full(L));
+	for (uint8_t i = 0; i < LL_MAX_CONN; i++) {
+		if (i != L) {
+			CHECK(!ll_rxq_isr_half_full(i));
+		}
+	}
+}
+
 static void test_long_pdus(void)
 {
 	struct ll_rx_pdu out;
@@ -599,9 +632,11 @@ int main(void)
 	test_crypt_per_link();
 	test_take_queued_any_link();
 	L = 0;
+	test_half_full();
 	test_long_pdus();
 	test_capacity_bytes();
 	L = (uint8_t)(LL_MAX_CONN - 1);
+	test_half_full();
 	test_long_pdus();
 	test_capacity_bytes();
 	DONE();

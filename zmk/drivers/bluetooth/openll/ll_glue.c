@@ -433,16 +433,22 @@ static void radio_evt(enum ll_radio_evt evt, const uint8_t *pdu, uint16_t len, u
 	/* advertising PDUs are at most 39 bytes (8-bit length there) */
 	ll_adv_radio_evt(evt, pdu, (uint8_t)len, tick);
 	ll_conn_radio_evt(evt, pdu, len, tick);
-	/* Wake the controller thread as soon as an event queued a data PDU,
-	 * not only at the event's end: it runs between the RX IRQs of a long
-	 * central burst and drains ll_rxq, so a burst longer than the queue
-	 * does not overflow it (an overflow ends the link with 0x08). With
-	 * long PDUs the byte area holds 8 maximum PDUs (LL_RXQ_POOL_BYTES),
-	 * and one event at a 50 ms interval can carry 11 exchanges of 4.5 ms;
-	 * 27-octet PDUs fill the 16 entries in about 12 ms of MD burst. Empty
-	 * PDUs queue nothing, so an idle event still wakes nobody. */
-	if (evt == LL_RADIO_CONN_RX && ll_rxq_isr_take_queued()) {
-		k_sem_give(&wake);
+	/* Wake the controller thread before the event ends when the link's
+	 * RX queue is half full: it then runs between the RX IRQs of a long
+	 * central burst and drains ll_rxq, so the burst does not overflow it
+	 * (an overflow ends the link with 0x08). With long PDUs the byte area
+	 * holds 8 maximum PDUs (LL_RXQ_POOL_BYTES), and one event at a 50 ms
+	 * interval can carry 11 exchanges of 4.5 ms; 27-octet PDUs fill the
+	 * 16 entries in about 12 ms of MD burst. Only then: the thread running
+	 * during an event (decryption, copies) moved the first-exchange T_IFS
+	 * later on the device (<= 150 us 74 % -> 45 % with a wake per PDU). */
+	if (evt == LL_RADIO_CONN_RX) {
+		for (uint8_t i = 0; i < LL_MAX_CONN; i++) {
+			if (ll_rxq_isr_half_full(i)) {
+				k_sem_give(&wake);
+				break;
+			}
+		}
 	}
 	if (evt != LL_RADIO_CONN_DONE) {
 		return;
