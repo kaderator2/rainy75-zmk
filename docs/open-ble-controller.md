@@ -511,6 +511,19 @@ documentation. They may help anyone writing a B91 link layer.
   window (up to 31 x 15 ms = 465 ms). A kick only helps when we have TX data.
 - **Interrupt latency from outside the link layer.** USB interrupts and flash
   writes with interrupts off can still skip single connection events.
+- **A reconnect to a bonded host takes about 1.1 s until encryption, on the
+  host side.** On LE Connection Complete the Zephyr host loads the peer's CCC
+  values from settings (`CONFIG_BT_SETTINGS_CCC_LAZY_LOADING`, default y).
+  That scans the whole NVS storage, every read with interrupts off, inside the
+  cooperative BT RX work queue, so no thread runs for about 1.07 s (PC
+  sampling: 99.8 % `bt_workq` in `settings_nvs_load` and the NVS ATE reads).
+  Our controller thread, which delivered the event, answers the central's
+  LL_FEATURE_REQ only then (on air 1.09 s after CONNECT_IND, encryption at
+  1.15 s). The controller's own part is 1.3 ms (CONNECT_IND to the event
+  handed to the host). With `CONFIG_BT_SETTINGS_CCC_LAZY_LOADING=n` (CCCs
+  loaded at boot, +312 B RAM) the host returns after 6 ms and encryption is
+  on after about 0.12 s. The time grows with the NVS contents (about 0.3 s in
+  slice 2).
 - **Not supported:** CSA #2 (we advertise ChSel 0, so the central uses CSA #1),
   2M and Coded PHY, Data Length Extension, LL privacy (LE Set Random Address,
   RPA), LE Ping (answered with LL_UNKNOWN_RSP, which the tested central
