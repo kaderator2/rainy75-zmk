@@ -971,6 +971,7 @@ patches/
     0007-usb-device-reclaim-transfer-slots-whose-completion-n.patch
     0008-usb-device-expose-a-transfer-slot-s-work-item-for-di.patch
     0009-usb-device-do-not-re-init-transfer-slots-on-every-us.patch
+    0010-mgmt-uart_mcumgr-keep-log-output-out-of-SMP-frames.patch
   mcuboot/
     0001-b91-riscv-boot-fixes.patch
   hal_telink/
@@ -990,7 +991,7 @@ commands. The two waited on each other until the HCI command timeout
 asserted; the MCUboot test image then reverted, and the previous image went
 on advertising the public address.
 
-### Zephyr (4 files, 9 patches)
+### Zephyr (10 patches)
 
 **`drivers/gpio/gpio_b91.c`** — WRITE_BIT double-BIT fix **[VERIFIED]**
 
@@ -1034,6 +1035,22 @@ Upstream reports 256B programming pages. MCUboot enumerates these as swap sector
 ```
 
 TLSR951x supports `sys_poweroff()` via deep retention sleep, but upstream never declared `HAS_POWEROFF`. Without it, `CONFIG_POWEROFF` (and thus `CONFIG_ZMK_SLEEP`) cannot be enabled.
+
+**`drivers/console/uart_mcumgr.c` + `subsys/logging/backends/log_backend_uart.c`** (0010) — log output never lands inside an SMP frame **[VERIFIED]**
+
+The log console and mcumgr share the one CDC ACM port, and both write it with
+`uart_poll_out()` byte by byte (log thread vs SMP work queue). A log message
+written while a response frame was going out ended up inside the frame, the
+host dropped the frame, and the request timed out. With the opt-in openll
+stats log (7 lines every 2 s) that was one lost response every 4 s: 17..27
+retries per image upload, 110..180 s instead of 80 s with the mcumgr CLI
+(17..34 CLI request timeouts), and 2 of 11 CLI uploads stopped making progress
+at a fixed offset until killed (a new mcumgr on the same port answered at once,
+so the device side was alive). The patch writes a whole SMP frame under a mutex
+that the UART log backend also takes around each message (not in panic or ISR
+context). Measured on the stats-log image with the patch: 0..1 lost responses
+per upload (the first request, which waits for the slot erase), CLI uploads
+81..84 s, a minimal one-request-at-a-time SMP client 15 s instead of 85 s.
 
 ### MCUboot (1 file, 1 patch)
 
