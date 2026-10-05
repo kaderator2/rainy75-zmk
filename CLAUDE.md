@@ -55,7 +55,7 @@ zmk/                             # Zephyr module — our custom firmware code
       ll_radio.c/.h ll_radio_mode.c/.h  # the only RF code (BRX, STX2RX, CPU hold, per-event link switch); adv register snapshot
       ll_sched.c/.h              # stimer main + guard alarm
       ll_flash.c/.h ll_flash_wrap.c  # flash window: no radio activity during hal flash erase/write (link-time --wrap)
-      ll_defs.h ll_plat.h tests/ # constants (LL_MAX_CONN, features 0x37/0x40); platform hooks; host tests (41 binaries)
+      ll_defs.h ll_plat.h tests/ # constants (LL_MAX_CONN, features 0x37/0x40); platform hooks; host tests (43 binaries)
   drivers/usb/                   # USB DC driver (legacy usb_dc.h API, linked and enabled)
   drivers/led_strip/             # WS2812 LED strip driver (PSPI + DMA, b91_pspi.h registers)
   drivers/sensor/                # Battery ADC driver (SAR ADC sensor + channel scanner)

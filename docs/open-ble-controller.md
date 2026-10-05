@@ -12,8 +12,141 @@ A keyboard running it advertises, keeps up to 3 peripheral links at once
 bond and works as a BLE HID keyboard. It supports CSA #2, Data Length Extension
 up to 251 octets, LE Ping, the Connection Parameters Request procedure (responder),
 peripheral latency and deep sleep, and opt-in privacy (`--privacy`). No blob is
-linked. Only one central has been tested so far (Intel controller with
-Linux/BlueZ), and only with one link at a time on the device.
+linked. Tested centrals: a Linux/BlueZ PC (Intel controller) and an Android
+phone, both connected at the same time; three simultaneous links have not been
+tested on the device yet.
+
+## Overview
+
+The open controller is a BLE link layer for the Telink B91 written from
+scratch for this keyboard. It is:
+
+- **Open:** Apache-2.0 (the repository licence, the same as Zephyr and
+  hal_telink). The firmware image contains no prebuilt binary, so anyone can
+  build it without fetching the blob, and the licences allow publishing
+  prebuilt images.
+- **The default:** `./build.sh` builds it; the blob is opt-in (`--blob`).
+- **Clean-room:** written from the Bluetooth Core Specification, the TLSR9511
+  datasheet, the open hal_telink sources (`rf.c`, `aes.c`, `ext_rf.h`) and our
+  own measurements. Neither the blob nor the stock firmware served as a
+  source; where no open source exists (2M PHY), the feature is left out.
+- **Test-driven:** everything except four device glue files is pure C and runs
+  in host tests with gcc before it runs on the keyboard.
+- **Reviewed:** every task was checked by an independent reviewer before it
+  was accepted, and the whole branch went through a three-part final review.
+- **Measured:** timing, throughput and power were measured on the keyboard,
+  with an nRF52840 sniffer on air and with the controller's own counters.
+
+### Comparison
+
+"Not measured" and "unknown" mean that we have no own evidence for that cell.
+The stock column is based on the manual and our analysis of the stock firmware
+(see [architecture.md](architecture.md)), not on air captures, unless stated.
+
+| | Stock Rainy firmware | ZMK + Telink blob | ZMK + open controller |
+|---|---|---|---|
+| Source and licence | Proprietary (Evision platform, no public source) | ZMK and drivers open; controller is a proprietary binary that cannot be committed or redistributed, every user builds locally | Fully open, Apache-2.0, no binary blob in the image |
+| Bluetooth hosts | 3 slots with separate names (`Rainy75-1` to `-3`), Fn+Tab then Fn+F1..F3; most likely one link at a time (not verified on air) | 3 ZMK profiles, but the blob is configured for 1 peripheral link; advertises in gaps while connected | Up to 3 links at once (Kconfig 1 to 5); 2 real hosts (PC + phone) tested connected at the same time, Fn+F1/F2 switches without reconnecting; 3 links not tested |
+| Channel Selection Algorithm #2 | Unknown | Yes (ChSel 1, seen on the sniffer) | Yes (179 of 179 sniffed events match CSA #2) |
+| Data Length Extension | Unknown | 27 octets as our shim configures it (Zephyr default host buffers); larger values not tried | 251 octets / 2120 us both ways, ATT MTU 247 |
+| LE Ping | Unknown | Not tested | Yes (responder and authenticated payload timeout) |
+| Connection Parameters Request | Unknown | Not tested | Responder (initiator not implemented) |
+| PHY | Unknown | 2M unusable: LL Response Timeout 0x22 40 s after the switch, so it is disabled; 1M | 1M only: no open register source for 2M exists |
+| Pairing security | Unknown | LE Secure Connections only with enforced MITM (passkey entry), security level 4: ZMK host configuration, same for both controllers | Same as the blob column |
+| Privacy (RPA) | Unknown | Not usable: `bt_enable()` hung; most likely the ZMK settings deadlock that zmk-src 0005 fixed, blob not retested, `build.sh` refuses `--privacy --blob` | Opt-in (`--privacy`), RPA rotation verified on air |
+| Firmware update | USB HID OTA (write-only); over BLE unknown | mcumgr over USB; BLE upload speed not measured | mcumgr over USB or BLE: 293 KB image over BLE in 25.0 s (27.1 to 27.4 s with the CPU hold) |
+| ZMK Studio over BLE | Not available (VIA over USB) | Not measured | 22.6 RPC per s (10.3 per s with 27-octet PDUs) |
+| Reconnect of a bonded host | Not measured | Not measured (the blob build keeps Zephyr's lazy CCC loading, which cost about 1 s per reconnect on the open build) | CONNECT_IND to Encryption Change 117 to 125 ms |
+| Idle link power | Vendor: about 900 h with RGB off (Pro), not measured by us | Not measured | 96 % of connection events skipped at 12 / 30 / 400 (answers every 31st event), 0.1 wakeups per s; battery drain vs the blob not compared yet |
+| T_IFS on air | Not measured | 96.8 / 97.2 % within 150 us (all peripheral responses, two captures) | 99.6 / 99.7 % within 150 us (first response per event, two runs) |
+| Pairing and connecting LEDs | F1..F3 blue indicator, long press pairs, 1 min pairing timeout (manual) | Slot status on F1..F4, passkey guidance on the number row (rainy_rgb, independent of the controller) | Same; device-tested with this controller |
+| Link counters for the host | None known | None | Power and arbiter counters over mcumgr group 66 (`openll_stats.py`, USB or BLE) |
+| Image size (ISO) | 120 KB stock image | ROM 328 KB, RAM 85 KB, ILM 40 KB | ROM 303 KB, RAM 106 KB (251-octet queues for 3 links), ILM 8 KB |
+
+### Technical highlights
+
+- **Multilink on one TX FIFO.** The B91 has a single 4-entry TX FIFO whose read
+  pointer cannot be reset. The FIFO is rebuilt for each event's link at the
+  current read pointer from software copies of that link's unacked PDUs, which
+  works because the hardware reads the head entry from RAM at TX time. See
+  [Links](#links-multilink).
+- **Event arbiter with a starvation bound.** One arbiter owns the radio alarm
+  and keeps events of all links and advertising free of overlaps, by priority
+  MUST > SUPERVISION > STARVING > ACTIVE > IDLE > ADV. A link that yielded two
+  events in a row is raised to STARVING. With a PC under echo load and an idle
+  phone, the phone's longest listen gap dropped from 265 events (3975 ms; a
+  channel map then arrived after its instant and ended the link with 0x28)
+  to 33 or 34 events. See
+  [Event arbiter](#event-arbiter-ll_arb).
+- **T_IFS from the hardware turnaround.** Connection events use the B91's BRX
+  command. The RX interrupt holds the CPU off the bus until our response has
+  started, which raised responses within 150 us to 99.6 % on the sniffer
+  (responses above 152 us: from 2.4 to 2.9 % down to 0.00 to 0.03 %). See
+  [CPU hold](#cpu-hold-in-the-turnaround).
+- **SCAN_RSP at 150 us.** The RF interrupt decides from RAM and schedules a
+  single TX, so the response is on air 150 us after the SCAN_REQ (119 of 129
+  sniffed responses at 150 us, the rest at 149 or 151 us), and it fails safe:
+  no answer unless the decision came in time. See
+  [SCAN_RSP at T_IFS](#scan_rsp-at-t_ifs).
+- **Peripheral latency without slow keys.** Idle links skip up to the latency
+  window; every TX push kicks the link to the next event, so a keypress is not
+  delayed. A 1 s holdoff after connect and a 1 s holdoff after central data
+  keep exchanges fast: follow-up GATT reads went from a 395 ms to a 20 ms
+  median. See [Peripheral latency rules](#peripheral-latency-rules).
+- **Spec-exact instants.** Connection updates and channel maps are judged
+  against the event the PDU was received in (Vol 6 Part B 5.5.1), and an
+  instant that went by while the thread was held off is applied late with a
+  bounded arithmetic catch-up. Client connects that ended with 0x28: 11 of 28
+  before, 0 of 140 after. See [Late instants](#late-instants).
+- **No acked PDU is lost.** The baseband acks packets by itself, so a full RX
+  queue would lose data. RX flow control stops receiving before that happens,
+  and flash windows keep the radio quiet while a flash erase or write runs
+  with interrupts off. 10 of 10 USB uploads under BLE load lost the link
+  before the flash window, 0 after it (13 252 of 13 252 echoes). See
+  [RX flow control](#rx-flow-control) and [Flash window](#flash-window).
+- **Data Length Extension.** 251-octet PDUs both ways, host packets
+  fragmented to the link's TX limit, which is the smaller of the effective
+  octets and what fits in the effective time. BLE image upload 4.9x faster.
+  See [Data Length Extension](#data-length-extension-251-octets).
+- **LLCP coverage.** LE Ping with the authenticated payload timeout, the
+  Connection Parameters Request responder, AES-CCM encryption on the hardware
+  AES block outside the IRQ lock, and opt-in privacy with a resolvable private
+  address. See [LLCP](#llcp-responder-and-encryption).
+- **Counters on the host.** mcumgr group 66 reports listens, skips and
+  misses in total and per link, kicks, arbiter losses and listen gaps,
+  advertising and flash window counters, over USB or BLE.
+  See [Power counters](#power-counters-mcumgr-group-66).
+
+### Quality
+
+- **Host tests:** 43 binaries with `-Wall -Wextra -Werror`, the per-link suites
+  built for 1, 3 and 5 links. They cover the Core Spec sample data (CSA #2,
+  AES-CCM, session key) and a fake TX FIFO that implements the measured
+  hardware model, including forced NACKs. See [Host tests](#host-tests).
+- **Mutation testing:** hand-made mutants per task check that the tests catch
+  real faults (for example 11 of 11 killed for CSA #2, 18 of 18 for the
+  LENGTH and PHY procedures).
+- **Reviews:** an independent review of every task before it was accepted,
+  then three parallel final reviews (scheduling; LLCP, HCI and glue; radio,
+  queues, flash and build) and a verification review of the fixes.
+- **Sniffer:** T_IFS, CSA #2 hops, SCAN_RSP timing, advertising while
+  connected and RPA rotation were checked on air with an nRF52840 sniffer.
+- **Soaks:** 33 min encrypted with 756 connection updates and 0 disconnects;
+  10 USB image uploads under a 1000 s BLE echo load, 13 252 of 13 252 echoes;
+  forced NACKs (about 18 % of our responses lost) with 2686 of 2686 encrypted
+  echoes and 5320 of 5320 with 251-octet PDUs.
+- **Multi-host:** a PC under echo load and an idle Android phone, 4 x 10 min:
+  no drop in 3 runs, one 0x08 in run 2 (see
+  [Multi-host](#multi-host-pc-and-phone-starvation-bound)); typing on both
+  hosts and fresh passkey pairing of the phone checked by hand.
+
+### Limitations in short
+
+No 2M PHY; only one PC and one Android phone tested as centrals (Windows, macOS
+and iOS untested), three links not tested; the SoC is not suspended between
+events and the battery drain has not been compared with the blob; central data
+can wait up to (latency + 1) x interval for the next listened event. Full list:
+[Known limitations and open items](#known-limitations-and-open-items).
 
 ## Why
 
@@ -114,7 +247,7 @@ Further options of the open controller:
 | Option | Default | Meaning |
 |---|---|---|
 | `BT_HCI_B91_OPENLL_MAX_CONN` | 3 | Simultaneous peripheral links (1 to 5) |
-| `BT_HCI_B91_OPENLL_SCANRSP_SETTLE_US` | 63 | TX settle of the SCAN_RSP (30 to 87), see [SCAN_RSP](#scan_rsp-at-t_ifs) |
+| `BT_HCI_B91_OPENLL_SCANRSP_SETTLE_US` | 63 | TX settle of the SCAN_RSP (40 to 87), see [SCAN_RSP](#scan_rsp-at-t_ifs) |
 | `BT_HCI_B91_OPENLL_STATS_LOG` | n | Radio and connection counters in the log every 2 s |
 
 Wiring:
@@ -1154,8 +1287,9 @@ documentation. They may help anyone writing a B91 link layer.
   permission.
 - **Multi-host device test partly done** (slice 6a Task 7). Two real
   centrals (PC and phone) with an SMP load on one link: see
-  [Multi-host](#multi-host-pc-and-phone-starvation-bound). Profile switching
-  with several real hosts (Fn+F1..F3) and three links are not tested yet.
+  [Multi-host](#multi-host-pc-and-phone-starvation-bound). Typing on both
+  hosts and switching between them (Fn+F1/F2) were checked by hand; three
+  links at once are not tested yet.
   The request span (`min_len`) still reserves the alarm lead after the floor
   although the clip only needs the safety margin there, so adjacent requests
   are kept 500 us further apart than necessary. With the starvation bound a
@@ -1212,9 +1346,9 @@ documentation. They may help anyone writing a B91 link layer.
   link was lost.
 - **CPU hold cost:** up to about 160 us per listened event with a received
   packet (see [CPU hold](#cpu-hold-in-the-turnaround)).
-- **One central tested.** Only an Intel controller with Linux/BlueZ. Windows,
-  macOS, Android and iOS are untested.
-- **Host-tested only:** fresh pairing without an existing bond, the LTK negative
+- **Two centrals tested.** A Linux/BlueZ PC (Intel controller) and an Android
+  phone. Windows, macOS and iOS are untested.
+- **Host-tested only:** the LTK negative
   reply path, HCI Reset during a connection, the masked Connection Parameters
   Request path, privacy reconnect after re-pairing.
 - **LL_ENC_REQ on an encrypted link is rejected (0x24)**: encryption pause and
@@ -1356,7 +1490,7 @@ Tests: `cd reverse/tools && python3 -m unittest test_ble_adv_report test_openll_
 zmk/drivers/bluetooth/openll/tests/run_host_tests.sh
 ```
 
-Builds and runs with the host gcc (`-Wall -Wextra -Werror`), 41 binaries: the
+Builds and runs with the host gcc (`-Wall -Wextra -Werror`), 43 binaries: the
 per-link suites for `LL_MAX_CONN` 1, 3 and 5, and the LLCP/HCI suites also with
 a supported maximum of 27 octets (`_sup27`):
 
@@ -1364,7 +1498,7 @@ a supported maximum of 27 octets (`_sup27`):
 |---|---|
 | `test_hci` | Opcode handling, event encoding and masks, parameter validation, unknown opcodes, handles, ACL framing and fragmentation, DLE/PHY/APTO/CPR commands |
 | `test_pdu` | PDU encoding (ChSel, TxAdd), SCAN_REQ match, CONNECT_IND parsing against captured bytes |
-| `test_scanrsp`, `test_scanrsp_s50` | SCAN_RSP decision and trigger lead for the default and a non-default settle |
+| `test_scanrsp`, `test_scanrsp_s40`, `_s50`, `_s87` | SCAN_RSP decision and trigger lead for the default settle and for 40, 50 and 87 us (the Kconfig range ends) |
 | `test_adv` | Advertising state machine against a fake radio: random address, advertising while connected, slicing, flash window |
 | `test_arb` | Event arbiter, multilink and advertising scenarios (incl. the starvation bound with channel maps on a background link), chains of flash operations against 1 to 3 links |
 | `test_csa1`, `test_csa2` | CSA #1 against hand-computed sequences, CSA #2 against the Core Spec sample data |
@@ -1381,8 +1515,8 @@ a supported maximum of 27 octets (`_sup27`):
 
 - **Slice 5b: battery measurement and SoC suspend.** Overnight comparison with
   the blob, then suspend between connection events and 32 kHz RC calibration.
-- **Multi-host test** (slice 6a Task 7) and **more centrals:** Windows, macOS,
-  Android and iOS hosts.
+- **Three links on the device** (two real hosts are done, slice 6a Task 7)
+  and **more centrals:** Windows, macOS and iOS hosts.
 - **Optional:** HCI LE Connection Update (initiator) and Peripheral-initiated
   Feature Exchange; 2M PHY if a register source becomes available.
 - **In parallel:** ask Telink for permission to redistribute the blob (and for
