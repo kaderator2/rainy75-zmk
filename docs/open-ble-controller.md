@@ -127,6 +127,8 @@ Zephyr or hardware dependencies and is tested on the host with gcc.
 | `ll_crypt.c` / `.h` | BLE AES-CCM (encrypt and decrypt one PDU, nonce from packet counter, direction and IV), session key derivation |
 | `ll_radio.c` / `.h` | The only RF-touching file. Wraps hal_telink `rf.c`: advertising (STX2RX, STX), connection events (BRX), TX FIFO pointers, RX DMA ring, timestamps, T_IFS monitor, return to advertising, counters |
 | `ll_sched.c` / `.h` | One-shot alarm and a guard alarm at absolute system timer (stimer, 16 MHz) ticks, callbacks in ISR context |
+| `ll_flash.c` / `.h` | Flash window: no radio activity while a flash erase or write runs with interrupts off (see [Flash window](#flash-window)) |
+| `ll_flash_wrap.c` | Device glue of the flash window: wraps the hal flash erase/write/read functions at link time |
 | `ll_defs.h` | Shared constants (HCI status codes, PDU types, LLIDs, features, version, ACL buffer sizes, ticks per us) |
 | `ll_plat.h` | Platform hooks used by the pure code: random number, IRQ lock, TX mutex, AES-128 block |
 | `tests/` | Host tests (see [Host tests](#host-tests)) |
@@ -246,6 +248,71 @@ PDU, so the central will never resend it. `ll_conn` then ends the link with
 stream. With data-only queuing no overflow has been seen since; before, empty
 PDUs filled the ring while the host processed LE Connection Complete (about
 300 ms, see "Measured results").
+
+### Flash window
+
+Every hal flash erase and write (hal_telink `flash.c`) runs with interrupts
+off: a 4 KB sector erase 12 to 29 ms, a 256-byte page write up to about 2 ms.
+A connection event that is open then keeps running in hardware: the baseband
+receives and acks the central's packets into the 4-entry RX DMA ring, but
+neither the RF interrupt (which empties the ring) nor the guard alarm (which
+ends the event) can run. A central burst of more than 4 packets overwrites
+acked entries (`ptr_skip` in the stats), the lost PDU makes the next one fail
+its MIC, and the link ends with 0x3D. Seen during USB image uploads with BLE
+traffic (the RF interrupt ran 0.2 ms before a 12.4 ms sector erase, 5 or 6
+packets arrived during it), and possible whenever ZMK writes settings while
+the PC sends data.
+
+`ll_flash_wrap.c` wraps the hal functions at link time (`-Wl,--wrap`, set in
+`zmk/drivers/bluetooth/CMakeLists.txt`; no Zephyr or hal patch), so every
+caller is covered: NVS / settings, mcumgr image upload, flash_mgmt and
+`b91_mac.c`. Each sector erase and each 256-byte page write runs in a window
+(`ll_flash.h`):
+
+- opening the window stops what is on air (`ll_radio_flash_abort()`: an open
+  connection event ends with the packets already in the ring delivered, an
+  advertising channel ends like an RX timeout);
+- while it is set, `ll_conn` issues no connection event (`flash_paused`, also
+  counted as missed; the central resends as after any missed event) and
+  `ll_adv` sends no advertising channel;
+- 32 and 64 KB block erases are split into sector erases; reads get no window
+  (at most 66 us with interrupts off) but are split into 256-byte reads.
+
+Supervision: a window opens only while every link is established and, after
+one operation (30 ms budget), still has half of its supervision timeout left
+since its last received packet. Otherwise the links' next events are pulled
+in (`ll_conn_kick()`) and the flash caller sleeps 1 ms and asks again (the
+window itself is never held across a sleep). A chain of back-to-back erases
+therefore lets an event through whenever a link needs one; after 100 ms of
+waiting the window opens anyway (`forced`). Cost: during a long chain of
+erases a link receives only about every half supervision timeout, so BLE
+throughput and key latency drop while the flash is busy.
+
+Measured (default NOSLEEP image): before the fix, 10 of 10 USB image uploads
+lost the link (MIC failure 0x3D, `ptr_skip` 1 or 2) under a bursty BLE echo
+load (150 to 240 characters in 20-byte writes without response). With it, 10
+USB uploads (mcumgr CLI, 90.1 to 90.7 s each; 79.6 s without BLE load, as
+before) under one 1000 s echo client: 13 252 of 13 252 echoes, no
+disconnect, `ptr_skip` 0, 12 451 windows, 0 waits. A 10 minute NVS-like
+load over BLE (flash_mgmt: 4 KB erase, then 64 writes of 32 bytes, 184
+erases and 11 758 writes) with the same echo load in parallel: 6 352 of
+6 352 echoes, no disconnect, in two runs (a third run, started right after
+a burst of ZMK Studio CCC writes that makes ZMK churn the connection
+parameters, lost the link after 235 s with `ptr_skip` 0 and no forced
+window; its reason was not captured). Idle cadence, typing path (SMP echo
+median 24.6 ms, p95 25.2 ms) and BLE image upload time (44 s) are the same
+as without the window.
+
+Why not other fixes: the hal's busy-wait loop (`flash_wait_done()`) calls a
+BLE hook only for hal_telink's own `CONFIG_BT_B91` controller path, and running
+our RX path from inside it would need all of it in RAM while XIP is stopped. A
+deeper RX ring does not exist in hardware (the DMA geometry is fixed at 4
+entries), and the baseband acks every new packet by itself.
+
+Counters: `ll_flash_get_stats()` (windows, waits, forced, longest wait),
+`ll_conn_stats.flash_paused` / `flash_cut`, `ll_adv_stats.flash`,
+`ll_radio_stats.flash_aborts`; the stats log line `flash: ...` and the `flash`
+map of mcumgr group 66 (with `pskip`, the RX ring overruns).
 
 ### LLCP (responder) and encryption
 
@@ -426,7 +493,10 @@ Reply fields: `up` (ms), `idle` (CPU idle ms, from
 `CONFIG_THREAD_RUNTIME_STATS`), `plan` (listen alarms armed), `listen`
 (events listened to), `skip` (events skipped by latency), `kick`, `ev`, `miss`
 (events without any CRC-valid packet, plus late alarms), `wake` (controller
-thread wakeups) and `mv` (battery millivolts, 0 if unavailable). The tool prints deltas, idle
+thread wakeups) and `mv` (battery millivolts, 0 if unavailable). Newer
+firmware adds per-link and advertising counters and the `flash` map (flash
+window: `win`, `wait`, `force`, `wmax`, `pause`, `cut`, `abort`, and `pskip`,
+the RX DMA ring overruns, which must stay 0). The tool prints deltas, idle
 percentage and the share of skipped events. `ev`, `miss` and `skip` are counted
 when planned or closed, so `skip` may overstate by up to the latency when a
 link ends. Over BLE the read itself is traffic: the host raises the link to
@@ -509,8 +579,9 @@ documentation. They may help anyone writing a B91 link layer.
 - **Latency applies from event 1 after connect.** Early LLCP or GATT requests
   from the central, before we have anything to send, can wait up to one skip
   window (up to 31 x 15 ms = 465 ms). A kick only helps when we have TX data.
-- **Interrupt latency from outside the link layer.** USB interrupts and flash
-  writes with interrupts off can still skip single connection events.
+- **Interrupt latency from outside the link layer.** USB interrupts can still
+  delay single connection events. Flash erases and writes no longer overlap
+  connection events (flash window), but they skip the events they cover.
 - **CCC values load at boot (`CONFIG_BT_SETTINGS_CCC_LAZY_LOADING=n` in
   `conf/openll.conf`, +312 B RAM).** With the Zephyr default (lazy loading)
   the host loads the peer's CCC values at every connection of a bonded peer
@@ -708,7 +779,8 @@ Builds and runs with the host gcc (`-Wall -Wextra -Werror`):
 | `test_crypt` | AES-CCM and session key against the Core Spec sample data (software AES reference) |
 | `test_txq`, `test_txq_safe` | TX queue against a fake FIFO implementing the measured hardware model, including forced NACKs, the placeholder case and pointer wrap |
 | `test_rxq` | RX queue, data-only queuing, decryption, MIC failure |
-| `test_conn` | Connection timing (transmit window, widening, anchor rule), instants, supervision, termination, RX queue loss |
+| `test_conn` | Connection timing (transmit window, widening, anchor rule), instants, supervision, termination, RX queue loss, flash window (pause, cut, readiness) |
+| `test_arb` | Event arbiter, multilink and advertising scenarios, chains of flash operations against 1 to 3 links |
 | `test_llcp` | Every LLCP PDU, encryption start, lock discipline (no AES under the IRQ lock) |
 
 ## SCAN_RSP timing (slice 7)
