@@ -59,6 +59,7 @@
 #include "ll_arb.h"
 #include "ll_conn.h"
 #include "ll_defs.h"
+#include "ll_flash.h"
 #include "ll_plat.h"
 
 #ifdef __ZEPHYR__
@@ -375,6 +376,12 @@ static void place_next_channel(uint32_t from)
 static void next_channel(void)
 {
 	adv.on_air = false;
+	if (ll_flash_active()) {
+		/* the flash window opened during the event (ll_flash.h) */
+		adv.stats.flash++;
+		schedule_next_event();
+		return;
+	}
 	while (++adv.ch_idx < 3) {
 		if (adv.prm.chan_map & (1 << adv.ch_idx)) {
 			if (adv.chans_left > 0) {
@@ -405,6 +412,13 @@ void ll_adv_arb_start(uint32_t cap_us)
 
 		ll_arb_cancel(LL_ARB_ADV);
 		ll_plat_unlock(key);
+		return;
+	}
+	if (ll_flash_active()) {
+		/* a flash operation turns interrupts off (ll_flash.h): no
+		 * channel on air; the event ends (or is not started) */
+		adv.stats.flash++;
+		schedule_next_event();
 		return;
 	}
 	if (!adv.in_event) {

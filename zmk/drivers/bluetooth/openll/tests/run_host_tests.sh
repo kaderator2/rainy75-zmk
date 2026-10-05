@@ -26,15 +26,16 @@ build_run_as test_scanrsp_s50 test_scanrsp -DLL_TEST_SETTLE_OVERRIDE -DLL_SCANRS
 # Suites with per-link state run for LL_MAX_CONN 1, 3 and 5 (slice 6a):
 # binaries <test>_n<N>.
 for n in 1 3 5; do
-    build_run_as test_adv_n$n test_adv -DLL_MAX_CONN=$n ../ll_adv.c ../ll_pdu.c ../ll_arb.c
+    build_run_as test_adv_n$n test_adv -DLL_MAX_CONN=$n ../ll_adv.c ../ll_pdu.c ../ll_arb.c ../ll_flash.c
     build_run_as test_hci_n$n test_hci -DLL_MAX_CONN=$n ../ll_hci.c
     build_run_as test_credit_n$n test_credit -DLL_MAX_CONN=$n ../ll_credit.c
     build_run_as test_txq_n$n test_txq -DLL_MAX_CONN=$n ../ll_txq.c
     build_run_as test_txq_safe_n$n test_txq -DLL_MAX_CONN=$n -DLL_TXQ_SAFE_MODE ../ll_txq.c
     build_run_as test_conn_n$n test_conn -DLL_MAX_CONN=$n \
-        ../ll_conn.c ../ll_arb.c ../ll_txq.c ../ll_rxq.c ../ll_csa1.c ../ll_csa2.c ../ll_crypt.c aes_ref.c
+        ../ll_conn.c ../ll_arb.c ../ll_flash.c ../ll_txq.c ../ll_rxq.c ../ll_csa1.c ../ll_csa2.c \
+        ../ll_crypt.c aes_ref.c
     build_run_as test_arb_n$n test_arb -DLL_MAX_CONN=$n \
-        ../ll_arb.c ../ll_conn.c ../ll_adv.c ../ll_pdu.c ../ll_txq.c ../ll_rxq.c \
+        ../ll_arb.c ../ll_conn.c ../ll_adv.c ../ll_pdu.c ../ll_flash.c ../ll_txq.c ../ll_rxq.c \
         ../ll_csa1.c ../ll_csa2.c ../ll_crypt.c aes_ref.c
     build_run_as test_rxq_n$n test_rxq -DLL_MAX_CONN=$n ../ll_rxq.c ../ll_crypt.c aes_ref.c
     build_run_as test_llcp_n$n test_llcp -DLL_MAX_CONN=$n \

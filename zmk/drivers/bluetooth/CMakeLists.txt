@@ -24,7 +24,19 @@ if(CONFIG_BT_HCI_B91_CTLR_OPEN)
     openll/ll_conn.c
     openll/ll_credit.c
     openll/ll_llcp.c
+    openll/ll_flash.c
+    openll/ll_flash_wrap.c
     ${B91_DRV}/rf.c
+  )
+  # Flash window (openll/ll_flash.h): every hal flash erase/write runs with
+  # interrupts off; ll_flash_wrap.c wraps them so the radio is idle meanwhile.
+  zephyr_ld_options(
+    -Wl,--wrap=flash_erase_sector
+    -Wl,--wrap=flash_erase_page
+    -Wl,--wrap=flash_erase_32kblock
+    -Wl,--wrap=flash_erase_64kblock
+    -Wl,--wrap=flash_write_page
+    -Wl,--wrap=flash_read_page
   )
   # hal AES (link encryption, ll_plat_aes_ecb). hal_telink compiles aes.c only
   # with its own CONFIG_BT_B91 BLE path, which neither build uses, so there is

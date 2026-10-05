@@ -63,6 +63,7 @@
 #include "ll_conn.h"
 #include "ll_credit.h"
 #include "ll_crypt.h"
+#include "ll_flash.h"
 #include "ll_hci.h"
 #include "ll_llcp.h"
 #include "ll_plat.h"
@@ -1177,6 +1178,7 @@ static void report_stats(struct ll_radio_stats *last, struct ll_conn_stats *last
 
 	uint32_t rxq_of = 0;
 	struct ll_adv_stats as;
+	struct ll_flash_stats fs;
 
 	ll_radio_get_stats(&st);
 	ll_conn_get_stats_total(&cs);
@@ -1214,6 +1216,10 @@ static void report_stats(struct ll_radio_stats *last, struct ll_conn_stats *last
 			ll_conn_count(), (uint32_t)atomic_get(&cnt_apto));
 		LOG_INF("conn: rx flow paused %u (longest run %u) stops %u (radio %u)",
 			cs.rx_paused, cs.rx_pause_streak_max, cs.rx_stops, st.conn_stopped);
+		ll_flash_get_stats(&fs);
+		LOG_INF("flash: windows %u waits %u forced %u wait max %u us, conn paused %u cut %u, adv %u, radio aborts %u",
+			fs.windows, fs.waits, fs.forced, fs.wait_max_us, cs.flash_paused,
+			cs.flash_cut, as.flash, st.flash_aborts);
 		LOG_INF("adv: events %u slid %u dropped %u cut %u stuck %u adv_guard %u",
 			as.events, as.slid, as.dropped, as.cut, as.stuck, st.adv_guard);
 		LOG_INF("conn: acl in %u out %u drop %u frag %u evt_drop %u lock max %u us acl_tx %u us aes %u us",
@@ -1344,6 +1350,8 @@ int b91_bt_controller_init(void)
 	}
 	ll_adv_init(bd_addr, on_connect_ind);
 	ll_hci_init(&hci_ops, evt_sink);
+	ll_flash_reset();
+	ll_flash_wrap_enable();   /* flash erases/writes from now on in a window */
 
 	k_thread_create(&ctrl_thread, ctrl_stack, K_THREAD_STACK_SIZEOF(ctrl_stack),
 			ctrl_thread_fn, NULL, NULL, NULL,

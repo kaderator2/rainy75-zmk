@@ -4,6 +4,7 @@
 #include "../ll_adv.h"
 #include "../ll_arb.h"
 #include "../ll_conn.h"
+#include "../ll_flash.h"
 #include "../ll_defs.h"
 #include "../ll_sched.h"
 #include "../ll_plat.h"
@@ -54,6 +55,16 @@ uint8_t ll_conn_count(void) { return taken; }
 void ll_radio_adv_restore(void) { restores++; }
 static int adv_enters;
 void ll_radio_adv_enter(void) { adv_enters++; }
+/* flash window fakes: links always ready; the radio ends an advertising
+ * channel on air like an RX timeout (ll_adv ignores it otherwise) */
+static int flash_aborts;
+bool ll_conn_flash_ready(uint32_t now) { (void)now; return true; }
+void ll_conn_flash_kick(void) {}
+void ll_radio_flash_abort(void)
+{
+	flash_aborts++;
+	ll_adv_radio_evt(LL_RADIO_RX_TIMEOUT, NULL, 0, 0);
+}
 
 static const uint8_t adva[6] = {0x01, 0x02, 0x03, 0x38, 0xC1, 0xA4};
 
@@ -506,6 +517,48 @@ static void test_sliced(void)
 	CHECK(ll_adv_enable(false) == LL_ST_SUCCESS);
 }
 
+/* Flash window (ll_flash.h): opening it during an event ends the event
+ * after the channel on air (no further channel), an event whose alarm
+ * fires while it is set sends nothing; both count in stats.flash. Once it
+ * is closed advertising goes on. */
+static void test_flash_window(void)
+{
+	struct ll_adv_params p = params(0, 7);
+	struct ll_adv_stats a0, a1;
+	int tx;
+
+	ll_adv_reset();
+	foreign_starts = foreign_bumps = 0;
+	CHECK(ll_adv_set_params(&p) == LL_ST_SUCCESS);
+	ll_adv_get_stats(&a0);
+	CHECK(ll_adv_enable(true) == LL_ST_SUCCESS);
+	now_tick = sched_tick;
+	fire_sched();
+	CHECK(radio_ch == 37);
+	tx = txrx_calls;
+	CHECK(ll_flash_open(now_tick, 0));
+	CHECK(flash_aborts > 0);
+	CHECK(txrx_calls == tx);                 /* no channel 38 */
+	ll_adv_get_stats(&a1);
+	CHECK(a1.flash - a0.flash == 1);
+	CHECK(sched_cb != NULL);                 /* the next event is planned */
+	now_tick = sched_tick;
+	fire_sched();
+	CHECK(txrx_calls == tx);                 /* not started */
+	ll_adv_get_stats(&a1);
+	CHECK(a1.flash - a0.flash == 2);
+	CHECK(sched_cb != NULL);
+	ll_flash_close();
+	now_tick = sched_tick;
+	fire_sched();
+	CHECK(txrx_calls == tx + 1 && radio_ch == 37);
+	ll_adv_radio_evt(LL_RADIO_RX_TIMEOUT, NULL, 0, 0);
+	CHECK(txrx_calls == tx + 2 && radio_ch == 38);
+	ll_adv_radio_evt(LL_RADIO_RX_TIMEOUT, NULL, 0, 0);
+	ll_adv_radio_evt(LL_RADIO_RX_TIMEOUT, NULL, 0, 0);
+	CHECK(ll_adv_enable(false) == LL_ST_SUCCESS);
+}
+
 int main(void)
 {
 	struct ll_adv_params p;
@@ -741,5 +794,6 @@ int main(void)
 	test_bumped_goes_to_gap();
 	test_sliced();
 	test_own_random();
+	test_flash_window();
 	DONE();
 }

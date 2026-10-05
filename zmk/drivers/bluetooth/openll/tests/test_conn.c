@@ -19,6 +19,7 @@
 #include "../ll_csa1.h"
 #include "../ll_csa2.h"
 #include "../ll_defs.h"
+#include "../ll_flash.h"
 #include "../ll_plat.h"
 #include "../ll_rxq.h"
 #include "../ll_sched.h"
@@ -56,6 +57,9 @@ static struct {
 	uint8_t fifo_len[4];
 	uint8_t fifo_hdr[4];
 	int stops;           /* ll_radio_conn_stop() requests */
+	bool evt_open;       /* ll_radio_conn_event() issued, CONN_DONE not yet reported */
+	int aborts;          /* ll_radio_flash_abort() calls */
+	int abort_cut;       /* ... that ended an open event */
 } rad;
 
 static struct {
@@ -88,8 +92,20 @@ void ll_radio_conn_event(uint8_t ch, uint32_t open_tick, uint32_t first_timeout_
 	rad.open = open_tick;
 	rad.fst = first_timeout_us;
 	rad.max_ev = max_event_us;
+	rad.evt_open = true;
 }
 void ll_radio_conn_stop(void) { rad.stops++; }
+/* the radio ends an open event with the packets seen so far (none here) */
+void ll_radio_flash_abort(void)
+{
+	CHECK(locks > 0);
+	rad.aborts++;
+	if (rad.evt_open) {
+		rad.evt_open = false;
+		rad.abort_cut++;
+		ll_conn_radio_evt(LL_RADIO_CONN_DONE, NULL, 0, now);
+	}
+}
 void ll_radio_conn_set_sn_init(uint8_t sn) { rad.sn_init = sn; }
 void ll_radio_conn_set_nesn_init(uint8_t nesn) { (void)nesn; }
 uint8_t ll_radio_fifo_rptr(void) { return rad.rptr; }
@@ -312,6 +328,7 @@ static void rx_nodata(uint32_t anchor)
 
 static void done(uint8_t n_rx)
 {
+	rad.evt_open = false;
 	if ((int32_t)(rad.open + T(rad.fst) - now) > 0) {
 		now = rad.open + T(rad.fst);
 	}
@@ -3481,6 +3498,169 @@ static void test_pending_instants(void)
 	ll_conn_end(0, LL_ST_REMOTE_TERM);
 }
 
+/* ---------------- flash window (ll_flash.h) ---------------- */
+
+static bool fw_open(uint32_t waited_us)
+{
+	unsigned int k = ll_plat_lock();
+	bool ok = ll_flash_open(now, waited_us);
+
+	ll_plat_unlock(k);
+	return ok;
+}
+
+static void fw_close(void)
+{
+	unsigned int k = ll_plat_lock();
+
+	ll_flash_close();
+	ll_plat_unlock(k);
+}
+
+/* While the window is set no event is issued: each one counts as
+ * flash_paused and missed (not late), the link stays up and listens again
+ * once the window is closed. */
+static void test_flash_pause(void)
+{
+	struct ll_connect_ind ci = mk_ci(12, 400, 1, 1, 0);
+	struct ll_conn_stats st0, st;
+	uint32_t a1 = 500000 + T(1250 + 300);
+	int ev;
+
+	reset_all(false);
+	ll_conn_get_stats(0, &st0);
+	CHECK(ll_conn_start(&ci, 500000) == 0);
+	ev_rx(a1);
+	CHECK(fw_open(0));
+	CHECK(ll_flash_active());
+	CHECK(rad.aborts == 1 && rad.abort_cut == 0);   /* nothing on air */
+	ev = rad.events;
+	fire_alarm();
+	fire_alarm();
+	CHECK(rad.events == ev);
+	CHECK(ll_conn_active(0) && sch.cb != NULL);
+	CHECK(ll_conn_event_counter(0) == 3);
+	ll_conn_get_stats(0, &st);
+	CHECK(st.flash_paused - st0.flash_paused == 2);
+	CHECK(st.missed - st0.missed == 2 && st.late == st0.late);
+	CHECK(st.rx_paused == st0.rx_paused);
+	fw_close();
+	CHECK(!ll_flash_active());
+	ev_rx(a1 + T(15000) * 3);
+	CHECK(rad.events == ev + 1);
+	ll_conn_get_stats(0, &st);
+	CHECK(st.flash_paused - st0.flash_paused == 2);
+	CHECK(st.flash_cut == st0.flash_cut);
+	ll_conn_end(0, LL_ST_REMOTE_TERM);
+}
+
+/* Opening the window ends an open event through the radio (the radio
+ * reports CONN_DONE): counted as flash_cut, the next event is paused. A
+ * window that is opened again later cuts again. */
+static void test_flash_cut(void)
+{
+	struct ll_connect_ind ci = mk_ci(12, 400, 1, 1, 0);
+	struct ll_conn_stats st0, st;
+	uint32_t a1 = 500000 + T(1250 + 300);
+	int ev;
+
+	reset_all(false);
+	ll_conn_get_stats(0, &st0);
+	CHECK(ll_conn_start(&ci, 500000) == 0);
+	ev_rx(a1);
+	fire_alarm();                      /* event 1 on air */
+	CHECK(rad.evt_open);
+	rx(a1 + T(15000), 0x01, 0);
+	CHECK(fw_open(0));
+	CHECK(rad.abort_cut == 1 && !rad.evt_open);
+	CHECK(ll_conn_active(0) && ll_conn_event_owner() < 0);
+	CHECK(ll_conn_event_counter(0) == 2);
+	ll_conn_get_stats(0, &st);
+	CHECK(st.flash_cut - st0.flash_cut == 1);
+	CHECK(st.rx_events - st0.rx_events == 2);   /* the cut event had its packet */
+	ev = rad.events;
+	fire_alarm();                      /* paused */
+	CHECK(rad.events == ev);
+	fw_close();
+	fire_alarm();
+	CHECK(rad.events == ev + 1 && rad.evt_open);
+	CHECK(fw_open(0));
+	ll_conn_get_stats(0, &st);
+	CHECK(st.flash_cut - st0.flash_cut == 2);
+	CHECK(st.flash_paused - st0.flash_paused == 1);
+	fw_close();
+	ll_conn_end(0, LL_ST_REMOTE_TERM);
+}
+
+/* ll_conn_flash_ready: a link that is not established is never ready (the
+ * window waits, then opens anyway after LL_FLASH_WAIT_MAX_US: forced); an
+ * established link is ready while now - last RX + LL_FLASH_OP_MAX_US <=
+ * timeout / 2; links awaiting release do not count. */
+static void test_flash_ready(void)
+{
+	struct ll_connect_ind ci = mk_ci(12, 400, 1, 1, 0);   /* 15 ms, 4 s */
+	struct ll_flash_stats f0, f;
+	uint32_t a1 = 500000 + T(1250 + 300);
+	uint32_t edge;
+
+	reset_all(false);
+	ll_flash_get_stats(&f0);
+	CHECK(ll_conn_flash_ready(now));             /* no link */
+	CHECK(ll_conn_start(&ci, 500000) == 0);
+	CHECK(!ll_conn_flash_ready(now));            /* not established */
+	CHECK(!fw_open(0));
+	CHECK(!ll_flash_active() && rad.aborts == 0);
+	CHECK(!fw_open(LL_FLASH_WAIT_MAX_US - 1));
+	CHECK(fw_open(LL_FLASH_WAIT_MAX_US));        /* forced */
+	CHECK(ll_flash_active() && rad.aborts == 1);
+	ll_flash_get_stats(&f);
+	CHECK(f.waits - f0.waits == 2);
+	CHECK(f.forced - f0.forced == 1);
+	CHECK(f.windows - f0.windows == 1);
+	CHECK(f.wait_max_us >= LL_FLASH_WAIT_MAX_US);
+	fw_close();
+	ev_rx(a1);                                   /* established */
+	CHECK(ll_conn_flash_ready(now));
+	/* sup_tick = a1 (anchor); half of 4 s minus one operation */
+	edge = a1 + T(2000000 - LL_FLASH_OP_MAX_US);
+	CHECK(ll_conn_flash_ready(edge));
+	CHECK(!ll_conn_flash_ready(edge + 1));
+	now = edge + 1;
+	CHECK(!fw_open(0));
+	now = edge;
+	CHECK(fw_open(0));
+	fw_close();
+	/* an ended link awaiting release does not hold the window back */
+	auto_release = false;
+	now = edge + 1;
+	ll_conn_end(0, LL_ST_REMOTE_TERM);
+	CHECK(ll_conn_count() == 1);
+	CHECK(ll_conn_flash_ready(now));
+	ll_conn_release(0);
+	auto_release = true;
+}
+
+/* N >= 2: the window waits while any link is not ready. */
+static void test_flash_ready_links(void)
+{
+	struct ll_connect_ind ci = mk_ci(12, 400, 1, 1, 0);
+	uint32_t a1 = 500000 + T(1250 + 300);
+
+	if (LL_MAX_CONN < 2) {
+		return;
+	}
+	reset_all(false);
+	CHECK(ll_conn_start(&ci, 500000) == 0);
+	ev_rx(a1);
+	CHECK(ll_conn_flash_ready(now));
+	ci.aa ^= 0x00010000u;
+	CHECK(ll_conn_start(&ci, now + T(3000)) == 1);
+	CHECK(!ll_conn_flash_ready(now));            /* link 1 not established */
+	ll_conn_end(1, LL_ST_REMOTE_TERM);
+	CHECK(ll_conn_flash_ready(now));
+	ll_conn_end(0, LL_ST_REMOTE_TERM);
+}
+
 int main(void)
 {
 	test_first_events();
@@ -3545,5 +3725,9 @@ int main(void)
 	test_dle_times();
 	test_dle_shrink_queued();
 	test_event_owner();
+	test_flash_pause();
+	test_flash_cut();
+	test_flash_ready();
+	test_flash_ready_links();
 	DONE();
 }

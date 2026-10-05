@@ -245,6 +245,19 @@ int ll_conn_event_owner(void);
  * listened to, so the glue wakes the consumer first. False for an
  * out-of-range link. ISR (producer side). */
 bool ll_conn_rx_wake_due(uint8_t link);
+/* Flash window (ll_flash.h). ll_conn_flash_ready: true when every active
+ * link can go without radio for one flash operation: it is established (a
+ * packet was received; before that, missed events count toward the 6-event
+ * establishment rule) and now - its last received packet +
+ * LL_FLASH_OP_MAX_US stays within half its connSupervisionTimeout. Links
+ * awaiting ll_conn_release() and free ids do not count. Pure; the caller
+ * holds ll_plat_lock(). ll_conn_flash_kick: ll_conn_kick() for every
+ * active link that is not ready, so its next event is listened to (no
+ * latency skip in between). While ll_flash_active(), events are not issued
+ * (stats.flash_paused, also in missed), and an event that ends while it is
+ * active was cut by ll_radio_flash_abort() (stats.flash_cut). */
+bool ll_conn_flash_ready(uint32_t now);
+void ll_conn_flash_kick(void);
 /* Slice 6b Task 4: the link's connEffectiveMaxRxTime / MaxTxTime (us), from
  * ll_llcp whenever they change (328 / 328 at every connection start). One
  * exchange of maximum PDUs, rx + T_IFS + tx + T_IFS, is the event length
@@ -296,6 +309,11 @@ struct ll_conn_stats {
 	uint32_t rx_paused;
 	uint32_t rx_stops;
 	uint32_t rx_pause_streak_max;
+	/* Flash window (ll_flash.h): events not issued while it was set (also
+	 * counted in missed), and events that ended while it was set (cut by
+	 * ll_radio_flash_abort when the window opened). */
+	uint32_t flash_paused;
+	uint32_t flash_cut;
 };
 /* Per link, cumulative since boot (not reset per connection). Out-of-range
  * link: all zero. */

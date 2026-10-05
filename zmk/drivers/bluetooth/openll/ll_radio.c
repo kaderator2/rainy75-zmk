@@ -158,6 +158,9 @@ static bool rsp_started;
 /* An advertising TX/RX (tx_then_rx, or a SCAN_RSP) whose end IRQ is
  * pending; the adv guard recovers if it never comes. */
 static volatile bool adv_open;
+/* ll_radio_flash_abort() runs the pending ISR work: a SCAN_REQ found then
+ * is not answered (the radio is about to be stopped) */
+static bool rsp_blocked;
 /* Adv guard: an stx2rx ends within about 0.8 ms (TX + 300 us RX window),
  * a SCAN_RSP within 0.5 ms of its trigger. ml-spike S3 saw one stall in
  * 3791 adv events between connection events (FSM idle, TX seen, no end
@@ -198,7 +201,7 @@ static struct ll_radio_mode rm;
 static atomic_t cnt_tx2rx, cnt_rx_ok, cnt_rx_crc, cnt_rx_timeout, cnt_rsp_tx, cnt_rsp_late;
 static atomic_t cnt_conn_events, cnt_conn_rx, cnt_conn_tx, cnt_conn_fto, cnt_conn_guard;
 static atomic_t cnt_rx_ptr_odd, cnt_tifs_le150, cnt_tifs_151_152, cnt_tifs_gt152, cnt_restores;
-static atomic_t cnt_rx_ptr_skip, cnt_fst_capped, cnt_holds, cnt_conn_stopped;
+static atomic_t cnt_rx_ptr_skip, cnt_fst_capped, cnt_holds, cnt_conn_stopped, cnt_flash_aborts;
 static uint8_t rx_wptr_max;      /* largest raw hardware rx wptr seen */
 static uint8_t guard_streak;     /* consecutive guard-ended events without a valid packet */
 static uint16_t restore_ptrs_before, restore_ptrs_after;
@@ -304,7 +307,7 @@ _attribute_ram_code_sec_noinline_ static void adv_isr(uint16_t st)
 	bool rsp = false;
 
 	if (st & FLD_RF_IRQ_RX) {
-		rsp = adv_rsp_isr(adv_open && !rsp_in_flight);
+		rsp = adv_rsp_isr(adv_open && !rsp_in_flight && !rsp_blocked);
 	}
 	rsp_started = rsp;
 	if (!rsp && adv_open &&
@@ -631,6 +634,46 @@ _attribute_ram_code_sec_noinline_ static void rf_isr(const void *arg)
 	}
 }
 
+void ll_radio_flash_abort(void)
+{
+	/* Advertising: first what the RF ISR would do with the status already
+	 * pending (a CONNECT_IND received just before is not lost). A
+	 * connection event needs no such step: the stop below drains every
+	 * packet the hardware has acked. conn_isr() is not called from here,
+	 * so it stays inlined into the RAM rf_isr with its helpers (a second
+	 * call site moved them to flash, slower in the T_IFS-critical path). */
+	if (mode == MODE_ADV) {
+		uint16_t st = reg_rf_irq_status;
+
+		if (st != 0) {
+			rf_clr_irq_status(FLD_RF_IRQ_ALL);
+			rsp_blocked = true;
+			adv_isr(st);
+			rsp_blocked = false;
+		}
+	}
+	if (mode == MODE_CONN && cn.evt_open) {
+		/* as conn_stop_now(), but the guard streak stays as it is (an
+		 * armed event that never started is no wedge sign either) */
+		atomic_inc(&cnt_flash_aborts);
+		ll_sched_guard_cancel();
+		rf_set_tx_rx_off_auto_mode();
+		rf_clr_irq_status(FLD_RF_IRQ_ALL);
+		conn_rx_drain();
+		conn_done();
+	} else if (mode == MODE_ADV && adv_open) {
+		atomic_inc(&cnt_flash_aborts);
+		rf_set_tx_rx_off_auto_mode();
+		rf_clr_irq_status(FLD_RF_IRQ_ALL);
+		adv_open = false;
+		rsp_in_flight = false;
+		if (!cn.evt_open) {
+			ll_sched_guard_cancel();
+		}
+		radio_cb(LL_RADIO_RX_TIMEOUT, NULL, 0, 0);
+	}
+}
+
 /* Baseband setup for advertising (also the state after a restore). The DMA
  * geometry is set only at boot (dma true), see RX_AREA_SIZE. */
 static void hw_init_adv(bool dma)
@@ -754,6 +797,7 @@ void ll_radio_get_stats(struct ll_radio_stats *s)
 	s->fst_capped = (uint32_t)atomic_get(&cnt_fst_capped);
 	s->holds = (uint32_t)atomic_get(&cnt_holds);
 	s->conn_stopped = (uint32_t)atomic_get(&cnt_conn_stopped);
+	s->flash_aborts = (uint32_t)atomic_get(&cnt_flash_aborts);
 	s->rx_wptr_max = rx_wptr_max;
 	s->restore_ptrs_before = restore_ptrs_before;
 	s->restore_ptrs_after = restore_ptrs_after;

@@ -75,6 +75,7 @@ struct ll_adv_stats {
 	uint32_t dropped;   /* events dropped: no gap before the next interval */
 	uint32_t cut;       /* events ended early: next channel found no gap within 10 ms */
 	uint32_t stuck;     /* advertising disabled: no request possible (never expected) */
+	uint32_t flash;     /* events ended or not started because of the flash window (ll_flash.h) */
 };
 /* Cumulative since boot. */
 void ll_adv_get_stats(struct ll_adv_stats *s);

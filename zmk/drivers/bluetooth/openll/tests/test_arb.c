@@ -25,6 +25,7 @@
 #include "../ll_conn.h"
 #include "../ll_csa1.h"
 #include "../ll_defs.h"
+#include "../ll_flash.h"
 #include "../ll_plat.h"
 #include "../ll_rxq.h"
 #include "../ll_sched.h"
@@ -107,6 +108,10 @@ bool ll_radio_tx_rsp_at(uint32_t tick) { (void)tick; return true; }
 void ll_radio_stop(void) { rad.stops++; }
 void ll_radio_adv_restore(void) {}
 void ll_radio_adv_enter(void) { rad.adv_enters++; }
+/* the simulator plays every radio activity to its end inside sim_step(),
+ * so nothing is ever on air when a flash window opens */
+static int flash_aborts;
+void ll_radio_flash_abort(void) { CHECK(locks > 0); flash_aborts++; }
 void ll_sched_init(void) {}
 void ll_sched_at(uint32_t tick, ll_sched_cb_t cb)
 {
@@ -632,6 +637,10 @@ static struct {
 	int adv_pdus;
 	uint32_t adv_last, adv_max_gap;
 	int overlaps, over_cap;
+	/* flash window: an operation is running (sim_flash_op), and radio
+	 * activity seen meanwhile (must stay 0) */
+	bool in_op;
+	int radio_in_op;
 	/* the next adv channel receives this CONNECT_IND instead of nothing */
 	const uint8_t *connect_pdu;
 	uint32_t connect_end;
@@ -655,6 +664,7 @@ static void sim_reset(void)
 	ll_arb_init(&sim_ops);
 	ll_conn_init(&ops);
 	ll_adv_init(adva, NULL);
+	ll_flash_reset();
 	sim_win_offset = 0;
 	for (uint8_t i = 0; i < LL_MAX_CONN; i++) {
 		struct ll_conn_stats st;
@@ -742,6 +752,9 @@ static void sim_step(void)
 	ll_adv_get_stats(&as0);
 	fire_alarm();
 	ll_adv_get_stats(&as1);
+	if (sim.in_op && (rad.events != ev || rad.txrx != tx)) {
+		sim.radio_in_op++;
+	}
 	if (rad.events != ev) {
 		int k = link_of_aa(rad.aa);
 		int e;
@@ -1300,6 +1313,179 @@ static void test_reset_consistent(void)
 	CHECK(ll_arb_gap(3000000, 0, 1000000) == 3000000);
 }
 
+/* ---------------- flash window (ll_flash.h) ---------------- */
+
+static uint32_t fw_wait_max_us;
+
+static void sim_advance(uint32_t t)
+{
+	sim_run_until(t);
+	if ((int32_t)(t - now) > 0) {
+		now = t;
+	}
+}
+
+/* One flash operation of op_us as the B91 glue runs it: ask for the
+ * window, wait 1 ms between attempts (the radio keeps running), then the
+ * operation (no radio activity allowed), then close. */
+static void sim_flash_op(uint32_t op_us)
+{
+	uint32_t waited = 0;
+
+	for (;;) {
+		unsigned int k = ll_plat_lock();
+		bool ok = ll_flash_open(now, waited);
+
+		ll_plat_unlock(k);
+		if (ok) {
+			break;
+		}
+		sim_advance(now + T(1000));
+		waited += 1000;
+	}
+	if (waited > fw_wait_max_us) {
+		fw_wait_max_us = waited;
+	}
+	sim.in_op = true;
+	sim_advance(now + T(op_us));
+	sim.in_op = false;
+	{
+		unsigned int k = ll_plat_lock();
+
+		ll_flash_close();
+		ll_plat_unlock(k);
+	}
+}
+
+/* A chain of back-to-back flash operations (26 ms erases and 2.5 ms page
+ * writes, as an image upload or NVS GC does) against links at the
+ * mcumgr parameters (7.5 ms, latency 0, 420 ms) and at an idle keyboard's
+ * (15 ms, latency 30, 1 s and 940 ms), up to 3 links 2.5 ms apart: no radio activity
+ * inside any operation, the links never time out, an event gets through
+ * between operations whenever a link needs one (never forced), and the
+ * waits stay within one interval per link. */
+static void test_flash_chain(void)
+{
+	static const struct {
+		uint16_t interval, latency, timeout;
+	} cfg[] = {
+		{6, 0, 42},
+		{12, 30, 100},
+		/* 940 ms: the latency window (465 ms) outlasts the ready limit
+		 * (470 - 30 ms), so a wait needs the kicked event */
+		{12, 30, 94},
+	};
+	uint8_t links = LL_MAX_CONN < 3 ? LL_MAX_CONN : 3;
+
+	for (unsigned c = 0; c < sizeof(cfg) / sizeof(cfg[0]); c++) {
+		const uint32_t t0 = 2000000;
+		struct ll_flash_stats f0, f;
+		struct ll_conn_stats st;
+		uint32_t paused = 0;
+		int rx0[LL_MAX_CONN];
+
+		sim_reset();
+		fw_wait_max_us = 0;
+		ll_flash_get_stats(&f0);
+		for (uint8_t k = 0; k < links; k++) {
+			CHECK(sim_connect(k, t0 + T(2500) * k, cfg[c].interval, cfg[c].latency,
+					  cfg[c].timeout, 0) == k);
+		}
+		sim_advance(t0 + T(1500000));      /* established, past the holdoff */
+		for (uint8_t k = 0; k < links; k++) {
+			rx0[k] = sim.rx[k];
+		}
+		for (int i = 0; i < 300; i++) {
+			sim_flash_op(i % 3 == 0 ? 26000 : 2500);
+		}
+		ll_flash_get_stats(&f);
+		for (uint8_t k = 0; k < links; k++) {
+			ll_conn_get_stats(k, &st);
+			paused += st.flash_paused;
+		}
+		printf("  flash_chain n%d cfg %u: windows %u waits %u forced %u wait max %u us, "
+		       "paused %u, link 0 rx %d\n", LL_MAX_CONN, c,
+		       (unsigned)(f.windows - f0.windows), (unsigned)(f.waits - f0.waits),
+		       (unsigned)(f.forced - f0.forced), (unsigned)fw_wait_max_us,
+		       (unsigned)paused, sim.rx[0] - rx0[0]);
+		CHECK(sim.radio_in_op == 0);
+		CHECK(f.windows - f0.windows == 300);
+		CHECK(f.forced == f0.forced);
+		/* a wait ends at the next event of every link that needs one:
+		 * one interval for one link (the kicked event; without the
+		 * kick an idle link would only listen at the end of its
+		 * latency window), up to one per link with several (a link
+		 * may yield its kicked event to another link's, and another
+		 * link may run out of budget meanwhile) */
+		CHECK(fw_wait_max_us <= links * 1250u * cfg[c].interval + 2000u);
+		CHECK(paused > 0);
+		for (uint8_t k = 0; k < links; k++) {
+			CHECK(ll_conn_active(k) && disconnects[k] == 0);
+			CHECK(sim.rx[k] > rx0[k]);
+		}
+		/* the links listen as before once the chain is over */
+		for (uint8_t k = 0; k < links; k++) {
+			rx0[k] = sim.rx[k];
+		}
+		sim_advance(now + T(1000000));
+		for (uint8_t k = 0; k < links; k++) {
+			CHECK(sim.rx[k] > rx0[k]);
+		}
+		CHECK(sim.overlaps == 0 && sim.over_cap == 0);
+		for (uint8_t k = 0; k < links; k++) {
+			ll_conn_end(k, 0x13);
+		}
+	}
+}
+
+/* A new link is not ready before its first packet: a flash operation
+ * requested right after the CONNECT_IND waits for it (the 6-event
+ * establishment rule is never put at risk by the window). */
+static void test_flash_not_established(void)
+{
+	const uint32_t t0 = 2000000;
+
+	sim_reset();
+	fw_wait_max_us = 0;
+	CHECK(sim_connect(0, t0, 12, 0, 400, 0) == 0);
+	CHECK(sim.rx[0] == 0);
+	sim_flash_op(26000);
+	CHECK(sim.rx[0] >= 1);
+	CHECK(fw_wait_max_us > 0);
+	CHECK(sim.radio_in_op == 0);
+	CHECK(ll_conn_active(0) && disconnects[0] == 0);
+	ll_conn_end(0, 0x13);
+}
+
+/* Advertising sends nothing while the window is set (its events end,
+ * stats.flash) and resumes afterwards. */
+static void test_flash_adv(void)
+{
+	const uint32_t t0 = 2000000;
+	struct ll_adv_params p = {.interval_min = 0x0020, .interval_max = 0x0020,   /* 20 ms */
+				  .type = 0, .chan_map = 7};
+	struct ll_adv_stats a0, a1;
+	int ev;
+
+	sim_reset();
+	ll_adv_get_stats(&a0);
+	CHECK(ll_adv_set_params(&p) == LL_ST_SUCCESS);
+	now = t0;
+	CHECK(ll_adv_enable(true) == LL_ST_SUCCESS);
+	sim_advance(t0 + T(100000));
+	CHECK(sim.adv_events > 0);
+	for (int i = 0; i < 20; i++) {
+		sim_flash_op(26000);
+	}
+	ll_adv_get_stats(&a1);
+	CHECK(sim.radio_in_op == 0);
+	CHECK(a1.flash - a0.flash > 0);
+	ev = sim.adv_events;
+	sim_advance(now + T(200000));
+	CHECK(sim.adv_events > ev);
+	CHECK(ll_adv_enable(false) == LL_ST_SUCCESS);
+}
+
 int main(void)
 {
 	test_accept_refuse_prio();
@@ -1320,6 +1506,9 @@ int main(void)
 	test_busy_links_adv();
 	test_adv_while_connected();
 	test_reset_consistent();
+	test_flash_chain();
+	test_flash_not_established();
+	test_flash_adv();
 	CHECK(locks == 0);
 	DONE();
 }

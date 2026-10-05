@@ -130,6 +130,18 @@ void ll_radio_conn_event(uint8_t ch, uint32_t open_tick, uint32_t first_timeout_
  * resent by the central in a later event. No-op without an open event.
  * ISR: from the connection radio callbacks only. */
 void ll_radio_conn_stop(void);
+/* Flash window (ll_flash.h): end whatever is on air before a flash
+ * operation turns interrupts off. An open or armed connection event is
+ * stopped like ll_radio_conn_stop() (the packets in the RX ring are
+ * delivered, then LL_RADIO_CONN_DONE; the guard streak is left as it is).
+ * In advertising mode pending radio IRQ status is handled first (as the RF
+ * ISR would, but a SCAN_REQ is not answered any more), then an advertising
+ * TX/RX or SCAN_RSP still on air is stopped and reported as
+ * LL_RADIO_RX_TIMEOUT. Counted in
+ * ll_radio_stats.flash_aborts when something was on air. Thread context
+ * with ll_plat_lock() held (interrupts off); the callbacks run in that
+ * context. */
+void ll_radio_flash_abort(void);
 /* Consecutive guard-ended connection events that received no CRC-valid
  * packet: the radio-wedge indicator, counted on the shared radio over all
  * links (the glue ends every active link with 0x08 at 3). A guard
@@ -187,6 +199,8 @@ struct ll_radio_stats {
 	 * executed stops; ll_conn_stats.rx_stops counts the requests, more
 	 * when an event had already ended in the same ISR */
 	uint32_t conn_stopped;
+	/* ll_radio_flash_abort() calls that ended radio activity */
+	uint32_t flash_aborts;
 	uint8_t rx_wptr_max;    /* largest raw hw rx wptr seen (its counter width) */
 	/* First-exchange T_IFS from the TX timestamp (us, rounded) */
 	uint32_t tifs_le150;

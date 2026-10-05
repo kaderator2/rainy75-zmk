@@ -68,6 +68,7 @@
 #include "ll_csa1.h"
 #include "ll_csa2.h"
 #include "ll_defs.h"
+#include "ll_flash.h"
 #include "ll_plat.h"
 #include "ll_radio.h"
 #include "ll_rxq.h"
@@ -684,6 +685,14 @@ static void prepare(struct ll_link *c, uint32_t cap_us)
 		return;
 	}
 	c->anchored = false;
+	if (ll_flash_active()) {
+		/* a flash operation turns interrupts off (ll_flash.h): no event
+		 * may be on air then; the central resends */
+		ST(c)->flash_paused++;
+		ST(c)->missed++;
+		event_closed(c, now);
+		return;
+	}
 	if ((int32_t)(c->open_tick - now) < (int32_t)US(LL_CONN_MIN_PREP_US)) {
 		ST(c)->late++;
 		ST(c)->missed++;
@@ -872,6 +881,9 @@ void ll_conn_radio_evt(enum ll_radio_evt evt, const uint8_t *pdu, uint16_t len, 
 			ST(c)->rx_events++;
 		} else {
 			ST(c)->missed++;
+		}
+		if (ll_flash_active()) {
+			ST(c)->flash_cut++;   /* ended by ll_radio_flash_abort() */
 		}
 		event_closed(c, tick);
 		break;
@@ -1311,11 +1323,47 @@ void ll_conn_get_stats_total(struct ll_conn_stats *s)
 		s->collisions += t->collisions;
 		s->rx_paused += t->rx_paused;
 		s->rx_stops += t->rx_stops;
+		s->flash_paused += t->flash_paused;
+		s->flash_cut += t->flash_cut;
 		if (t->rx_pause_streak_max > s->rx_pause_streak_max) {
 			s->rx_pause_streak_max = t->rx_pause_streak_max;
 		}
 	}
 	ll_plat_unlock(key);
+}
+
+/* Flash window (ll_flash.h): one flash operation without radio leaves the
+ * link at least half its supervision timeout. */
+static bool flash_ready(const struct ll_link *c, uint32_t now)
+{
+	if (!c->active) {
+		return true;
+	}
+	if (!c->established) {
+		return false;
+	}
+	return (uint32_t)(now - c->sup_tick) + US(LL_FLASH_OP_MAX_US) <= c->sup_ticks / 2u;
+}
+
+bool ll_conn_flash_ready(uint32_t now)
+{
+	for (uint8_t i = 0; i < LL_MAX_CONN; i++) {
+		if (!flash_ready(&links[i], now)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+void ll_conn_flash_kick(void)
+{
+	uint32_t now = ll_radio_now();
+
+	for (uint8_t i = 0; i < LL_MAX_CONN; i++) {
+		if (!flash_ready(&links[i], now)) {
+			ll_conn_kick(i);
+		}
+	}
 }
 
 uint32_t ll_conn_exchange_us(uint16_t max_rx_time, uint16_t max_tx_time)
