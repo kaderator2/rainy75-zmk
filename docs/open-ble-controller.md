@@ -244,6 +244,7 @@ Priorities (higher wins):
 |---|---|
 | MUST | transmit-window event (new connection or connection update) or an instant event |
 | SUPERVISION | the event opens later than last RX + timeout - 2 intervals |
+| STARVING | the link yielded 2 events in a row (`LL_CONN_STARVE_YIELDS`) since its last started event |
 | ACTIVE | TX backlog or an LLCP procedure waiting |
 | IDLE | anything else |
 | ADV | advertising (starving advertising asks at ACTIVE) |
@@ -260,6 +261,19 @@ Rules:
   miss for the latency rule). Instants on yielded events are still applied.
 - A running event cannot be displaced. If an alarm fires while another event
   overran its cap, the due request is bumped instead.
+- Starvation bound: a link that yielded `LL_CONN_STARVE_YIELDS` (2) events in
+  a row asks at STARVING until the arbiter starts one of its events. So a
+  link listens at most 2 events after the end of its latency window
+  (latency + 3 events after its last listen), unless a SUPERVISION or MUST
+  event of another link or a running event is in the way. Without it, an idle
+  link whose span overlapped every event of a busy one got through only at
+  its supervision priority (up to 265 events, 4 s, at 15 ms / timeout 4 s),
+  and an LL_CHANNEL_MAP_IND of its central (instant 37 events ahead on the
+  phone tested) arrived after the instant: 0x28. Round-robin ties did not
+  help either: a link at 15 ms whose span overlaps two events of a 7.5 ms
+  link has to win two ties in a row, and the alternation gives it one.
+  The cost for the busy link: one or two events per listen of the starving
+  link (up to four in a row when an instant event of that link follows).
 - Advertising slides into the next gap (`ll_arb_gap()`). A whole adv event
   reserves 6 ms (2 ms per channel incl. a SCAN_RSP); if it does not fit, the
   channels go into separate gaps, each PDU within 10 ms of the previous one
@@ -269,8 +283,12 @@ Rules:
 
 Host scenarios with the real `ll_conn`/`ll_adv` (`test_arb`): two links on the
 same interval drifting through each other (gap at most 2 events, no
-disconnect), an idle link overlapping an always-busy one (supervision priority
-keeps it alive), 3 always-busy links at 7.5 ms with advertising (adv gap at
+disconnect), an idle link overlapping an always-busy one (gets every third
+event by the starvation bound, before it only its supervision priority kept it
+alive), the multi-host case of a 7.5 ms link with MD bursts to its cap (busy
+or idle between bursts) and a 15 ms latency 30 link (or latency 0) receiving
+channel maps 6 to 10 events beyond its latency window (gap at most latency + 3
+events, no 0x28; before, 265 events and 0x28), 3 always-busy links at 7.5 ms with advertising (adv gap at
 most 250 ms; before the starvation rule advertising never got out).
 
 ### Advertising while connected
@@ -868,7 +886,7 @@ reverse/tools/openll_stats.py --ble           # over BLE (needs bleak)
 | `wake` | controller thread wakeups |
 | `mv` | battery millivolts (0 if unavailable) |
 | `links` | links up |
-| `link` | list, one map per link id: `up`, `listen`, `skip`, `coll` (events yielded to the arbiter), `miss` |
+| `link` | list, one map per link id: `up`, `listen`, `skip`, `coll` (events yielded to the arbiter), `miss`; maxima since boot: `gmax` / `gus` (longest gap between two listened events, in events / us), `gx` (events beyond the latency window), `elen` (longest event, us); `clip` (starts with a clipped cap), `lost` (events lost to a winner of each arbiter priority: adv, idle, active, starving, supervision, must) |
 | `adv` | `ev`, `slid` (moved into a gap), `drop`, `cut` (10 ms PDU rule), `stuck` |
 | `flash` | `win` (windows), `wait`, `force`, `wmax` / `hmax` (longest wait and window, us, maxima), `pause`, `cut`, `fkick`, `abort`, `pskip` (RX DMA ring overruns, must stay 0) |
 
@@ -999,6 +1017,34 @@ disconnect in 0.8 s. With a test module that starts connectable advertising
 on the sniffer while connected, a 10 minute echo run with advertising 5463 /
 5463, 0 disconnects.
 
+### Multi-host: PC and phone (starvation bound)
+
+First test with two real centrals: the BlueZ PC (Intel controller) and an
+Android phone, both bonded, `MAX_CONN=3` NOSLEEP image. The phone link stays
+idle at 12 / 30 / 400 (CSA #2) and sends an LL_CHANNEL_MAP_IND every 2 to 15
+s with the instant 36 or 37 events after the event it was received in (the
+PC's maps come 7 events ahead). The PC link runs `echo_load.py` (SMP echoes
+of 20 to 120 characters, 50 ms apart, 10 minutes); the host switches it to
+6 / 0 / 42 while the GATT client runs, 251-octet data length both ways.
+
+| | Before (65e560d + stats) | After (starvation bound) |
+|---|---|---|
+| Phone link drops | 0x28 after 2.5 min (earlier runs: twice in 10 min) | 4 x 10 min: none in 3 runs, one 0x08 in run 2 (see below) |
+| Phone longest listen gap | 265 events, 3975 ms (supervision rescue) | 33 to 34 events, 495 to 510 ms (latency window + 2 or 3) |
+| Phone events lost to the PC | to IDLE 739, to ACTIVE 170 in 2.5 min | per 10 min: about 1500 to IDLE, 230 to ACTIVE, all within the bound |
+| PC link | 778 events yielded in 10 min, gap within latency + 2 | 2880 yielded in 10 min (3.6 % of its events); longest gap at 7.5 ms 3 events in run 1, 5 events (37.5 ms) in runs 3 and 4 (a phone instant event right after a starving listen), 9 events once in run 2 (the phone link at SUPERVISION priority before its 0x08) |
+| Echoes in 10 min | 7059, 0 errors | 6890 / 6987 / 6947 / 6978, 0 errors |
+| Echo latency, 300 echoes 50 ms apart (7.5 ms) | median 24.7 ms, p95 31.9 ms, max 444.8 ms | median 24.7 ms, p95 32.9 ms, max 445.1 ms |
+| Idle, both links 12 / 30 / 400 | | 96.6 % / 96.5 % skipped, 0 collisions, 0.2 wakeups/s |
+
+The 0x08 in run 2 came 4 s after a normal map instant: the phone link kept
+its listen gap within 33 events up to the end, then listened with
+SUPERVISION priority (it won 6 times) and heard nothing. The simulator
+checks every BRX channel against the central's own CSA #1 / #2 sequence with
+changing maps under the same arbitration (no mismatch), so this looks like
+the phone or the radio environment (its maps excluded up to 10 channels),
+not the scheduler; it is listed under known limitations.
+
 ### Late events and stack usage
 
 Under traffic the stimer alarm often starts 150 to 270 us late, mostly because
@@ -1072,15 +1118,22 @@ documentation. They may help anyone writing a B91 link layer.
 - **No 2M PHY.** No open register source exists (see
   [PHY](#phy-1m-only)); needs Telink to publish `rf_set_ble_2M_mode()` or give
   permission.
-- **Multi-host device test pending** (slice 6a Task 7). Multilink is
-  host-tested with up to 3 simulated centrals and device-tested with one real
-  central plus advertising while connected. Profile switching with several
-  real hosts (Fn+F1..F3), a second central (nRF dongle) and a phone are not
-  tested yet. The request span (`min_len`) still reserves the alarm lead
-  after the floor although the clip only needs the safety margin there, so
-  adjacent requests are kept 500 us further apart than necessary. That costs
-  multilink capacity only (for example 3 links at 7.5 ms plus advertising)
-  and is left for the multi-host test, since it changes timing reservations.
+- **Multi-host device test partly done** (slice 6a Task 7). Two real
+  centrals (PC and phone) with an SMP load on one link: see
+  [Multi-host](#multi-host-pc-and-phone-starvation-bound). Profile switching
+  with several real hosts (Fn+F1..F3) and three links are not tested yet.
+  The request span (`min_len`) still reserves the alarm lead after the floor
+  although the clip only needs the safety margin there, so adjacent requests
+  are kept 500 us further apart than necessary. With the starvation bound a
+  starving link is accepted by priority, so this only costs capacity: a
+  15 ms link and a 7.5 ms link with 251-octet spans (about 6 ms each) cannot
+  both fit in one 7.5 ms interval anyway. An idle link without latency
+  that overlaps every event of a busy one takes every third event (the
+  busy one keeps two of three).
+- **One phone link 0x08 in 40 minutes of multi-host load** (run 2 of the
+  starvation fix): 4 s without a packet from the phone right after a map
+  instant, while the link kept listening (gap within 33 events, then
+  SUPERVISION priority). Not reproduced in the other three runs.
 - **Reconnect after wake not re-measured** with the CCC load at boot (slice 7
   Task 2 item 4; 13 s was measured in slice 5 with lazy loading).
 - **Slice 5b: battery and suspend.** The CPU idles but the SoC is not suspended
@@ -1276,7 +1329,7 @@ a supported maximum of 27 octets (`_sup27`):
 | `test_pdu` | PDU encoding (ChSel, TxAdd), SCAN_REQ match, CONNECT_IND parsing against captured bytes |
 | `test_scanrsp`, `test_scanrsp_s50` | SCAN_RSP decision and trigger lead for the default and a non-default settle |
 | `test_adv` | Advertising state machine against a fake radio: random address, advertising while connected, slicing, flash window |
-| `test_arb` | Event arbiter, multilink and advertising scenarios, chains of flash operations against 1 to 3 links |
+| `test_arb` | Event arbiter, multilink and advertising scenarios (incl. the starvation bound with channel maps on a background link), chains of flash operations against 1 to 3 links |
 | `test_csa1`, `test_csa2` | CSA #1 against hand-computed sequences, CSA #2 against the Core Spec sample data |
 | `test_crypt` | AES-CCM and session key against the Core Spec sample data (software AES reference) |
 | `test_txq`, `test_txq_safe` | TX queue against a fake FIFO implementing the measured hardware model, including forced NACKs, the placeholder case, pointer wrap, other links' events in between, long PDUs |
