@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Read the open BLE controller's power counters (mcumgr group 66, command 0).
+Read the open BLE controller's power counters (mcumgr group 66, command 0,
+and the per-link arbiter counters of command 1 where the firmware has it).
 
 Works over USB CDC-ACM serial (default) or BLE SMP GATT (--ble). The firmware
 must be built with the open controller (CONFIG_OPENLL_MGMT, enabled by
@@ -26,6 +27,11 @@ longest wait / longest window in us (maxima, no deltas), pause / cut =
 connection events not issued / ended by it, fkick = events pulled in for
 it, abort = radio activity ended, pskip = RX DMA ring overruns, which must
 stay 0).
+Firmware with the starvation bound sends "link" as positional lists
+[up, listen, skip, coll, miss] and adds command 1 ("arb": per link id
+[gmax, gus, gx, elen, clip, lost...]: longest listen gap in events / us /
+events beyond the latency window, longest event in us, clipped starts, events
+lost to each arbiter priority); both are merged into one dict per link.
 Counters are uint32, cumulative since boot; deltas are computed modulo 2**32.
 """
 
@@ -40,6 +46,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 GROUP = 66          # MGMT_GROUP_ID_PERUSER + 2
 CMD_STATS = 0
+CMD_ARB = 1
+# positional per-link lists (command 0 "link", command 1 "arb")
+LINK_FIELDS = ("up", "listen", "skip", "coll", "miss")
+ARB_FIELDS = ("gmax", "gus", "gx", "elen", "clip")
 SMP_OP_READ = 0
 FIELDS = ("up", "idle", "plan", "listen", "skip", "kick", "ev", "miss", "wake", "mv")
 COUNTERS = ("idle", "plan", "listen", "skip", "kick", "ev", "miss", "wake")
@@ -72,6 +82,23 @@ def parse_response(frame):
     if rc != 0:
         raise RuntimeError(f"device rc={rc}")
     return body
+
+
+def normalize(stats, arb=None):
+    """Merge a command 0 reply and an optional command 1 reply into the dict
+    format_stats() takes: positional per-link lists become dicts (maps of
+    older firmware stay as they are), the "arb" lists add gmax, gus, gx, elen,
+    clip and lost to the link dicts."""
+    links = stats.get("link")
+    if isinstance(links, list):
+        stats["link"] = [dict(zip(LINK_FIELDS, lk)) if isinstance(lk, list) else lk
+                         for lk in links]
+    rows = arb.get("arb") if isinstance(arb, dict) else None
+    if isinstance(rows, list) and isinstance(stats.get("link"), list):
+        for lk, row in zip(stats["link"], rows):
+            lk.update(zip(ARB_FIELDS, row))
+            lk["lost"] = list(row[len(ARB_FIELDS):])
+    return stats
 
 
 def _sub(new, old, keys):
@@ -151,7 +178,12 @@ def read_serial(port=None, timeout=3.0):
         old = r.RGB_GROUP
         r.RGB_GROUP = GROUP
         try:
-            return kb._request(SMP_OP_READ, CMD_STATS, [], timeout=timeout)
+            s = kb._request(SMP_OP_READ, CMD_STATS, [], timeout=timeout)
+            try:
+                a = kb._request(SMP_OP_READ, CMD_ARB, [], timeout=timeout)
+            except RuntimeError:
+                a = None   # older firmware: no command 1
+            return normalize(s, a)
         finally:
             r.RGB_GROUP = old
     finally:
@@ -168,7 +200,12 @@ async def read_ble(address=None, timeout=10.0):
         old = b.RGB_GROUP
         b.RGB_GROUP = GROUP
         try:
-            return await kb._request(SMP_OP_READ, CMD_STATS, [])
+            s = await kb._request(SMP_OP_READ, CMD_STATS, [])
+            try:
+                a = await kb._request(SMP_OP_READ, CMD_ARB, [])
+            except RuntimeError:
+                a = None   # older firmware: no command 1
+            return normalize(s, a)
         finally:
             b.RGB_GROUP = old
     finally:

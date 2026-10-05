@@ -114,6 +114,70 @@ class T(unittest.TestCase):
         txt = o.format_stats(s)
         self.assertIn("lost to adv 0 idle 5 active 3 starving 2 sup 1 must 0", txt)
 
+    # --- reply size and positional formats (multi-host review) ---------------
+
+    U32 = 0xFFFFFFFF
+    NETBUF = 512    # CONFIG_MCUMGR_TRANSPORT_NETBUF_SIZE, conf/app.conf
+
+    def _stats_frame(self, n, v):
+        # command 0 as the firmware encodes it (indefinite containers), all
+        # counters v
+        body = b"\xbf" + _cbor_tstr("rc") + _cbor_uint(0)
+        body += b"".join(_cbor_tstr(k) + _cbor_uint(v) for k in o.FIELDS)
+        body += _cbor_tstr("links") + _cbor_uint(v)
+        body += _cbor_tstr("link") + _indef_array(
+            [_indef_array([_cbor_uint(v)] * len(o.LINK_FIELDS)) for _ in range(n)])
+        body += _cbor_tstr("adv") + _indef_map([(k, _cbor_uint(v)) for k in o.ADV_COUNTERS])
+        body += _cbor_tstr("flash") + _indef_map([(k, _cbor_uint(v))
+                                                 for k in o.FLASH_FIELDS])
+        return bytes([1, 0, 0, 0, 0, 66, 1, 0]) + body + b"\xff"
+
+    def _arb_frame(self, n, v):
+        rows = [_indef_array([_cbor_uint(v)] * (len(o.ARB_FIELDS) + len(o.PRIO_NAMES)))
+                for _ in range(n)]
+        body = (b"\xbf" + _cbor_tstr("rc") + _cbor_uint(0) + _cbor_tstr("arb") +
+                _indef_array(rows) + b"\xff")
+        return bytes([1, 0, 0, 0, 0, 66, 1, 1]) + body
+
+    def test_worst_case_reply_size(self):
+        # every MAX_CONN (1..5) with every counter at UINT32_MAX fits one
+        # mcumgr buffer (the firmware asserts the same bound at build time)
+        for n in range(1, 6):
+            st = self._stats_frame(n, self.U32)
+            ab = self._arb_frame(n, self.U32)
+            self.assertLessEqual(len(st), self.NETBUF, n)
+            self.assertLessEqual(len(ab), self.NETBUF, n)
+            s = o.normalize(o.parse_response(st), o.parse_response(ab))
+            self.assertEqual(len(s["link"]), n)
+            self.assertEqual(s["link"][n - 1]["miss"], self.U32)
+            self.assertEqual(s["link"][n - 1]["lost"], [self.U32] * len(o.PRIO_NAMES))
+        self.assertEqual(len(self._stats_frame(5, self.U32)), 428)
+
+    def test_named_link_maps_too_big(self):
+        # the first multilink version's per-link maps with 11 named keys and a
+        # lost list did not fit at MAX_CONN 3 (why the lists are positional)
+        U = _cbor_uint(self.U32)
+        named = _indef_map([(k, U) for k in ("up", "listen", "skip", "coll", "miss", "gmax",
+                                             "gus", "gx", "elen", "clip")] +
+                           [("lost", _indef_array([U] * 6))])
+        base = len(self._stats_frame(0, self.U32))
+        self.assertGreater(base + 3 * len(named), self.NETBUF)
+
+    def test_normalize_positional(self):
+        st = o.parse_response(self._stats_frame(2, 7))
+        ab = o.parse_response(self._arb_frame(2, 9))
+        s = o.normalize(st, ab)
+        self.assertEqual(s["link"][0], {"up": 7, "listen": 7, "skip": 7, "coll": 7,
+                                        "miss": 7, "gmax": 9, "gus": 9, "gx": 9,
+                                        "elen": 9, "clip": 9, "lost": [9] * 6})
+        txt = o.format_stats(s)
+        self.assertIn("link 1: up listen 7 skip 7 coll 7 miss 7", txt)
+        self.assertIn("lost to adv 9 idle 9 active 9 starving 9 sup 9 must 9", txt)
+        # older firmware: named maps, no command 1
+        s = o.normalize(o.parse_response(self._frame()), None)
+        self.assertEqual(s["link"][0]["listen"], 100)
+        self.assertNotIn("gmax", s["link"][0])
+
     def test_format_old_firmware(self):
         # a slice 5 reply has neither "links" nor "link" nor "adv"
         s = dict(zip(o.FIELDS, [10000, 9000, 1, 2, 3, 4, 5, 6, 7, 3900]))
