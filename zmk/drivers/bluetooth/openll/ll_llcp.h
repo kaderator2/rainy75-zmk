@@ -18,8 +18,10 @@
  *
  * Context: thread only (except ll_llcp_busy(), ISR-safe), but entry points
  * may come from different threads (controller thread: ll_llcp_rx,
- * ll_llcp_tick, ll_llcp_tx; HCI thread: ll_llcp_ltk_reply/_neg_reply/
- * _terminate). State changes and the encrypt+push step run under
+ * ll_llcp_tick, ll_llcp_tx_acl, ll_llcp_retry; HCI thread:
+ * ll_llcp_ltk_reply/_neg_reply/_terminate, ll_llcp_set_data_len,
+ * ll_llcp_read_apto/_write_apto, ll_llcp_conn_param_reply/_neg_reply).
+ * State changes and the encrypt+push step run under
  * ll_plat_tx_lock() (a thread mutex); the IRQ lock ll_plat_lock() is taken
  * only around ll_txq_push(), the switch of the RX decryption context and
  * inside ll_conn_kick(), so AES never runs with interrupts locked except
@@ -52,8 +54,11 @@ struct ll_llcp_cpr {
  * and LE Connection Update Complete come from ll_conn, not from here. */
 struct ll_llcp_ops {
 	/* HCI LE Long Term Key Request: rand as on air / HCI (LSB first),
-	 * EDIV. Answered with ll_llcp_ltk_reply() or ll_llcp_ltk_neg_reply(). */
-	void (*ltk_req)(uint8_t link, const uint8_t rand[8], uint16_t ediv);
+	 * EDIV. Answered with ll_llcp_ltk_reply() or ll_llcp_ltk_neg_reply().
+	 * Returns false when the event was not sent (masked): ll_llcp then
+	 * rejects at once as for a negative reply (0x06), as Zephyr's
+	 * ll_sw does, instead of leaving the central waiting for TMR_ENC. */
+	bool (*ltk_req)(uint8_t link, const uint8_t rand[8], uint16_t ediv);
 	/* HCI Encryption Change (status, Encryption_Enabled). Reported with
 	 * (LL_ST_SUCCESS, true) once our encrypted LL_START_ENC_RSP is
 	 * queued. Not reported after a negative reply (the host chose it) or
@@ -114,7 +119,8 @@ uint8_t ll_llcp_ltk_neg_reply(uint8_t link);
 uint8_t ll_llcp_terminate(uint8_t link, uint8_t reason);
 /* Procedure response timeout (Vol 6 Part B 5.2), per link and procedure
  * (encryption start, our LENGTH request, the PHY update after our
- * LL_PHY_RSP, our LL_PING_REQ): 40 s from the last LL control PDU the
+ * LL_PHY_RSP, our LL_PING_REQ, a Connection Parameters Request while it
+ * waits on the host or on the central's LL_CONNECTION_UPDATE_IND): 40 s from the last LL control PDU the
  * procedure queued while it waits on the central (or on the host's LTK),
  * then ll_conn_end(LL_ST_LMP_TIMEOUT) of that link only (its owed PDUs are
  * dropped with it). Also the authenticated payload timeout (slice 6d,
@@ -140,7 +146,8 @@ int32_t ll_llcp_timeout_ticks(uint32_t now_tick);
  * procedure of the link waits on the host or the central (encryption
  * start: LL_ENC_RSP queued until our LL_START_ENC_RSP is queued; our
  * LL_LENGTH_REQ until LL_LENGTH_RSP; our LL_PHY_RSP until
- * LL_PHY_UPDATE_IND; our LL_PING_REQ until its answer, slice 6d; not the
+ * LL_PHY_UPDATE_IND; our LL_PING_REQ until its answer, slice 6d; a
+ * Connection Parameters Request in WAIT_HOST / WAIT_IND (TMR_CPR); not the
  * authenticated payload timer itself), and while the link owes a control
  * PDU. Reads
  * the procedure state without ll_plat_tx_lock(): ISR-safe, never blocks; a
@@ -170,8 +177,9 @@ bool ll_llcp_busy(uint8_t link);
  * nothing changed; a merely full backlog owes the request, slice 7).
  * Thread. */
 uint8_t ll_llcp_set_data_len(uint8_t link, uint16_t tx_octets, uint16_t tx_time);
-/* The link's effective values; 27 / 328 for a new connection and for an
- * out-of-range link. Thread. */
+/* Test and diagnostic accessor (no product caller). The link's effective
+ * values; 27 / 328 for a new connection and for an out-of-range link.
+ * Thread. */
 void ll_llcp_get_dle(uint8_t link, struct ll_llcp_dle *out);
 
 /* PHY Update procedure (5.1.10), handled by ll_llcp_rx() (there is no
@@ -242,7 +250,8 @@ uint8_t ll_llcp_conn_param_neg_reply(uint8_t link, uint8_t reason);
  * 7); keep the PDU and retry later. After
  * a successful push it calls ll_conn_kick() (without ll_plat_lock() held),
  * so the PDU leaves at the next regular connection event even while
- * peripheral latency skips events. Thread. */
+ * peripheral latency skips events. Thread. Test API: the product pushes
+ * host ACL with ll_llcp_tx_acl(). */
 int ll_llcp_tx(uint8_t link, enum ll_txq_kind kind, uint8_t llid, const uint8_t *payload,
 	       uint8_t len);
 /* Slice 6b Task 4: the link's TX limit for one data PDU (plaintext

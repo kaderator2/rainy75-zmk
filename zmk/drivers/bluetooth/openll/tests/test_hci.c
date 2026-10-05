@@ -378,7 +378,7 @@ static void test_event_masks(void)
 	ll_hci_evt_chan_sel_algo(0, 1);       /* bit 19 off */
 	CHECK(evt_len == 0);
 	evt_len = 0;
-	ll_hci_evt_ltk_req(0, rnd8, 0);
+	CHECK(ll_hci_evt_ltk_req(0, rnd8, 0));
 	CHECK(evt_len == 16);
 	m[0] = 0x05;                       /* Conn Complete + Conn Update Complete */
 	cmd(0x2001, m, 8);
@@ -386,7 +386,7 @@ static void test_event_masks(void)
 	ll_hci_evt_conn_update(0, &p);
 	CHECK(evt_len == 13);
 	evt_len = 0;
-	ll_hci_evt_ltk_req(0, rnd8, 0);
+	CHECK(!ll_hci_evt_ltk_req(0, rnd8, 0));   /* masked: ll_llcp rejects */
 	CHECK(evt_len == 0);
 
 	all_events_on();

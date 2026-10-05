@@ -11,7 +11,7 @@
  *   ll_conn event callback and the ll_txq completion callback only record
  *   what happened (pending bits, counters) and wake the controller thread.
  * - Controller thread: consumes ll_rxq (LLCP to ll_llcp, ACL to the host),
- *   sends host ACL through ll_llcp_tx() (the single encrypt+push point),
+ *   sends host ACL through ll_llcp_tx_acl() (the single encrypt+push point),
  *   emits LE Connection Complete / Connection Update Complete / Number Of
  *   Completed Packets / Disconnection Complete, and on a disconnect resets
  *   the link's ll_rxq and ll_llcp in thread context before it releases the
@@ -20,7 +20,10 @@
  * - HCI thread (host TX): HCI commands (ll_hci) and host ACL, which is only
  *   parsed and queued here, so encryption and the TX packet counter run in
  *   one thread for data (LTK reply / Disconnect queue control PDUs from the
- *   HCI thread under ll_plat_tx_lock(), see ll_llcp.h).
+ *   HCI thread under ll_plat_tx_lock(), see ll_llcp.h). HCI Disconnect
+ *   queues its Command Status after ll_conn_terminate() returns; if the
+ *   HCI thread is then starved for a whole air round trip, Disconnection
+ *   Complete can reach the host first (not seen; Zephyr tolerates it).
  *
  * Multilink (slice 6a): every per-connection item below is per link (link
  * id == HCI handle): pending bits, Number Of Completed Packets, the host ACL
@@ -199,7 +202,7 @@ static atomic_t cnt_guard_escalations;
 static atomic_t cnt_wakeups;             /* controller thread passes (power counter) */
 static atomic_t cnt_apto;                /* authenticated payload timeouts (our LL_PING_REQs) */
 static uint32_t lock_depth, lock_t0, lock_max_ticks, acl_tx_lock_max_ticks, aes_max_ticks;
-static volatile bool in_acl_tx;          /* controller thread is inside ll_llcp_tx() for ACL */
+static volatile bool in_acl_tx;          /* controller thread is inside ll_llcp_tx_acl() */
 static bool aes_reversed;                /* hal AES needs reversed byte order (self-test) */
 
 /* ---- platform hooks (ll_plat.h) ---- */
@@ -499,9 +502,9 @@ static const struct ll_conn_ops conn_ops = {
 };
 
 /* HCI handle == link id */
-static void llcp_ltk_req(uint8_t link, const uint8_t rand[8], uint16_t ediv)
+static bool llcp_ltk_req(uint8_t link, const uint8_t rand[8], uint16_t ediv)
 {
-	ll_hci_evt_ltk_req(link, rand, ediv);
+	return ll_hci_evt_ltk_req(link, rand, ediv);
 }
 
 static void llcp_enc_change(uint8_t link, uint8_t status, bool enabled)
@@ -670,7 +673,6 @@ static void hci_reset(void)
 		}
 	}
 }
-
 
 /* HCI thread: the negative reply resumes paused host ACL; wake the
  * controller thread, which holds it (nothing else would). */

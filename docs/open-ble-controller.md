@@ -551,7 +551,11 @@ payload timer (default 30 s, Vol 6 Part B 5.4) runs while the link is
 encrypted and restarts on every PDU with a valid MIC. On expiry we send an
 encrypted LL_PING_REQ (at most one per timeout) and the Authenticated Payload
 Timeout Expired event if the host enabled it on event mask page 2 (Zephyr
-does not). HCI Read/Write Authenticated Payload Timeout and Set Event Mask
+does not). We ping only at expiry, not ahead of it as Zephyr's ll_sw does
+(about timeout - (latency + 6) x interval), so with a central that sends no
+MIC'd PDU for a whole timeout the event fires once per idle timeout, not
+only on a real loss of authenticated traffic; on ZMK the event is masked,
+so this costs nothing. HCI Read/Write Authenticated Payload Timeout and Set Event Mask
 Page 2 are implemented, since claiming LE Ping makes them mandatory. A value
 below the connection's interval x (1 + latency) is raised at connection
 updates.

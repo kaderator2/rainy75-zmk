@@ -92,8 +92,9 @@ void ll_hci_init(const struct ll_hci_ops *ops, ll_hci_sink_t sink);
 void ll_hci_cmd(const uint8_t *cmd, uint16_t len);
 
 /* ---- Events toward the host. Each builds one H4 event and passes it to
- * the sink unless the event mask suppresses it. Callable from any context
- * (also ISR: ll_conn and ll_txq callbacks), so the sink must be ISR-safe. */
+ * the sink unless the event mask suppresses it. The glue produces every
+ * event in a thread (the controller or the HCI thread); the sink still
+ * copes with ISR context. */
 /* LE Connection Complete (0x3E/0x01): status 0, handle, role peripheral,
  * peer address (type) from the CONNECT_IND, interval, latency, supervision
  * timeout, Central_Clock_Accuracy = ci->sca. */
@@ -101,13 +102,14 @@ void ll_hci_evt_conn_complete(uint16_t handle, const struct ll_connect_ind *ci);
 /* Disconnection Complete (0x05): status 0, handle, reason. */
 void ll_hci_evt_disconn_complete(uint16_t handle, uint8_t reason);
 /* Number Of Completed Packets (0x13), one handle per event; count 0:
- * nothing is sent. One per acked ACL PDU (ll_txq completion of kind
- * LL_TXQ_ACL), or batched by the caller. Never after the Disconnection
+ * nothing is sent. One per host ACL packet (the ack of its last
+ * fragment), or batched by the caller. Never after the Disconnection
  * Complete of the connection (the host frees its buffers on disconnect
  * itself). */
 void ll_hci_evt_num_completed(uint16_t handle, uint16_t count);
-/* LE Long Term Key Request (0x3E/0x05): rand as on air (LSB first), EDIV. */
-void ll_hci_evt_ltk_req(uint16_t handle, const uint8_t rand[8], uint16_t ediv);
+/* LE Long Term Key Request (0x3E/0x05): rand as on air (LSB first), EDIV.
+ * false: masked, not sent. */
+bool ll_hci_evt_ltk_req(uint16_t handle, const uint8_t rand[8], uint16_t ediv);
 /* Encryption Change (0x08): status, handle, Encryption_Enabled 0/1. */
 void ll_hci_evt_enc_change(uint16_t handle, uint8_t status, bool enabled);
 /* LE Connection Update Complete (0x3E/0x03): status 0, new parameters. */

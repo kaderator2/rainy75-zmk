@@ -712,7 +712,7 @@ void ll_hci_evt_num_completed(uint16_t handle, uint16_t count)
 	send_evt(EVT_NUM_COMPLETED, p, sizeof(p));
 }
 
-void ll_hci_evt_ltk_req(uint16_t handle, const uint8_t rand[8], uint16_t ediv)
+bool ll_hci_evt_ltk_req(uint16_t handle, const uint8_t rand[8], uint16_t ediv)
 {
 	uint8_t p[13];
 
@@ -720,7 +720,7 @@ void ll_hci_evt_ltk_req(uint16_t handle, const uint8_t rand[8], uint16_t ediv)
 	ll_put_le16(&p[1], handle);
 	memcpy(&p[3], rand, 8);
 	ll_put_le16(&p[11], ediv);
-	send_le_evt(p, sizeof(p));
+	return send_le_evt(p, sizeof(p));
 }
 
 bool ll_hci_evt_conn_param_req(uint16_t handle, uint16_t interval_min, uint16_t interval_max,

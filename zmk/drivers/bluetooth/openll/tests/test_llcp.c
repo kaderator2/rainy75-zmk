@@ -255,6 +255,7 @@ void ll_conn_kick(uint8_t link)
 
 static struct {
 	int ltk_req;
+	bool ltk_masked;   /* the host has the LE LTK Request event masked */
 	uint8_t rand[8];
 	uint16_t ediv;
 	int enc_change;
@@ -263,13 +264,14 @@ static struct {
 } hcil[LL_MAX_CONN];
 #define hci (hcil[L])
 
-static void on_ltk_req(uint8_t link, const uint8_t r[8], uint16_t e)
+static bool on_ltk_req(uint8_t link, const uint8_t r[8], uint16_t e)
 {
 	CHECK(locks == 0);
 	CHECK(link < LL_MAX_CONN);
 	hcil[link].ltk_req++;
 	memcpy(hcil[link].rand, r, 8);
 	hcil[link].ediv = e;
+	return !hcil[link].ltk_masked;
 }
 
 static void on_enc_change(uint8_t link, uint8_t status, bool enabled)
@@ -790,6 +792,32 @@ static void single_link_suite(void)
 		sample_rand();
 		rx(req, sizeof(req));
 		CHECK(hci.ltk_req == 2);
+	}
+	/* final review B-1: LE LTK Request masked by the host: rejected at
+	 * once like a negative reply (0x06, as Zephyr ll_sw), data resumes,
+	 * no 40 s wait for the TMR_ENC timeout */
+	fresh();
+	features(LL_FEAT_LE_ENC | LL_FEAT_EXT_REJ_IND);
+	tx.n = 0;
+	{
+		uint8_t req[23];
+		static const uint8_t exp[3] = {0x11, 0x03, 0x06};
+
+		hci.ltk_masked = true;
+		sample_rand();
+		build_enc_req(req);
+		rx(req, sizeof(req));
+		CHECK(hci.ltk_req == 1);
+		CHECK(tx.n == 2);
+		CHECK(last_is(exp, 3));
+		CHECK(hci.enc_change == 0);
+		CHECK(ll_llcp_ltk_reply(L, ltk) == LL_ST_DISALLOWED);
+		CHECK(ll_llcp_ltk_neg_reply(L) == LL_ST_DISALLOWED);
+		CHECK(ll_llcp_tx(L, LL_TXQ_ACL, LL_LLID_START, data2_clear, 27) == 0);
+		CHECK(tx.p[2].len == 27);
+		now += T(TIMEOUT_US) + 1;
+		ll_llcp_tick(now);
+		CHECK(cn.end_calls == 0);
 	}
 	/* negative reply, central's features unknown: LL_REJECT_IND(0x06) */
 	fresh();

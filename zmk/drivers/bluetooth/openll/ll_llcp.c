@@ -36,7 +36,7 @@
  * Slice 6b: Data Length Update (5.1.9, values per 4.5.10) as responder and
  * initiator, and the PHY Update procedure (5.1.10) as a 1M-only responder.
  * Each procedure kind has its own 40 s response timer (TMR_ENC, TMR_DLE,
- * TMR_PHY): they can overlap (LENGTH has no instant, so it is compatible
+ * TMR_PHY, and since slice 6d TMR_PING, TMR_CPR): they can overlap (LENGTH has no instant, so it is compatible
  * with the others, 5.3), and one completing must not stop another's timer.
  *
  * Slice 7: every control PDU we must send goes through ctrl_send_locked().
@@ -907,6 +907,9 @@ void ll_llcp_get_dle(uint8_t link, struct ll_llcp_dle *out)
 
 /* ---- PHY (5.1.10), 1M only ---- */
 
+/* Unlike rx_conn_param_req(), no 5.3 collision check (an open CPR or a
+ * pending instant): only a central that starts a second procedure with an
+ * instant while one runs can reach it, and the answer keeps 1M anyway. */
 static void rx_phy_req(uint8_t link)
 {
 	static const uint8_t rsp[3] = {OP_PHY_RSP, LL_PHY_1M, LL_PHY_1M};
@@ -984,8 +987,9 @@ static void rx_enc_req(uint8_t link, const uint8_t *p)
 	}
 	/* same thread as the ll_rxq consumer; enc_rx is still off */
 	ll_rxq_set_crypt(link, &s->crypt);
-	if (ops.ltk_req) {
-		ops.ltk_req(link, &p[1], ll_get_le16(&p[9]));
+	if (ops.ltk_req && !ops.ltk_req(link, &p[1], ll_get_le16(&p[9]))) {
+		/* masked: no host answer will come */
+		(void)ll_llcp_ltk_neg_reply(link);
 	}
 }
 
@@ -1187,8 +1191,8 @@ void ll_llcp_rx(uint8_t link, const uint8_t *payload, uint8_t len, uint16_t rx_e
 	}
 	want = expected_len(op);
 	if (want == 0 || len != want) {
-		/* Unsupported (PERIPHERAL_FEATURE, MIN_USED_CHANNELS,
-		 * CONN_PARAM, ...), or a known request whose length is not
+		/* Unsupported (PERIPHERAL_FEATURE, MIN_USED_CHANNELS, ...),
+		 * or a known request whose length is not
 		 * exactly the specified one: LL_UNKNOWN_RSP, as Zephyr ll_sw
 		 * does for PDUs failing its exact-length validation. */
 		unknown_rsp(link, op);
