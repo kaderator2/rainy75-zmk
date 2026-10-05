@@ -900,6 +900,26 @@ static void test_drift_pair(void)
 	if (LL_MAX_CONN >= 3) {
 		CHECK(ll_conn_active(2) && coll(2) == 0 && sim.max_gap[2] == 1);
 	}
+	/* the listen gap stats (the first multilink test since boot, so the
+	 * maxima are this test's) and the arbiter's loss counters */
+	for (uint8_t k = 0; k < 2; k++) {
+		struct ll_conn_stats st;
+		struct ll_arb_stats as;
+		uint32_t lost = 0;
+
+		ll_conn_get_stats(k, &st);
+		ll_arb_get_stats(k, &as);
+		for (int p = 0; p < LL_ARB_PRIOS; p++) {
+			lost += as.lost[p];
+		}
+		CHECK(st.gap_max == (uint32_t)sim.max_gap[k]);
+		CHECK(st.gap_max_us >= (uint32_t)(sim.max_gap[k] * 15000 - 100));
+		/* + the window margin and widening of the first events */
+		CHECK(st.gap_max_us <= (uint32_t)(sim.max_gap[k] * 15000 + 400));
+		CHECK(st.gap_excess_max == (uint32_t)sim.max_gap[k] - 1);   /* latency 0 */
+		CHECK(st.ev_len_max_us > 400 && st.ev_len_max_us < 1000);
+		CHECK(lost > 0 && lost <= c0 + c1);
+	}
 }
 
 /* An idle link with latency 4 (15 ms) meets an active link (75 ms, busy)

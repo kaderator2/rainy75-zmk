@@ -33,6 +33,14 @@ struct slot {
 };
 
 static struct slot slots[LL_ARB_IDS];
+static struct ll_arb_stats astats[LL_ARB_IDS];
+
+static void lost_to(int id, uint8_t prio)
+{
+	if (prio < LL_ARB_PRIOS) {
+		astats[id].lost[prio]++;
+	}
+}
 static struct ll_arb_ops ops;
 static bool armed;
 /* Displaced ids whose bumped callback is still due, and whether a dispatch
@@ -161,6 +169,7 @@ static void alarm_fired(void)
 	s = &slots[id];
 	if (running_other(id) >= 0) {
 		/* the previous event overran into this one: it yields */
+		lost_to(id, slots[running_other(id)].r.prio);
 		s->used = false;
 		s->yielded = true;
 		arm();
@@ -170,6 +179,9 @@ static void alarm_fired(void)
 		return;
 	}
 	cap = clip_cap(id);
+	if (cap < s->r.max_len_us) {
+		astats[id].clipped++;
+	}
 	s->running = true;
 	/* The event may use the cap; a request accepted while it runs must
 	 * still open its RX the clipping reserve after it (the same distance
@@ -269,6 +281,7 @@ int ll_arb_request(uint8_t id, const struct ll_arb_req *r)
 		if (victims & (1u << i)) {
 			slots[i].used = false;
 			slots[i].yielded = true;
+			lost_to(i, r->prio);
 		}
 	}
 	arm();
@@ -286,6 +299,7 @@ void ll_arb_yield(uint8_t id)
 	for (int i = 0; i < LL_ARB_IDS; i++) {
 		if (slots[id].refused_by & (1u << i)) {
 			slots[i].yielded = false;
+			lost_to(id, slots[i].used ? slots[i].r.prio : LL_ARB_PRIOS);
 		}
 	}
 	slots[id].refused_by = 0;
@@ -299,6 +313,18 @@ void ll_arb_cancel(uint8_t id)
 	slots[id].used = false;
 	slots[id].running = false;
 	arm();
+}
+
+void ll_arb_get_stats(uint8_t id, struct ll_arb_stats *s)
+{
+	unsigned int key = ll_plat_lock();
+
+	if (id < LL_ARB_IDS) {
+		*s = astats[id];
+	} else {
+		memset(s, 0, sizeof(*s));
+	}
+	ll_plat_unlock(key);
 }
 
 uint32_t ll_arb_gap(uint32_t from_tick, uint32_t lead_us, uint32_t len_us)

@@ -8,7 +8,10 @@
  *                       "wake": uint, "mv": uint (battery, 0 if unavailable),
  *                       "links": uint (links up),
  *                       "link": [{"up": 0/1, "listen": uint, "skip": uint,
- *                                 "coll": uint, "miss": uint}, ...] (per link id),
+ *                                 "coll": uint, "miss": uint, "gmax": uint,
+ *                                 "gus": uint, "gx": uint, "elen": uint,
+ *                                 "clip": uint, "lost": [5 x uint]}, ...]
+ *                       (per link id),
  *                       "adv": {"ev": uint, "slid": uint, "drop": uint,
  *                               "cut": uint, "stuck": uint},
  *                       "flash": {"win": uint, "wait": uint, "force": uint,
@@ -21,7 +24,11 @@
  *   packet plus late alarms), wake counts controller-thread passes. With
  *   peripheral latency active and idle, skip grows much faster than listen.
  *   "link" has one map per link id 0..CONFIG_BT_HCI_B91_OPENLL_MAX_CONN-1
- *   (coll: events yielded to the arbiter); "adv" are the advertising
+ *   (coll: events yielded to the arbiter; gmax / gus / gx: longest listen
+ *   gap in events / us / events beyond latency + 1, elen: longest event in
+ *   us, all maxima since boot; clip: starts with a clipped cap; lost: events
+ *   given up to a winner of arbiter priority ADV, IDLE, ACTIVE, SUPERVISION,
+ *   MUST, see ll_arb.h); "adv" are the advertising
  *   arbitration counters (ll_adv_get_stats); "flash" the flash window
  *   (ll_flash.h: windows, waits for the links, forced opens, longest wait
  *   and longest window in us, connection events paused / cut / pulled in,
@@ -48,6 +55,7 @@
 
 #include "b91_bt.h"
 #include "ll_adv.h"
+#include "ll_arb.h"
 #include "ll_conn.h"
 #include "ll_defs.h"
 #include "ll_flash.h"
@@ -132,16 +140,29 @@ static int openll_mgmt_stats(struct smp_streamer *ctxt)
 		  zcbor_tstr_put_lit(zse, "link") && zcbor_list_start_encode(zse, LL_MAX_CONN);
 	for (uint8_t i = 0; ok && i < LL_MAX_CONN; i++) {
 		struct ll_conn_stats l;
+		struct ll_arb_stats a;
 
 		ll_conn_get_stats(i, &l);
-		ok = zcbor_map_start_encode(zse, 5) &&
+		ll_arb_get_stats(i, &a);
+		ok = zcbor_map_start_encode(zse, 11) &&
 		     zcbor_tstr_put_lit(zse, "up") &&
 		     zcbor_uint32_put(zse, ll_conn_active(i) ? 1 : 0) &&
 		     zcbor_tstr_put_lit(zse, "listen") && zcbor_uint32_put(zse, l.listened) &&
 		     zcbor_tstr_put_lit(zse, "skip") && zcbor_uint32_put(zse, l.skipped) &&
 		     zcbor_tstr_put_lit(zse, "coll") && zcbor_uint32_put(zse, l.collisions) &&
 		     zcbor_tstr_put_lit(zse, "miss") && zcbor_uint32_put(zse, l.missed) &&
-		     zcbor_map_end_encode(zse, 5);
+		     zcbor_tstr_put_lit(zse, "gmax") && zcbor_uint32_put(zse, l.gap_max) &&
+		     zcbor_tstr_put_lit(zse, "gus") && zcbor_uint32_put(zse, l.gap_max_us) &&
+		     zcbor_tstr_put_lit(zse, "gx") && zcbor_uint32_put(zse, l.gap_excess_max) &&
+		     zcbor_tstr_put_lit(zse, "elen") && zcbor_uint32_put(zse, l.ev_len_max_us) &&
+		     zcbor_tstr_put_lit(zse, "clip") && zcbor_uint32_put(zse, a.clipped) &&
+		     zcbor_tstr_put_lit(zse, "lost") &&
+		     zcbor_list_start_encode(zse, LL_ARB_PRIOS);
+		for (uint8_t k = 0; ok && k < LL_ARB_PRIOS; k++) {
+			ok = zcbor_uint32_put(zse, a.lost[k]);
+		}
+		ok = ok && zcbor_list_end_encode(zse, LL_ARB_PRIOS) &&
+		     zcbor_map_end_encode(zse, 11);
 	}
 	ok = ok && zcbor_list_end_encode(zse, LL_MAX_CONN) &&
 	     zcbor_tstr_put_lit(zse, "adv") && zcbor_map_start_encode(zse, 5) &&

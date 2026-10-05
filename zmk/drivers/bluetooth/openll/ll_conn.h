@@ -339,6 +339,17 @@ struct ll_conn_stats {
 	 * skipped). */
 	uint32_t late_instants;
 	uint32_t catch_up_steps_max;
+	/* Listen gaps (maxima since boot, per connection: the first event of
+	 * a connection has no gap): the longest distance between two events
+	 * issued to the radio, in events (gap_max) and in us between their RX
+	 * opens (gap_max_us), and the most events beyond the latency window
+	 * (gap - (latency + 1), gap_excess_max: what the arbiter cost on top
+	 * of peripheral latency). ev_len_max_us: the longest event, RX open
+	 * to CONN_DONE. */
+	uint32_t gap_max;
+	uint32_t gap_max_us;
+	uint32_t gap_excess_max;
+	uint32_t ev_len_max_us;
 };
 /* Per link, cumulative since boot (not reset per connection). Out-of-range
  * link: all zero. */

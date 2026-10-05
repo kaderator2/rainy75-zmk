@@ -43,7 +43,9 @@ CMD_STATS = 0
 SMP_OP_READ = 0
 FIELDS = ("up", "idle", "plan", "listen", "skip", "kick", "ev", "miss", "wake", "mv")
 COUNTERS = ("idle", "plan", "listen", "skip", "kick", "ev", "miss", "wake")
-LINK_COUNTERS = ("listen", "skip", "coll", "miss")
+LINK_COUNTERS = ("listen", "skip", "coll", "miss", "clip")
+# arbiter priorities of the "lost" list
+PRIO_NAMES = ("adv", "idle", "active", "sup", "must")
 ADV_COUNTERS = ("ev", "slid", "drop", "cut", "stuck")
 FLASH_FIELDS = ("win", "wait", "force", "wmax", "hmax", "pause", "cut", "fkick", "abort", "pskip")
 # wmax / hmax are maxima since boot (longest wait, longest window): no deltas
@@ -102,6 +104,12 @@ def format_stats(s, d=None):
                      f"coll {lk.get('coll', 0)} miss {lk.get('miss', 0)}")
         else:
             line += f"\n  link {i}: down"
+        if "gmax" in lk:
+            lost = lk.get("lost") or []
+            line += (f"\n    gap max {lk.get('gmax', 0)} ev / {lk.get('gus', 0) / 1000:.1f} ms"
+                     f" (+{lk.get('gx', 0)} beyond latency)  event max "
+                     f"{lk.get('elen', 0)} us  clip {lk.get('clip', 0)}  lost to "
+                     + " ".join(f"{n} {v}" for n, v in zip(PRIO_NAMES, lost)))
     if isinstance(s.get("adv"), dict):
         a = s["adv"]
         line += "\n  adv: " + " ".join(f"{k} {a.get(k, 0)}" for k in ADV_COUNTERS)

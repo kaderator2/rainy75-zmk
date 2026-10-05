@@ -931,12 +931,16 @@ static void flush_nocp(uint8_t link)
  * a few per connection, typically): logged so the exchange is visible on
  * the device. LL_CONNECTION_PARAM_REQ is logged with its outcome
  * (llcp_conn_param_req). */
-static void log_llcp_rx(uint8_t link, const uint8_t *d, uint8_t len)
+static void log_llcp_rx(uint8_t link, const uint8_t *d, uint8_t len, uint16_t event)
 {
 	if (len == 12 && d[0] == 0x00) {
 		LOG_INF("LL_CONNECTION_UPDATE_IND (handle %u): interval %u latency %u timeout %u "
-			"instant %u", link, ll_get_le16(&d[4]), ll_get_le16(&d[6]),
-			ll_get_le16(&d[8]), ll_get_le16(&d[10]));
+			"instant %u (rx event %u)", link, ll_get_le16(&d[4]), ll_get_le16(&d[6]),
+			ll_get_le16(&d[8]), ll_get_le16(&d[10]), event);
+	} else if (len == 8 && d[0] == 0x01) {
+		LOG_INF("LL_CHANNEL_MAP_IND (handle %u): %02x %02x %02x %02x %02x instant %u "
+			"(rx event %u)", link, d[1], d[2], d[3], d[4], d[5], ll_get_le16(&d[6]),
+			event);
 	} else if (len == 3 && d[0] == 0x11) {
 		LOG_INF("LL_REJECT_EXT_IND (handle %u): opcode 0x%02x error 0x%02x", link, d[1],
 			d[2]);
@@ -1007,7 +1011,7 @@ static void handle_rx_pdus(uint8_t link, bool *got)
 		uint8_t llid = pdu.hdr0 & 0x03;
 
 		if (llid == LL_LLID_CTRL) {
-			log_llcp_rx(link, pdu.data, pdu.len);
+			log_llcp_rx(link, pdu.data, pdu.len, pdu.event);
 			ll_llcp_rx(link, pdu.data, pdu.len, pdu.event);
 			continue;
 		}

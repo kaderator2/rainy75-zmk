@@ -104,6 +104,10 @@ struct ll_link {
 	uint16_t pause_run;   /* consecutive events not listened to (RX flow control) */
 	bool anchored;        /* the last closed event re-anchored (latency rule) */
 	bool holdoff_done;    /* LL_CONN_LATENCY_HOLDOFF_MS has passed (latched, see skip_count) */
+	/* last event issued to the radio (listen gap stats) */
+	bool listen_seen;
+	uint16_t listen_counter;
+	uint32_t listen_open;
 	/* effective maximum RX / TX times (ll_conn_set_dle_times): one
 	 * exchange of such PDUs after the first RX window is the guard floor
 	 * and part of the arbiter span (xchg_of) */
@@ -728,6 +732,31 @@ static void event_closed(struct ll_link *c, uint32_t now)
 	plan(c);
 }
 
+/* Listen gap stats: the event about to be issued against the last issued
+ * one of this connection (in events, in us, and in events beyond the
+ * latency window, latency + 1). */
+static void listen_gap(struct ll_link *c)
+{
+	if (c->listen_seen) {
+		uint16_t g = (uint16_t)(c->counter - c->listen_counter);
+		uint32_t us = (c->open_tick - c->listen_open) / LL_TICKS_PER_US;
+		uint16_t nominal = (uint16_t)(c->p.latency + 1u);
+
+		if (g > ST(c)->gap_max) {
+			ST(c)->gap_max = g;
+		}
+		if (us > ST(c)->gap_max_us) {
+			ST(c)->gap_max_us = us;
+		}
+		if (g > nominal && (uint32_t)(g - nominal) > ST(c)->gap_excess_max) {
+			ST(c)->gap_excess_max = (uint32_t)(g - nominal);
+		}
+	}
+	c->listen_seen = true;
+	c->listen_counter = c->counter;
+	c->listen_open = c->open_tick;
+}
+
 /* Arbiter start: issue the BRX for the planned event of link c. */
 static void prepare(struct ll_link *c, uint32_t cap_us)
 {
@@ -774,6 +803,7 @@ static void prepare(struct ll_link *c, uint32_t cap_us)
 		return;
 	}
 	c->pause_run = 0;
+	listen_gap(c);
 	ll_radio_conn_select(c->ci.aa, c->ci.crc_init);
 	ll_txq_event_start(c->id);
 	c->rx_this_event = false;
@@ -935,6 +965,13 @@ void ll_conn_radio_evt(enum ll_radio_evt evt, const uint8_t *pdu, uint16_t len, 
 		on_rx_nodata(c);
 		break;
 	case LL_RADIO_CONN_DONE:
+		{
+			uint32_t len_us = (tick - c->open_tick) / LL_TICKS_PER_US;
+
+			if (len_us > ST(c)->ev_len_max_us) {
+				ST(c)->ev_len_max_us = len_us;
+			}
+		}
 		c->in_event = false;
 		ev_owner = -1;
 		ll_txq_event_end(c->id);
@@ -1553,6 +1590,18 @@ void ll_conn_get_stats_total(struct ll_conn_stats *s)
 		}
 		if (t->rx_pause_streak_max > s->rx_pause_streak_max) {
 			s->rx_pause_streak_max = t->rx_pause_streak_max;
+		}
+		if (t->gap_max > s->gap_max) {
+			s->gap_max = t->gap_max;
+		}
+		if (t->gap_max_us > s->gap_max_us) {
+			s->gap_max_us = t->gap_max_us;
+		}
+		if (t->gap_excess_max > s->gap_excess_max) {
+			s->gap_excess_max = t->gap_excess_max;
+		}
+		if (t->ev_len_max_us > s->ev_len_max_us) {
+			s->ev_len_max_us = t->ev_len_max_us;
 		}
 	}
 	ll_plat_unlock(key);

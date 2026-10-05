@@ -99,6 +99,17 @@ class T(unittest.TestCase):
         txt = o.format_stats(s, d)
         self.assertIn("delta link 0: listen 0 skip 0 coll 0 miss 0", txt)
 
+    def test_format_gaps(self):
+        # listen gap maxima and arbiter losses per link (when present)
+        s = dict(zip(o.FIELDS, [10000, 9000, 1, 2, 3, 4, 5, 6, 7, 3900]))
+        s["links"] = 1
+        s["link"] = [{"up": 1, "listen": 9, "skip": 8, "coll": 7, "miss": 6, "gmax": 33,
+                      "gus": 495000, "gx": 2, "elen": 6700, "clip": 4,
+                      "lost": [0, 5, 3, 1, 0]}]
+        txt = o.format_stats(s)
+        self.assertIn("gap max 33 ev / 495.0 ms (+2 beyond latency)  event max 6700 us"
+                      "  clip 4  lost to adv 0 idle 5 active 3 sup 1 must 0", txt)
+
     def test_format_old_firmware(self):
         # a slice 5 reply has neither "links" nor "link" nor "adv"
         s = dict(zip(o.FIELDS, [10000, 9000, 1, 2, 3, 4, 5, 6, 7, 3900]))

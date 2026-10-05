@@ -92,6 +92,18 @@ int ll_arb_request(uint8_t id, const struct ll_arb_req *r);
  * recorded refusal only id is marked. Caller holds ll_plat_lock. */
 void ll_arb_yield(uint8_t id);
 void ll_arb_cancel(uint8_t id);
+/* Per requester id, cumulative since boot (ll_arb_init keeps them).
+ * lost[p]: events given up to a winner of priority p (displaced by it,
+ * refused by it and then yielded via ll_arb_yield, or bumped at its alarm
+ * by a running event of priority p). clipped: starts whose cap was cut
+ * below max_len_us for a following request. */
+#define LL_ARB_PRIOS 5
+struct ll_arb_stats {
+	uint32_t lost[LL_ARB_PRIOS];
+	uint32_t clipped;
+};
+void ll_arb_get_stats(uint8_t id, struct ll_arb_stats *s);
+
 /* Earliest tick >= from_tick at which a span [t - lead_us, t + len_us] overlaps no accepted request
  * (advertising uses it to slide into a gap). */
 uint32_t ll_arb_gap(uint32_t from_tick, uint32_t lead_us, uint32_t len_us);
