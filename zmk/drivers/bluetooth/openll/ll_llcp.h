@@ -120,11 +120,12 @@ uint8_t ll_llcp_terminate(uint8_t link, uint8_t reason);
 /* Procedure response timeout (Vol 6 Part B 5.2), per link and procedure
  * (encryption start, our LENGTH request, the PHY update after our
  * LL_PHY_RSP, our LL_PING_REQ, a Connection Parameters Request while it
- * waits on the host or on the central's LL_CONNECTION_UPDATE_IND): 40 s from the last LL control PDU the
- * procedure queued while it waits on the central (or on the host's LTK),
- * then ll_conn_end(LL_ST_LMP_TIMEOUT) of that link only (its owed PDUs are
- * dropped with it). Also the authenticated payload timeout (slice 6d,
- * see below): ops.apto_expired and LL_PING_REQ. Checks all links. Call from the controller thread with
+ * waits on the host or on the central's LL_CONNECTION_UPDATE_IND): 40 s
+ * from the last LL control PDU the procedure queued while it waits on the
+ * central (or on the host's LTK), then ll_conn_end(LL_ST_LMP_TIMEOUT) of
+ * that link only (its owed PDUs are dropped with it). Also the
+ * authenticated payload timeout (slice 6d, see below): ops.apto_expired
+ * and LL_PING_REQ. Checks all links. Call from the controller thread with
  * the stimer tick when ll_llcp_timeout_ticks() says it is due (calling it
  * earlier or more often is harmless). */
 void ll_llcp_tick(uint32_t now_tick);

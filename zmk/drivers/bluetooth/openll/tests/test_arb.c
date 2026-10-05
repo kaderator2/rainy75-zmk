@@ -1685,7 +1685,6 @@ static void test_flash_adv(void)
 	CHECK(ll_adv_enable(false) == LL_ST_SUCCESS);
 }
 
-
 /* Starvation (first multi-host device test): link 0 (a PC at 7.5 ms,
  * latency 0, timeout 420 ms, always busy, 251-octet data length, every
  * event an MD burst up to its cap) fills almost every interval; link 1 (a

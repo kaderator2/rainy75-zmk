@@ -17,11 +17,12 @@
  * it runs still opens its RX that long after the event's cap, the distance
  * the cap keeps before an accepted request), and it can neither be
  * displaced nor overlapped. A new request is tested against a running span
- * by its open_tick (its lead may lie in the reserve, as it does for a request
- * accepted before the event started, which can therefore be re-requested
- * while the event runs); ll_arb_gap() still uses the whole span. If the alarm of a request fires while another
- * request is still running (an event overran its cap), that request is
- * displaced (bumped) instead of started.
+ * by its open_tick (its lead may lie in the reserve, as it does for a
+ * request accepted before the event started, which can therefore be
+ * re-requested while the event runs); ll_arb_gap() still uses the whole
+ * span. If the alarm of a request fires while another request is still
+ * running (an event overran its cap), that request is displaced (bumped)
+ * instead of started.
  *
  * Collisions: a new request that overlaps accepted ones is refused if any
  * of them is running or has a higher priority, or has the same priority
@@ -56,7 +57,8 @@ enum ll_arb_prio {                                    /* higher wins */
 	LL_ARB_PRIO_ADV = 0,
 	LL_ARB_PRIO_IDLE = 1,                         /* link without backlog */
 	LL_ARB_PRIO_ACTIVE = 2,                       /* TX backlog or ops.busy */
-	LL_ARB_PRIO_STARVING = 3,                     /* yielded LL_CONN_STARVE_YIELDS events in a row */
+	/* yielded LL_CONN_STARVE_YIELDS events in a row */
+	LL_ARB_PRIO_STARVING = 3,
 	/* next listen within 2 intervals of the supervision timeout */
 	LL_ARB_PRIO_SUPERVISION = 4,
 	LL_ARB_PRIO_MUST = 5,                         /* transmit-window event or instant event */
@@ -65,17 +67,20 @@ enum ll_arb_prio {                                    /* higher wins */
 struct ll_arb_req {
 	uint32_t alarm_tick;   /* when the owner must be called (RX open - lead) */
 	uint32_t open_tick;    /* RX window open */
-	uint32_t min_len_us;   /* from open_tick: first RX window + one exchange (adv: whole adv event) */
+	/* from open_tick: first RX window + one exchange (adv: whole adv event) */
+	uint32_t min_len_us;
 	uint32_t max_len_us;   /* owner's own cap (interval derived) */
 	uint8_t prio;
 };
 
 struct ll_arb_ops {
-	/* Main alarm of id's request fired (ISR). cap_us = max_len_us clipped so the event ends
-	 * LL_CONN_EVENT_SAFETY_US + LL_CONN_ARM_LEAD_US before the next accepted request's open_tick. */
+	/* Main alarm of id's request fired (ISR). cap_us = max_len_us clipped so the event
+	 * ends LL_CONN_EVENT_SAFETY_US + LL_CONN_ARM_LEAD_US before the next accepted
+	 * request's open_tick. */
 	void (*start)(uint8_t id, uint32_t cap_us);
-	/* id's accepted request was displaced by a higher-priority one (same context as the displacing
-	 * ll_arb_request call, ll_plat_lock held); the owner re-plans and requests again. */
+	/* id's accepted request was displaced by a higher-priority one (same context as the
+	 * displacing ll_arb_request call, ll_plat_lock held); the owner re-plans and requests
+	 * again. */
 	void (*bumped)(uint8_t id);
 };
 
@@ -86,12 +91,12 @@ void ll_arb_init(const struct ll_arb_ops *ops);
  * priority, or has the same priority unless id yielded at its last collision and the other one did
  * not (round-robin: the one that yielded last wins ties). Otherwise the other one is displaced
  * (bumped, marked yielded; id is marked not yielded). A refusal only records the refusing requests
- * for ll_arb_yield(). Replaces id's previous request (also when refused: id then has none). Arms the
- * main alarm (ll_sched_at) for the earliest accepted request. Caller holds ll_plat_lock. */
+ * for ll_arb_yield(). Replaces id's previous request (also when refused: id then has none). Arms
+ * the main alarm (ll_sched_at) for the earliest accepted request. Caller holds ll_plat_lock. */
 int ll_arb_request(uint8_t id, const struct ll_arb_req *r);
-/* id gives up the event of its last refused request (a yield, not a probe): id is marked yielded,
- * the requests that refused it are marked not yielded (fairness, see the file header). Without a
- * recorded refusal only id is marked. Caller holds ll_plat_lock. */
+/* id gives up the event of its last refused request (a yield, not a probe): id is marked
+ * yielded, the requests that refused it are marked not yielded (fairness, see the file
+ * header). Without a recorded refusal only id is marked. Caller holds ll_plat_lock. */
 void ll_arb_yield(uint8_t id);
 void ll_arb_cancel(uint8_t id);
 /* Per requester id, cumulative since boot (ll_arb_init keeps them).
@@ -103,8 +108,10 @@ void ll_arb_cancel(uint8_t id);
  * a displaced link that dodges to another event of its latency window lost
  * a request but yielded no event, and a start with a cap below the floor
  * (ll_arb_yield without a recorded refusal) yields an event that is not a
- * loss here but counts in clipped. clipped: starts whose cap was cut below
- * max_len_us for a following request. */
+ * loss here but counts in clipped. For a yield, p is the current priority
+ * of the slot that refused id's last request, and that last request may
+ * have been a dodge probe rather than the event first planned. clipped:
+ * starts whose cap was cut below max_len_us for a following request. */
 #define LL_ARB_PRIOS 6
 struct ll_arb_stats {
 	uint32_t lost[LL_ARB_PRIOS];

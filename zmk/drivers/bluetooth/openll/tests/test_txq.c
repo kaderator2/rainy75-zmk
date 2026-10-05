@@ -958,7 +958,7 @@ static void test_link_bounds(void)
  * acks complete only its own entries, each central gets only its own PDUs. */
 static void test_two_links_interleaved(void)
 {
-	int a_cpl, b_cpl;
+	int cpl_before, cpl_after;   /* completions of the other link */
 
 	boot(0x1b);   /* wraps the 5-bit pointers during the test */
 	for (uint8_t t = 0; t < 6; t++) {
@@ -972,7 +972,7 @@ static void test_two_links_interleaved(void)
 		uint8_t l = (ev & 1) ? LB : LA;
 		uint8_t o = (ev & 1) ? LA : LB;
 
-		a_cpl = lk[o].cpl.acl + lk[o].cpl.ctrl;
+		cpl_before = lk[o].cpl.acl + lk[o].cpl.ctrl;
 		/* a lost response now and then, so entries stay unacked across
 		 * the other link's event */
 		if (ev % 5 == 2) {
@@ -980,8 +980,8 @@ static void test_two_links_interleaved(void)
 		} else {
 			run_event_l(l, NULL, 0);
 		}
-		b_cpl = lk[o].cpl.acl + lk[o].cpl.ctrl;
-		CHECK(a_cpl == b_cpl);   /* this event completed nothing of the other link */
+		cpl_after = lk[o].cpl.acl + lk[o].cpl.ctrl;
+		CHECK(cpl_before == cpl_after);   /* this event completed nothing of the other link */
 	}
 	CHECK(lk[LA].c.n_got == 6);
 	for (int i = 0; i < 6 && i < lk[LA].c.n_got; i++) {
@@ -1103,7 +1103,7 @@ static void test_links_random(uint32_t seed, bool foreign, bool big)
 	}
 	for (int p = 0; p < nl; p++) {
 		struct link_model *m = &lk[ids[p]];
-		int got_cpl = (p & 1) ? m->cpl.acl : m->cpl.ctrl;
+		int got_cpl;
 
 		run_ok_l(ids[p], 1);
 		CHECK(pushed[p] > 200);

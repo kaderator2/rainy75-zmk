@@ -297,7 +297,6 @@ static void single_link_suite(void)
 	}
 }
 
-
 static void reset_all(void)
 {
 	for (uint8_t i = 0; i < LL_MAX_CONN; i++) {

@@ -36,8 +36,9 @@
  * Slice 6b: Data Length Update (5.1.9, values per 4.5.10) as responder and
  * initiator, and the PHY Update procedure (5.1.10) as a 1M-only responder.
  * Each procedure kind has its own 40 s response timer (TMR_ENC, TMR_DLE,
- * TMR_PHY, and since slice 6d TMR_PING, TMR_CPR): they can overlap (LENGTH has no instant, so it is compatible
- * with the others, 5.3), and one completing must not stop another's timer.
+ * TMR_PHY, and since slice 6d TMR_PING, TMR_CPR): they can overlap (LENGTH
+ * has no instant, so it is compatible with the others, 5.3), and one
+ * completing must not stop another's timer.
  *
  * Slice 7: every control PDU we must send goes through ctrl_send_locked().
  * When the TX backlog is full it is owed (ll_llcp.h): the procedure moves
@@ -155,7 +156,6 @@ enum enc_state {
 	ENC_WAIT_LTK,        /* LL_ENC_RSP queued, LTK request at the host */
 	ENC_WAIT_START_RSP,  /* LL_START_ENC_REQ queued */
 };
-
 
 static struct ll_llcp_ops ops;
 

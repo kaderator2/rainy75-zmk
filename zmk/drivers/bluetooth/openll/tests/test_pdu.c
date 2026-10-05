@@ -23,9 +23,9 @@ static void test_random_adva(void)
 	n = ll_pdu_build_adv(out, LL_PDU_SCAN_RSP, rnda, 1, NULL, 0);
 	CHECK(n == 8 && out[0] == (0x04 | 0x40));
 	n = ll_pdu_build_adv(out, LL_PDU_ADV_NONCONN_IND, rnda, 1, ad, 3);
-	CHECK(out[0] == (0x02 | 0x40));
+	CHECK(n == 11 && out[0] == (0x02 | 0x40));
 	n = ll_pdu_build_adv(out, LL_PDU_ADV_SCAN_IND, rnda, 1, ad, 3);
-	CHECK(out[0] == (0x06 | 0x40));
+	CHECK(n == 11 && out[0] == (0x06 | 0x40));
 	/* any non-zero tx_add is 1 */
 	(void)ll_pdu_build_adv(out, LL_PDU_ADV_IND, rnda, 2, ad, 3);
 	CHECK(out[0] == (0x20 | 0x40));
@@ -73,6 +73,10 @@ int main(void)
 	/* SCAN_RSP with empty data */
 	n = ll_pdu_build_adv(out, LL_PDU_SCAN_RSP, adva, 0, NULL, 0);
 	CHECK(n == 8 && out[0] == 0x04 && out[1] == 6);
+	/* ADV_DIRECT_IND is connectable too: ChSel 1 (the builder only; the
+	 * HCI layer refuses directed advertising as unsupported) */
+	n = ll_pdu_build_adv(out, LL_PDU_ADV_DIRECT_IND, adva, 0, NULL, 0);
+	CHECK(n == 8 && out[0] == 0x21);
 	/* ChSel is RFU (0) in the other advertising PDUs */
 	n = ll_pdu_build_adv(out, LL_PDU_ADV_NONCONN_IND, adva, 0, ad, 3);
 	CHECK(n == 11 && out[0] == 0x02);
