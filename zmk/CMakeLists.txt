@@ -64,6 +64,7 @@ if(CONFIG_RAINY_RGB)
     src/rainy_rgb/engine.c
     src/rainy_rgb/state.c
     src/rainy_rgb/overlay.c
+    src/rainy_rgb/ble_status.c
     src/rainy_rgb/zmk_adapter.c
   )
 endif()
