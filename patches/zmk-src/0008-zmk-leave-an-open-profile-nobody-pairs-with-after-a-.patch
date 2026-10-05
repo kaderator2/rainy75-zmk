@@ -1,4 +1,4 @@
-From 9b5e5d96eadaa39c30d0d9700cd0165c27601f49 Mon Sep 17 00:00:00 2001
+From 6a2b57b435d40ebeeaadfdc1a10f324fba25a519 Mon Sep 17 00:00:00 2001
 From: scholzri <33288574+scholzri@users.noreply.github.com>
 Date: Mon, 5 Oct 2026 17:04:10 +0200
 Subject: [PATCH] zmk: leave an open profile nobody pairs with after a timeout
@@ -7,45 +7,56 @@ Selecting an open (unpaired) profile puts the keyboard in pairing mode
 for good: when the user picks the wrong slot or gives up, it keeps
 advertising for a new host and types nowhere useful.
 
-Add CONFIG_ZMK_BLE_OPEN_PROFILE_TIMEOUT (seconds, default 30, 0 = off).
-When zmk_ble_prof_select() makes an open profile active and no new host
-connects within the timeout, the keyboard selects the previously active
-profile again if it is connected, else the most recently connected
-profile (tracked in ble.c, RAM only), else it stays. A connection from
-a host that is not bonded to any profile pauses the timer (it pairs or
-is about to); if it leaves without pairing, the timer starts again. A
-completed pairing, selecting a bonded profile and clearing bonds disarm
-it: clearing the active profile means the user wants to pair there, and
-after clearing all bonds there is nothing to return to. The timer is
-only armed when there is a profile to return to.
+Add CONFIG_ZMK_BLE_OPEN_PROFILE_TIMEOUT (seconds, default 30, 0 = off,
+at most 3600). When zmk_ble_prof_select() makes an open profile active
+and no host pairs within the timeout, the keyboard selects the
+previously active profile again if it is connected, else the most
+recently connected profile (tracked in ble.c, RAM only), else it stays.
+The return is not a user selection, so it keeps the output transport
+as it is (an internal select without the switch to BLE).
+
+A pairing in progress (from the accepted pairing request until it
+completes, fails, is cancelled or the host leaves) pauses the timer;
+its failure restarts the full timeout. A plain connection does not
+pause it: a host that stays connected after a failed pairing, or one
+with stale keys that keeps reconnecting, must not hold the open profile
+forever. A completed pairing, selecting a bonded profile and clearing
+bonds disarm it: clearing the active profile means the user wants to
+pair there, and after clearing all bonds there is nothing to return to.
+The timer is only armed when there is a profile to return to. It lives
+in RAM (not after a reboot or wake), and selecting the already active
+open profile again does not restart it.
 
 Before switching back, a new ZMK_BLE_AUTH_PAIRING_TIMEOUT auth state is
 raised for the open profile, so status indicators can show it.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
- app/Kconfig                                   |  10 ++
+ app/Kconfig                                   |  13 ++
  .../zmk/events/ble_auth_state_changed.h       |   2 +
- app/src/ble.c                                 | 148 ++++++++++++++++++
- 3 files changed, 160 insertions(+)
+ app/src/ble.c                                 | 175 +++++++++++++++++-
+ 3 files changed, 187 insertions(+), 3 deletions(-)
 
 diff --git a/app/Kconfig b/app/Kconfig
-index baac9ba3..8c1b5b7a 100644
+index baac9ba3..c5bf87ca 100644
 --- a/app/Kconfig
 +++ b/app/Kconfig
-@@ -210,6 +210,16 @@ config ZMK_BLE_PASSKEY_ENTRY
+@@ -210,6 +210,19 @@ config ZMK_BLE_PASSKEY_ENTRY
      bool "Require passkey entry on the keyboard to complete pairing"
      select RING_BUFFER
  
 +config ZMK_BLE_OPEN_PROFILE_TIMEOUT
 +    int "Seconds an explicitly selected open profile waits for a host (0 = forever)"
 +    default 30
++    range 0 3600
 +    help
 +      When the user selects an open (unpaired) profile and no new host connects within this
 +      time, the keyboard selects the previously active profile again if it is connected, else
-+      the most recently connected profile. If there is none, it stays. A host that connects to
-+      pair stops the timer; if it disconnects without pairing, the timer starts again. Clearing
-+      the bond of the active profile also stops it: the user wants to pair there.
++      the most recently connected profile. If there is none, it stays. A pairing in progress
++      (SMP running, passkey entry) pauses the timer; if it fails or the host leaves, the timer
++      starts again. Clearing the bond of the active profile also stops it: the user wants to
++      pair there. The timer lives in RAM only: it does not survive a reboot or deep sleep wake,
++      and selecting the already active open profile again does not restart it.
 +
  config BT_SMP_ALLOW_UNAUTH_OVERWRITE
      imply ZMK_BLE_PASSKEY_ENTRY
@@ -64,10 +75,10 @@ index 08073065..b1e62378 100644
  
  struct zmk_ble_auth_state_changed {
 diff --git a/app/src/ble.c b/app/src/ble.c
-index 2c1662dd..009fb253 100644
+index 8700d369..68276237 100644
 --- a/app/src/ble.c
 +++ b/app/src/ble.c
-@@ -98,6 +98,20 @@ enum advertising_type {
+@@ -118,6 +118,24 @@ enum advertising_type {
  static struct zmk_ble_profile profiles[ZMK_BLE_PROFILE_COUNT];
  static uint8_t active_profile;
  
@@ -82,13 +93,17 @@ index 2c1662dd..009fb253 100644
 +// profile timeout is armed (it runs, or a pairing connection paused it).
 +static uint8_t open_profile_return = PROFILE_NONE;
 +static bool open_profile_armed;
++// A pairing runs (accepted pairing request until it completes, fails or the host leaves).
++static bool open_profile_pairing;
 +static void open_profile_disarm(void);
 +#endif
++
++static int ble_prof_select(uint8_t index, bool by_user);
 +
  #define DEVICE_NAME CONFIG_BT_DEVICE_NAME
  #define DEVICE_NAME_LEN (sizeof(DEVICE_NAME) - 1)
  
-@@ -289,11 +303,24 @@ static void clear_profile_bond(uint8_t profile) {
+@@ -309,11 +327,24 @@ static void clear_profile_bond(uint8_t profile) {
          bt_unpair(BT_ID_DEFAULT, &profiles[profile].peer);
          set_profile_address(profile, BT_ADDR_LE_ANY);
      }
@@ -113,7 +128,7 @@ index 2c1662dd..009fb253 100644
      clear_profile_bond(active_profile);
      update_advertising();
      raise_auth_state_changed(active_profile, ZMK_BLE_AUTH_CLEARED, 0);
-@@ -302,6 +329,11 @@ void zmk_ble_clear_bonds(void) {
+@@ -322,6 +353,11 @@ void zmk_ble_clear_bonds(void) {
  void zmk_ble_clear_all_bonds(void) {
      LOG_DBG("zmk_ble_clear_all_bonds()");
  
@@ -125,7 +140,7 @@ index 2c1662dd..009fb253 100644
      // Unpair all profiles
      for (int i = 0; i < ZMK_BLE_PROFILE_COUNT; i++) {
          clear_profile_bond(i);
-@@ -347,6 +379,94 @@ static int ble_save_profile(void) {
+@@ -367,6 +403,106 @@ static int ble_save_profile(void) {
  #endif
  }
  
@@ -145,26 +160,14 @@ index 2c1662dd..009fb253 100644
 +    return -ENODEV;
 +}
 +
-+// A connection from a host that is not bonded to any profile: it pairs (or is about to).
-+static void find_pairing_conn(struct bt_conn *conn, void *data) {
-+    struct bt_conn_info info;
-+
-+    if (bt_conn_get_info(conn, &info) == 0 && info.role == BT_CONN_ROLE_PERIPHERAL &&
-+        info.state == BT_CONN_STATE_CONNECTED && zmk_ble_profile_index(bt_conn_get_dst(conn)) < 0) {
-+        *(bool *)data = true;
-+    }
-+}
-+
 +static void open_profile_timeout(struct k_work *work) {
-+    bool pairing = false;
 +    int target;
 +
 +    if (!open_profile_armed || !zmk_ble_active_profile_is_open()) {
 +        return;
 +    }
-+    bt_conn_foreach(BT_CONN_TYPE_LE, find_pairing_conn, &pairing);
-+    if (pairing) {
-+        // Its disconnect restarts the timer, its pairing disarms it.
++    if (open_profile_pairing) {
++        // Its end restarts the timer, its success disarms it.
 +        LOG_DBG("Open profile %d timeout: a host is pairing, staying", active_profile);
 +        return;
 +    }
@@ -177,13 +180,15 @@ index 2c1662dd..009fb253 100644
 +
 +    LOG_INF("Open profile %d timeout: no host, back to profile %d", active_profile, target);
 +    raise_auth_state_changed(active_profile, ZMK_BLE_AUTH_PAIRING_TIMEOUT, 0);
-+    zmk_ble_prof_select(target);
++    // Not a user selection: keep the output as it is.
++    ble_prof_select(target, false);
 +}
 +
 +static K_WORK_DELAYABLE_DEFINE(open_profile_timeout_work, open_profile_timeout);
 +
 +static void open_profile_disarm(void) {
 +    open_profile_armed = false;
++    open_profile_pairing = false;
 +    open_profile_return = PROFILE_NONE;
 +    k_work_cancel_delayable(&open_profile_timeout_work);
 +}
@@ -196,7 +201,24 @@ index 2c1662dd..009fb253 100644
 +    }
 +}
 +
-+// After an explicit profile change from prev: arm the timeout on an open profile when there is a
++// A pairing request was accepted: pause the timeout while it runs.
++static void open_profile_pairing_started(void) {
++    if (open_profile_armed) {
++        open_profile_pairing = true;
++        k_work_cancel_delayable(&open_profile_timeout_work);
++    }
++}
++
++// The pairing failed or its host left: wait the full timeout again. Only after a pairing, so a
++// host with stale keys that keeps reconnecting cannot hold the open profile forever.
++static void open_profile_pairing_ended(void) {
++    if (open_profile_pairing) {
++        open_profile_pairing = false;
++        open_profile_restart();
++    }
++}
++
++// After a profile change from prev: arm the timeout on an open profile when there is a
 +// profile to return to, disarm it on a bonded one.
 +static void open_profile_selected(uint8_t prev) {
 +    if (!zmk_ble_active_profile_is_open()) {
@@ -215,12 +237,34 @@ index 2c1662dd..009fb253 100644
 +    open_profile_restart();
 +}
 +
++#else
++
++static inline void open_profile_pairing_started(void) {}
++static inline void open_profile_pairing_ended(void) {}
++
 +#endif /* CONFIG_ZMK_BLE_OPEN_PROFILE_TIMEOUT > 0 */
 +
  // Selecting a profile means the user wants to type over BLE.
  static void select_ble_transport(void) {
      if (zmk_endpoint_get_preferred_transport() == ZMK_TRANSPORT_USB) {
-@@ -365,7 +485,13 @@ int zmk_ble_prof_select(uint8_t index) {
+@@ -374,20 +510,32 @@ static void select_ble_transport(void) {
+     }
+ }
+ 
+-int zmk_ble_prof_select(uint8_t index) {
++// by_user: an explicit selection (behavior, API), which also switches the output to BLE; the open
++// profile timeout's return is not one.
++static int ble_prof_select(uint8_t index, bool by_user) {
+     if (index >= ZMK_BLE_PROFILE_COUNT) {
+         return -ERANGE;
+     }
+ 
+     LOG_DBG("profile %d", index);
+     if (active_profile == index) {
+-        select_ble_transport();
++        if (by_user) {
++            select_ble_transport();
++        }
          return 0;
      }
  
@@ -232,9 +276,23 @@ index 2c1662dd..009fb253 100644
 +    ARG_UNUSED(prev);
 +#endif
      // After the profile change, so the output never flips to the old profile.
-     select_ble_transport();
+-    select_ble_transport();
++    if (by_user) {
++        select_ble_transport();
++    }
      ble_save_profile();
-@@ -607,6 +733,17 @@ static void connected(struct bt_conn *conn, uint8_t err) {
+ 
+     update_advertising();
+@@ -397,6 +545,8 @@ int zmk_ble_prof_select(uint8_t index) {
+     return 0;
+ };
+ 
++int zmk_ble_prof_select(uint8_t index) { return ble_prof_select(index, true); }
++
+ int zmk_ble_prof_next(void) {
+     LOG_DBG("");
+     return zmk_ble_prof_select((active_profile + 1) % ZMK_BLE_PROFILE_COUNT);
+@@ -627,6 +777,11 @@ static void connected(struct bt_conn *conn, uint8_t err) {
  
      LOG_DBG("Connected %s", addr);
  
@@ -242,31 +300,53 @@ index 2c1662dd..009fb253 100644
 +    if (index >= 0) {
 +        last_connected_profile = index;
 +    }
-+#if CONFIG_ZMK_BLE_OPEN_PROFILE_TIMEOUT > 0
-+    else if (open_profile_armed) {
-+        // A new host connects to pair: pause the open profile timeout.
-+        k_work_cancel_delayable(&open_profile_timeout_work);
-+    }
-+#endif
 +
      update_advertising();
  
      if (is_conn_active_profile(conn)) {
-@@ -635,6 +772,13 @@ static void disconnected(struct bt_conn *conn, uint8_t reason) {
+@@ -658,6 +813,9 @@ static void disconnected(struct bt_conn *conn, uint8_t reason) {
      // connection for a profile as active, and not start advertising yet.
      k_work_submit(&update_advertising_work);
  
-+#if CONFIG_ZMK_BLE_OPEN_PROFILE_TIMEOUT > 0
-+    if (zmk_ble_profile_index(bt_conn_get_dst(conn)) < 0) {
-+        // A host left without pairing: wait for a host again.
-+        open_profile_restart();
-+    }
-+#endif
++    // A host left during its pairing: wait for a host again.
++    open_profile_pairing_ended();
 +
      if (is_conn_active_profile(conn)) {
          LOG_DBG("Active profile disconnected");
          k_work_submit(&raise_profile_changed_event_work);
-@@ -762,6 +906,10 @@ static void auth_pairing_complete(struct bt_conn *conn, bool bonded) {
+@@ -674,6 +832,7 @@ static void security_changed(struct bt_conn *conn, bt_security_t level, enum bt_
+     } else {
+         LOG_ERR("Security failed: %s level %u err %d", addr, level, err);
+         auth_pairing_end(conn);
++        open_profile_pairing_ended();
+         if (is_conn_peripheral(conn)) {
+             raise_auth_state_changed(auth_profile_index(conn), ZMK_BLE_AUTH_FAILED, 0);
+         }
+@@ -731,6 +890,7 @@ static void auth_cancel(struct bt_conn *conn) {
+ 
+     bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+     auth_pairing_end(conn);
++    open_profile_pairing_ended();
+ 
+     LOG_DBG("Pairing cancelled: %s", addr);
+     if (is_conn_peripheral(conn)) {
+@@ -755,6 +915,9 @@ static enum bt_security_err auth_pairing_accept(struct bt_conn *conn,
+         return BT_SECURITY_ERR_PAIR_NOT_ALLOWED;
+     }
+ 
++    if (info.role == BT_CONN_ROLE_PERIPHERAL) {
++        open_profile_pairing_started();
++    }
+     return BT_SECURITY_ERR_SUCCESS;
+ };
+ 
+@@ -775,11 +938,16 @@ static void auth_pairing_complete(struct bt_conn *conn, bool bonded) {
+     if (!pairing_allowed_for_current_profile(conn)) {
+         LOG_ERR("Pairing completed but current profile is not open: %s", addr);
+         bt_unpair(BT_ID_DEFAULT, dst);
++        open_profile_pairing_ended();
+         raise_auth_state_changed(active_profile, ZMK_BLE_AUTH_FAILED, 0);
+         return;
      }
  
      set_profile_address(active_profile, dst);
@@ -277,6 +357,14 @@ index 2c1662dd..009fb253 100644
      update_advertising();
      raise_auth_state_changed(active_profile, ZMK_BLE_AUTH_PAIRED_OK, 0);
  };
+@@ -787,6 +955,7 @@ static void auth_pairing_complete(struct bt_conn *conn, bool bonded) {
+ static void auth_pairing_failed(struct bt_conn *conn, enum bt_security_err reason) {
+     LOG_DBG("Pairing failed: reason %d", reason);
+     auth_pairing_end(conn);
++    open_profile_pairing_ended();
+     if (is_conn_peripheral(conn)) {
+         raise_auth_state_changed(auth_profile_index(conn), ZMK_BLE_AUTH_FAILED, 0);
+     }
 -- 
 2.53.0
 
