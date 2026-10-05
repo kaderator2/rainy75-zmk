@@ -107,8 +107,11 @@
  * LL_CHANNEL_MAP_IND or LL_CONNECTION_UPDATE_IND of that link's central
  * arrived after its instant (0x28, first multi-host test). With 2, a link
  * listens at most 2 events beyond its latency window (latency + 3 events
- * after its last listen); a central gives the peripheral at least 6
- * listened events before an instant (5.1.1 / 5.1.2). */
+ * after its last listen), unless a SUPERVISION or MUST event or a running
+ * event is in the way. That is enough only because real centrals leave a
+ * margin: 5.1.1 / 5.1.2 say the central "should" allow at least 6 listened
+ * events before an instant, which is not a requirement; the phone measured
+ * put its instants latency + 6 or 7 events ahead, the PC 7 at latency 0. */
 #define LL_CONN_STARVE_YIELDS 2
 
 struct ll_conn_params {

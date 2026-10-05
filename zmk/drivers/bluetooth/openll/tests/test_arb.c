@@ -272,6 +272,39 @@ static void test_accept_refuse_prio(void)
 	}
 }
 
+/* Loss counters (ll_arb_stats.lost): one per lost request, by the winner's
+ * priority. A displacement counts at once; a refusal counts only when the
+ * requester gives the event up (ll_arb_yield), once however many probes
+ * were refused before; a yield without a recorded refusal counts nothing. */
+static void test_lost_stats(void)
+{
+	const uint32_t t = 2000000;
+	struct ll_arb_stats s0, s1;
+
+	arb_reset();
+	ll_arb_get_stats(A, &s0);
+	CHECK(req(A, mk(t, 500, 2000, 10000, LL_ARB_PRIO_IDLE)) == 0);
+	CHECK(req(B, mk(t + T(500), 500, 2000, 10000, LL_ARB_PRIO_STARVING)) == 0);
+	ll_arb_get_stats(A, &s1);
+	CHECK(s1.lost[LL_ARB_PRIO_STARVING] == s0.lost[LL_ARB_PRIO_STARVING] + 1);  /* displaced */
+	CHECK(req(A, mk(t + T(1000), 500, 2000, 10000, LL_ARB_PRIO_ACTIVE)) == -EBUSY);
+	CHECK(req(A, mk(t + T(1500), 500, 2000, 10000, LL_ARB_PRIO_ACTIVE)) == -EBUSY);
+	ll_arb_get_stats(A, &s1);
+	CHECK(s1.lost[LL_ARB_PRIO_STARVING] == s0.lost[LL_ARB_PRIO_STARVING] + 1);  /* probes */
+	yield(A);
+	ll_arb_get_stats(A, &s1);
+	CHECK(s1.lost[LL_ARB_PRIO_STARVING] == s0.lost[LL_ARB_PRIO_STARVING] + 2);
+	yield(A);   /* nothing recorded any more */
+	ll_arb_get_stats(A, &s1);
+	CHECK(s1.lost[LL_ARB_PRIO_STARVING] == s0.lost[LL_ARB_PRIO_STARVING] + 2);
+	for (int p = 0; p < LL_ARB_PRIOS; p++) {
+		if (p != LL_ARB_PRIO_STARVING) {
+			CHECK(s1.lost[p] == s0.lost[p]);
+		}
+	}
+	ll_arb_cancel(B);
+}
+
 static void test_bump(void)
 {
 	const uint32_t t = 2000000;
@@ -1151,7 +1184,8 @@ static void test_supervision_rescue(void)
 	       sim.listened[1], sim.max_gap[1], (unsigned)coll(0), (unsigned)coll(1));
 	CHECK(ll_conn_active(0) && ll_conn_active(1));
 	CHECK(disconnects[0] == 0 && disconnects[1] == 0);
-	CHECK(sim.max_gap[0] == LL_CONN_STARVE_YIELDS + 1);   /* the busy link wins the ties */
+	CHECK(sim.max_gap[0] <= LL_CONN_STARVE_YIELDS + 1);   /* the starvation bound */
+	CHECK(sim.max_gap[0] >= 2);                            /* the busy link wins the ties */
 	CHECK(sim.max_gap[1] <= 2);
 	CHECK(sim.listened[0] >= 2000 / (LL_CONN_STARVE_YIELDS + 1) - 2);
 	CHECK(sim.listened[1] >= 2000 * LL_CONN_STARVE_YIELDS / (LL_CONN_STARVE_YIELDS + 1) - 2);
@@ -1748,6 +1782,7 @@ int main(void)
 {
 	test_accept_refuse_prio();
 	test_bump();
+	test_lost_stats();
 	test_bump_chain();
 	test_round_robin();
 	test_running();

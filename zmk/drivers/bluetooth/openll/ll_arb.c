@@ -299,7 +299,10 @@ void ll_arb_yield(uint8_t id)
 	for (int i = 0; i < LL_ARB_IDS; i++) {
 		if (slots[id].refused_by & (1u << i)) {
 			slots[i].yielded = false;
+			/* one loss per yield (refused_by holds the one slot the
+			 * request lost to) */
 			lost_to(id, slots[i].used ? slots[i].r.prio : LL_ARB_PRIOS);
+			break;
 		}
 	}
 	slots[id].refused_by = 0;

@@ -279,7 +279,8 @@ Rules:
   channels go into separate gaps, each PDU within 10 ms of the previous one
   (Vol 6 Part B 4.4.2.3), else the event is cut. After 2 intervals without a
   complete event, or 2 drops or cuts in a row, advertising asks at ACTIVE and
-  may displace idle or active link events (never SUPERVISION or MUST ones).
+  may displace idle or active link events (never STARVING, SUPERVISION or
+  MUST ones).
 
 Host scenarios with the real `ll_conn`/`ll_adv` (`test_arb`): two links on the
 same interval drifting through each other (gap at most 2 events, no
@@ -288,8 +289,9 @@ event by the starvation bound, before it only its supervision priority kept it
 alive), the multi-host case of a 7.5 ms link with MD bursts to its cap (busy
 or idle between bursts) and a 15 ms latency 30 link (or latency 0) receiving
 channel maps 6 to 10 events beyond its latency window (gap at most latency + 3
-events, no 0x28; before, 265 events and 0x28), 3 always-busy links at 7.5 ms with advertising (adv gap at
-most 250 ms; before the starvation rule advertising never got out).
+events, no 0x28; before, 265 events and 0x28), 3 always-busy links at 7.5 ms
+with advertising (adv gap at most 250 ms; before the starvation rule
+advertising never got out).
 
 ### Advertising while connected
 
@@ -870,7 +872,9 @@ is a cold boot through MCUboot. The blob variant of this hook is a no-op.
 
 ### Power counters (mcumgr group 66)
 
-Read only, command 0, read with `reverse/tools/openll_stats.py`:
+Read only, command 0 (stats) and command 1 (per-link arbiter counters),
+read with `reverse/tools/openll_stats.py` (it reads both and merges them;
+older firmware without command 1 and with named per-link maps works too):
 
 ```bash
 reverse/tools/openll_stats.py                 # one read over USB serial
@@ -886,9 +890,16 @@ reverse/tools/openll_stats.py --ble           # over BLE (needs bleak)
 | `wake` | controller thread wakeups |
 | `mv` | battery millivolts (0 if unavailable) |
 | `links` | links up |
-| `link` | list, one map per link id: `up`, `listen`, `skip`, `coll` (events yielded to the arbiter), `miss`; maxima since boot: `gmax` / `gus` (longest gap between two listened events, in events / us), `gx` (events beyond the latency window), `elen` (longest event, us); `clip` (starts with a clipped cap), `lost` (events lost to a winner of each arbiter priority: adv, idle, active, starving, supervision, must) |
+| `link` | list, one positional list per link id: `[up, listen, skip, coll, miss]` (`coll`: events yielded to the arbiter) |
+| `arb` (command 1) | list, one positional list per link id: `[gmax, gus, gx, elen, clip, lost...]`; maxima since boot: `gmax` / `gus` (longest gap between two listened events, in events / us), `gx` (events beyond the latency window), `elen` (longest event, us); `clip` (starts with a clipped cap), `lost` (one per lost request, by the winner's priority: adv, idle, active, starving, supervision, must; see `ll_arb.h`) |
 | `adv` | `ev`, `slid` (moved into a gap), `drop`, `cut` (10 ms PDU rule), `stuck` |
 | `flash` | `win` (windows), `wait`, `force`, `wmax` / `hmax` (longest wait and window, us, maxima), `pause`, `cut`, `fkick`, `abort`, `pskip` (RX DMA ring overruns, must stay 0) |
+
+Positional lists keep both replies within one mcumgr buffer (512 bytes) for
+every `MAX_CONN` with every counter at its 32-bit maximum (428 and 305 bytes
+at `MAX_CONN=5`); `openll_mgmt.c` asserts that at build time from the same
+key lists it encodes. The first multilink version's per-link maps with named
+keys did not fit at 3 links in the worst case.
 
 The tool prints deltas (not for the maxima), idle percentage and the share of
 skipped events. `ev`, `miss` and `skip` are counted when planned or closed, so
@@ -1039,11 +1050,14 @@ of 20 to 120 characters, 50 ms apart, 10 minutes); the host switches it to
 
 The 0x08 in run 2 came 4 s after a normal map instant: the phone link kept
 its listen gap within 33 events up to the end, then listened with
-SUPERVISION priority (it won 6 times) and heard nothing. The simulator
-checks every BRX channel against the central's own CSA #1 / #2 sequence with
-changing maps under the same arbitration (no mismatch), so this looks like
-the phone or the radio environment (its maps excluded up to 10 channels),
-not the scheduler; it is listed under known limitations.
+SUPERVISION priority (it won 6 times) and heard nothing. The simulator's
+centrals hop with the controller's own `ll_csa1` / `ll_csa2` and apply their
+map at the instant, and every BRX channel is checked against that sequence
+with changing maps under the same arbitration (no mismatch). That shows the
+scheduler applies the maps at the right events; CSA correctness itself is
+covered by `test_csa1` / `test_csa2` against the spec vectors. So this looks
+like the phone or the radio environment (its maps excluded up to 10
+channels), not the scheduler; it is listed under known limitations.
 
 ### Late events and stack usage
 

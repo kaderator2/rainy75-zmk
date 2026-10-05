@@ -95,10 +95,16 @@ int ll_arb_request(uint8_t id, const struct ll_arb_req *r);
 void ll_arb_yield(uint8_t id);
 void ll_arb_cancel(uint8_t id);
 /* Per requester id, cumulative since boot (ll_arb_init keeps them).
- * lost[p]: events given up to a winner of priority p (displaced by it,
- * refused by it and then yielded via ll_arb_yield, or bumped at its alarm
- * by a running event of priority p). clipped: starts whose cap was cut
- * below max_len_us for a following request. */
+ * lost[p]: arbitration losses to a winner of priority p, one per lost
+ * request: displaced by it, refused by it and then given up via
+ * ll_arb_yield (a request is refused by one slot, the first it loses to;
+ * probes that are not yielded do not count), or bumped at its alarm by a
+ * running event of priority p. This is not ll_conn's collision count:
+ * a displaced link that dodges to another event of its latency window lost
+ * a request but yielded no event, and a start with a cap below the floor
+ * (ll_arb_yield without a recorded refusal) yields an event that is not a
+ * loss here but counts in clipped. clipped: starts whose cap was cut below
+ * max_len_us for a following request. */
 #define LL_ARB_PRIOS 6
 struct ll_arb_stats {
 	uint32_t lost[LL_ARB_PRIOS];
