@@ -432,7 +432,9 @@ void rrgb_set_idle(bool idle) {
     }
 }
 void rrgb_on_key(uint32_t position, bool pressed) {
-    if (pressed) {
+    /* Fn-layer presses (BT slot, output, media, RGB controls) leave no
+     * reactive trace: see rrgb_overlay_key_reactive(). */
+    if (pressed && rrgb_overlay_key_reactive(position)) {
         rt.last_press_tick = rt.tick;
         rrgb_reactive_on_press(position, rt.tick);
     }

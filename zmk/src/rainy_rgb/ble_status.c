@@ -5,13 +5,15 @@
 /* BLE slot status indicators. Pure, ZMK-free; see ble_status.h.
  *
  * Per slot key (F1..F3), highest priority first:
- *   1. a timed animation (connected solid+fade, or red flash), newest wins;
+ *   1. a timed animation (connected solid+fade, switch confirm solid+fade,
+ *      or red flash), newest wins;
  *   2. the active slot, not connected, blinks (EMPTY, pairing) or breathes
  *      (PAIRED, connecting): with Fn held always, without Fn only while the
  *      output is BLE and for RRGB_BLE_STEADY_HOLD_FRAMES after the slot's
- *      last event (boot/wake, profile select, state change, flash end);
+ *      last event (boot/wake, profile select, state change, flash or
+ *      switch confirm end);
  *   3. with Fn held: the overview colour.
- * F4 shows the output (white USB / blue BLE) only with Fn held. The passkey
+ * F4 shows the output (white USB / cyan BLE) only with Fn held. The passkey
  * guidance owns the number row and Enter while the host waits for the code.
  *
  * Timing uses wrap-safe tick differences (int32). Expired animation kinds
@@ -24,10 +26,10 @@
  * variable has one writer); render/active run on the render thread. Single
  * core, so a torn read is a one-frame glitch. */
 
-enum anim_kind { ANIM_NONE = 0, ANIM_CONN, ANIM_FLASH };
+enum anim_kind { ANIM_NONE = 0, ANIM_CONN, ANIM_FLASH, ANIM_SELECT };
 
 struct slot_anim {
-	uint8_t kind;    /* enum anim_kind, kept after expiry (flash end = blink origin) */
+	uint8_t kind;    /* enum anim_kind, kept after expiry (flash/confirm end = blink origin) */
 	uint32_t t0;
 };
 
@@ -51,6 +53,7 @@ static int32_t since(uint32_t tick, uint32_t t0) { return (int32_t)(tick - t0); 
 static struct rrgb blue(uint8_t v)  { return (struct rrgb){0, 0, v}; }
 static struct rrgb white(uint8_t v) { return (struct rrgb){v, v, v}; }
 static struct rrgb red(uint8_t v)   { return (struct rrgb){v, 0, 0}; }
+static struct rrgb cyan(uint8_t v)  { return (struct rrgb){0, v, v}; }
 
 /* Triangle: RRGB_BLE_BRIGHT at phase 0, 0 at half period. */
 static uint8_t tri(int32_t dt, uint32_t period) {
@@ -64,6 +67,7 @@ static bool anim_running(uint8_t s, uint32_t tick) {
 	switch (s_anim[s].kind) {
 	case ANIM_CONN:  return dt >= 0 && dt < RRGB_BLE_CONN_SOLID + RRGB_BLE_CONN_FADE;
 	case ANIM_FLASH: return dt >= 0 && dt < RRGB_BLE_FLASH_TOTAL;
+	case ANIM_SELECT: return dt >= 0 && dt < RRGB_BLE_SELECT_TOTAL;
 	default:         return false;
 	}
 }
@@ -74,11 +78,14 @@ static bool pk_running(uint32_t tick) {
 }
 
 /* Steady phase origin: the last steady event, or the end of a later red
- * flash on the slot (the flash comes first, then the steady animation). */
+ * flash or switch confirm on the slot (that comes first, then the steady
+ * animation). */
 static uint32_t steady_origin(uint8_t s) {
 	uint32_t origin = s_steady_t0;
-	if (s_anim[s].kind == ANIM_FLASH) {
-		uint32_t end = s_anim[s].t0 + RRGB_BLE_FLASH_TOTAL;
+	uint32_t len = s_anim[s].kind == ANIM_FLASH  ? RRGB_BLE_FLASH_TOTAL
+		     : s_anim[s].kind == ANIM_SELECT ? RRGB_BLE_SELECT_TOTAL : 0;
+	if (len) {
+		uint32_t end = s_anim[s].t0 + len;
 		if (since(end, origin) > 0) { origin = end; }
 	}
 	return origin;
@@ -114,6 +121,7 @@ void rrgb_ble_init(const struct rrgb_ble_keys *keys) {
 
 void rrgb_ble_set_slots(const uint8_t state[3], uint8_t active, uint32_t tick) {
 	if (active >= RRGB_BLE_SLOTS) { active = RRGB_BLE_NONE; }
+	bool switched = !s_first_poll && active != s_active && active < RRGB_BLE_SLOTS;
 	bool steady_changed = s_first_poll || active != s_active;
 	s_first_poll = false;
 	for (uint8_t s = 0; s < RRGB_BLE_SLOTS; s++) {
@@ -129,6 +137,9 @@ void rrgb_ble_set_slots(const uint8_t state[3], uint8_t active, uint32_t tick) {
 		}
 		s_state[s] = now;
 		if (s == active) { steady_changed = true; }
+	}
+	if (switched && !(s_anim[active].kind == ANIM_CONN && anim_running(active, tick))) {
+		start_anim(active, ANIM_SELECT, tick);   /* explicit profile switch: confirm */
 	}
 	s_active = active;
 	if (steady_changed) { s_steady_t0 = tick; }
@@ -199,9 +210,10 @@ static struct rrgb timed_colour(uint8_t s, uint32_t tick) {
 		bool on = (uint32_t)dt % (RRGB_BLE_FLASH_ON + RRGB_BLE_FLASH_OFF) < RRGB_BLE_FLASH_ON;
 		return red(on ? RRGB_BLE_BRIGHT : 0);
 	}
-	if (dt < RRGB_BLE_CONN_SOLID) { return blue(RRGB_BLE_BRIGHT); }
+	int32_t solid = s_anim[s].kind == ANIM_SELECT ? RRGB_BLE_SELECT_SOLID : RRGB_BLE_CONN_SOLID;
+	if (dt < solid) { return blue(RRGB_BLE_BRIGHT); }
 	return blue((uint8_t)(RRGB_BLE_BRIGHT *
-		(uint32_t)(RRGB_BLE_CONN_SOLID + RRGB_BLE_CONN_FADE - dt) / RRGB_BLE_CONN_FADE));
+		(uint32_t)(solid + RRGB_BLE_CONN_FADE - dt) / RRGB_BLE_CONN_FADE));
 }
 
 /* Active slot not connected: blink (EMPTY, pairing) or breathe (PAIRED, connecting),
@@ -218,7 +230,7 @@ static struct rrgb steady_colour(uint8_t s, uint32_t tick) {
 
 static struct rrgb overview_colour(uint8_t s) {
 	switch (s_state[s]) {
-	case RRGB_BLE_CONNECTED: return blue(s == s_active ? RRGB_BLE_BRIGHT : RRGB_BLE_DIM);
+	case RRGB_BLE_CONNECTED: return blue(s == s_active ? RRGB_BLE_BRIGHT : RRGB_BLE_BG);
 	case RRGB_BLE_PAIRED:    return blue(RRGB_BLE_VDIM);
 	default:                 return white(RRGB_BLE_VDIM);
 	}
@@ -243,7 +255,7 @@ bool rrgb_ble_render(struct rrgb *px, uint16_t n, uint32_t tick) {
 
 	if (s_fn) {
 		painted |= put(px, n, s_keys.output,
-			       s_output_ble ? blue(RRGB_BLE_BRIGHT) : white(RRGB_BLE_BRIGHT));
+			       s_output_ble ? cyan(RRGB_BLE_OUT) : white(RRGB_BLE_OUT));
 	}
 
 	if (pk_running(tick)) {

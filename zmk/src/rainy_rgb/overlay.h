@@ -9,7 +9,7 @@
  * Call once at boot, before the first BLE event. */
 void rrgb_overlay_init(bool ble);
 
-/* Neutral state — set by the adapter from the ZMK event thread. */
+/* Neutral state, set by the adapter from the ZMK event thread. */
 void rrgb_overlay_set_caps(bool on);
 void rrgb_overlay_set_fn(bool active);
 void rrgb_overlay_set_battery(uint8_t pct);
@@ -21,8 +21,13 @@ void rrgb_overlay_battery_show(uint32_t tick);   /* start the ~3s gauge window *
 void rrgb_overlay_render(struct rrgb *px, uint16_t n, uint32_t tick);
 
 /* True if any functional overlay needs to show this frame (caps on, Fn held,
- * battery gauge window open, or a BLE status indication) — lets the engine render indicators even when
- * the decorative RGB is toggled off. */
+ * battery gauge window open, or a BLE status indication), so the engine
+ * renders indicators even when the decorative RGB is toggled off. */
 bool rrgb_overlay_active(uint32_t tick);
+
+/* False while the Fn layer is held: Fn combinations are commands (BT slots,
+ * output, media, RGB controls), not typing, so they leave no reactive
+ * afterglow or ripple; the indicators own those keys. */
+bool rrgb_overlay_key_reactive(uint32_t position);
 
 #endif

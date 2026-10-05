@@ -23,6 +23,8 @@ static int eq(struct rrgb a, struct rrgb b) { return a.r == b.r && a.g == b.g &&
 static struct rrgb blue(uint8_t v)  { return (struct rrgb){0, 0, v}; }
 static struct rrgb white(uint8_t v) { return (struct rrgb){v, v, v}; }
 static struct rrgb red(uint8_t v)   { return (struct rrgb){v, 0, 0}; }
+static struct rrgb cyan(uint8_t v)  { return (struct rrgb){0, v, v}; }
+#define SEL RRGB_BLE_SELECT_TOTAL
 static const struct rrgb BLACK = {0, 0, 0};
 
 static bool frame(uint32_t tick) {
@@ -99,15 +101,15 @@ static void test_fn_overview(void) {
 	CHECK(rrgb_ble_active(t));
 	CHECK(frame(t));
 	CHECK(eq(px[F(0)], blue(RRGB_BLE_BRIGHT)));
-	CHECK(eq(px[F(1)], blue(RRGB_BLE_DIM)));
+	CHECK(eq(px[F(1)], blue(RRGB_BLE_BG)));
 	CHECK(eq(px[F(2)], blue(RRGB_BLE_VDIM)));
-	CHECK(eq(px[F4], white(RRGB_BLE_BRIGHT)));   /* output USB */
+	CHECK(eq(px[F4], white(RRGB_BLE_OUT)));      /* output USB */
 	const uint8_t owned[] = {F(0), F(1), F(2), F4};
 	CHECK(only_touched(owned, 4));
 
 	rrgb_ble_set_output_ble(true);
 	frame(t);
-	CHECK(eq(px[F4], blue(RRGB_BLE_BRIGHT)));    /* output BLE */
+	CHECK(eq(px[F4], cyan(RRGB_BLE_OUT)));       /* output BLE, not the slot blue */
 
 	/* other slot EMPTY: very dim white; active slot 1 connected */
 	slots(RRGB_BLE_EMPTY, RRGB_BLE_CONNECTED, RRGB_BLE_EMPTY, 1, t);
@@ -117,19 +119,71 @@ static void test_fn_overview(void) {
 
 	/* active EMPTY under Fn: fast blink bright blue */
 	slots(RRGB_BLE_EMPTY, RRGB_BLE_CONNECTED, RRGB_BLE_EMPTY, 2, 2000);
-	frame(2000);
+	frame(2000 + SEL);                          /* after the switch confirm */
 	CHECK(eq(px[F(2)], blue(RRGB_BLE_BRIGHT)));
-	frame(2000 + RRGB_BLE_BLINK_ON);
+	frame(2000 + SEL + RRGB_BLE_BLINK_ON);
 	CHECK(eq(px[F(2)], BLACK));
-	CHECK(eq(px[F(1)], blue(RRGB_BLE_DIM)));   /* other connected */
+	CHECK(eq(px[F(1)], blue(RRGB_BLE_BG)));    /* other connected */
 
 	/* active PAIRED under Fn: breathing */
 	slots(RRGB_BLE_PAIRED, RRGB_BLE_CONNECTED, RRGB_BLE_EMPTY, 0, 3000);
-	frame(3000 + 10);
+	frame(3000 + SEL + 10);
 	CHECK(eq(px[F(0)], blue(tri(10, RRGB_BLE_BREATHE_PERIOD))));
 
 	rrgb_ble_set_fn(false);
 	rrgb_ble_set_output_ble(false);
+}
+
+/* Brightness levels chosen with the user (2026-10-05). */
+static void test_levels(void) {
+	CHECK(RRGB_BLE_BRIGHT == 255 && RRGB_BLE_BG == 20 && RRGB_BLE_VDIM == 8);
+	CHECK(RRGB_BLE_OUT == 102 && RRGB_BLE_DIM == 38);
+	CHECK(RRGB_BLE_SELECT_SOLID == 50 && SEL == 75);
+}
+
+/* Explicit profile switch: the new slot confirms with solid 1 s + fade. */
+static void test_switch_confirm(void) {
+	reset();
+	slots(RRGB_BLE_CONNECTED, RRGB_BLE_CONNECTED, RRGB_BLE_EMPTY, 0, QUIET);  /* bg connect */
+	uint32_t t = QUIET + 500;
+	CHECK(!rrgb_ble_active(t));
+	slots(RRGB_BLE_CONNECTED, RRGB_BLE_CONNECTED, RRGB_BLE_EMPTY, 1, t);      /* Fn+F2 */
+	const uint8_t owned[] = {F(1)};
+	for (uint32_t dt = 0; dt < SEL; dt++) {
+		CHECK(rrgb_ble_active(t + dt));
+		CHECK(frame(t + dt));
+		uint8_t want = dt < RRGB_BLE_SELECT_SOLID ? RRGB_BLE_BRIGHT
+			: (uint8_t)(RRGB_BLE_BRIGHT * (SEL - dt) / RRGB_BLE_CONN_FADE);
+		CHECK(eq(px[F(1)], blue(want)));
+		CHECK(only_touched(owned, 1));     /* the old slot F1 stays dark */
+	}
+	CHECK(!rrgb_ble_active(t + SEL));
+	CHECK(!frame(t + SEL));
+
+	/* and back to slot 0 */
+	t += 1000;
+	slots(RRGB_BLE_CONNECTED, RRGB_BLE_CONNECTED, RRGB_BLE_EMPTY, 0, t);
+	frame(t + 1);
+	CHECK(eq(px[F(0)], blue(RRGB_BLE_BRIGHT)));
+	CHECK(eq(px[F(1)], SENT));
+
+	/* switch onto a slot in its connected solid: the longer solid is kept */
+	t += 1000;
+	slots(RRGB_BLE_CONNECTED, RRGB_BLE_CONNECTED, RRGB_BLE_CONNECTED, 0, t);
+	slots(RRGB_BLE_CONNECTED, RRGB_BLE_CONNECTED, RRGB_BLE_CONNECTED, 2, t + 10);
+	frame(t + 80);
+	CHECK(eq(px[F(2)], blue(RRGB_BLE_BRIGHT)));
+
+	/* re-selecting the active slot (same index) is no switch */
+	t += 1000;
+	slots(RRGB_BLE_CONNECTED, RRGB_BLE_CONNECTED, RRGB_BLE_CONNECTED, 2, t);
+	CHECK(!rrgb_ble_active(t));
+
+	/* boot / wake (first poll) is no switch: a connected slot just shows its connect */
+	boot();
+	slots(RRGB_BLE_PAIRED, RRGB_BLE_EMPTY, RRGB_BLE_EMPTY, 0, 100);
+	frame(110);
+	CHECK(eq(px[F(0)], blue(tri(10, RRGB_BLE_BREATHE_PERIOD))));
 }
 
 static void test_active_empty_blinks(void) {
@@ -137,6 +191,10 @@ static void test_active_empty_blinks(void) {
 	uint32_t t0 = 5000;
 	slots(RRGB_BLE_CONNECTED, RRGB_BLE_EMPTY, RRGB_BLE_EMPTY, 1, t0);
 	const uint8_t owned[] = {F(1)};
+	frame(t0);
+	CHECK(eq(px[F(1)], blue(RRGB_BLE_BRIGHT)));   /* switch confirm first */
+	CHECK(only_touched(owned, 1));
+	t0 += SEL;                                    /* blink phase 0 at the confirm end */
 	for (uint32_t dt = 0; dt < 3 * RRGB_BLE_BLINK_PERIOD; dt++) {
 		CHECK(rrgb_ble_active(t0 + dt));
 		CHECK(frame(t0 + dt));
@@ -176,7 +234,7 @@ static void test_connected_solid_fade(void) {
 		CHECK(frame(t0 + dt));
 		CHECK(eq(px[F(1)], blue(RRGB_BLE_BRIGHT)));
 	}
-	uint8_t prev = 255;
+	int prev = 256;
 	for (uint32_t dt = RRGB_BLE_CONN_SOLID; dt < RRGB_BLE_CONN_SOLID + RRGB_BLE_CONN_FADE; dt++) {
 		CHECK(rrgb_ble_active(t0 + dt));
 		CHECK(frame(t0 + dt));
@@ -431,9 +489,12 @@ static void test_steady_gating(void) {
 	rrgb_ble_set_output_ble(false);
 	uint32_t t0 = 60000;
 	slots(RRGB_BLE_CONNECTED, RRGB_BLE_EMPTY, RRGB_BLE_EMPTY, 1, t0);
-	CHECK(!rrgb_ble_active(t0));
-	CHECK(!frame(t0));
+	CHECK(rrgb_ble_active(t0));                /* the switch confirm ignores the output */
+	CHECK(rrgb_ble_active(t0 + SEL - 1));
+	CHECK(!rrgb_ble_active(t0 + SEL));
+	CHECK(!frame(t0 + SEL));
 	CHECK(only_touched(NULL, 0));
+	t0 += SEL;
 	/* Fn held on USB: the overview still blinks the active slot */
 	rrgb_ble_set_fn(true);
 	frame(t0);
@@ -486,7 +547,7 @@ static void test_steady_hold(void) {
 	slots(RRGB_BLE_PAIRED, RRGB_BLE_EMPTY, RRGB_BLE_EMPTY, 1, t1);
 	frame(t1);
 	CHECK(f_on(1));
-	CHECK(rrgb_ble_active(t1 + HOLD - 1) && !rrgb_ble_active(t1 + HOLD));
+	CHECK(rrgb_ble_active(t1 + SEL + HOLD - 1) && !rrgb_ble_active(t1 + SEL + HOLD));
 
 	/* CLEARED on the active slot: flash, then blink for HOLD from the flash end */
 	uint32_t t2 = t1 + 5000;
@@ -611,6 +672,8 @@ static void test_wraparound(void) {
 int main(void) {
 	test_timing_constants();
 	test_idle();
+	test_levels();
+	test_switch_confirm();
 	test_fn_overview();
 	test_active_empty_blinks();
 	test_active_paired_breathes();

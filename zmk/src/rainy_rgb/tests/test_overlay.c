@@ -13,7 +13,11 @@ static struct rrgb at(const struct rrgb *px, int pos) { return px[rrgb_led_for_p
 #define POS_F4    4
 #define POS_F5    5
 #define POS_NUM(i) (16 + (i)) /* number row 1..0 */
+#ifdef CONFIG_RAINY_RGB_ANSI_LEDMAP
+#define POS_ENTER 56          /* ANSI wide Enter */
+#else
 #define POS_ENTER 43          /* ISO Enter */
+#endif
 
 /* ble_status integration: render order, ownership, overlay_active. */
 static void test_ble(void) {
@@ -40,7 +44,7 @@ static void test_ble(void) {
     for (int i = 0; i < 83; i++) { px[i] = (struct rrgb){50, 50, 50}; }
     rrgb_overlay_render(px, 83, t);
     for (int s = 0; s < 3; s++) { CHECK(eq(at(px, POS_F(s)), white(RRGB_BLE_VDIM))); }
-    CHECK(eq(at(px, POS_F4), white(RRGB_BLE_BRIGHT)));
+    CHECK(eq(at(px, POS_F4), white(RRGB_BLE_OUT)));
     CHECK(eq(at(px, 0), white(255)));            /* ESC: Fn white */
     CHECK(eq(at(px, POS_F5), white(255)));       /* F5: Fn white */
     CHECK(eq(at(px, 13), white(255)));           /* BT_CLR key: Fn white */
@@ -55,7 +59,8 @@ static void test_ble(void) {
     CHECK(eq(at(px, POS_F(0)), blue(RRGB_BLE_BRIGHT)));
     CHECK(eq(at(px, POS_F(1)), blue(RRGB_BLE_VDIM)));
     CHECK(eq(at(px, POS_F(2)), white(RRGB_BLE_VDIM)));
-    CHECK(eq(at(px, POS_F4), blue(RRGB_BLE_BRIGHT)));
+    CHECK(!eq(at(px, POS_F4), at(px, POS_F(0))));              /* F4 distinct from the slot */
+    CHECK(eq(at(px, POS_F4), (struct rrgb){0, RRGB_BLE_OUT, RRGB_BLE_OUT}));   /* cyan */
     CHECK(eq(at(px, POS_F5), white(255)));
 
     /* Fn released, everything connected and settled: nothing to draw */
@@ -97,13 +102,28 @@ static void test_ble(void) {
     /* RGB off with only a ble animation: overlay_active keeps the loop alive */
     t += 1000;                                                  /* all settled */
     CHECK(!rrgb_overlay_active(t));
-    rrgb_ble_set_slots(all_empty, 1, t);                        /* active slot 1 cleared */
+    rrgb_ble_set_slots(all_empty, 0, t);                        /* active slot 0 cleared */
     CHECK(rrgb_overlay_active(t));                              /* blinking */
     for (int i = 0; i < 83; i++) { px[i] = (struct rrgb){0, 0, 0}; }
     rrgb_overlay_render(px, 83, t);
-    CHECK(eq(at(px, POS_F(1)), blue(RRGB_BLE_BRIGHT)));
+    CHECK(eq(at(px, POS_F(0)), blue(RRGB_BLE_BRIGHT)));
     rrgb_ble_set_output_ble(false);
     CHECK(!rrgb_overlay_active(t));                             /* USB: steady gated */
+
+    /* explicit profile switch: confirm flash on the new slot, also on USB */
+    rrgb_ble_set_slots(all_empty, 2, t);
+    CHECK(rrgb_overlay_active(t));
+    rrgb_overlay_render(px, 83, t);
+    CHECK(eq(at(px, POS_F(2)), blue(RRGB_BLE_BRIGHT)));
+    CHECK(!rrgb_overlay_active(t + RRGB_BLE_SELECT_TOTAL));    /* then gated (USB) */
+
+    /* reactive presses: suppressed while the Fn layer is held */
+    rrgb_overlay_set_fn(true);
+    CHECK(!rrgb_overlay_key_reactive(POS_F(0)));
+    CHECK(!rrgb_overlay_key_reactive(31));
+    rrgb_overlay_set_fn(false);
+    CHECK(rrgb_overlay_key_reactive(POS_F(0)));
+    CHECK(rrgb_overlay_key_reactive(31));
 
     /* build without BLE: ble owns nothing, Fn-highlight unchanged */
     rrgb_overlay_init(false);

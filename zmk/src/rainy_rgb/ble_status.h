@@ -38,10 +38,22 @@ enum rrgb_ble_ev {
 #define RRGB_BLE_PASSKEY_LEN      6    /* progress keys on the number row */
 #define RRGB_BLE_STEADY_HOLD_FRAMES 1500 /* blink/breathe shown 30 s after the slot's last event */
 
-/* Fixed brightness levels (0..255), independent of the RGB brightness. */
-#define RRGB_BLE_BRIGHT 153   /* ~60 % */
-#define RRGB_BLE_DIM     38   /* ~15 % */
-#define RRGB_BLE_VDIM    13   /* ~5 %  */
+/* Profile switch confirm: the newly active slot shows solid SELECT_SOLID
+ * frames (1 s), then fades over CONN_FADE, even if it is already connected. */
+#define RRGB_BLE_SELECT_SOLID    50
+#define RRGB_BLE_SELECT_TOTAL    (RRGB_BLE_SELECT_SOLID + RRGB_BLE_CONN_FADE)
+
+/* Fixed brightness levels (0..255), independent of the RGB brightness.
+ * WS2812 perceived brightness is far from linear: the step from 0 to a few
+ * counts is very visible, while 60 % and 100 % look close. So the background
+ * levels sit near the bottom and the active slot at full scale to keep a
+ * clear contrast (user tuning 2026-10-05). */
+#define RRGB_BLE_BRIGHT 255   /* active connected slot, blink, breathe peak, red flash,
+                               * connected/switch solid, passkey digits, Enter peak */
+#define RRGB_BLE_DIM     38   /* ~15 %: number row waiting for passkey digits */
+#define RRGB_BLE_BG      20   /* ~8 %: background connected slot (Fn overview) */
+#define RRGB_BLE_VDIM     8   /* ~3 %: paired-not-connected (blue) / empty (white) slot */
+#define RRGB_BLE_OUT    102   /* ~40 %: F4 output, white = USB, cyan = BLE */
 
 /* LED indices (not keymap positions), provided by overlay.c which resolves
  * its keymap-coupled positions with rrgb_led_for_position(). An index of
@@ -62,7 +74,9 @@ void rrgb_ble_init(const struct rrgb_ble_keys *keys);
  * solid-then-fade; CONNECTED -> PAIRED raises the LOST red flash itself;
  * CONNECTED -> EMPTY (bond cleared) only cancels the solid, the CLEARED event
  * flashes. The first call after init (boot/wake), an active slot change and a
- * state change of the active slot restart the steady hold window. */
+ * state change of the active slot restart the steady hold window. An active
+ * slot change after the first call (an explicit profile switch) also starts
+ * the switch confirm on the new slot (unless it is in its connected solid). */
 void rrgb_ble_set_slots(const uint8_t state[3], uint8_t active, uint32_t tick);
 void rrgb_ble_set_output_ble(bool ble);
 void rrgb_ble_set_fn(bool held);

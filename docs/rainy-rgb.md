@@ -124,29 +124,45 @@ Rendered on top of the active effect — and **still shown when RGB is toggled o
 
 The three BT profile slots show their state on F1..F3, so pairing, connecting,
 switching and failures are visible without a host tool. Slot states: EMPTY (no
-bond), PAIRED (bond, not connected), CONNECTED. Colours use fixed levels
-(`RRGB_BLE_BRIGHT` / `DIM` / `VDIM` in `ble_status.h`, about 60 / 15 / 5 %),
-independent of the RGB brightness, and show with RGB off too.
+bond), PAIRED (bond, not connected), CONNECTED. Colours use fixed levels in
+`ble_status.h`, independent of the RGB brightness, and show with RGB off too:
+`RRGB_BLE_BRIGHT` 255 (active slot, every animation, passkey digits),
+`RRGB_BLE_BG` 20 (~8 %, background connected slot), `RRGB_BLE_VDIM` 8 (~3 %,
+paired or empty slot), `RRGB_BLE_OUT` 102 (~40 %, F4), `RRGB_BLE_DIM` 38
+(~15 %, number row waiting for digits). WS2812 perceived brightness is far
+from linear: the first few counts above 0 are clearly visible, while 60 % and
+100 % look almost the same. A first device test with 153 / 38 / 13 made the
+active slot hard to tell from the background slot, so the active slot now runs
+at full scale and the background levels sit near the bottom (user tuning
+2026-10-05).
 
 | When | Key | Shows |
 |---|---|---|
 | active slot EMPTY (advertising for pairing) | its F-key | bright blue fast blink, 4 Hz |
 | active slot PAIRED, not connected (connecting) | its F-key | bright blue breathing, 1 Hz |
 | slot becomes CONNECTED (or pairing completes) | its F-key | solid bright blue 2 s, fade 0.5 s |
+| explicit profile switch (Fn+F1..F3 changes the active slot) | new slot's F-key | solid bright blue 1 s, fade 0.5 s (also when already connected), then its steady animation |
 | connection lost, pairing failed or cancelled | its F-key | red flash 3x (about 1 s), then the steady animation |
 | bond cleared (Fn+Del = `BT_CLR`, clears the active slot) | its F-key | red flash 3x, then fast blink |
 | host asks for the passkey | 1..0, Enter | number row dim white, keys 1..6 turn bright blue per digit typed, Enter pulses 1 Hz |
-| Fn held | F1..F3 | active+connected bright blue, other connected dim blue, other paired very dim blue, empty very dim white; the active slot keeps blinking/breathing while not connected |
-| Fn held | F4 | white = USB output, blue = BLE output |
+| Fn held | F1..F3 | active+connected full blue, other connected dim blue (~8 %), other paired very dim blue (~3 %), empty very dim white (~3 %); the active slot keeps blinking/breathing while not connected |
+| Fn held | F4 | white = USB output, cyan = BLE output (~40 %, distinct from the slot blue) |
 
 Blink and breathing (steady animations) show without Fn only while the output
 is BLE and for 30 s (`RRGB_BLE_STEADY_HOLD_FRAMES`) after the slot's last event
-(boot/wake, profile select, state change, end of a red flash); after that the key
+(boot/wake, profile select, state change, end of a red flash or of the switch
+confirm, which comes first); after that the key
 stays dark and Fn shows the state. Event animations (red flash, connected fade,
 passkey guidance) always show. The newest event per slot wins; several slots can
 animate at once (multilink). The passkey guidance ends on pairing complete or
 failure, and at the latest 60 s after the last passkey event. Selecting a slot
 (Fn+F1..F3) while the output is USB switches the output to BLE (ZMK patch 0006).
+
+Fn-layer presses leave no reactive trace: while layer 1 is held,
+`rrgb_overlay_key_reactive()` is false and `rrgb_on_key()` skips the
+ripple/heat and `last_press_tick` for every press, not only F1..F4. All Fn
+combinations are commands (BT slots, output, media, RGB controls), and without
+this a quickly released Fn left the reactive afterglow on the pressed F-key.
 
 Render order: `ble_status` is drawn last, so F1..F4 replace the Fn-highlight
 white and the passkey guidance wins over the battery gauge on the number row;

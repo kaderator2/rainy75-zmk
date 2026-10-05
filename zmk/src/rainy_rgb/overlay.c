@@ -66,6 +66,11 @@ void rrgb_overlay_set_fn(bool active)      { s_fn = active; rrgb_ble_set_fn(acti
 void rrgb_overlay_set_battery(uint8_t pct) { s_battery = pct; }
 void rrgb_overlay_battery_show(uint32_t tick) { s_bat_until = tick + BAT_SHOW_FRAMES; }
 
+bool rrgb_overlay_key_reactive(uint32_t position) {
+    (void)position;   /* every Fn-layer press is a command, not only F1..F4 */
+    return !s_fn;
+}
+
 bool rrgb_overlay_active(uint32_t tick) {
     return s_caps || s_fn || (tick < s_bat_until) || (s_ble && rrgb_ble_active(tick));
 }
