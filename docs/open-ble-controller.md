@@ -232,7 +232,11 @@ advertising: the whole adv event or one channel). Accepted requests never
 overlap. The arbiter arms the main alarm for the earliest one and calls the
 owner when it fires; the event's cap is clipped so it ends 800 us
 (`LL_CONN_EVENT_SAFETY_US` + `LL_CONN_ARM_LEAD_US`) before the next accepted
-request opens.
+request opens. While an event runs, its span ends at the cap plus those
+800 us, and a new request is tested against it by its RX open, not its
+alarm: a request accepted before the event started can be requested again
+while it runs (a kick or an instant re-plan of a following link keeps its
+event; final review A-M1).
 
 Priorities (higher wins):
 
@@ -1072,7 +1076,11 @@ documentation. They may help anyone writing a B91 link layer.
   host-tested with up to 3 simulated centrals and device-tested with one real
   central plus advertising while connected. Profile switching with several
   real hosts (Fn+F1..F3), a second central (nRF dongle) and a phone are not
-  tested yet.
+  tested yet. The request span (`min_len`) still reserves the alarm lead
+  after the floor although the clip only needs the safety margin there, so
+  adjacent requests are kept 500 us further apart than necessary. That costs
+  multilink capacity only (for example 3 links at 7.5 ms plus advertising)
+  and is left for the multi-host test, since it changes timing reservations.
 - **Reconnect after wake not re-measured** with the CCC load at boot (slice 7
   Task 2 item 4; 13 s was measured in slice 5 with lazy loading).
 - **Slice 5b: battery and suspend.** The CPU idles but the SoC is not suspended
