@@ -123,6 +123,9 @@ static uint32_t idle_ms(void)
 #define SZ_V(v)     + CB_UINT_MAX
 #define PUT_KV(k, v) && zcbor_tstr_put_lit(zse, k) && zcbor_uint32_put(zse, (v))
 #define PUT_V(v)     && zcbor_uint32_put(zse, (v))
+/* element counts of the lists below, for the zcbor list / map headers */
+#define CNT_KV(k, v) + 1u
+#define CNT_V(v)     + 1u
 
 #define STATS_TOP(X)                                                                   \
 	X("up", (uint32_t)k_uptime_get())                                              \
@@ -150,6 +153,10 @@ static uint32_t idle_ms(void)
 /* command 1, per link id: [gmax, gus, gx, elen, clip, lost[0..LL_ARB_PRIOS-1]] */
 #define ARB_LINK(X)                                                                    \
 	X(l.gap_max) X(l.gap_max_us) X(l.gap_excess_max) X(l.ev_len_max_us) X(a.clipped)
+#define STATS_LINK_N  (0u STATS_LINK(CNT_V))
+#define STATS_ADV_N   (0u STATS_ADV(CNT_KV))
+#define STATS_FLASH_N (0u STATS_FLASH(CNT_KV))
+#define ARB_LINK_N    (0u ARB_LINK(CNT_V) + LL_ARB_PRIOS)
 
 /* the SMP header (struct smp_hdr, internal to Zephyr's mcumgr) */
 #define SMP_HDR_SZ 8u
@@ -197,14 +204,14 @@ static int openll_mgmt_stats(struct smp_streamer *ctxt)
 		struct ll_conn_stats l;
 
 		ll_conn_get_stats(i, &l);
-		ok = zcbor_list_start_encode(zse, 5) STATS_LINK(PUT_V) &&
-		     zcbor_list_end_encode(zse, 5);
+		ok = zcbor_list_start_encode(zse, STATS_LINK_N) STATS_LINK(PUT_V) &&
+		     zcbor_list_end_encode(zse, STATS_LINK_N);
 	}
 	ok = ok && zcbor_list_end_encode(zse, LL_MAX_CONN) &&
-	     zcbor_tstr_put_lit(zse, "adv") && zcbor_map_start_encode(zse, 5)
-	     STATS_ADV(PUT_KV) && zcbor_map_end_encode(zse, 5) &&
-	     zcbor_tstr_put_lit(zse, "flash") && zcbor_map_start_encode(zse, 10)
-	     STATS_FLASH(PUT_KV) && zcbor_map_end_encode(zse, 10);
+	     zcbor_tstr_put_lit(zse, "adv") && zcbor_map_start_encode(zse, STATS_ADV_N)
+	     STATS_ADV(PUT_KV) && zcbor_map_end_encode(zse, STATS_ADV_N) &&
+	     zcbor_tstr_put_lit(zse, "flash") && zcbor_map_start_encode(zse, STATS_FLASH_N)
+	     STATS_FLASH(PUT_KV) && zcbor_map_end_encode(zse, STATS_FLASH_N);
 	return ok ? MGMT_ERR_EOK : MGMT_ERR_EMSGSIZE;
 }
 
@@ -220,11 +227,11 @@ static int openll_mgmt_arb(struct smp_streamer *ctxt)
 
 		ll_conn_get_stats(i, &l);
 		ll_arb_get_stats(i, &a);
-		ok = zcbor_list_start_encode(zse, 5 + LL_ARB_PRIOS) ARB_LINK(PUT_V);
+		ok = zcbor_list_start_encode(zse, ARB_LINK_N) ARB_LINK(PUT_V);
 		for (uint8_t k = 0; ok && k < LL_ARB_PRIOS; k++) {
 			ok = zcbor_uint32_put(zse, a.lost[k]);
 		}
-		ok = ok && zcbor_list_end_encode(zse, 5 + LL_ARB_PRIOS);
+		ok = ok && zcbor_list_end_encode(zse, ARB_LINK_N);
 	}
 	ok = ok && zcbor_list_end_encode(zse, LL_MAX_CONN);
 	return ok ? MGMT_ERR_EOK : MGMT_ERR_EMSGSIZE;
