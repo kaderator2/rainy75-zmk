@@ -114,8 +114,10 @@
  * the steps of such an exchange (a phone's SMP / GATT layer answers within
  * tens to a few hundred ms) with margin, and costs at most 1 s of
  * listening at every interval after the last data, which an idle link
- * (a keyboard sends, the central rarely writes) almost never pays. Per
- * link. */
+ * (a keyboard sends, the central rarely writes) almost never pays. Worst
+ * case: a central that sends data more often than once per second keeps
+ * the link at effectively latency 0. L2CAP signaling (LLID 2, e.g. a
+ * Connection Parameter Update Response) also starts it. Per link. */
 #define LL_CONN_DATA_HOLDOFF_MS 1000
 /* Starvation bound (arbiter priority STARVING): a link that yielded this
  * many events in a row (refused, displaced, or started without room)

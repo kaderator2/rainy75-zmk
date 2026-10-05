@@ -294,9 +294,10 @@ static uint32_t anchor_of(const struct ll_link *c, uint16_t counter)
 /* The anchor of event `counter` is at or before `now`. Unlike a signed
  * test on anchor_of(), this does not wrap for an event more than 2^31 ticks
  * (about 134 s) after ref_tick: the offset is taken in 64 bits. now -
- * ref_tick itself stays far below 2^31 ticks (ref_tick is at most a
- * supervision timeout, 32 s, plus an interval old, or a planned update
- * anchor ahead). */
+ * ref_tick itself stays far below 2^31 ticks: ref_tick is at most a
+ * supervision timeout (32 s) plus an interval old, plus the thread stall
+ * when catch_up re-anchors on the old anchor of an instant handled late
+ * (test_instant_late_long_stall: 30 s), or a planned update anchor ahead. */
 static bool anchor_passed(const struct ll_link *c, uint16_t counter, uint32_t now)
 {
 	uint64_t off = (uint64_t)(uint16_t)(counter - c->ref_counter) * c->interval_ticks;
@@ -467,12 +468,13 @@ static uint16_t skip_count(struct ll_link *c)
 		c->holdoff_done = true;
 	}
 	/* RX data holdoff: the first candidate's anchor must lie at least
-	 * LL_CONN_DATA_HOLDOFF_MS after the last non-empty data PDU. The
-	 * anchor always lies after that packet (it was received in an
-	 * earlier event), so the unsigned age is exact; the flag is cleared
-	 * once it passed, so the age is never tested after a wrap. */
+	 * LL_CONN_DATA_HOLDOFF_MS after the last non-empty data PDU. Signed
+	 * age like the holdoff above: the flag is latched off once it passed,
+	 * so the age is tested only within a second or so of the packet (never
+	 * after a wrap), and an anchor that is not after the packet holds. */
 	if (c->data_hold) {
-		if (anchor_of(c, c->counter) - c->data_tick < US(LL_CONN_DATA_HOLDOFF_MS * 1000u)) {
+		if ((int32_t)(anchor_of(c, c->counter) - c->data_tick) <
+		    (int32_t)US(LL_CONN_DATA_HOLDOFF_MS * 1000u)) {
 			return 0;
 		}
 		c->data_hold = false;
@@ -953,7 +955,9 @@ static void on_rx(struct ll_link *c, const uint8_t *pdu, uint16_t len, uint32_t 
 	if (((pdu[0] & 0x03) == LL_LLID_CONT || (pdu[0] & 0x03) == LL_LLID_START) &&
 	    pdu[1] != 0) {
 		/* a non-empty L2CAP fragment (LLID 1 or 2): the hosts are in
-		 * an exchange, hold off latency (LL_CONN_DATA_HOLDOFF_MS) */
+		 * an exchange, hold off latency (LL_CONN_DATA_HOLDOFF_MS).
+		 * L2CAP signaling counts too (e.g. the central's Connection
+		 * Parameter Update Response arms it). */
 		c->data_hold = true;
 		c->data_tick = tick;
 	}
@@ -1008,7 +1012,10 @@ void ll_conn_radio_evt(enum ll_radio_evt evt, const uint8_t *pdu, uint16_t len, 
 		break;
 	case LL_RADIO_CONN_DONE:
 		{
-			uint32_t len_us = (tick - c->open_tick) / LL_TICKS_PER_US;
+			/* signed: an event can end before its RX opens (flash
+			 * abort, stop or guard during the arm lead), length 0 */
+			int32_t span = (int32_t)(tick - c->open_tick);
+			uint32_t len_us = span > 0 ? (uint32_t)span / LL_TICKS_PER_US : 0u;
 
 			if (len_us > ST(c)->ev_len_max_us) {
 				ST(c)->ev_len_max_us = len_us;

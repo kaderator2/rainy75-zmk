@@ -848,6 +848,9 @@ the last sync) when all of these hold, else the next event is listened to:
   (`LL_CONN_DATA_HOLDOFF_MS`) after the last non-empty data PDU (LLID 1 or 2)
   received from the central, per link, re-armed by every such PDU and latched
   off once it passed (so the 32-bit tick age is never tested after a wrap).
+  L2CAP signaling counts too (LLID 2, e.g. the central's Connection Parameter
+  Update Response). A central that sends data more often than once per second
+  keeps the link at effectively latency 0.
   A host exchange (SMP pairing and key distribution, GATT discovery, ATT
   writes) then runs at one round trip per 2 intervals instead of waiting for
   the next listen of each latency window. LL control PDUs (LE Ping, channel
@@ -1181,9 +1184,10 @@ documentation. They may help anyone writing a B91 link layer.
   p95 25.3 ms): it is the first echo, sent while latency 30 is in force; mcumgr's
   parameter request then moves the link to 6 / 0 / 42. It is not a host stall.
   The same bound applies to other central-to-peripheral data, for example a Caps
-  Lock LED update from the host. It applies to the first PDU of an exchange
-  only: after a data PDU the RX data holdoff listens to every event for 1 s, so
-  the follow-up requests of the exchange are not delayed again. Keypresses (peripheral to central) are not
+  Lock LED update from the host. It applies to the first PDU of an exchange, or
+  to one after more than 1 s of central silence: after a data PDU the RX data
+  holdoff listens to every event for 1 s, so the follow-up requests of the
+  exchange are not delayed again. Keypresses (peripheral to central) are not
   affected: a TX push kicks the link to the next connection event.
 - **Zephyr host warning** "Controller to host flow control not supported" once
   per boot (see [HCI subset](#hci-subset)).

@@ -610,7 +610,6 @@ static void test_rx_flow_burst(void)
 			uint32_t anchor = a1 + T(7500 * e);
 			int ev = rad.events, stops = rad.stops, n = 0, after = 0;
 
-
 			fire_alarm();
 			if (!ll_conn_active(0)) {
 				break;
@@ -659,7 +658,6 @@ static void test_rx_flow_burst(void)
 		ll_conn_end(0, LL_ST_REMOTE_TERM);
 	}
 }
-
 
 /* Review fix: the controller thread is woken before an event has to be
  * stopped. ll_conn_rx_wake_due() is true one maximum PDU before the stop
@@ -3947,6 +3945,33 @@ static void test_flash_cut(void)
 	ll_conn_end(0, LL_ST_REMOTE_TERM);
 }
 
+/* An event that ends before its RX window opens (here: the flash window
+ * cuts it during the arm lead) has length 0: the negative RX-open-to-DONE
+ * span must not wrap into ev_len_max_us. */
+static void test_ev_len_before_open(void)
+{
+	struct ll_connect_ind ci = mk_ci(12, 400, 1, 1, 0);
+	struct ll_conn_stats st0, st, tot;
+	uint32_t a1 = 500000 + T(1250 + 300);
+
+	reset_all(false);
+	ll_conn_get_stats(0, &st0);
+	CHECK(ll_conn_start(&ci, 500000) == 0);
+	ev_rx(a1);
+	ll_conn_get_stats(0, &st0);
+	fire_alarm();                      /* event 1 issued, RX opens after the lead */
+	CHECK(rad.evt_open && (int32_t)(rad.open - now) > 0);
+	CHECK(fw_open(0));                 /* CONN_DONE before the RX open */
+	CHECK(rad.abort_cut == 1 && !rad.evt_open);
+	ll_conn_get_stats(0, &st);
+	CHECK(st.ev_len_max_us == st0.ev_len_max_us && st.ev_len_max_us < 1000000u);
+	CHECK(st.flash_cut - st0.flash_cut == 1);
+	ll_conn_get_stats_total(&tot);
+	CHECK(tot.ev_len_max_us < 1000000u);
+	fw_close();
+	ll_conn_end(0, LL_ST_REMOTE_TERM);
+}
+
 /* ll_conn_flash_ready: a link that is not established is never ready (the
  * window waits, then opens anyway after LL_FLASH_WAIT_MAX_US: forced); an
  * established link is ready while now - last RX + LL_FLASH_OP_MAX_US <=
@@ -4069,7 +4094,6 @@ static void test_flash_ready_links(void)
 	CHECK(ll_conn_flash_ready(now));
 	ll_conn_end(0, LL_ST_REMOTE_TERM);
 }
-
 
 /* ---------------- late instants (debug: 0x28 after 6/0/42) ----------------
  *
@@ -4732,6 +4756,7 @@ int main(void)
 	test_event_owner();
 	test_flash_pause();
 	test_flash_cut();
+	test_ev_len_before_open();
 	test_flash_hold_max();
 	test_flash_ready();
 	test_flash_ready_future_sup();
