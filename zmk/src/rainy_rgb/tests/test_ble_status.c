@@ -575,6 +575,39 @@ static void test_verify_review(void) {
 	}
 }
 
+/* The digit flash belongs to the verify failure only: a later flash on the
+ * same slot (LOST, CLEARED, FAILED, the open slot timeout) leaves keys 1..6. */
+static void test_digit_flash_once(void) {
+	for (int ev = 0; ev < 3; ev++) {
+		reset();
+		slots(RRGB_BLE_CONNECTED, RRGB_BLE_EMPTY, RRGB_BLE_EMPTY, 1, QUIET);
+		rrgb_ble_event(RRGB_BLE_EV_PASSKEY_SUBMITTED, 1, 0, QUIET + 5);
+		uint32_t tf = QUIET + 40;
+		rrgb_ble_event(RRGB_BLE_EV_FAILED, 1, 0, tf);
+		frame(tf);
+		CHECK(eq(px[NUM(0)], red(RRGB_BLE_BRIGHT)));
+		uint32_t t2 = tf + RRGB_BLE_FLASH_TOTAL + 1500;   /* 30 s later */
+		enum rrgb_ble_ev e = ev == 0 ? RRGB_BLE_EV_FAILED : ev == 1 ? RRGB_BLE_EV_LOST
+				   : RRGB_BLE_EV_CLEARED;
+		rrgb_ble_event(e, 1, 0, t2);
+		for (uint32_t dt = 0; dt < RRGB_BLE_FLASH_TOTAL; dt++) {
+			frame(t2 + dt);
+			for (int k = 0; k < 10; k++) { CHECK(eq(px[NUM(k)], SENT)); }
+		}
+		CHECK(eq((frame(t2), px[F(1)]), red(RRGB_BLE_BRIGHT)));
+	}
+	/* a polled LOST (CONNECTED -> PAIRED) later does not flash the digits either */
+	reset();
+	slots(RRGB_BLE_CONNECTED, RRGB_BLE_CONNECTED, RRGB_BLE_EMPTY, 1, QUIET);
+	rrgb_ble_event(RRGB_BLE_EV_PASSKEY_SUBMITTED, 1, 0, QUIET + 5);
+	rrgb_ble_event(RRGB_BLE_EV_FAILED, 1, 0, QUIET + 40);
+	uint32_t t3 = QUIET + 40 + RRGB_BLE_FLASH_TOTAL + 10;
+	slots(RRGB_BLE_CONNECTED, RRGB_BLE_PAIRED, RRGB_BLE_EMPTY, 1, t3);
+	frame(t3);
+	CHECK(eq(px[F(1)], red(RRGB_BLE_BRIGHT)));
+	CHECK(eq(px[NUM(0)], SENT));
+}
+
 /* Just Works (host without display, no passkey request): fast blink goes
  * straight to PAIRED_OK solid + fade, the number row and Enter untouched. */
 static void test_just_works(void) {
@@ -869,6 +902,7 @@ int main(void) {
 	test_verifying();
 	test_just_works();
 	test_verify_review();
+	test_digit_flash_once();
 	test_pairing_timeout();
 	test_multi_slot();
 	test_active_exact();

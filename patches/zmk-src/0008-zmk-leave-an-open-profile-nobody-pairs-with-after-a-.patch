@@ -1,4 +1,4 @@
-From 6a2b57b435d40ebeeaadfdc1a10f324fba25a519 Mon Sep 17 00:00:00 2001
+From ceda3e62690f2ac40ef43aa03d58a7b25e5f59d7 Mon Sep 17 00:00:00 2001
 From: scholzri <33288574+scholzri@users.noreply.github.com>
 Date: Mon, 5 Oct 2026 17:04:10 +0200
 Subject: [PATCH] zmk: leave an open profile nobody pairs with after a timeout
@@ -75,7 +75,7 @@ index 08073065..b1e62378 100644
  
  struct zmk_ble_auth_state_changed {
 diff --git a/app/src/ble.c b/app/src/ble.c
-index 8700d369..68276237 100644
+index c5b32424..ccb3a08a 100644
 --- a/app/src/ble.c
 +++ b/app/src/ble.c
 @@ -118,6 +118,24 @@ enum advertising_type {

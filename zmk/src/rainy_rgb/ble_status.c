@@ -122,6 +122,10 @@ static bool steady_shown(uint8_t s, uint32_t tick) {
 }
 
 static void start_anim(uint8_t s, uint8_t kind, uint32_t tick) {
+	/* The digit flash belongs to one verify failure: a new animation on its
+	 * slot after it ended (a later LOST/CLEARED/FAILED) does not bring it back.
+	 * A repeated FAILED while it runs keeps it (in sync). */
+	if (s_df_on && s_df_slot == s && !df_running(tick)) { s_df_on = false; }
 	s_anim[s].t0 = tick;
 	s_anim[s].kind = kind;
 }
@@ -194,10 +198,12 @@ void rrgb_ble_event(enum rrgb_ble_ev ev, uint8_t slot, uint8_t arg, uint32_t tic
 	case RRGB_BLE_EV_FAILED:
 		pk_end(slot);
 		if (vf_end(slot, tick)) {   /* wrong passkey: keys 1..6 flash with the slot */
+			start_anim(slot, ANIM_FLASH, tick);
 			s_df_slot = slot;
 			s_df_on = true;
+		} else {
+			start_anim(slot, ANIM_FLASH, tick);
 		}
-		start_anim(slot, ANIM_FLASH, tick);
 		break;
 	case RRGB_BLE_EV_CLEARED:
 		pk_end(slot);

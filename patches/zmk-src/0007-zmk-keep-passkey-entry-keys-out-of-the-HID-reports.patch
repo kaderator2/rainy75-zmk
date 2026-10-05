@@ -1,4 +1,4 @@
-From 54515df43dd90e372ec3a23270c727e4b7856c5d Mon Sep 17 00:00:00 2001
+From 0749e853c399094585bc8b66ecc746f93a31ade2 Mon Sep 17 00:00:00 2001
 From: scholzri <33288574+scholzri@users.noreply.github.com>
 Date: Mon, 5 Oct 2026 16:37:16 +0200
 Subject: [PATCH] zmk: keep passkey entry keys out of the HID reports
@@ -31,14 +31,16 @@ Before, it stayed set on those paths and, with the check above, kept
 every key away from the hosts until the next pairing. Enter and Esc in
 the key thread take it with an atomic exchange, so it is never dropped
 twice. A disconnect that ends a pairing nothing else ended raises
-FAILED.
+FAILED. A digit raises PASSKEY_DIGITS only if the entry is still
+open, so a digit typed while the RX thread ends the pairing does not
+restart the guidance after its FAILED.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
- app/include/zmk/ble.h  |  6 +++
- app/src/ble.c          | 96 +++++++++++++++++++++++++++++++++++-------
- app/src/hid_listener.c | 22 +++++++++-
- 3 files changed, 107 insertions(+), 17 deletions(-)
+ app/include/zmk/ble.h  |   6 +++
+ app/src/ble.c          | 103 ++++++++++++++++++++++++++++++++++-------
+ app/src/hid_listener.c |  22 ++++++++-
+ 3 files changed, 112 insertions(+), 19 deletions(-)
 
 diff --git a/app/include/zmk/ble.h b/app/include/zmk/ble.h
 index 92b2107d..7337bc39 100644
@@ -58,7 +60,7 @@ index 92b2107d..7337bc39 100644
  
  int zmk_ble_unpair_all(void);
 diff --git a/app/src/ble.c b/app/src/ble.c
-index 8c1d5a90..8700d369 100644
+index 8c1d5a90..c5b32424 100644
 --- a/app/src/ble.c
 +++ b/app/src/ble.c
 @@ -44,11 +44,63 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
@@ -236,6 +238,20 @@ index 8c1d5a90..8700d369 100644
          return ZMK_EV_EVENT_HANDLED;
      }
  
+@@ -892,8 +956,11 @@ static int zmk_ble_handle_key_user(struct zmk_keycode_state_changed *event) {
+     ring_buf_put(&passkey_entries, &val, 1);
+     LOG_DBG("value entered: %d, digits collected so far: %d", val,
+             ring_buf_size_get(&passkey_entries));
+-    raise_auth_state_changed(auth_passkey_entry_profile, ZMK_BLE_AUTH_PASSKEY_DIGITS,
+-                             ring_buf_size_get(&passkey_entries));
++    // The BT RX thread may have ended the pairing meanwhile: no guidance after its FAILED.
++    if (atomic_ptr_get(&auth_passkey_entry_conn)) {
++        raise_auth_state_changed(auth_passkey_entry_profile, ZMK_BLE_AUTH_PASSKEY_DIGITS,
++                                 ring_buf_size_get(&passkey_entries));
++    }
+ 
+     return ZMK_EV_EVENT_HANDLED;
+ }
 diff --git a/app/src/hid_listener.c b/app/src/hid_listener.c
 index cd463d8e..245fa8ba 100644
 --- a/app/src/hid_listener.c

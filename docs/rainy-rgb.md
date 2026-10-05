@@ -164,7 +164,9 @@ last passkey event. After Enter the verify chase runs until pairing complete
 connection, at the latest 40 s (`RRGB_BLE_VERIFY_MAX`, the SMP timeout is 30 s);
 meanwhile the pairing slot blinks regardless of output and hold window, also
 on a re-pair over a bonded slot. The red digit flash mirrors the slot's flash
-(same start), so repeated `FAILED` events keep both in sync. ZMK
+(same start), so repeated `FAILED` events keep both in sync. It belongs to that
+one failure: a later flash on the slot (LOST, CLEARED, FAILED, the open slot
+timeout) flashes the slot only. ZMK
 keeps every key away from the hosts from the passkey request until the pairing
 ends (patch 0007), so a second Enter during the check does not reach the PC.
 Just Works pairings (no passkey request) never touch the number row. Selecting
