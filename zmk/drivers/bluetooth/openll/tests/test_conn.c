@@ -1271,6 +1271,7 @@ static void test_instant_passed(void)
 	struct ll_connect_ind ci = mk_ci(12, 400, 1, 1, 0);
 	struct ll_conn_params np = {.interval = 6, .latency = 0, .timeout = 50};
 	uint32_t a = 6000000 + T(1250 + 100);
+	struct ll_conn_stats s0, s1;
 	uint16_t c;
 
 	reset_all(false);
@@ -1282,9 +1283,14 @@ static void test_instant_passed(void)
 	c = ll_conn_event_counter(0);
 	CHECK(c == 10);
 	/* judged against the event the PDU was received in (rxe = c - 1):
-	 * passed when (Instant - connEventCount) mod 65536 >= 32767 (5.5.1) */
+	 * passed when (Instant - connEventCount) mod 65536 >= 32767 (5.5.1).
+	 * 32766 events ahead is far beyond the planned window: not late (its
+	 * anchor, about 491 s ahead, must not wrap the 32-bit tick difference) */
+	ll_conn_get_stats(0, &s0);
 	CHECK(ll_conn_update_at(0, rxe(0), (uint16_t)(rxe(0) + 32766), 1, 0, &np) == 0);
 	CHECK(ll_conn_active(0));
+	ll_conn_get_stats(0, &s1);
+	CHECK(s1.late_instants == s0.late_instants);
 	CHECK(ll_conn_chmap_at(0, rxe(0), (uint16_t)(rxe(0) + 32767), no0to9) ==
 	      LL_ST_INSTANT_PASSED);
 	CHECK(!ll_conn_active(0));

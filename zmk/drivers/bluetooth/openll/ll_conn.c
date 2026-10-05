@@ -279,6 +279,20 @@ static uint32_t anchor_of(const struct ll_link *c, uint16_t counter)
 	return c->ref_tick + (uint32_t)(uint16_t)(counter - c->ref_counter) * c->interval_ticks;
 }
 
+/* The anchor of event `counter` is at or before `now`. Unlike a signed
+ * test on anchor_of(), this does not wrap for an event more than 2^31 ticks
+ * (about 134 s) after ref_tick: the offset is taken in 64 bits. now -
+ * ref_tick itself stays far below 2^31 ticks (ref_tick is at most a
+ * supervision timeout, 32 s, plus an interval old, or a planned update
+ * anchor ahead). */
+static bool anchor_passed(const struct ll_link *c, uint16_t counter, uint32_t now)
+{
+	uint64_t off = (uint64_t)(uint16_t)(counter - c->ref_counter) * c->interval_ticks;
+	int32_t el = (int32_t)(now - c->ref_tick);
+
+	return el >= 0 && off <= (uint64_t)el;
+}
+
 static void set_params(struct ll_link *c, const struct ll_conn_params *p)
 {
 	c->p = *p;
@@ -1179,8 +1193,9 @@ static void catch_up(struct ll_link *c, uint16_t planned)
  * in between are missed. *late is also set for an instant at the event on
  * air (issued with the old values) and, while an event is planned, for an
  * instant event whose anchor has gone by (slice 7: the anchor, not the
- * alarm time; a skipped one, or one at or after the planned event when its
- * alarm was not served). A skipped
+ * alarm time; a skipped one, or the planned event when its alarm was not
+ * served, or any event when the thread stalled). anchor_passed() does not
+ * wrap for an instant more than 2^31 ticks (about 134 s) ahead. A skipped
  * instant event whose alarm time is gone but whose anchor is not is
  * honoured as before: instant_replan() plans it with a late alarm,
  * prepare() issues it if there is time left (LL_CONN_MIN_PREP_US), else it
@@ -1192,7 +1207,7 @@ static int check_instant(struct ll_link *c, uint16_t rx_event, uint16_t instant,
 	uint16_t d = (uint16_t)(instant - cur);
 
 	*late = inst_past(instant, cur) || (d == 0 && c->in_event) ||
-		(c->planned && (int32_t)(anchor_of(c, instant) - ll_radio_now()) <= 0);
+		(c->planned && anchor_passed(c, instant, ll_radio_now()));
 	if (inst_past(instant, rx_event)) {
 		request_end(c, LL_ST_INSTANT_PASSED);
 		return LL_ST_INSTANT_PASSED;
