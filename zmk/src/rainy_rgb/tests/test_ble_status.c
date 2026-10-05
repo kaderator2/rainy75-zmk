@@ -54,10 +54,17 @@ static uint8_t tri(uint32_t dt, uint32_t period) {
 
 static void reset(void) {
 	rrgb_ble_init(&KEYS);
+	rrgb_ble_set_output_ble(true);   /* steady animations need BLE output */
 	/* reach a quiet baseline: slot 0 connected and its solid/fade over */
 	slots(RRGB_BLE_CONNECTED, RRGB_BLE_EMPTY, RRGB_BLE_EMPTY, 0, 0);
 }
+static void boot(void) {
+	rrgb_ble_init(&KEYS);
+	rrgb_ble_set_output_ble(true);
+}
 #define QUIET 1000u   /* tick after the baseline's connected animation */
+
+static void check_red_flash(uint8_t slot, uint32_t t0);
 
 static void test_timing_constants(void) {
 	CHECK(RRGB_BLE_BLINK_PERIOD == 12 && RRGB_BLE_BLINK_ON == 6);
@@ -66,6 +73,7 @@ static void test_timing_constants(void) {
 	CHECK(RRGB_BLE_FLASH_COUNT == 3 && RRGB_BLE_FLASH_ON == 8 && RRGB_BLE_FLASH_OFF == 8);
 	CHECK(RRGB_BLE_FLASH_TOTAL == 48);
 	CHECK(RRGB_BLE_ENTER_PERIOD == 50);
+	CHECK(RRGB_BLE_STEADY_HOLD_FRAMES == 1500);
 }
 
 static void test_idle(void) {
@@ -86,6 +94,7 @@ static void test_fn_overview(void) {
 	/* slot0 active connected, slot1 connected (background), slot2 paired */
 	slots(RRGB_BLE_CONNECTED, RRGB_BLE_CONNECTED, RRGB_BLE_PAIRED, 0, 0);
 	uint32_t t = QUIET;
+	rrgb_ble_set_output_ble(false);
 	rrgb_ble_set_fn(true);
 	CHECK(rrgb_ble_active(t));
 	CHECK(frame(t));
@@ -136,12 +145,13 @@ static void test_active_empty_blinks(void) {
 		CHECK(eq(px[F(1)], want));
 		CHECK(only_touched(owned, 1));   /* not F4, not the other slots */
 	}
-	/* still blinking much later (until the state changes) */
-	CHECK(rrgb_ble_active(t0 + 100000));
+	/* still blinking until the hold expires */
+	CHECK(rrgb_ble_active(t0 + RRGB_BLE_STEADY_HOLD_FRAMES - 1));
+	CHECK(!rrgb_ble_active(t0 + RRGB_BLE_STEADY_HOLD_FRAMES));
 }
 
 static void test_active_paired_breathes(void) {
-	reset();
+	boot();   /* fresh poll: slot 0 PAIRED without a LOST from CONNECTED */
 	uint32_t t0 = 7000;
 	slots(RRGB_BLE_PAIRED, RRGB_BLE_EMPTY, RRGB_BLE_EMPTY, 0, t0);
 	CHECK(eq((frame(t0), px[F(0)]), blue(RRGB_BLE_BRIGHT)));   /* bright at phase 0 */
@@ -191,10 +201,9 @@ static void test_connected_solid_fade(void) {
 	frame(end + 10);
 	CHECK(eq(px[F(2)], blue(RRGB_BLE_BRIGHT)));
 
-	/* connected then dropped (polled, no LOST event): solid cancelled */
+	/* connected then dropped (polled, no LOST event): solid replaced by the LOST flash */
 	slots(RRGB_BLE_CONNECTED, RRGB_BLE_CONNECTED, RRGB_BLE_PAIRED, 1, end + 20);
-	frame(end + 20);
-	CHECK(eq(px[F(2)], SENT));
+	check_red_flash(2, end + 20);
 }
 
 static void check_red_flash(uint8_t slot, uint32_t t0) {
@@ -319,6 +328,7 @@ static void test_passkey(void) {
 	/* digits beyond 6 clamp to 6 */
 	rrgb_ble_event(RRGB_BLE_EV_PASSKEY_DIGITS, 1, 9, t0 + 200);
 	frame(t0 + 200);
+	CHECK(eq(px[NUM(5)], blue(RRGB_BLE_BRIGHT)));
 	CHECK(eq(px[NUM(6)], white(RRGB_BLE_DIM)));
 	/* backspace: fewer digits */
 	rrgb_ble_event(RRGB_BLE_EV_PASSKEY_DIGITS, 1, 2, t0 + 201);
@@ -411,6 +421,193 @@ static void test_bounds(void) {
 	rrgb_ble_set_fn(false);
 }
 
+
+static bool f_on(uint8_t s) { return eq(px[F(s)], blue(RRGB_BLE_BRIGHT)); }
+#define HOLD RRGB_BLE_STEADY_HOLD_FRAMES
+
+static void test_steady_gating(void) {
+	/* output USB: no steady animation, nothing to draw */
+	reset();
+	rrgb_ble_set_output_ble(false);
+	uint32_t t0 = 60000;
+	slots(RRGB_BLE_CONNECTED, RRGB_BLE_EMPTY, RRGB_BLE_EMPTY, 1, t0);
+	CHECK(!rrgb_ble_active(t0));
+	CHECK(!frame(t0));
+	CHECK(only_touched(NULL, 0));
+	/* Fn held on USB: the overview still blinks the active slot */
+	rrgb_ble_set_fn(true);
+	frame(t0);
+	CHECK(f_on(1));
+	frame(t0 + RRGB_BLE_BLINK_ON);
+	CHECK(eq(px[F(1)], BLACK));
+	rrgb_ble_set_fn(false);
+	/* output BLE: shown (window from the slot event at t0) */
+	rrgb_ble_set_output_ble(true);
+	CHECK(rrgb_ble_active(t0 + 1));
+	frame(t0 + 1);
+	CHECK(f_on(1));
+	/* event animations ignore the output */
+	rrgb_ble_set_output_ble(false);
+	rrgb_ble_event(RRGB_BLE_EV_LOST, 2, 0, t0 + 10);
+	frame(t0 + 10);
+	CHECK(eq(px[F(2)], red(RRGB_BLE_BRIGHT)));
+	slots(RRGB_BLE_CONNECTED, RRGB_BLE_EMPTY, RRGB_BLE_CONNECTED, 1, t0 + 100);
+	frame(t0 + 100);
+	CHECK(f_on(2));
+	CHECK(eq(px[F(1)], SENT));                  /* steady still gated */
+	rrgb_ble_event(RRGB_BLE_EV_PASSKEY_REQ, 1, 0, t0 + 300);
+	frame(t0 + 300);
+	CHECK(eq(px[NUM(0)], white(RRGB_BLE_DIM)));
+}
+
+static void test_steady_hold(void) {
+	/* breathing for HOLD frames after the event, then dark */
+	boot();   /* fresh poll: slot 0 PAIRED without a LOST from CONNECTED */
+	uint32_t t0 = 70000;
+	slots(RRGB_BLE_PAIRED, RRGB_BLE_EMPTY, RRGB_BLE_EMPTY, 0, t0);
+	CHECK(rrgb_ble_active(t0 + HOLD - 1));
+	frame(t0 + HOLD - 1);
+	CHECK(eq(px[F(0)], blue(tri(HOLD - 1, RRGB_BLE_BREATHE_PERIOD))));
+	CHECK(!rrgb_ble_active(t0 + HOLD));
+	CHECK(!frame(t0 + HOLD));
+	CHECK(only_touched(NULL, 0));
+	/* a repeated poll with the same state is no event */
+	slots(RRGB_BLE_PAIRED, RRGB_BLE_EMPTY, RRGB_BLE_EMPTY, 0, t0 + HOLD + 10);
+	CHECK(!rrgb_ble_active(t0 + HOLD + 10));
+	/* Fn after expiry: the overview still breathes the active slot */
+	rrgb_ble_set_fn(true);
+	CHECK(rrgb_ble_active(t0 + HOLD + 20));
+	frame(t0 + HOLD + 20);
+	CHECK(eq(px[F(0)], blue(tri(HOLD + 20, RRGB_BLE_BREATHE_PERIOD))));
+	rrgb_ble_set_fn(false);
+
+	/* profile select restarts the window: EMPTY slot becomes active */
+	uint32_t t1 = t0 + 5000;
+	slots(RRGB_BLE_PAIRED, RRGB_BLE_EMPTY, RRGB_BLE_EMPTY, 1, t1);
+	frame(t1);
+	CHECK(f_on(1));
+	CHECK(rrgb_ble_active(t1 + HOLD - 1) && !rrgb_ble_active(t1 + HOLD));
+
+	/* CLEARED on the active slot: flash, then blink for HOLD from the flash end */
+	uint32_t t2 = t1 + 5000;
+	slots(RRGB_BLE_CONNECTED, RRGB_BLE_EMPTY, RRGB_BLE_EMPTY, 0, t2 - 1000);
+	rrgb_ble_event(RRGB_BLE_EV_CLEARED, 0, 0, t2);
+	uint32_t e = t2 + RRGB_BLE_FLASH_TOTAL;
+	frame(e);
+	CHECK(f_on(0));
+	CHECK(rrgb_ble_active(e + HOLD - 1) && !rrgb_ble_active(e + HOLD));
+
+	/* disconnect (polled LOST) of the active slot: flash, then breathe for HOLD */
+	uint32_t t3 = e + 5000;
+	slots(RRGB_BLE_CONNECTED, RRGB_BLE_EMPTY, RRGB_BLE_EMPTY, 0, t3 - 1000);
+	slots(RRGB_BLE_PAIRED, RRGB_BLE_EMPTY, RRGB_BLE_EMPTY, 0, t3);
+	e = t3 + RRGB_BLE_FLASH_TOTAL;
+	frame(e);
+	CHECK(f_on(0));
+	CHECK(rrgb_ble_active(e + HOLD - 1) && !rrgb_ble_active(e + HOLD));
+
+	/* boot/wake: the first set_slots after init starts the window */
+	rrgb_ble_init(&KEYS);
+	rrgb_ble_set_output_ble(true);
+	uint32_t t4 = 90000;
+	slots(RRGB_BLE_PAIRED, RRGB_BLE_EMPTY, RRGB_BLE_EMPTY, 0, t4);
+	frame(t4);
+	CHECK(f_on(0));
+	CHECK(rrgb_ble_active(t4 + HOLD - 1) && !rrgb_ble_active(t4 + HOLD));
+	/* boot with an EMPTY active slot (init state is EMPTY too): still an event */
+	rrgb_ble_init(&KEYS);
+	rrgb_ble_set_output_ble(true);
+	slots(RRGB_BLE_EMPTY, RRGB_BLE_EMPTY, RRGB_BLE_EMPTY, 0, t4);
+	frame(t4);
+	CHECK(f_on(0));
+	CHECK(rrgb_ble_active(t4 + HOLD - 1) && !rrgb_ble_active(t4 + HOLD));
+}
+
+static void test_lost_detection(void) {
+	/* CONNECTED -> PAIRED in the poll: LOST red flash */
+	reset();
+	uint32_t t0 = 100000;
+	slots(RRGB_BLE_CONNECTED, RRGB_BLE_CONNECTED, RRGB_BLE_EMPTY, 0, t0 - 1000);
+	slots(RRGB_BLE_CONNECTED, RRGB_BLE_PAIRED, RRGB_BLE_EMPTY, 0, t0);
+	check_red_flash(1, t0);
+
+	/* CLEARED event then the poll: one flash from the CLEARED tick, no LOST restart */
+	reset();
+	slots(RRGB_BLE_CONNECTED, RRGB_BLE_EMPTY, RRGB_BLE_EMPTY, 0, t0 - 1000);
+	rrgb_ble_event(RRGB_BLE_EV_CLEARED, 0, 0, t0);
+	slots(RRGB_BLE_EMPTY, RRGB_BLE_EMPTY, RRGB_BLE_EMPTY, 0, t0 + 20);
+	frame(t0 + 16);
+	CHECK(eq(px[F(0)], red(RRGB_BLE_BRIGHT)));   /* 3rd flash of the CLEARED flash */
+	frame(t0 + 20);
+	CHECK(eq(px[F(0)], red(RRGB_BLE_BRIGHT)));   /* restart at 20 would be on too ... */
+	frame(t0 + 24);
+	CHECK(eq(px[F(0)], BLACK));                  /* ... but this is the CLEARED off phase */
+	frame(t0 + RRGB_BLE_FLASH_TOTAL);
+	CHECK(f_on(0));                              /* blink after the single flash */
+
+	/* poll first (CONNECTED -> EMPTY means the bond is gone): no LOST flash */
+	reset();
+	slots(RRGB_BLE_CONNECTED, RRGB_BLE_EMPTY, RRGB_BLE_EMPTY, 0, t0 - 1000);
+	slots(RRGB_BLE_EMPTY, RRGB_BLE_EMPTY, RRGB_BLE_EMPTY, 0, t0);
+	frame(t0);
+	CHECK(f_on(0));                              /* blink, not red */
+	frame(t0 + RRGB_BLE_BLINK_ON);
+	CHECK(eq(px[F(0)], BLACK));
+	rrgb_ble_event(RRGB_BLE_EV_CLEARED, 0, 0, t0 + 10);
+	frame(t0 + 10);
+	CHECK(eq(px[F(0)], red(RRGB_BLE_BRIGHT)));
+
+	/* explicit LOST still works */
+	reset();
+	rrgb_ble_event(RRGB_BLE_EV_LOST, 0, 0, t0);
+	check_red_flash(0, t0);
+
+	/* state values > 2 are ignored */
+	reset();
+	slots(RRGB_BLE_CONNECTED, 7, 200, 0, t0);
+	CHECK(!rrgb_ble_active(t0));
+	rrgb_ble_set_fn(true);
+	frame(t0);
+	CHECK(eq(px[F(1)], white(RRGB_BLE_VDIM)));   /* still EMPTY */
+	CHECK(eq(px[F(2)], white(RRGB_BLE_VDIM)));
+	rrgb_ble_set_fn(false);
+}
+
+static void test_wraparound(void) {
+	uint32_t w = 0xFFFFFFF0u;
+	/* connected solid across the wrap */
+	rrgb_ble_init(&KEYS);
+	rrgb_ble_set_output_ble(true);
+	slots(RRGB_BLE_CONNECTED, RRGB_BLE_EMPTY, RRGB_BLE_EMPTY, 1, w);
+	frame(w + 50);                              /* tick 34 after the wrap */
+	CHECK(eq(px[F(0)], blue(RRGB_BLE_BRIGHT)));
+	CHECK(rrgb_ble_active(w + RRGB_BLE_CONN_SOLID + RRGB_BLE_CONN_FADE - 1));
+	/* blink of the active EMPTY slot across the wrap */
+	for (uint32_t dt = 0; dt < 40; dt++) {
+		frame(w + dt);
+		CHECK(eq(px[F(1)], (dt % RRGB_BLE_BLINK_PERIOD) < RRGB_BLE_BLINK_ON
+				  ? blue(RRGB_BLE_BRIGHT) : BLACK));
+	}
+	CHECK(rrgb_ble_active(w + HOLD - 1) && !rrgb_ble_active(w + HOLD));
+	/* red flash across the wrap */
+	rrgb_ble_event(RRGB_BLE_EV_LOST, 2, 0, 0xFFFFFFFAu);
+	check_red_flash(2, 0xFFFFFFFAu);
+	/* passkey across the wrap, incl. its safety end */
+	rrgb_ble_event(RRGB_BLE_EV_PASSKEY_REQ, 1, 0, 0xFFFFFFFFu);
+	frame(5);
+	CHECK(eq(px[NUM(0)], white(RRGB_BLE_DIM)));
+	CHECK(eq(px[ENTER], white(tri(6, RRGB_BLE_ENTER_PERIOD))));
+	rrgb_ble_set_output_ble(false);   /* only the passkey guidance left */
+	CHECK(rrgb_ble_active(0xFFFFFFFFu + RRGB_BLE_PASSKEY_MAX - 1));
+	CHECK(!rrgb_ble_active(0xFFFFFFFFu + RRGB_BLE_PASSKEY_MAX));
+	frame(0xFFFFFFFFu + RRGB_BLE_PASSKEY_MAX);
+	CHECK(eq(px[NUM(0)], SENT));
+	/* very old events stay off (up to 2^31 frames later) */
+	rrgb_ble_set_output_ble(true);
+	CHECK(!rrgb_ble_active(0x7FFFFFF0u));
+	CHECK(!frame(0x7FFFFFF0u));
+}
+
 int main(void) {
 	test_timing_constants();
 	test_idle();
@@ -423,5 +620,9 @@ int main(void) {
 	test_multi_slot();
 	test_active_exact();
 	test_bounds();
+	test_steady_gating();
+	test_steady_hold();
+	test_lost_detection();
+	test_wraparound();
 	DONE();
 }

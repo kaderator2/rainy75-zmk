@@ -6,13 +6,18 @@
  *
  * Per slot key (F1..F3), highest priority first:
  *   1. a timed animation (connected solid+fade, or red flash), newest wins;
- *   2. with Fn held: the overview colour (active slot blinks/breathes);
- *   3. without Fn: the active slot blinks (EMPTY, pairing) or breathes
- *      (PAIRED, connecting).
+ *   2. the active slot, not connected, blinks (EMPTY, pairing) or breathes
+ *      (PAIRED, connecting): with Fn held always, without Fn only while the
+ *      output is BLE and for RRGB_BLE_STEADY_HOLD_FRAMES after the slot's
+ *      last event (boot/wake, profile select, state change, flash end);
+ *   3. with Fn held: the overview colour.
  * F4 shows the output (white USB / blue BLE) only with Fn held. The passkey
  * guidance owns the number row and Enter while the host waits for the code.
  *
- * Timing uses wrap-safe tick differences. Setters run on the ZMK event
+ * Timing uses wrap-safe tick differences (int32). Expired animation kinds
+ * and an expired s_pk_on are never cleared: harmless until the tick has
+ * moved ~2^31 frames (~497 days at 50 FPS) past them, when the difference
+ * turns negative (still off); only after ~2^32 frames could one reappear. Setters run on the ZMK event
  * thread, render/active on the render thread: single writer, single core,
  * a torn read is a one-frame glitch. */
 
@@ -26,7 +31,8 @@ struct slot_anim {
 static struct rrgb_ble_keys s_keys;
 static volatile uint8_t s_state[RRGB_BLE_SLOTS];
 static volatile uint8_t s_active = RRGB_BLE_NONE;
-static volatile uint32_t s_steady_t0;    /* active slot's steady animation origin */
+static volatile uint32_t s_steady_t0;    /* active slot's last steady event */
+static volatile bool s_first_poll;       /* next set_slots is boot/wake: an event */
 static volatile bool s_output_ble;
 static volatile bool s_fn;
 static struct slot_anim s_anim[RRGB_BLE_SLOTS];
@@ -60,7 +66,27 @@ static bool anim_running(uint8_t s, uint32_t tick) {
 }
 
 static bool pk_running(uint32_t tick) {
-	return s_pk_on && since(tick, s_pk_last) < RRGB_BLE_PASSKEY_MAX;
+	int32_t dt = since(tick, s_pk_last);
+	return s_pk_on && dt >= 0 && dt < RRGB_BLE_PASSKEY_MAX;
+}
+
+/* Steady phase origin: the last steady event, or the end of a later red
+ * flash on the slot (the flash comes first, then the steady animation). */
+static uint32_t steady_origin(uint8_t s) {
+	uint32_t origin = s_steady_t0;
+	if (s_anim[s].kind == ANIM_FLASH) {
+		uint32_t end = s_anim[s].t0 + RRGB_BLE_FLASH_TOTAL;
+		if (since(end, origin) > 0) { origin = end; }
+	}
+	return origin;
+}
+
+/* Slot s shows its steady (blink/breathe) animation this frame. */
+static bool steady_shown(uint8_t s, uint32_t tick) {
+	if (s != s_active || s_state[s] == RRGB_BLE_CONNECTED) { return false; }
+	if (s_fn) { return true; }
+	int32_t dt = since(tick, steady_origin(s));
+	return s_output_ble && dt >= 0 && dt < RRGB_BLE_STEADY_HOLD_FRAMES;
 }
 
 static void start_anim(uint8_t s, uint8_t kind, uint32_t tick) {
@@ -76,6 +102,7 @@ void rrgb_ble_init(const struct rrgb_ble_keys *keys) {
 	}
 	s_active = RRGB_BLE_NONE;
 	s_steady_t0 = 0;
+	s_first_poll = true;
 	s_output_ble = false;
 	s_fn = false;
 	s_pk_on = false;
@@ -84,14 +111,18 @@ void rrgb_ble_init(const struct rrgb_ble_keys *keys) {
 
 void rrgb_ble_set_slots(const uint8_t state[3], uint8_t active, uint32_t tick) {
 	if (active >= RRGB_BLE_SLOTS) { active = RRGB_BLE_NONE; }
-	bool steady_changed = active != s_active;
+	bool steady_changed = s_first_poll || active != s_active;
+	s_first_poll = false;
 	for (uint8_t s = 0; s < RRGB_BLE_SLOTS; s++) {
 		uint8_t old = s_state[s], now = state[s];
-		if (now == old) { continue; }
+		if (now == old || now > RRGB_BLE_CONNECTED) { continue; }   /* bad value: ignored */
 		if (now == RRGB_BLE_CONNECTED) {
 			start_anim(s, ANIM_CONN, tick);
+		} else if (old == RRGB_BLE_CONNECTED && now == RRGB_BLE_PAIRED) {
+			start_anim(s, ANIM_FLASH, tick);   /* LOST (still bonded) */
 		} else if (s_anim[s].kind == ANIM_CONN) {
-			s_anim[s].kind = ANIM_NONE;   /* dropped while solid: follow the polled state */
+			/* CONNECTED -> EMPTY is a bond clear, not a LOST: CLEARED flashes */
+			s_anim[s].kind = ANIM_NONE;
 		}
 		s_state[s] = now;
 		if (s == active) { steady_changed = true; }
@@ -150,7 +181,7 @@ bool rrgb_ble_active(uint32_t tick) {
 	for (uint8_t s = 0; s < RRGB_BLE_SLOTS; s++) {
 		if (anim_running(s, tick)) { return true; }
 	}
-	return s_active < RRGB_BLE_SLOTS && s_state[s_active] != RRGB_BLE_CONNECTED;
+	return s_active < RRGB_BLE_SLOTS && steady_shown(s_active, tick);
 }
 
 static bool put(struct rrgb *px, uint16_t n, uint8_t led, struct rrgb c) {
@@ -170,15 +201,10 @@ static struct rrgb timed_colour(uint8_t s, uint32_t tick) {
 		(uint32_t)(RRGB_BLE_CONN_SOLID + RRGB_BLE_CONN_FADE - dt) / RRGB_BLE_CONN_FADE));
 }
 
-/* Active slot not connected: blink (EMPTY, pairing) or breathe (PAIRED, connecting).
- * The phase starts at the state change, or at the end of a red flash on the slot. */
+/* Active slot not connected: blink (EMPTY, pairing) or breathe (PAIRED, connecting),
+ * phase 0 at steady_origin(). */
 static struct rrgb steady_colour(uint8_t s, uint32_t tick) {
-	uint32_t origin = s_steady_t0;
-	if (s_anim[s].kind == ANIM_FLASH) {
-		uint32_t end = s_anim[s].t0 + RRGB_BLE_FLASH_TOTAL;
-		if (since(end, origin) > 0) { origin = end; }
-	}
-	int32_t dt = since(tick, origin);
+	int32_t dt = since(tick, steady_origin(s));
 	if (dt < 0) { dt = 0; }
 	if (s_state[s] == RRGB_BLE_EMPTY) {
 		bool on = (uint32_t)dt % RRGB_BLE_BLINK_PERIOD < RRGB_BLE_BLINK_ON;
@@ -199,11 +225,10 @@ bool rrgb_ble_render(struct rrgb *px, uint16_t n, uint32_t tick) {
 	bool painted = false;
 
 	for (uint8_t s = 0; s < RRGB_BLE_SLOTS; s++) {
-		bool steady = s == s_active && s_state[s] != RRGB_BLE_CONNECTED;
 		struct rrgb c;
 		if (anim_running(s, tick)) {
 			c = timed_colour(s, tick);
-		} else if (steady) {
+		} else if (steady_shown(s, tick)) {
 			c = steady_colour(s, tick);
 		} else if (s_fn) {
 			c = overview_colour(s);

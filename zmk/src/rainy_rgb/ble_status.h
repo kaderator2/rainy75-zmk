@@ -36,6 +36,7 @@ enum rrgb_ble_ev {
 #define RRGB_BLE_ENTER_PERIOD    50    /* Enter pulse 1 Hz               */
 #define RRGB_BLE_PASSKEY_MAX   3000    /* safety: guidance ends 60 s after the last passkey event */
 #define RRGB_BLE_PASSKEY_LEN      6    /* progress keys on the number row */
+#define RRGB_BLE_STEADY_HOLD_FRAMES 1500 /* blink/breathe shown 30 s after the slot's last event */
 
 /* Fixed brightness levels (0..255), independent of the RGB brightness. */
 #define RRGB_BLE_BRIGHT 153   /* ~60 % */
@@ -57,8 +58,11 @@ struct rrgb_ble_keys {
 void rrgb_ble_init(const struct rrgb_ble_keys *keys);
 
 /* Polled slot states for slots 0..2 and the active slot index (>= 3: none
- * shown). A slot that becomes CONNECTED starts solid-then-fade; a slot that
- * stops being CONNECTED cancels it (LOST is a separate event). */
+ * shown; state values > 2 are ignored). A slot that becomes CONNECTED starts
+ * solid-then-fade; CONNECTED -> PAIRED raises the LOST red flash itself;
+ * CONNECTED -> EMPTY (bond cleared) only cancels the solid, the CLEARED event
+ * flashes. The first call after init (boot/wake), an active slot change and a
+ * state change of the active slot restart the steady hold window. */
 void rrgb_ble_set_slots(const uint8_t state[3], uint8_t active, uint32_t tick);
 void rrgb_ble_set_output_ble(bool ble);
 void rrgb_ble_set_fn(bool held);
