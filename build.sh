@@ -15,6 +15,8 @@
 #   --openll  accepted no-op alias (the open controller is the default)
 #   --privacy resolvable private address (BT_PRIVACY), open controller only. Every
 #             host must be paired again; refused with --blob.
+# Environment: BUILD_DIR=<dir> puts the app build (and the combined/OTA images)
+#   there instead of build/.
 
 set -e
 
@@ -35,51 +37,135 @@ ANSI_DTFLAG=""        # set when LAYOUT=ansi
 APP_CONF="$(pwd)/conf/app.conf"
 USE_BLOB=0            # set by --blob (default: open controller)
 USE_PRIVACY=0         # set by --privacy (refused with --blob)
+BUILD_DIR="${BUILD_DIR:-build}"   # app build directory
 
 # ── Apply upstream patches if needed ──────────────────────────
 #
-# A patch is "already applied" when its commit subject is in the target repo's
-# history — `git am` records the subject verbatim, so this holds for every patch
-# in a stack. The obvious test, `git apply --reverse --check`, does NOT: once a
-# later patch rewrites the same lines, the earlier one no longer reverses
-# cleanly and gets re-applied on every build, failing loudly and harmlessly.
-# That noise is indistinguishable from a patch that genuinely did not apply,
-# which is how the bind-window grace (zmk-src 0003) went missing from every
-# build unnoticed.
+# The patches live in patches/<repo>/ and are listed, with their sha256 and
+# target tree, in zmk/zephyr/patches.yml for Zephyr's `west patch` (manual
+# flow: `west update && west patch -b ../patches apply`). `west patch apply`
+# applies every listed patch and is not idempotent, so this script decides
+# per tree which patches are missing and hands only those to `west patch`.
+#
+# A patch is "already applied" when its commit subject is in the tree's
+# history: the apply-command is `git am`, which records the subject verbatim,
+# so this holds for every patch in a stack. The obvious test, `git apply
+# --reverse --check`, does NOT: once a later patch rewrites the same lines,
+# the earlier one no longer reverses cleanly and gets re-applied on every
+# build, failing loudly and harmlessly. That noise is indistinguishable from
+# a patch that genuinely did not apply, which is how the bind-window grace
+# (zmk-src 0003) went missing from every build unnoticed.
+#
+# Missing patches are applied only when they are the tail of the series
+# (none applied yet after `west update`, or new patches appended). A gap (a
+# later patch is in the tree, an earlier one is not, e.g. a patch was
+# rewritten) stops the build: the tree carries an older series and needs
+# `git -C <tree> checkout --detach manifest-rev` first. This script never
+# resets or cleans a tree itself, so uncommitted work there is never lost.
 #
 # A patch that truly fails is fatal: building without it silently produces
 # firmware that is not the tree anyone reviewed.
-apply_patches() {
-    local repo="$1" dir="$2" patch subject
-    # Neutral committer for both am and its abort: these are throwaway commits
-    # in fetched trees (the patch carries its own author), and `git am --abort`
-    # also needs an identity — without one it fails and leaves a half-finished
-    # .git/rebase-apply behind, which breaks the *next* build with a confusing
-    # "previous rebase directory still exists".
-    local ident=(-c user.name="rainy75 build" -c user.email="build@localhost")
-    for patch in "patches/$repo"/*.patch; do
-        [ -f "$patch" ] || continue
-        subject=$(git mailinfo /dev/null /dev/null < "$patch" 2>/dev/null |
-                  sed -n 's/^Subject: //p')
-        if [ -n "$subject" ] &&
-           git -C "$dir" log --format=%s | grep -Fxq "$subject"; then
-            continue
-        fi
-        echo "Applying patch: $repo/$(basename "$patch")"
-        if ! git -C "$dir" "${ident[@]}" am --3way "$PWD/$patch"; then
-            git -C "$dir" "${ident[@]}" am --abort 2>/dev/null || true
-            rm -rf "$dir/.git/rebase-apply"
-            echo "ERROR: $repo/$(basename "$patch") failed to apply." >&2
-            echo "       Resolve it in $dir before building; a build without" >&2
-            echo "       it is not the firmware this tree describes." >&2
+PATCH_YML=zmk/zephyr/patches.yml
+
+# patches.yml queries (PyYAML comes with west).
+patch_yml() {
+    python3 - "$PATCH_YML" "$@" <<'PYEOF'
+import sys, yaml
+yml, cmd, args = sys.argv[1], sys.argv[2], sys.argv[3:]
+data = yaml.safe_load(open(yml))
+patches = data.get("patches") or []
+if cmd == "modules":            # target trees, in order
+    print("\n".join(dict.fromkeys(p["module"] for p in patches)))
+elif cmd == "paths":            # patch files of one tree, in order
+    print("\n".join(p["path"] for p in patches if p["module"] == args[0]))
+elif cmd == "all-paths":
+    print("\n".join(p["path"] for p in patches))
+elif cmd == "subset":           # write a copy with only the given patches
+    keep = set(args[1:])
+    data["patches"] = [p for p in patches if p["path"] in keep]
+    with open(args[0], "w") as f:
+        yaml.safe_dump(data, f, sort_keys=False)
+PYEOF
+}
+
+check_patch_list() {
+    local f listed
+    listed=$(patch_yml all-paths)
+    for f in patches/*/*.patch; do
+        [ -f "$f" ] || continue
+        if ! grep -Fxq "${f#patches/}" <<< "$listed"; then
+            echo "ERROR: $f is not listed in $PATCH_YML (path, sha256sum, module, ...)." >&2
             exit 1
         fi
     done
 }
-apply_patches zephyr zephyr
-apply_patches mcuboot bootloader/mcuboot
-apply_patches hal_telink modules/hal/hal_telink
-apply_patches zmk-src zmk-src
+
+apply_patches() {
+    local dir="$1" path subject gap=0 tmp rebase
+    local -a missing=() subjects=()
+    # Neutral identity for `git am --abort`: these are throwaway commits in
+    # fetched trees, and without an identity the abort fails and leaves a
+    # half-finished rebase-apply behind, which breaks the *next* build with a
+    # confusing "previous rebase directory still exists". The apply-command
+    # in patches.yml sets the same identity for `git am`.
+    local ident=(-c user.name="rainy75 build" -c user.email="build@localhost")
+    while IFS= read -r path; do
+        [ -n "$path" ] || continue
+        subject=$(git mailinfo /dev/null /dev/null < "patches/$path" 2>/dev/null |
+                  sed -n 's/^Subject: //p')
+        subjects+=("$subject")
+        if [ -n "$subject" ] &&
+           git -C "$dir" log --format=%s | grep -Fxq "$subject"; then
+            [ ${#missing[@]} -gt 0 ] && gap=1
+        else
+            missing+=("$path")
+        fi
+    done < <(patch_yml paths "$dir")
+
+    # Own commits on top are fine, but say so: a patch dropped from the
+    # series stays in a tree that has it until the tree is reset.
+    local extra
+    extra=$(git -C "$dir" log --format=%s manifest-rev..HEAD 2>/dev/null |
+            grep -Fxv -f <(printf '%s\n' "${subjects[@]}") || true)
+    if [ -n "$extra" ]; then
+        echo "NOTE: $dir has commits beyond manifest-rev that are not in $PATCH_YML:" >&2
+        sed 's/^/        /' <<< "$extra" >&2
+    fi
+
+    [ ${#missing[@]} -eq 0 ] && return 0
+
+    if [ "$gap" -eq 1 ]; then
+        echo "ERROR: $dir carries a different patch series than $PATCH_YML." >&2
+        echo "       Missing, while later patches are applied:" >&2
+        printf '         %s\n' "${missing[@]}" >&2
+        echo "       Commit or save any own work in $dir, then:" >&2
+        echo "         git -C $dir checkout --detach manifest-rev   # or: west update" >&2
+        echo "       and build again (the patches are re-applied)." >&2
+        exit 1
+    fi
+
+    echo "Applying ${#missing[@]} patch(es) to $dir with west patch"
+    tmp=$(mktemp --suffix=.yml)
+    patch_yml subset "$tmp" "${missing[@]}"
+    if ! west patch -b ../patches -l "$tmp" apply; then
+        rm -f "$tmp"
+        git -C "$dir" "${ident[@]}" am --abort 2>/dev/null || true
+        rebase=$(git -C "$dir" rev-parse --git-path rebase-apply)
+        case "$rebase" in /*) ;; *) rebase="$dir/$rebase" ;; esac
+        rm -rf "$rebase"
+        echo "ERROR: a patch for $dir failed to apply (see above)." >&2
+        echo "       Resolve it in $dir before building; a build without" >&2
+        echo "       it is not the firmware this tree describes." >&2
+        exit 1
+    fi
+    rm -f "$tmp"
+}
+
+check_patch_list
+mapfile -t PATCH_TREES < <(patch_yml modules)
+for tree in "${PATCH_TREES[@]}"; do
+    apply_patches "$tree"
+done
 
 # Allow long forms --iso / --ansi as aliases for -I / -A.
 ARGS=(); for a in "$@"; do case "$a" in
@@ -162,7 +248,7 @@ fi
 # ── App build ──────────────────────────────────────────────────
 if [ "$BUILD_APP" -eq 1 ]; then
     echo "=== Building ZMK app ($(echo "$LAYOUT" | tr a-z A-Z) layout) ==="
-    west build $PRISTINE -b rainy75 zmk-src/app -- \
+    west build $PRISTINE -b rainy75 -d "$BUILD_DIR" zmk-src/app -- \
         -DZMK_CONFIG="$(pwd)/zmk/boards/rainy75" \
         -DZMK_EXTRA_MODULES="$(pwd)/zmk" \
         -DEXTRA_CONF_FILE="$APP_CONF" \
@@ -178,34 +264,34 @@ if [ "$BUILD_COMBINED" -eq 1 ]; then
         echo "ERROR: MCUboot binary not found. Build with -m first." >&2
         exit 1
     fi
-    if [ ! -f build/zephyr/zmk.signed.bin ]; then
+    if [ ! -f "$BUILD_DIR/zephyr/zmk.signed.bin" ]; then
         echo "ERROR: Signed app binary not found. Build app first." >&2
         exit 1
     fi
 
     python3 -c "
 mcuboot = open('build-mcuboot/zephyr/zephyr.bin','rb').read()
-app = open('build/zephyr/zmk.signed.bin','rb').read()
+app = open('$BUILD_DIR/zephyr/zmk.signed.bin','rb').read()
 pad = 0x10000 - len(mcuboot)  # 64KB boot partition
 assert pad > 0, f'MCUboot too large: {len(mcuboot)} bytes'
 combined = mcuboot + (b'\xff' * pad) + app
-open('build/combined.bin','wb').write(combined)
+open('$BUILD_DIR/combined.bin','wb').write(combined)
 print(f'MCUboot:  {len(mcuboot):,} bytes')
 print(f'App:      {len(app):,} bytes (at offset 0x10000)')
 print(f'Combined: {len(combined):,} bytes')
 "
-    echo "Output: build/combined.bin"
+    echo "Output: $BUILD_DIR/combined.bin"
 fi
 
 # ── OTA image ─────────────────────────────────────────────────
 if [ "$BUILD_OTA" -eq 1 ]; then
     echo "=== Creating OTA-ready image ==="
-    if [ ! -f build/combined.bin ]; then
+    if [ ! -f "$BUILD_DIR/combined.bin" ]; then
         echo "ERROR: Combined image not found. Build with -c first." >&2
         exit 1
     fi
 
-    python3 reverse/tools/prepare_ota.py build/combined.bin -o build/combined_ota.bin
+    python3 reverse/tools/prepare_ota.py "$BUILD_DIR/combined.bin" -o "$BUILD_DIR/combined_ota.bin"
 fi
 
 # ── Bridge build (monolithic, no MCUboot) ─────────────────────

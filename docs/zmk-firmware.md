@@ -991,7 +991,30 @@ MCUboot ROM usage: ~49KB (77% of 64KB boot partition). Includes USB device stack
 
 ## Upstream Patches
 
-All upstream modifications are tracked as `git format-patch` files in `patches/` and auto-applied by `build.sh` before each build. After `west update`, patches are re-applied automatically.
+All upstream modifications are tracked as `git format-patch` files in `patches/` and listed in `zmk/zephyr/patches.yml` for Zephyr's `west patch`. `build.sh` applies the missing ones before each build, so after `west update` they are re-applied automatically.
+
+### Applying the patches
+
+`zmk/zephyr/patches.yml` lists every patch with its sha256, target tree (`module`: the path relative to the workspace, e.g. `zephyr`, `bootloader/mcuboot`, `modules/hal/hal_telink`, `zmk-src`; not the west project name, because the ZMK project is named `zmk` like our module directory), author, date, an `upstreamable` flag and a comment. It sits where `west patch` looks by default (the manifest repository is `zmk/`); the patch files stay in `patches/`, so every call passes the patch base relative to `zmk/`:
+
+```
+west update && west patch -b ../patches apply    # manual flow: fresh trees, then all patches
+west patch -b ../patches list
+west patch -b ../patches clean                   # back to manifest-rev, see below
+```
+
+The apply-command is `git am --3way` with a neutral committer, so each patch becomes a commit with its subject. `west patch apply` applies every listed patch and is not idempotent: run it on trees fresh from `west update` (`git am --3way` happens to skip a patch whose change is already in the tree, but a stack that rewrites the same lines conflicts). `build.sh` therefore decides per tree itself:
+
+- A patch counts as applied when its commit subject is in the tree's history (the old, known-good rule; `git apply --reverse --check` fails for an earlier patch once a later one rewrites its lines).
+- All applied: nothing to do. Missing patches that are the tail of the series (none applied after `west update`, or new patches appended) go to `west patch apply` through a temporary copy of `patches.yml` with just those entries, so the sha256 check and the apply-command still come from `west patch`.
+- A gap (a later patch is in the tree, an earlier one is not, e.g. after a patch was rewritten) stops the build with the missing files and the fix: `git -C <tree> checkout --detach manifest-rev` (or `west update`), then build again.
+- A failed apply runs `git am --abort` and stops the build.
+- Commits beyond `manifest-rev` that are not in `patches.yml` are listed as a NOTE (own work is fine; a patch dropped from the series stays in a tree that has it).
+- A patch file in `patches/` that `patches.yml` does not list stops the build.
+
+`build.sh` never resets or cleans a tree, so uncommitted work there is never lost; a conflicting change makes `git am` fail, and the build stops. `west patch clean` runs `git checkout --detach manifest-rev` in each patched tree (`checkout-command` in `patches.yml`, `clean-command` empty): it drops the patch commits, leaves own commits behind (reflog) and refuses to overwrite conflicting uncommitted changes. The upstream defaults (`git checkout .`, `git clean -d -f -x`) would discard uncommitted work and keep the `git am` commits.
+
+Adding or changing a patch: commit in the tree, `git format-patch -N` into `patches/<repo>/`, then add or update the entry in `patches.yml` (`sha256sum patches/<repo>/<file>`).
 
 ```
 patches/
@@ -1154,7 +1177,7 @@ B91 has no USB VBUS detection pin. Without this patch, `is_usb_power_present()` 
 
 **0007, `app/src/hid_listener.c` + `app/src/ble.c` + `app/include/zmk/ble.h`:** keys typed for a passkey no longer reach a host. ZMK event listeners run in link order (the `.event_subscription` linker section is not sorted), and `hid_listener.c` is linked before `ble.c`, so upstream ZMK reported every passkey key to the current endpoint before the passkey listener consumed it. On the device the digits appeared on the USB host, because the endpoint falls back to USB while the new BLE profile is not connected yet. `zmk_ble_passkey_entry_active()` (true while `auth_passkey_entry_conn` or `auth_pairing_keys_conn` is set) is checked at the top of the HID listener: while a passkey is entered it drops presses and drops releases of keys that are not in the report; releases of keys held from before the request still go out, so nothing gets stuck. The check does not depend on listener order. The ownership lasts beyond the Enter release: `auth_passkey_entry_conn` is cleared there, but the host still checks the passkey, and a second Enter typed meanwhile reached the PC. A separate reference (`auth_pairing_keys_conn`, atomic) is taken at the passkey request and released on `pairing_complete`, `pairing_failed`, `security_changed` with an error, `cancel` or the disconnect of that connection. `auth_passkey_entry_conn` is atomic too and is cleared on all the same paths: Zephyr calls the `cancel` callback only for a remote Pairing Failed, while Esc (a local `bt_conn_auth_cancel()`), the SMP timeout and a disconnect before Enter only reach `pairing_failed`/`security_changed`. Upstream left it set on those paths; with the check above that kept every key away from the hosts until the next pairing. Enter and Esc take it with an atomic exchange, so it is never dropped twice. A disconnect that ends a pairing nothing else ended raises `FAILED`. A digit raises `PASSKEY_DIGITS` only while the entry is still open, so a digit typed while the RX thread ends the pairing does not restart the guidance after its `FAILED`. Corner case kept: a usage held from before the request and pressed again on another key during the entry is released early by that key's release.
 
-**Updating an older zmk-src tree.** Until October 2026 the series had 8 patches: 0006 also switched the output in `zmk_ble_prof_select()` and 0008 carried the open profile timeout. A tree that still has those commits does not have the new 0006 subject, so `build.sh` tries to apply it on top of the old series, fails and stops. Move the tree back to the manifest revision (`git -C zmk-src checkout --detach manifest-rev`, or `west update`) and run `./build.sh` again, which applies the series.
+**Updating an older zmk-src tree.** Until October 2026 the series had 8 patches: 0006 also switched the output in `zmk_ble_prof_select()` and 0008 carried the open profile timeout. A tree that still has those commits lacks the new 0006 subject while 0007 is applied, so `build.sh` stops with the gap message (see [Applying the patches](#applying-the-patches)). Move the tree back to the manifest revision (`git -C zmk-src checkout --detach manifest-rev`, or `west update`) and run `./build.sh` again, which applies the series.
 
 ### BLE policy module
 

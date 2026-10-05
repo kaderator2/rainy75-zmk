@@ -39,6 +39,7 @@ All technical findings are in `docs/`:
 ```
 zmk/                             # Zephyr module — our custom firmware code
   west.yml                       # west manifest (fetches ZMK + hal_telink + mcuboot)
+  zephyr/patches.yml             # `west patch` list of patches/<repo>/*.patch (sha256, target tree, upstreamable); build.sh applies missing ones
   boards/rainy75/                # HWMv2 board definition (DTS, keymap, defconfig)
   drivers/bluetooth/             # BLE HCI driver (b91_bt.c shim) + deep sleep PM hooks
     b91_mac.c                    # MAC from flash (0xFF000) or random static fallback, shared by blob and open controller
@@ -292,5 +293,5 @@ Own peripheral-only link layer behind the `b91_bt.h` seam on hal_telink `rf.c` (
 - OTA protocol is write-only — SWS via Burning EVK is the only way to read flash
 - For bigger research tasks, the user has an external deep-research LLM available — provide a prompt and the user will return the research results
 - Ghidra headless Java scripts are broken in 12.0.1 (OSGi error) — use PyGhidra instead
-- **ZMK build**: `./build.sh -p --iso` (open controller by default; `--blob` for the Telink blob, `--privacy` for RPA). Requires Zephyr SDK 0.17.0 (not 0.17.4), set `ZEPHYR_SDK_INSTALL_DIR=$(pwd)/toolchain/zephyr-sdk-0.17.0`; manual builds pass `-DEXTRA_CONF_FILE="$(pwd)/conf/app.conf;$(pwd)/conf/openll.conf"` (see [docs/zmk-firmware.md](docs/zmk-firmware.md))
+- **ZMK build**: `./build.sh -p --iso` (open controller by default; `--blob` for the Telink blob, `--privacy` for RPA). Requires Zephyr SDK 0.17.0 (not 0.17.4), set `ZEPHYR_SDK_INSTALL_DIR=$(pwd)/toolchain/zephyr-sdk-0.17.0`; manual builds pass `-DEXTRA_CONF_FILE="$(pwd)/conf/app.conf;$(pwd)/conf/openll.conf"` (see [docs/zmk-firmware.md](docs/zmk-firmware.md)). `build.sh` applies missing upstream patches via `west patch` (`zmk/zephyr/patches.yml`); manual flow `west update && west patch -b ../patches apply`; `BUILD_DIR=<dir>` moves the app build out of `build/`
 - **Environment**: Arch Linux distrobox, use `pacman` not `dnf`
