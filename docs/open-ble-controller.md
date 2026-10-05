@@ -511,26 +511,43 @@ documentation. They may help anyone writing a B91 link layer.
   window (up to 31 x 15 ms = 465 ms). A kick only helps when we have TX data.
 - **Interrupt latency from outside the link layer.** USB interrupts and flash
   writes with interrupts off can still skip single connection events.
-- **A reconnect to a bonded host takes about 1.1 s until encryption, on the
-  host side.** On LE Connection Complete the Zephyr host loads the peer's CCC
-  values from settings (`CONFIG_BT_SETTINGS_CCC_LAZY_LOADING`, default y).
-  That scans the whole NVS storage, every read with interrupts off, inside the
-  cooperative BT RX work queue, so no thread runs for about 1.07 s (PC
+- **CCC values load at boot (`CONFIG_BT_SETTINGS_CCC_LAZY_LOADING=n` in
+  `conf/openll.conf`, +312 B RAM).** With the Zephyr default (lazy loading)
+  the host loads the peer's CCC values at every connection of a bonded peer
+  (`settings_load_subtree_direct()`), which scans the whole NVS storage with
+  interrupt-locked flash reads inside the BT RX work queue. That queue is
+  cooperative: for about 1 s per reconnect no lower-priority thread runs,
+  neither our controller thread (it answers the central's LL_FEATURE_REQ only
+  then, on air 1.09 s after CONNECT_IND) nor ZMK's key processing (PC
   sampling: 99.8 % `bt_workq` in `settings_nvs_load` and the NVS ATE reads).
-  Our controller thread, which delivered the event, answers the central's
-  LL_FEATURE_REQ only then (on air 1.09 s after CONNECT_IND, encryption at
-  1.15 s). The controller's own part is 1.3 ms (CONNECT_IND to the event
-  handed to the host). With `CONFIG_BT_SETTINGS_CCC_LAZY_LOADING=n` (CCCs
-  loaded at boot, +312 B RAM) the host returns after 6 ms and encryption is
-  on after about 0.12 s. The time grows with the NVS contents (about 0.3 s in
-  slice 2).
+  Measured CONNECT_IND to Encryption Change on a host-side reconnect: 1.098
+  to 1.112 s with lazy loading (the host returns from LE Connection Complete
+  after 1.002 s), 117 to 125 ms without (4.5 to 6.4 ms), n 4 each. The
+  controller's own part is 1.3 ms (CONNECT_IND to the event handed to the
+  host). The scan is bounded by the 72 KB storage partition (about 0.3 s in
+  slice 2, 1 s now). Not verified: whether frequent settings writes (for
+  example rainy_rgb saves) fill NVS and lengthen boot-time settings loading.
 - **Not supported:** CSA #2 (we advertise ChSel 0, so the central uses CSA #1),
   2M and Coded PHY, Data Length Extension, LL privacy (LE Set Random Address,
   RPA), LE Ping (answered with LL_UNKNOWN_RSP, which the tested central
   accepts), encryption pause and key refresh, multiple connections.
-- **A SCAN_REQ whose RX interrupt comes too late is not answered** (about 1 %
-  in the measurement, counted in `rsp_late`); the scanner retries. Discovery
-  is not affected: the name is in ADV_IND.
+- **A SCAN_REQ whose RX interrupt comes too late is not answered**
+  (`rsp_late`; the scanner retries). Measured with the default settle 63:
+  14 of 406 (3.4 %) while not connected (15 min of active scanning), 27 of 77
+  (35 %) while advertising during a connection with SMP echo load (10 min).
+  Discovery is not affected: the name is in ADV_IND.
+- **SCAN_RSP TX settle below 63 us is not spectrally verified.**
+  `CONFIG_BT_HCI_B91_OPENLL_SCANRSP_SETTLE_US` (default 63, the smallest TX
+  settle hal_telink publishes for BLE 1M) can be lowered for fewer late
+  responses (50: 1.5 % idle, 12 % loaded); 40 and 50 had valid CRCs at the
+  sniffer and the tested scanner took them, but the spectrum at the packet
+  start was not checked. The 59 us TX path delay is a single-board
+  measurement.
+- **Each answered SCAN_REQ holds the CPU in the RF interrupt** until the
+  response is on air (up to about 150 us). Any nearby active scanner can
+  trigger it, at most once per advertising channel. With advertising during a
+  connection under load the connection alarm-late counter rose from 17 to 51
+  in about 75k events (settle 50), plausibly from this hold; no link was lost.
 - **About 3 % of the responses have a T_IFS above 152 us** (first exchange of
   an event, cause unknown). The tested central accepts them; stricter centrals
   might not.
@@ -698,15 +715,20 @@ Builds and runs with the host gcc (`-Wall -Wextra -Werror`):
 
 The RX interrupt answers a SCAN_REQ itself, before the link layer callback:
 a CRC-valid SCAN_REQ for the AdvA and TxAdd of the prepared SCAN_RSP gets a
-single scheduled TX (`rf_start_stx()`, TX settle 50 us) triggered 41 us after
-the request's end, so the first bit is on air 150 us after the request
-(trigger + settle + a fixed 59 us TX path delay, measured). The decision and
+single scheduled TX (`rf_start_stx()`, TX settle
+`CONFIG_BT_HCI_B91_OPENLL_SCANRSP_SETTLE_US`, default 63 us) triggered
+150 - settle - 59 us (default 28 us) after the request's end, so the first bit
+is on air 150 us after the request (trigger + settle + a fixed 59 us TX path
+delay, measured on one board). Sniffer, default settle: 149 us 2, 150 us 119,
+151 us 8 (not connected) and 149 us 1, 150 us 27, 151 us 1 (advertising during
+a connection); TX-timestamp estimate 150 us in 392 of 392. The decision and
 the trigger run from RAM (`.ram_code`, `ll_scanrsp.h` inline): through the
 callback chain, or with flash-resident helpers, the decision came 50 to 90 us
 after the request, too late. The CPU then holds on the cycle counter until the
 response is on air, which removes a 2 to 5 us jitter of the TX start (as in
 the connection turnaround). A decision later than 3 us before the trigger is
-not answered (`rsp_late`). Nothing else is ever answered.
+not answered (`rsp_late`, also a SCAN_REQ for us outside an open RX window).
+Nothing else is ever answered.
 
 Why not the hardware turnaround: BRX and RX2TX transmit after whatever they
 receive (a CONNECT_IND, another advertiser's SCAN_REQ). Only a CPU veto in the
