@@ -10,6 +10,8 @@
  * "Central -> Peripheral" packets are what ll_rxq must decrypt for us (we
  * are the peripheral, directionBit 1).
  */
+#include <stddef.h>
+#include <stdint.h>
 #include <string.h>
 #include "test.h"
 #include "../ll_crypt.h"
@@ -707,6 +709,21 @@ static void test_room(void)
 	}
 }
 
+/* ll_rx_pdu.data must sit 2 bytes past a word boundary like the ring's
+ * records (area + 2), so ll_fifo_copy() moves whole words (review: a field
+ * before data moved it to offset 4 and forced the byte memcpy). */
+_Static_assert(offsetof(struct ll_rx_pdu, data) % 4 == 2, "ll_rx_pdu.data at 2 mod 4");
+_Static_assert(_Alignof(struct ll_rx_pdu) % 4 == 0, "ll_rx_pdu word aligned");
+
+static void test_data_alignment(void)
+{
+	static struct ll_rx_pdu s;
+	struct ll_rx_pdu a;
+
+	CHECK(((uintptr_t)s.data & 3u) == 2);
+	CHECK(((uintptr_t)a.data & 3u) == 2);
+}
+
 /* Each PDU carries the connection event it was received in (instants are
  * judged against it, ll_conn.h), in order, also when the link encrypts. */
 static void test_event_kept(void)
@@ -737,6 +754,7 @@ int main(void)
 	test_links_isolated();
 	test_crypt_per_link();
 	test_take_queued_any_link();
+	test_data_alignment();
 	L = 0;
 	test_event_kept();
 	test_half_full();

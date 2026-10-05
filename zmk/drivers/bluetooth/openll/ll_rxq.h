@@ -17,15 +17,17 @@
 #include "ll_crypt.h"
 #include "ll_defs.h"
 
+/* data sits 2 bytes past a word boundary, like the ring's records, so
+ * ll_fifo_copy() moves whole words (word-aligned struct, data at offset 2). */
 struct ll_rx_pdu {
 	uint8_t hdr0;   /* data PDU header byte 0 (LLID, NESN, SN, MD) */
 	uint8_t len;    /* payload length (after decryption: without MIC) */
+	uint8_t data[LL_DATA_PDU_MAX + LL_MIC_LEN];
 	/* connEventCounter of the connection event the PDU was received in
 	 * (instants are judged against it, not against the event counter at
 	 * the time the controller thread handles the PDU) */
 	uint16_t event;
-	uint8_t data[LL_DATA_PDU_MAX + LL_MIC_LEN];
-};
+} __attribute__((aligned(4)));
 
 /* Per link (slice 6b Task 4, long PDUs): at most LL_RXQ_ENTRIES PDUs
  * queued, their payload bytes (each rounded up to 4) in one FIFO area of

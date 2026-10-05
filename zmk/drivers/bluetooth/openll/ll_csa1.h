@@ -25,5 +25,8 @@ void ll_csa1_set_map(struct ll_csa1 *c, const uint8_t chm[5]);
  * order, including events skipped by latency. A map without used channels
  * (invalid, the spec requires at least 2) yields the unmapped channel. */
 uint8_t ll_csa1_next(struct ll_csa1 *c);
+/* Advance over n events without computing their channels (the state n
+ * ll_csa1_next() calls leave): lastUnmappedChannel += n * hop mod 37. */
+void ll_csa1_skip(struct ll_csa1 *c, uint32_t n);
 
 #endif /* LL_CSA1_H_ */

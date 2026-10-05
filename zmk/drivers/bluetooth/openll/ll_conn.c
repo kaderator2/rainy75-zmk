@@ -79,7 +79,9 @@
 #define SUP_UNIT_US      10000u    /* supervision timeout unit */
 #define NOT_ESTAB_EVENTS 6
 #define OP_TERMINATE_IND 0x02
-#define INSTANT_PAST     32767u   /* passed: (instant - counter) mod 65536 > this */
+/* Vol 6 Part B 5.5.1: an instant has passed when (Instant - connEventCount)
+ * mod 65536 >= 32767 */
+#define INSTANT_PAST     32767u
 /* Yields in a row before the link is given up (the arbiter holds at most
  * LL_ARB_IDS - 1 other requests, each blocking one or two events). */
 #define YIELD_MAX        64
@@ -285,12 +287,19 @@ static void set_params(struct ll_link *c, const struct ll_conn_params *p)
 	c->widen_max_us = (uint32_t)p->interval * UNIT_US / 2u - LL_T_IFS_US;
 }
 
-/* The instant is event `counter` or lies before it: (counter - instant)
- * mod 65536 <= INSTANT_PAST (check_instant accepts instants at most
- * INSTANT_PAST events ahead, so a pending one is never mistaken for this). */
+/* (instant - counter) mod 65536 >= INSTANT_PAST: the instant lies before
+ * event `counter` (5.5.1) */
+static bool inst_past(uint16_t instant, uint16_t counter)
+{
+	return (uint16_t)(instant - counter) >= INSTANT_PAST;
+}
+
+/* The instant is event `counter` or lies before it (check_instant accepts
+ * instants less than INSTANT_PAST events ahead of their reception, so a
+ * pending one that is still ahead is never mistaken for this). */
 static bool inst_due(uint16_t counter, uint16_t instant)
 {
-	return (uint16_t)(counter - instant) <= INSTANT_PAST;
+	return instant == counter || inst_past(instant, counter);
 }
 
 /* A pending instant whose event lies before the one about to be planned:
@@ -318,7 +327,12 @@ static bool apply_instants(struct ll_link *c)
 	if (c->upd_pending && inst_due(c->counter, c->upd_instant)) {
 		/* 5.1.1: the transmit window starts WinOffset after the anchor
 		 * the instant event would have had with the old parameters
-		 * (signed: a late instant may lie before the last re-sync). */
+		 * (signed: a late instant may lie before the last re-sync).
+		 * That re-sync can be a packet of the central's new timing
+		 * received in an old-timing event after the instant, but only
+		 * inside that event's RX window: the old anchor computed back
+		 * from it is off by at most the window widening, and WinOffset
+		 * is added once (test_instant_late_update_resync_offset). */
 		int16_t back = (int16_t)(uint16_t)(c->upd_instant - c->ref_counter);
 		uint32_t old_anchor = c->ref_tick + (uint32_t)((int32_t)back *
 							       (int32_t)c->interval_ticks);
@@ -591,7 +605,7 @@ static void place_latest(struct ll_link *c, uint16_t lo, uint16_t hi)
 	yield_on(c, true);
 }
 
-static void catch_up(struct ll_link *c);
+static void catch_up(struct ll_link *c, uint16_t planned);
 
 /* Plan the next event, skipping idle events where allowed. */
 static void plan(struct ll_link *c)
@@ -601,7 +615,7 @@ static void plan(struct ll_link *c)
 	if (instant_overdue(c)) {
 		/* a late instant handled while its event was on air */
 		ST(c)->planned++;
-		catch_up(c);
+		catch_up(c, c->counter);
 		return;
 	}
 	c->chm_win = false;
@@ -1040,52 +1054,133 @@ int ll_conn_start(const struct ll_connect_ind *ci, uint32_t connect_ind_end_tick
 	return c->id;
 }
 
-/* Events a late instant may skip at most (catch_up): beyond the longest
- * supervision timeout (32 s) at the shortest interval (7.5 ms) the link is
- * lost anyway. */
-#define CATCH_UP_MAX 4300u
+/* open_of() evaluations per first_ahead(): after the arithmetic jump the
+ * event reached may still be unreachable, the next one may be (widening +
+ * margin + lead), the one after that never is (widening <= interval / 2 -
+ * T_IFS, margin + lead < interval / 2 + T_IFS for every valid interval). */
+#define CATCH_UP_STEPS 4u
 
-/* A late instant (check_instant) is pending; counter is the first event
- * not issued yet, csa its CSA#1 state, nothing planned. Step over the
- * events that can no longer be prepared, applying each instant at its own
- * event (the new map from it on, the new timing from its old anchor, 5.1.1),
- * and plan the first one whose alarm is still ahead. The events stepped
- * over count as missed: they ran on the old map or timing, which the
- * central no longer used. */
-static void catch_up(struct ll_link *c)
+/* Events from c->counter to the first one whose alarm is still ahead under
+ * the current timing: jump over the events whose anchor lies before now +
+ * the alarm lead (arithmetic, as first_reachable()), then at most
+ * CATCH_UP_STEPS open_of() evaluations; *steps counts them. */
+static uint16_t first_ahead(const struct ll_link *c, uint32_t now, uint32_t *steps)
 {
-	uint32_t now = ll_radio_now();
+	int32_t el = (int32_t)(now + US(LL_CONN_ARM_LEAD_US) - anchor_of(c, c->counter));
+	uint32_t k = el > 0 ? (uint32_t)el / c->interval_ticks : 0u;
 
-	c->chm_win = false;
-	for (uint32_t i = 0; i < CATCH_UP_MAX; i++) {
-		if (apply_instants(c)) {
-			c->inst_evt = false;
-		}
-		if ((int32_t)(open_of(c, c->counter, NULL) - US(LL_CONN_ARM_LEAD_US) - now) > 0 &&
-		    !instant_overdue(c)) {
+	for (uint32_t i = 0; i < CATCH_UP_STEPS; i++) {
+		(*steps)++;
+		if ((int32_t)(open_of(c, (uint16_t)(c->counter + k), NULL) -
+			      US(LL_CONN_ARM_LEAD_US) - now) > 0) {
 			break;
 		}
-		(void)ll_csa1_next(&c->csa);
-		c->counter++;
-		ST(c)->missed++;
+		k++;
+	}
+	return (uint16_t)k;
+}
+
+/* Offset from c->counter of the earliest pending instant at or before
+ * counter + k (a due one counts as 0), or -1. */
+static int32_t next_instant(const struct ll_link *c, uint16_t k)
+{
+	int32_t best = -1;
+
+	if (c->upd_pending) {
+		uint16_t o = inst_due(c->counter, c->upd_instant) ? 0 :
+			     (uint16_t)(c->upd_instant - c->counter);
+
+		if (o <= k) {
+			best = o;
+		}
+	}
+	if (c->chm_pending) {
+		uint16_t o = inst_due(c->counter, c->chm_instant) ? 0 :
+			     (uint16_t)(c->chm_instant - c->counter);
+
+		if (o <= k && (best < 0 || o < best)) {
+			best = o;
+		}
+	}
+	return best;
+}
+
+/* A late instant (check_instant) is pending; counter is the first event
+ * not issued yet, csa its CSA#1 state, nothing planned; `planned` is the
+ * listen that was planned (counter itself when none was). Jump to the
+ * first event whose alarm is still ahead, applying each instant on the
+ * way at its own event (the new map from it on; the new timing from its
+ * old anchor, 5.1.1, after which the target is computed again), and plan
+ * it. The work under the lock is bounded: CSA#1 is advanced
+ * arithmetically, at most CATCH_UP_STEPS open_of() per timing
+ * (stats.catch_up_steps_max). The planned event keeps the instant event's
+ * MUST priority (inst_evt). Stats: events stepped over before `planned`
+ * were latency skips and stay in skipped (skipped events between the
+ * target and `planned` are taken back); events from `planned` on count as
+ * missed (they ran on the old map or timing, which the central no longer
+ * used). */
+static void catch_up(struct ll_link *c, uint16_t planned)
+{
+	uint32_t now = ll_radio_now();
+	uint32_t steps = 0;
+	uint16_t start = c->counter;
+	uint16_t k = first_ahead(c, now, &steps);
+	bool applied = false;
+
+	c->chm_win = false;
+	for (int i = 0; i < 2; i++) {   /* at most one update and one map */
+		int32_t o = next_instant(c, k);
+		uint16_t ival = c->p.interval;
+		uint32_t ref = c->ref_tick;
+
+		if (o < 0) {
+			break;
+		}
+		ll_csa1_skip(&c->csa, (uint32_t)o);
+		c->counter = (uint16_t)(c->counter + o);
+		(void)apply_instants(c);
+		applied = true;
+		if (c->p.interval != ival || c->ref_tick != ref) {
+			k = first_ahead(c, now, &steps);   /* new timing */
+		} else {
+			k = (uint16_t)(k - o);
+		}
+	}
+	ll_csa1_skip(&c->csa, k);
+	c->counter = (uint16_t)(c->counter + k);
+	if (steps > ST(c)->catch_up_steps_max) {
+		ST(c)->catch_up_steps_max = steps;
+	}
+	if ((uint16_t)(c->counter - start) <= (uint16_t)(planned - start)) {
+		ST(c)->skipped -= (uint16_t)(planned - c->counter);
+	} else {
+		ST(c)->missed += (uint16_t)(c->counter - planned);
 	}
 	c->skip_base = c->counter;
 	c->skip_n = 0;
+	if (applied) {
+		c->inst_evt = true;
+		c->inst_counter = c->counter;
+	}
 	plan_event(c);
 	if (request(c) != 0) {
 		yield_on(c, true);
 	}
 }
 
-/* 0, or LL_ST_INSTANT_PASSED (connection ending): the instant is the event
- * the PDU was received in (rx_event) or lies before it (5.1.1, 5.1.2: the
- * instant is judged against connEventCounter at reception). The controller
+/* 0, or LL_ST_INSTANT_PASSED (connection ending): (instant - rx_event) mod
+ * 65536 >= 32767, rx_event being the event the PDU was received in (Vol 6
+ * Part B 5.5.1, "because the instant is in the past"; an instant equal to
+ * rx_event is not passed: its event was issued with the old values, so it
+ * is applied late like the next case). The controller
  * thread handles the PDU later, after decryption; when the instant's event
  * has gone by meanwhile (*late) the instant is still honoured, late:
  * applied from the first event that can be prepared (catch_up), the events
  * in between are missed. *late is also set for an instant at the event on
- * air (issued with the old values) and for a skipped instant event whose
- * anchor has gone by (slice 7: the anchor, not the alarm time). A skipped
+ * air (issued with the old values) and, while an event is planned, for an
+ * instant event whose anchor has gone by (slice 7: the anchor, not the
+ * alarm time; a skipped one, or one at or after the planned event when its
+ * alarm was not served). A skipped
  * instant event whose alarm time is gone but whose anchor is not is
  * honoured as before: instant_replan() plans it with a late alarm,
  * prepare() issues it if there is time left (LL_CONN_MIN_PREP_US), else it
@@ -1095,12 +1190,10 @@ static int check_instant(struct ll_link *c, uint16_t rx_event, uint16_t instant,
 {
 	uint16_t cur = c->planned ? c->skip_base : c->counter;
 	uint16_t d = (uint16_t)(instant - cur);
-	uint16_t d_rx = (uint16_t)(instant - rx_event);
 
-	*late = d > INSTANT_PAST || (d == 0 && c->in_event) ||
-		(c->planned && d < c->skip_n &&
-		 (int32_t)(anchor_of(c, instant) - ll_radio_now()) <= 0);
-	if (d_rx == 0 || d_rx > INSTANT_PAST) {
+	*late = inst_past(instant, cur) || (d == 0 && c->in_event) ||
+		(c->planned && (int32_t)(anchor_of(c, instant) - ll_radio_now()) <= 0);
+	if (inst_past(instant, rx_event)) {
 		request_end(c, LL_ST_INSTANT_PASSED);
 		return LL_ST_INSTANT_PASSED;
 	}
@@ -1114,16 +1207,18 @@ static int check_instant(struct ll_link *c, uint16_t rx_event, uint16_t instant,
  * one), catch up now. */
 static void late_replan(struct ll_link *c)
 {
+	uint16_t planned = c->counter;
+
+	ST(c)->late_instants++;
 	if (!c->planned) {
 		return;
 	}
 	chm_repend(c);
 	c->planned = false;
-	ST(c)->skipped -= c->skip_n;
 	c->csa = c->csa_base;
 	c->counter = c->skip_base;
 	c->skip_n = 0;
-	catch_up(c);
+	catch_up(c, planned);
 }
 
 /* A new instant for the planned event or one of the skipped events before
@@ -1430,6 +1525,10 @@ void ll_conn_get_stats_total(struct ll_conn_stats *s)
 		s->flash_paused += t->flash_paused;
 		s->flash_cut += t->flash_cut;
 		s->flash_kicks += t->flash_kicks;
+		s->late_instants += t->late_instants;
+		if (t->catch_up_steps_max > s->catch_up_steps_max) {
+			s->catch_up_steps_max = t->catch_up_steps_max;
+		}
 		if (t->rx_pause_streak_max > s->rx_pause_streak_max) {
 			s->rx_pause_streak_max = t->rx_pause_streak_max;
 		}

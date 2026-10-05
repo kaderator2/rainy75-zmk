@@ -24,10 +24,36 @@ static uint8_t ref_next(uint8_t *last, uint8_t hop, const uint8_t chm[5])
 	return used[unmapped % n];
 }
 
+/* ll_csa1_skip(n) leaves the state n ll_csa1_next() calls would */
+static void test_skip(void)
+{
+	static const uint32_t ns[] = {0, 1, 2, 36, 37, 38, 100, 1000, 4321, 65535};
+	static const uint8_t no0to9[5] = {0x00, 0xFC, 0xFF, 0xFF, 0x1F};
+
+	for (uint8_t hop = 5; hop <= 16; hop++) {
+		for (unsigned int i = 0; i < sizeof(ns) / sizeof(ns[0]); i++) {
+			struct ll_csa1 a, b;
+
+			ll_csa1_init(&a, hop, no0to9);
+			(void)ll_csa1_next(&a);
+			(void)ll_csa1_next(&a);
+			b = a;
+			for (uint32_t k = 0; k < ns[i]; k++) {
+				(void)ll_csa1_next(&a);
+			}
+			ll_csa1_skip(&b, ns[i]);
+			CHECK(b.last_unmapped == a.last_unmapped);
+			CHECK(ll_csa1_next(&b) == ll_csa1_next(&a));
+		}
+	}
+}
+
 int main(void)
 {
 	struct ll_csa1 c;
 	uint8_t last;
+
+	test_skip();
 
 	/* all channels used: sequence is k*hop mod 37 */
 	ll_csa1_init(&c, 5, all37);

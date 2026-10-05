@@ -30,6 +30,12 @@ void ll_csa1_set_map(struct ll_csa1 *c, const uint8_t chm[5])
 	}
 }
 
+void ll_csa1_skip(struct ll_csa1 *c, uint32_t n)
+{
+	c->last_unmapped = (uint8_t)((c->last_unmapped + (n % LL_DATA_CHANNELS) * c->hop) %
+				     LL_DATA_CHANNELS);
+}
+
 void ll_csa1_init(struct ll_csa1 *c, uint8_t hop, const uint8_t chm[5])
 {
 	c->hop = hop;

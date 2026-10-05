@@ -171,16 +171,17 @@ void ll_conn_radio_evt(enum ll_radio_evt evt, const uint8_t *pdu, uint16_t len, 
 /* Schedule LL_CONNECTION_UPDATE_IND / LL_CHANNEL_MAP_IND parameters for the
  * event with counter == instant. rx_event: the connection event the PDU
  * was received in (ll_rx_pdu.event). Return 0, or LL_ST_INSTANT_PASSED
- * when (instant - rx_event) mod 65536 is 0 or > 32767 (Vol 6 Part B 5.1.1,
- * 5.1.2; the connection is then terminated with 0x28). An instant whose
- * event has gone by since the reception (the controller thread handled
- * the PDU late: the instant is before the planned event, is the event on
- * air, or is a skipped event whose anchor has passed) is applied late: the
- * map from the instant event on, the new timing from the instant's old
- * anchor + WinOffset (transmit window repeated every new interval), and
- * the first event that can still be prepared is listened to; the events in
- * between count as missed. Without an active connection:
- * LL_ST_DISALLOWED. ll_conn_update_at checks the
+ * when (instant - rx_event) mod 65536 >= 32767 (Vol 6 Part B 5.5.1, "the
+ * instant is in the past"; the connection is then terminated with 0x28).
+ * An instant whose event has gone by since the reception (the controller
+ * thread handled the PDU late: the instant is before the planned event, is
+ * the event on air, which includes instant == rx_event, or is an event
+ * whose anchor has passed) is applied late: the map from the instant event
+ * on, the new timing from the instant's old anchor + WinOffset (transmit
+ * window repeated every new interval), and the first event that can still
+ * be prepared is listened to (stats: late_instants, catch_up_steps_max;
+ * the events in between count as missed unless they were latency skips).
+ * Without an active connection: LL_ST_DISALLOWED. ll_conn_update_at checks the
  * parameters first (interval 6..3200, latency <= 499, timeout 10..3200 and
  * > (1 + latency) * interval * 2, WinSize 1..min(8, interval - 1), WinOffset
  * <= interval) and returns LL_ST_INVALID_LL_PARAM for invalid ones without
@@ -320,6 +321,14 @@ struct ll_conn_stats {
 	/* re-plans by ll_conn_flash_kick() (not counted in kicks, which are
 	 * the TX kicks) */
 	uint32_t flash_kicks;
+	/* Late instants (handled after their event went by, applied by
+	 * catch_up): how many, and the most open_of() evaluations one catch_up
+	 * needed (the bound of its work with the lock held; a maximum, also in
+	 * the totals). Events catch_up steps over count in missed, except
+	 * those that were latency skips of the planned window (they stay in
+	 * skipped). */
+	uint32_t late_instants;
+	uint32_t catch_up_steps_max;
 };
 /* Per link, cumulative since boot (not reset per connection). Out-of-range
  * link: all zero. */
