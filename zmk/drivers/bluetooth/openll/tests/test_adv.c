@@ -23,7 +23,7 @@ uint32_t ll_radio_now(void) { return now_tick; }
 void ll_radio_set_adv_channel(uint8_t ch) { radio_ch = ch; }
 void ll_radio_tx_then_rx(const uint8_t *p, uint8_t l, uint32_t t, uint32_t w)
 { (void)w; memcpy(tx_pdu, p, l); tx_len = l; tx_start = t; txrx_calls++; }
-void ll_radio_prepare_rsp(const uint8_t *p, uint8_t l) { memcpy(rsp_pdu, p, l); rsp_len = l; }
+void ll_radio_prepare_rsp(const uint8_t *p, uint8_t l) { if (p) { memcpy(rsp_pdu, p, l); } rsp_len = l; }
 bool ll_radio_tx_rsp_at(uint32_t t) { rsp_tick = t; rsp_calls++; return rsp_ok; }
 void ll_radio_stop(void) { radio_stops++; }
 void ll_sched_init(void) {}
@@ -612,6 +612,9 @@ int main(void)
 	CHECK(ll_adv_enable(true) == LL_ST_SUCCESS);
 	fire_sched();
 	CHECK(radio_ch == 37 && tx_pdu[0] == LL_PDU_ADV_NONCONN_IND);
+	/* the radio answers SCAN_REQs by itself (ll_radio_prepare_rsp): a
+	 * non-scannable event must leave no SCAN_RSP armed from before */
+	CHECK(rsp_len == 0);
 	ll_adv_radio_evt(LL_RADIO_RX_OK, req, 14, 8000000);
 	CHECK(rsp_calls == 1);
 	CHECK(radio_ch == 39);

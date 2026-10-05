@@ -117,6 +117,7 @@ Zephyr or hardware dependencies and is tested on the host with gcc.
 | `ll_glue.c` | Implements `b91_bt.h`. Init (TRNG, MAC, radio, scheduler, AES self-test), controller thread, ACL in and out, HCI flow control (Number Of Completed Packets), connection and disconnection handling, platform hooks (`ll_plat.h`), periodic statistics |
 | `ll_hci.c` / `.h` | HCI command parser and dispatcher, Command Complete/Status builders, all events toward the host (LE Connection Complete, Disconnection Complete, Number Of Completed Packets, LE LTK Request, Encryption Change, LE Connection Update Complete), ACL framing |
 | `ll_pdu.c` / `.h` | Advertising PDUs and SCAN_RSP, SCAN_REQ match, CONNECT_IND parsing |
+| `ll_scanrsp.h` | SCAN_REQ -> SCAN_RSP decision and STX trigger tick, inline for the RX ISR in RAM |
 | `ll_adv.c` / `.h` | Advertising state machine; hands a CONNECT_IND for us to `ll_conn_start()` |
 | `ll_conn.c` / `.h` | Connection state machine: transmit window, window widening, anchor re-sync, event counter, CSA #1 channel, instants (connection update, channel map), supervision timeout, termination |
 | `ll_csa1.c` / `.h` | Channel Selection Algorithm #1 |
@@ -467,10 +468,9 @@ documentation. They may help anyone writing a B91 link layer.
 
 - **BRX turnaround.** The BRX command (`0x80140a00 = 0x82`, register sequence of
   hal `rf_start_brx()`) receives and answers in hardware. TX settle 86 us gives
-  an on-air T_IFS of 148/149 us, like the blob. A software-triggered TX cannot
-  meet T_IFS: the RX IRQ arrives 19 to 57 us after the packet end and the TX
-  path adds about 59 us plus settle (the SCAN_RSP of slice 1 lands at about
-  209 us).
+  an on-air T_IFS of 148/149 us, like the blob. BRX (and RX2TX) answer
+  whatever they receive, so they are not used for SCAN_RSP (see "SCAN_RSP
+  timing" below).
 - **Chaining and MD.** One BRX command chains RX/TX exchanges while either side
   has MD. Our MD bit comes from the TX FIFO occupancy, not from the buffer.
 - **SN/NESN in hardware.** The baseband sets SN and NESN on air. Before every
@@ -515,9 +515,9 @@ documentation. They may help anyone writing a B91 link layer.
   2M and Coded PHY, Data Length Extension, LL privacy (LE Set Random Address,
   RPA), LE Ping (answered with LL_UNKNOWN_RSP, which the tested central
   accepts), encryption pause and key refresh, multiple connections.
-- **SCAN_RSP is about 59 us late** (T_IFS about 209 us, software timed), and a
-  response whose trigger would be too late is skipped. Discovery is not
-  affected: the name is in ADV_IND.
+- **A SCAN_REQ whose RX interrupt comes too late is not answered** (about 1 %
+  in the measurement, counted in `rsp_late`); the scanner retries. Discovery
+  is not affected: the name is in ADV_IND.
 - **About 3 % of the responses have a T_IFS above 152 us** (first exchange of
   an event, cause unknown). The tested central accepts them; stricter centrals
   might not.
@@ -681,18 +681,31 @@ Builds and runs with the host gcc (`-Wall -Wextra -Werror`):
 | `test_conn` | Connection timing (transmit window, widening, anchor rule), instants, supervision, termination, RX queue loss |
 | `test_llcp` | Every LLCP PDU, encryption start, lock discipline (no AES under the IRQ lock) |
 
-## Slice 1 notes: SCAN_RSP turnaround
+## SCAN_RSP timing (slice 7)
 
-The advertising SCAN_RSP is software timed: the RX IRQ parses the SCAN_REQ and
-starts a single TX with `rf_start_stx()` at `packet end + 150 us - 78 us` TX
-settle. On air it starts about 209 us after the SCAN_REQ (59 us late), measured
-indirectly with the sniffer: SCAN_REQ end to the next ADV on channel 38 is
-577 us, SCAN_RSP start to the next ADV start 368 us. An attempt with the
-hardware RX->TX turnaround on the advertising path (FSM `0x88`) sent nothing
-within the timebox. A response whose TX trigger would be less than 10 us ahead
-is not started (`rsp_late`), so the advertising state machine cannot stall on a
-trigger in the past. Scanners back off after missing responses, which does not
-matter here because the name is in ADV_IND.
+The RX interrupt answers a SCAN_REQ itself, before the link layer callback:
+a CRC-valid SCAN_REQ for the AdvA and TxAdd of the prepared SCAN_RSP gets a
+single scheduled TX (`rf_start_stx()`, TX settle 50 us) triggered 41 us after
+the request's end, so the first bit is on air 150 us after the request
+(trigger + settle + a fixed 59 us TX path delay, measured). The decision and
+the trigger run from RAM (`.ram_code`, `ll_scanrsp.h` inline): through the
+callback chain, or with flash-resident helpers, the decision came 50 to 90 us
+after the request, too late. The CPU then holds on the cycle counter until the
+response is on air, which removes a 2 to 5 us jitter of the TX start (as in
+the connection turnaround). A decision later than 3 us before the trigger is
+not answered (`rsp_late`). Nothing else is ever answered.
+
+Why not the hardware turnaround: BRX and RX2TX transmit after whatever they
+receive (a CONNECT_IND, another advertiser's SCAN_REQ). Only a CPU veto in the
+RX interrupt could stop that, and the interrupt can be held off by
+interrupt-locked sections (a flash erase takes 13 to 26 ms), so the controller
+would sometimes answer a packet it must not answer. The scheduled TX fails
+safe: no answer unless the CPU decided in time.
+
+Before slice 7 the RX interrupt reached the decision through the link layer
+callbacks 60 to 90 us after the request and triggered with the hal's settle of
+78 us: on air at about 209 us, outside the scanner's window (the tested Intel
+scanner never took one; it takes the 150 us responses).
 
 ## Roadmap
 

@@ -21,6 +21,7 @@ build_run test_csa2 ../ll_csa2.c
 build_run test_crypt ../ll_crypt.c aes_ref.c
 build_run test_radio_mode ../ll_radio_mode.c
 build_run test_fifo
+build_run test_scanrsp ../ll_pdu.c
 # Suites with per-link state run for LL_MAX_CONN 1, 3 and 5 (slice 6a):
 # binaries <test>_n<N>.
 for n in 1 3 5; do

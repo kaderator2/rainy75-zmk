@@ -79,8 +79,8 @@ LOG_MODULE_DECLARE(openll, CONFIG_BT_HCI_DRIVER_LOG_LEVEL);
  *   ADV_IND, 37-byte payload: (1 + 4 + 2 + 37 + 3) * 8 us         376
  *   T_IFS + SCAN_REQ (12-byte payload, 176 us) or CONNECT_IND
  *   (34-byte payload, 352 us)                               150 + 352
- *   SCAN_RSP: measured 209 us after the request ends + 376 us     585
- *   sum 2017 (SCAN_REQ: 1841; RX window only, no request: 1230)
+ *   SCAN_RSP: 150 us after the request ends + 376 us              526
+ *   sum 2017 (SCAN_REQ: 1782; RX window only, no request: 1230)
  * A CONNECT_IND ends the event (the link's first event lies at least
  * 1.25 ms later), so the SCAN_RSP case bounds the span: 2000 us
  * (ADV_RX_WINDOW_US 300 > T_IFS + the 40 us until a request's access
@@ -409,8 +409,12 @@ void ll_adv_arb_start(uint32_t cap_us)
 	}
 	if (!adv.in_event) {
 		adv.stats.events++;
+		/* the radio answers SCAN_REQs for the prepared SCAN_RSP by
+		 * itself: none for a non-scannable type */
 		if (scannable()) {
 			ll_radio_prepare_rsp(adv.rsp_pdu, adv.rsp_pdu_len);
+		} else {
+			ll_radio_prepare_rsp(NULL, 0);
 		}
 		adv.ch_idx = 0;
 		while (!(adv.prm.chan_map & (1 << adv.ch_idx))) {
@@ -602,6 +606,7 @@ void ll_adv_radio_evt(enum ll_radio_evt evt, const uint8_t *pdu, uint8_t len,
 	}
 	if (evt == LL_RADIO_RX_OK) {
 		if (scannable() && ll_pdu_is_scan_req_for(pdu, len, adv.use_a, adv.use_tx_add)) {
+			/* the radio's RX ISR has already decided (ll_radio.h) */
 			if (ll_radio_tx_rsp_at(end_tick + LL_T_IFS_US * LL_TICKS_PER_US)) {
 				return; /* continue on LL_RADIO_TX_DONE */
 			}

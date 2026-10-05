@@ -63,11 +63,16 @@ void ll_radio_set_adv_channel(uint8_t ch);   /* 37..39; adv AA + CRC init */
  * baseband restore if no end IRQ comes (also for ll_radio_tx_rsp_at). */
 void ll_radio_tx_then_rx(const uint8_t *pdu, uint8_t len, uint32_t start_tick,
 			 uint32_t rx_window_us);
-/* Pre-load the response buffer (SCAN_RSP), so the IFS path only triggers. */
+/* Prepare the SCAN_RSP of the advertising set (pdu NULL / len 0: none).
+ * The radio answers in its RX ISR, before the LL_RADIO_RX_OK callback,
+ * every CRC-valid SCAN_REQ for the AdvA and TxAdd of this PDU (and nothing
+ * else) with the response's first bit on air T_IFS after the request
+ * (ll_scanrsp.h), as long as that is still possible when the ISR runs. */
 void ll_radio_prepare_rsp(const uint8_t *pdu, uint8_t len);
-/* Send the prepared response so that its first bit is on air at tick.
- * Returns false (and starts nothing, so no LL_RADIO_TX_DONE follows) when
- * the TX trigger tick is already too close or in the past. */
+/* From the LL_RADIO_RX_OK callback of a SCAN_REQ for us: true when the RX
+ * ISR has started the SCAN_RSP for it (on air at tick, T_IFS after the
+ * request; LL_RADIO_TX_DONE follows), false when it was too late (counted
+ * in rsp_late; nothing was sent, no LL_RADIO_TX_DONE). */
 bool ll_radio_tx_rsp_at(uint32_t tick);
 void ll_radio_stop(void);
 /* Before SoC poweroff (device only): stop the FSM, clear all RF IRQ masks and
@@ -165,7 +170,7 @@ struct ll_radio_stats {
 	uint32_t rx_crc;
 	uint32_t rx_timeout;
 	uint32_t rsp_tx;     /* SCAN_RSP TX triggered (not confirmed sent) */
-	uint32_t rsp_late;   /* SCAN_RSP refused: trigger tick too late */
+	uint32_t rsp_late;   /* SCAN_REQ for us not answered: the RX ISR ran too late */
 	/* Connection mode */
 	uint32_t conn_events;   /* BRX commands issued */
 	uint32_t conn_rx;       /* CRC-valid packets (CRC-bad ones count in rx_crc) */

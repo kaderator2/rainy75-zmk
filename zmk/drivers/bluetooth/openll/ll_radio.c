@@ -40,6 +40,14 @@
  *   init bit is programmed by ll_txq before every BRX.
  * - The event ends with CMD_DONE, FIRST_TIMEOUT (nothing received) or
  *   RX_TIMEOUT; a guard alarm on the stimer ends it if none of them comes.
+ *
+ * SCAN_RSP (slice 7 Task 2 item 1, ll_scanrsp.h): the RX ISR answers a
+ * SCAN_REQ for us itself, first thing in the ISR, with a scheduled STX at
+ * a 41 us trigger lead and a 50 us TX settle (first bit on air 150 us after
+ * the request); the link layer callback only learns the decision
+ * (ll_radio_tx_rsp_at). Through the callback chain the decision came 60..90
+ * us after the request, too late for that (the former trigger, 72 us after
+ * the request with settle 78, put the response on air at 209 us).
  */
 #include <string.h>
 #include <zephyr/kernel.h>
@@ -59,6 +67,7 @@
 #include "ll_radio.h"
 #include "ll_radio_mode.h"
 #include "ll_sched.h"
+#include "ll_scanrsp.h"
 
 LOG_MODULE_DECLARE(openll, CONFIG_BT_HCI_DRIVER_LOG_LEVEL);
 
@@ -70,12 +79,9 @@ LOG_MODULE_DECLARE(openll, CONFIG_BT_HCI_DRIVER_LOG_LEVEL);
  * canary behind entry 3 was never touched. Kept as a small margin. */
 #define RX_BUF_SIZE            32
 #define ADV_RX_MAXLEN          37
-/* Settle times from ext_rf.h (LL_TX_STL_ADV_1M, LL_SCANRSP_TX_SETTLE). */
+/* Settle time from ext_rf.h (LL_TX_STL_ADV_1M); the SCAN_RSP settle and
+ * trigger lead are in ll_scanrsp.h. */
 #define TX_SETTLE_ADV_US       84
-#define TX_SETTLE_RSP_US       78
-/* Refuse a SCAN_RSP whose TX trigger tick is closer than this to now: a
- * trigger in the past would leave the FSM waiting and stall advertising. */
-#define RSP_MIN_LEAD_TICKS     (10 * LL_TICKS_PER_US)
 #define POWER_INDEX_0DBM       11   /* same index the blob shim uses, about 0 dBm */
 
 /* Connection mode */
@@ -143,6 +149,11 @@ BUILD_ASSERT(RX_ENTRY_SIZE % 16 == 0 && RX_ENTRY_SIZE >= 4 + 4 * ((CONN_RX_MAXLE
 	     "RX entry: the DMA write extent of a full packet (dle-spike-report S2)");
 static ll_radio_cb_t radio_cb;
 static volatile bool rsp_in_flight;
+/* Prepared SCAN_RSP PDU length in rsp_buf (0: none, nothing is answered) */
+static uint8_t rsp_len;
+/* The RX ISR's SCAN_RSP decision for the packet being reported, read once
+ * by ll_radio_tx_rsp_at() from the callback */
+static bool rsp_started;
 /* An advertising TX/RX (tx_then_rx, or a SCAN_RSP) whose end IRQ is
  * pending; the adv guard recovers if it never comes. */
 static volatile bool adv_open;
@@ -207,6 +218,34 @@ static uint16_t tx_ptrs(void)
 	return (uint16_t)(rf_get_tx_rptr(0) << 8) | rf_get_tx_wptr(0);
 }
 
+/* CPU hold: busy wait on the CPU cycle counter (a CSR, no bus access). */
+#define CPU_HZ        DT_PROP(DT_PATH(cpus, cpu_0), clock_frequency)
+#define CYC_PER_TICK  (CPU_HZ / (LL_TICKS_PER_US * 1000000))
+BUILD_ASSERT(CYC_PER_TICK >= 1 && CPU_HZ % (LL_TICKS_PER_US * 1000000) == 0,
+	     "CPU clock: a whole number of cycles per stimer tick");
+
+/* SCAN_RSP hold: until this long after the response's first bit is due on
+ * air. hold_until() never waits longer than HOLD_UNTIL_MAX_US (a bogus
+ * tick holds nothing). */
+#define RSP_HOLD_PAST_US       10
+#define HOLD_UNTIL_MAX_US      200
+
+_attribute_ram_code_sec_noinline_ static void hold_until(uint32_t tick)
+{
+	int32_t left = (int32_t)(tick - stimer_get_tick());
+	uint32_t c0, n;
+
+	if (left <= 0 || left > HOLD_UNTIL_MAX_US * LL_TICKS_PER_US) {
+		return;
+	}
+	c0 = csr_read(mcycle);
+	n = (uint32_t)left * CYC_PER_TICK;
+	while (csr_read(mcycle) - c0 < n) {
+	}
+}
+
+static void adv_guard(void);
+
 /* ---- advertising mode ISR ---- */
 
 static uint8_t *rx_entry(uint8_t idx)
@@ -214,14 +253,58 @@ static uint8_t *rx_entry(uint8_t idx)
 	return &rx_buf[(idx & (RING_N - 1)) * RX_ENTRY_SIZE];
 }
 
-static void adv_isr(uint16_t st)
+/* SCAN_REQ -> SCAN_RSP, first thing in the RF ISR (file header,
+ * ll_scanrsp.h): a CRC-valid SCAN_REQ for the AdvA of the prepared SCAN_RSP
+ * gets the STX at once, when the trigger can still be met; anything else,
+ * and a late decision, gets nothing. The CPU then holds on the cycle counter
+ * until the response is on air: CPU work (flash fetches of the callback
+ * chain) while the TX starts delays it by a few us, as in the connection
+ * turnaround (slice 6b Task 4 review). Returns true if the response was
+ * started; the adv guard covers it like any adv TX. */
+_attribute_ram_code_sec_noinline_ static bool adv_rsp_isr(void)
 {
-	if (adv_open && ((st & (FLD_RF_IRQ_RX | FLD_RF_IRQ_RX_TIMEOUT | FLD_RF_IRQ_FIRST_TIMEOUT)) ||
-			 ((st & FLD_RF_IRQ_TX) && rsp_in_flight))) {
-		/* ended (a SCAN_RSP re-opens it from the callback below): drop
-		 * the adv guard, so no stimer IRQ per adv channel. In adv mode
-		 * the guard slot can only hold the adv guard (a connection
-		 * event arms its own guard when it is issued). */
+	uint8_t hw = rf_get_rx_wptr() & RX_WPTR_MASK;
+	uint8_t *p = rx_entry((uint8_t)(hw - 1));
+	uint8_t plen = p[DMA_RFRX_OFFSET_RFLEN];
+	uint32_t trigger, ts;
+
+	if (rsp_len == 0 || hw == cn.rx_sw || !RF_BLE_PACKET_VALIDITY_CHECK(p) ||
+	    !ll_scanrsp_for_us(&rsp_buf[4], rsp_len, &p[DMA_RFRX_OFFSET_HEADER],
+			       (uint8_t)(plen + 2))) {
+		return false;
+	}
+	ts = ll_get_le32(&p[DMA_RFRX_OFFSET_TIME_STAMP(p)]);
+	if (!ll_scanrsp_trigger(ts + RX_TS_TO_END_TICKS(plen), stimer_get_tick(), &trigger)) {
+		atomic_inc(&cnt_rsp_late);
+		return false;
+	}
+	rsp_in_flight = true;
+	adv_open = true;
+	rf_tx_settle_us(LL_SCANRSP_SETTLE_US);
+	rf_start_stx(rsp_buf, trigger);
+	ll_sched_guard_at(trigger + ADV_RSP_GUARD_US * LL_TICKS_PER_US, adv_guard);
+	atomic_inc(&cnt_rsp_tx);
+	hold_until(trigger + (LL_SCANRSP_SETTLE_US + LL_SCANRSP_TX_PATH_US + RSP_HOLD_PAST_US) *
+			     LL_TICKS_PER_US);
+	return true;
+}
+
+_attribute_ram_code_sec_noinline_ static void adv_isr(uint16_t st)
+{
+	bool rsp = false;
+
+	if ((st & FLD_RF_IRQ_RX) && adv_open && !rsp_in_flight) {
+		rsp = adv_rsp_isr();
+	}
+	rsp_started = rsp;
+	if (!rsp && adv_open &&
+	    ((st & (FLD_RF_IRQ_RX | FLD_RF_IRQ_RX_TIMEOUT | FLD_RF_IRQ_FIRST_TIMEOUT)) ||
+	     ((st & FLD_RF_IRQ_TX) && rsp_in_flight))) {
+		/* ended (a SCAN_RSP started above keeps it open with its own
+		 * guard): drop the adv guard, so no stimer IRQ per adv
+		 * channel. In adv mode the guard slot can only hold the adv
+		 * guard (a connection event arms its own guard when it is
+		 * issued). */
 		adv_open = false;
 		if (!cn.evt_open) {
 			ll_sched_guard_cancel();
@@ -300,10 +383,6 @@ static void adv_isr(uint16_t st)
  * for the event's first packet (the chained exchanges are not held); it
  * costs up to about 160 us of CPU per event with a received packet (about
  * 2 % at a 7.5 ms interval under load, nothing in skipped events). */
-#define CPU_HZ        DT_PROP(DT_PATH(cpus, cpu_0), clock_frequency)
-#define CYC_PER_TICK  (CPU_HZ / (LL_TICKS_PER_US * 1000000))
-BUILD_ASSERT(CYC_PER_TICK >= 1 && CPU_HZ % (LL_TICKS_PER_US * 1000000) == 0,
-	     "CPU clock: a whole number of cycles per stimer tick");
 #define HOLD_TO_US    170
 #define HOLD_MAX_US   200
 
@@ -311,9 +390,8 @@ static bool hold_turnaround(const uint8_t *p)
 {
 	uint8_t plen = p[DMA_RFRX_OFFSET_RFLEN];
 	uint32_t ts = ll_get_le32(&p[DMA_RFRX_OFFSET_TIME_STAMP(p)]);
-	int32_t left = (int32_t)(ts + RX_TS_TO_END_TICKS(plen) + HOLD_TO_US * LL_TICKS_PER_US -
-				 ll_radio_now());
-	uint32_t c0, n;
+	uint32_t until = ts + RX_TS_TO_END_TICKS(plen) + HOLD_TO_US * LL_TICKS_PER_US;
+	int32_t left = (int32_t)(until - ll_radio_now());
 
 	if (left > HOLD_MAX_US * LL_TICKS_PER_US) {
 		return false;   /* a bogus timestamp */
@@ -322,10 +400,7 @@ static bool hold_turnaround(const uint8_t *p)
 		return true;    /* our TX has started already (late IRQ) */
 	}
 	atomic_inc(&cnt_holds);
-	c0 = csr_read(mcycle);
-	n = (uint32_t)left * CYC_PER_TICK;
-	while (csr_read(mcycle) - c0 < n) {
-	}
+	hold_until(until);
 	return true;
 }
 
@@ -532,7 +607,7 @@ static void conn_isr(uint16_t st)
 	}
 }
 
-static void rf_isr(const void *arg)
+_attribute_ram_code_sec_noinline_ static void rf_isr(const void *arg)
 {
 	uint16_t st = reg_rf_irq_status;
 
@@ -623,26 +698,27 @@ void ll_radio_tx_then_rx(const uint8_t *pdu, uint8_t len, uint32_t start_tick,
 
 void ll_radio_prepare_rsp(const uint8_t *pdu, uint8_t len)
 {
-	load(rsp_buf, pdu, len);
+	unsigned int key = irq_lock();
+
+	/* the RX ISR matches SCAN_REQs against rsp_buf: no half-written PDU */
+	if (pdu == NULL || len < 2 || len > DMA_BUF_SIZE - 4) {
+		rsp_len = 0;
+	} else {
+		load(rsp_buf, pdu, len);
+		rsp_len = len;
+	}
+	irq_unlock(key);
 }
 
-/* Measured: the SCAN_RSP reaches the air about 209 us after the SCAN_REQ
- * ends (59 us late), from a fixed delay in the TX path. */
 bool ll_radio_tx_rsp_at(uint32_t tick)
 {
-	uint32_t trigger_tick = tick - TX_SETTLE_RSP_US * LL_TICKS_PER_US;
+	/* The RX ISR decided before this callback (adv_rsp_isr), aiming at
+	 * the same tick (T_IFS after the request's end). */
+	bool started = rsp_started;
 
-	if ((int32_t)(trigger_tick - ll_radio_now()) < RSP_MIN_LEAD_TICKS) {
-		atomic_inc(&cnt_rsp_late);
-		return false;
-	}
-	rsp_in_flight = true;
-	rf_tx_settle_us(TX_SETTLE_RSP_US);
-	atomic_inc(&cnt_rsp_tx);
-	adv_open = true;
-	rf_start_stx(rsp_buf, trigger_tick);
-	ll_sched_guard_at(trigger_tick + ADV_RSP_GUARD_US * LL_TICKS_PER_US, adv_guard);
-	return true;
+	ARG_UNUSED(tick);
+	rsp_started = false;
+	return started;
 }
 
 void ll_radio_get_stats(struct ll_radio_stats *s)
