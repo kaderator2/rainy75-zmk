@@ -448,23 +448,29 @@ decryption, and cooperative host work held that thread off for 70 to 220 ms
 at exactly that moment (a GATT client connect triggers settings stores whose
 NVS reads run in the system work queue, about 1 s later, when the update
 instant comes). Judged against the event counter at handling time, the
-instant had passed and the link ended with 0x28 (Instant Passed) in 8 of 19
+instant had passed and the link ended with 0x28 (Instant Passed) in 11 of 28
 client connects (debug log: received in event 2609, instant 2615, handled
 with event 2619 planned).
 
-The spec judges an instant against the event the PDU was received in. ll_rxq
-keeps that event with every PDU (`ll_rx_pdu.event`), ll_llcp hands it to
-`ll_conn_update_at()` / `ll_conn_chmap_at()`, and 0x28 is reported only for an
-instant at or before that event. An instant whose event has gone by since the
-reception is applied late (`catch_up()` in `ll_conn.c`): the map from the
+The spec judges an instant against the event the PDU was received in (Vol 6
+Part B 5.5.1: passed when (Instant - connEventCount) mod 65536 >= 32767).
+ll_rxq keeps that event with every PDU (`ll_rx_pdu.event`), ll_llcp hands it
+to `ll_conn_update_at()` / `ll_conn_chmap_at()`, and 0x28 is reported only for
+an instant before that event. An instant whose event has gone by since the
+reception (also one equal to the reception event, which was issued with the
+old values) is applied late (`catch_up()` in `ll_conn.c`): the map from the
 instant event on, the new timing from the old anchor of the instant event
 plus WinOffset (the transmit window repeats every new interval), and the
-first event that can still be prepared is listened to; the events in between
-count as missed. After the fix: no 0x28 in 130 client connects (the late path
-was taken in 7 of 20 logged ones, handled 14 to 25 events after the
-reception), and none in 5 minutes of CCC toggles with SMP echo load. One of
-the 130 connects ended with 0x08 after 5.4 s without any log output; its
-cause is open.
+first event that can still be prepared is listened to, with the instant
+event's MUST priority. The catch-up jumps arithmetically (CSA #1 advanced by
+`ll_csa1_skip()`, the target from the elapsed time), so its work with the lock
+held is at most a few `open_of()` evaluations however long the stall
+(`catch_up_steps_max`). Stepped-over events count as missed, except those
+that were latency skips of the planned window. After the fix: 0 of 140
+client connects ended with 0x28 (the late path was taken in 7 of 20 logged
+ones, handled 14 to 25 events after the reception), and none in 5 minutes of
+CCC toggles with SMP echo load. One of the 140 connects ended with 0x08
+after 5.4 s without any log output; its cause is open.
 
 ### Late events
 
