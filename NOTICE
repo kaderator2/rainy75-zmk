@@ -8,7 +8,9 @@ under the Apache License, Version 2.0 (see the LICENSE file).
 Third-party components fetched at build time (NOT included in this repository)
 ================================================================================
 
-No third-party code is redistributed in this repository. The build fetches it:
+No third-party code is redistributed in this repository. The build fetches it.
+The default firmware image (open Bluetooth LE controller) contains no proprietary
+code: everything it links is this project's own code or open source listed here.
 
   ZMK Firmware   MIT          https://github.com/zmkfirmware/zmk
   Zephyr RTOS    Apache-2.0   https://github.com/zephyrproject-rtos/zephyr
@@ -16,14 +18,16 @@ No third-party code is redistributed in this repository. The build fetches it:
   hal_telink     Apache-2.0   https://github.com/telink-semi/hal_telink
     (the above are fetched by `west`, per zmk/west.yml)
 
-  Telink B91 Bluetooth LE controller library — liblt_9518_zephyr.a
+  Telink B91 Bluetooth LE controller library, liblt_9518_zephyr.a
+  (OPTIONAL, only for `./build.sh --blob`; the default build does not use it)
     Source:    https://github.com/telink-semi/zephyr_hal_telink_b91_ble_lib
     Copyright (c) Telink Semiconductor (Shanghai) Co., Ltd.
-    License:   PROPRIETARY — confidential, non-transferable, granted under NDA;
+    License:   PROPRIETARY: confidential, non-transferable, granted under NDA;
                NOT redistributable. This repository therefore does NOT contain
-               the blob. `fetch_ble_blob.sh` downloads it at build time (pinned
-               commit + SHA-256 verified) from Telink's own public repository,
-               and links it unmodified.
+               the blob. Only with `--blob` does `fetch_ble_blob.sh` download it
+               at build time (pinned commit + SHA-256 verified) from Telink's own
+               public repository, and the build links it unmodified. An image
+               built with `--blob` embeds the blob and must not be redistributed.
 
 ================================================================================
 Intentionally NOT included (proprietary / copyrighted third-party material)

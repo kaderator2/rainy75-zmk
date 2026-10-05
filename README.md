@@ -49,10 +49,11 @@ Two things in one repository:
 Honest expectations first — this is an **enthusiast, build-it-yourself** project, not a
 one-click flasher:
 
-- **You build it from source.** There's no prebuilt download: the firmware links a
-  proprietary Telink BLE blob that can't be redistributed, so everyone builds locally (the
-  build fetches the blob for you). Expect a real Zephyr toolchain setup — Zephyr SDK 0.17.0
-  + west; see [INSTALL.md](INSTALL.md#4-build-from-source).
+- **You build it from source.** There's no prebuilt download yet. The default build uses
+  the project's own open Bluetooth LE controller and contains no proprietary code; the
+  Telink BLE blob is only fetched (at build time, never redistributed) when you opt in with
+  `./build.sh --blob`. Expect a real Zephyr toolchain setup: Zephyr SDK 0.17.0 + west; see
+  [INSTALL.md](INSTALL.md#4-build-from-source).
 - **Linux only.** The install/restore helpers are bash + [`mcumgr`](https://github.com/apache/mynewt-mcumgr-cli)
   (`/dev/ttyACM*`, udev rules). macOS/Windows aren't covered yet.
 - **Comfortable in a terminal.** You'll build, install `mcumgr`, add udev rules, and run
@@ -139,7 +140,9 @@ read on their own.
 A Zephyr module under [`zmk/`](zmk/) provides everything the Rainy 75 needs that isn't
 upstream yet — written as out-of-tree drivers so it survives ZMK upgrades:
 
-- **BLE HCI driver** around Telink's BLE controller blob (peripheral HID-over-GATT)
+- **Open Bluetooth LE controller** (peripheral link layer on hal_telink's `rf.c`, the
+  default; see [docs/open-ble-controller.md](docs/open-ble-controller.md)) behind an HCI
+  driver that can still use Telink's BLE controller blob as an opt-in (`./build.sh --blob`)
 - **USB device driver** (legacy `usb_dc` API) — HID + CDC-ACM console
 - **WS2812 LED-strip driver** — PSPI + DMA, interrupt-driven, drives the 83 per-key LEDs
 - **Battery ADC**, **hardware watchdog**, and **deep-sleep** power management
@@ -194,12 +197,12 @@ zmk/                  # Our Zephyr module: board def, out-of-tree drivers, rainy
   boards/rainy75/     # Board definition (DTS, keymap, defconfig)
   drivers/            # BLE / USB / LED-strip / battery / watchdog drivers
   src/rainy_rgb/      # Custom RGB lighting engine
-  lib/                # Telink BLE blob — fetched by fetch_ble_blob.sh, not committed
+  lib/                # Telink BLE blob, only for --blob builds: fetched by fetch_ble_blob.sh, not committed
 conf/                 # Build configuration overlays (app / mcuboot / ota-bridge)
 patches/             # Small Zephyr patches (applied by west)
 docs/                 # Reverse-engineering writeups + firmware docs
 reverse/tools/        # USB/HID tools: OTA flasher, VIA probes, stock-firmware extractor, SWS helper
-fetch_ble_blob.sh     # Downloads the (non-redistributable) Telink BLE blob at build time
+fetch_ble_blob.sh     # Downloads the (non-redistributable) Telink BLE blob, only for ./build.sh --blob
 install_zmk.sh        # Stock → ZMK (OTA bridge + mcumgr)
 restore_stock.sh      # ZMK → stock
 build.sh              # Build MCUboot + app (+ combined / bridge)
@@ -244,8 +247,10 @@ repo — point Claude Code at it and go.
 
 - Firmware built on [ZMK](https://github.com/zmkfirmware/zmk) (MIT) and
   [Zephyr](https://github.com/zephyrproject-rtos/zephyr) (Apache-2.0).
-- The Bluetooth controller blob is **fetched at build time** from
-  [telink-semi](https://github.com/telink-semi) — it is proprietary and **not
+- The default firmware image uses the project's own open Bluetooth LE controller and
+  contains **no proprietary code**. The optional Telink controller blob is only used with
+  `./build.sh --blob`; it is then **fetched at build time** from
+  [telink-semi](https://github.com/telink-semi). It is proprietary and **not
   redistributed here** (see [NOTICE](NOTICE)).
 - This project's own code and documentation are licensed under **Apache-2.0**
   ([LICENSE](LICENSE)).

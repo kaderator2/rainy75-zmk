@@ -21,9 +21,10 @@ The full toolchain is described in [docs/zmk-firmware.md](docs/zmk-firmware.md).
 - **Zephyr SDK 0.17.0** (exactly) at `toolchain/zephyr-sdk-0.17.0`.
 - A west workspace using `zmk/west.yml` as the manifest (ZMK + `hal_telink` + MCUboot are
   fetched at **pinned** revisions for reproducibility), plus a `.venv`.
-- The proprietary **Telink BLE blob** is not in the repo; `build.sh` fetches it
-  (`fetch_ble_blob.sh`, pinned + SHA-256 verified). Don't commit it — `.gitignore` covers
-  `zmk/lib/*.a` (see [NOTICE](NOTICE)).
+- The default build uses the open BLE controller and no blob. The proprietary **Telink
+  BLE blob** is not in the repo; only `./build.sh --blob` fetches it (`fetch_ble_blob.sh`,
+  pinned + SHA-256 verified). Don't commit it: `.gitignore` covers `zmk/lib/*.a` (see
+  [NOTICE](NOTICE)).
 
 Build and test:
 
