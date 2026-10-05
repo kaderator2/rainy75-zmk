@@ -179,15 +179,17 @@ static struct {
 	struct ll_conn_params p;
 	uint8_t chm[5];
 	uint8_t term_reason, end_reason;
+	uint16_t rx_event;   /* rx_event of the last update_at / chmap_at */
 } cnl[LL_MAX_CONN];
 #define cn (cnl[L])
 
 /* link-aware ll_conn fakes */
 
-int ll_conn_update_at(uint8_t link, uint16_t instant, uint8_t win_size, uint16_t win_offset,
-			const struct ll_conn_params *p)
+int ll_conn_update_at(uint8_t link, uint16_t rx_event, uint16_t instant, uint8_t win_size,
+		      uint16_t win_offset, const struct ll_conn_params *p)
 {
 	CHECK(link < LL_MAX_CONN);
+	cnl[link].rx_event = rx_event;
 	cnl[link].upd_calls++;
 	cnl[link].instant = instant;
 	cnl[link].win_size = win_size;
@@ -195,9 +197,10 @@ int ll_conn_update_at(uint8_t link, uint16_t instant, uint8_t win_size, uint16_t
 	cnl[link].p = *p;
 	return cnl[link].upd_ret;
 }
-int ll_conn_chmap_at(uint8_t link, uint16_t instant, const uint8_t chm[5])
+int ll_conn_chmap_at(uint8_t link, uint16_t rx_event, uint16_t instant, const uint8_t chm[5])
 {
 	CHECK(link < LL_MAX_CONN);
+	cnl[link].rx_event = rx_event;
 	cnl[link].chm_calls++;
 	cnl[link].instant = instant;
 	memcpy(cnl[link].chm, chm, 5);
@@ -354,16 +357,19 @@ static void fresh(void)
 	ll_llcp_reset(L);
 }
 
+/* connection event the next PDUs are received in (ll_rx_pdu.event) */
+static uint16_t rx_event;
+
 static void rx_l(uint8_t link, const uint8_t *pdu, uint8_t len)
 {
-	ll_llcp_rx(link, pdu, len);
+	ll_llcp_rx(link, pdu, len, rx_event);
 	CHECK(locks == 0);
 	CHECK(tx_locks == 0);
 }
 
 static void rx(const uint8_t *pdu, uint8_t len)
 {
-	ll_llcp_rx(L, pdu, len);
+	ll_llcp_rx(L, pdu, len, rx_event);
 	CHECK(locks == 0);
 	CHECK(tx_locks == 0);
 }
@@ -533,9 +539,11 @@ static void single_link_suite(void)
 		static const uint8_t upd[12] = {0x00, 0x02, 0x03, 0x00, 0x06, 0x00, 0x1E, 0x00,
 						0x90, 0x01, 0x34, 0x12};
 
+		rx_event = 0x1230;
 		rx(upd, 12);
+		rx_event = 0;
 		CHECK(cn.upd_calls == 1);
-		CHECK(cn.instant == 0x1234);
+		CHECK(cn.instant == 0x1234 && cn.rx_event == 0x1230);
 		CHECK(cn.win_size == 2 && cn.win_offset == 3);
 		CHECK(cn.p.interval == 6 && cn.p.latency == 30 && cn.p.timeout == 400);
 		CHECK(tx.n == 0 && cn.end_calls == 0);
@@ -555,9 +563,11 @@ static void single_link_suite(void)
 	{
 		static const uint8_t chm[8] = {0x01, 0xFF, 0x00, 0xF0, 0x0F, 0x1F, 0x05, 0x00};
 
+		rx_event = 2609;
 		rx(chm, 8);
+		rx_event = 0;
 		CHECK(cn.chm_calls == 1);
-		CHECK(cn.instant == 5);
+		CHECK(cn.instant == 5 && cn.rx_event == 2609);
 		CHECK(memcmp(cn.chm, &chm[1], 5) == 0);
 		CHECK(tx.n == 0 && cn.end_calls == 0);
 		cn.chm_ret = LL_ST_INSTANT_PASSED;
@@ -1571,8 +1581,8 @@ static void test_link_bounds(void)
 	fresh();
 	sample_rand();
 	build_enc_req(req);
-	ll_llcp_rx(LL_MAX_CONN, req, sizeof(req));
-	ll_llcp_rx(LL_MAX_CONN, vi, sizeof(vi));
+	ll_llcp_rx(LL_MAX_CONN, req, sizeof(req), 0);
+	ll_llcp_rx(LL_MAX_CONN, vi, sizeof(vi), 0);
 	CHECK(tx.n == 0 && rxq_set_calls == 0);
 	CHECK(ll_llcp_ltk_reply(LL_MAX_CONN, ltk) == LL_ST_DISALLOWED);
 	CHECK(ll_llcp_ltk_neg_reply(LL_MAX_CONN) == LL_ST_DISALLOWED);

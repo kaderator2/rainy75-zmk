@@ -169,19 +169,26 @@ int ll_conn_start(const struct ll_connect_ind *ci, uint32_t connect_ind_end_tick
  * ignores the rest and everything while no event is on air. */
 void ll_conn_radio_evt(enum ll_radio_evt evt, const uint8_t *pdu, uint16_t len, uint32_t tick);
 /* Schedule LL_CONNECTION_UPDATE_IND / LL_CHANNEL_MAP_IND parameters for the
- * event with counter == instant. Return 0, or LL_ST_INSTANT_PASSED when
- * (instant - counter) mod 65536 > 32767, when instant is the event
- * already on air, or when it is a skipped event whose anchor has passed
- * (the connection is then terminated with 0x28). Without an
- * active connection: LL_ST_DISALLOWED. ll_conn_update_at checks the
+ * event with counter == instant. rx_event: the connection event the PDU
+ * was received in (ll_rx_pdu.event). Return 0, or LL_ST_INSTANT_PASSED
+ * when (instant - rx_event) mod 65536 is 0 or > 32767 (Vol 6 Part B 5.1.1,
+ * 5.1.2; the connection is then terminated with 0x28). An instant whose
+ * event has gone by since the reception (the controller thread handled
+ * the PDU late: the instant is before the planned event, is the event on
+ * air, or is a skipped event whose anchor has passed) is applied late: the
+ * map from the instant event on, the new timing from the instant's old
+ * anchor + WinOffset (transmit window repeated every new interval), and
+ * the first event that can still be prepared is listened to; the events in
+ * between count as missed. Without an active connection:
+ * LL_ST_DISALLOWED. ll_conn_update_at checks the
  * parameters first (interval 6..3200, latency <= 499, timeout 10..3200 and
  * > (1 + latency) * interval * 2, WinSize 1..min(8, interval - 1), WinOffset
  * <= interval) and returns LL_ST_INVALID_LL_PARAM for invalid ones without
  * changing anything (the caller, ll_llcp, decides how to end the link).
  * Thread. */
-int ll_conn_update_at(uint8_t link, uint16_t instant, uint8_t win_size, uint16_t win_offset,
-		      const struct ll_conn_params *p);
-int ll_conn_chmap_at(uint8_t link, uint16_t instant, const uint8_t chm[5]);
+int ll_conn_update_at(uint8_t link, uint16_t rx_event, uint16_t instant, uint8_t win_size,
+		      uint16_t win_offset, const struct ll_conn_params *p);
+int ll_conn_chmap_at(uint8_t link, uint16_t rx_event, uint16_t instant, const uint8_t chm[5]);
 /* Local termination (HCI Disconnect via ll_llcp): queue LL_TERMINATE_IND
  * with reason (via ops.ctrl_tx), then end with LL_ST_LOCAL_TERM once it is
  * acked, or after connSupervisionTimeout without ack. Thread. */
@@ -203,18 +210,14 @@ uint8_t ll_conn_count(void);
  * not awaiting release. Takes ll_plat_lock(). */
 void ll_conn_release(uint8_t link);
 /* Counter of the next connection event not yet completed (the one on air,
- * if any). Instants are relative to this. While a latency skip is planned
- * this is the first skipped event (conservative: an instant for a skipped
- * event re-plans the listen to the first reachable event, or to the
- * instant if that comes first, and is passed only once the instant
- * event's anchor has gone by; slice 7: an instant event whose alarm time
- * is gone but not its anchor is planned late, issued if it can still be
- * prepared, else a late miss, and the instant is applied). After a
- * re-plan (kick, instant, or a yield to the arbiter) it is the planned
- * event, so an instant for an earlier event is
- * treated as passed (0x28); a conforming central never sends one (the
- * instant is >= 6 events after the PDU, which arrives in a listened event;
- * after yields it may be passed in rare multilink overlaps). */
+ * if any). While a latency skip is planned this is the first skipped event
+ * (an instant for a skipped event re-plans the listen to the first
+ * reachable event, or to the instant if that comes first; slice 7: an
+ * instant event whose alarm time is gone but not its anchor is planned
+ * late, issued if it can still be prepared, else a late miss, and the
+ * instant is applied). After a re-plan (kick, instant, or a yield to the
+ * arbiter) it is the planned event. Instants are judged against the event
+ * their PDU was received in, not against this (ll_conn_update_at). */
 uint16_t ll_conn_event_counter(uint8_t link);
 /* Instants of the link not yet reached (slice 6d Task 2, procedure
  * collisions, Vol 6 Part B 5.3): LL_CONN_PENDING_UPDATE while an

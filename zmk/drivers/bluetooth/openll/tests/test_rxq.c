@@ -39,7 +39,7 @@ static bool try_put_l(uint8_t link, uint8_t hdr0, const uint8_t *payload, uint8_
 	if (paylen) {
 		memcpy(&pdu[2], payload, paylen);
 	}
-	return ll_rxq_isr_put(link, pdu, (uint16_t)(2 + paylen));
+	return ll_rxq_isr_put(link, pdu, (uint16_t)(2 + paylen), 0);
 }
 
 static void put_l(uint8_t link, uint8_t hdr0, const uint8_t *payload, uint8_t paylen)
@@ -172,7 +172,7 @@ static void single_link_suite(void)
 		{
 			uint8_t pdu[3] = {0x02, 1, 0xFF};
 
-			CHECK(!ll_rxq_isr_put(L, pdu, 3));
+			CHECK(!ll_rxq_isr_put(L, pdu, 3, 0));
 		}
 		CHECK(ll_rxq_overflow_count(L) == 1);
 		for (int i = 0; i < 16; i++) {
@@ -281,7 +281,7 @@ static void single_link_suite(void)
 		put(0x01, NULL, 0);
 		CHECK(ll_rxq_isr_take_queued());
 		CHECK(!ll_rxq_isr_take_queued());     /* cleared by the take */
-		CHECK(!ll_rxq_isr_put(L, bad, 1));       /* malformed: dropped, not queued */
+		CHECK(!ll_rxq_isr_put(L, bad, 1, 0));       /* malformed: dropped, not queued */
 		CHECK(!ll_rxq_isr_take_queued());
 		/* consuming does not clear a pending flag of a later put */
 		put(0x02, d, 3);
@@ -527,7 +527,7 @@ static void test_long_pdus(void)
 	pdu[0] = 0x1E;
 	pdu[1] = 255;
 	memcpy(&pdu[2], max_dir1, 255);
-	CHECK(ll_rxq_isr_put(L, pdu, 257));
+	CHECK(ll_rxq_isr_put(L, pdu, 257, 0));
 	CHECK(ll_rxq_get(L, &out) == LL_RXQ_OK);
 	CHECK(out.hdr0 == 0x1E && out.len == 251);
 	for (int i = 0; i < 251; i++) {
@@ -543,11 +543,11 @@ static void test_long_pdus(void)
 		pdu[2 + i] = (uint8_t)(0xFF - i);
 	}
 	pdu[0] = 0x02;
-	CHECK(ll_rxq_isr_put(L, pdu, 257));
+	CHECK(ll_rxq_isr_put(L, pdu, 257, 0));
 	CHECK(ll_rxq_get(L, &out) == LL_RXQ_OK);
 	CHECK(out.len == 255 && memcmp(out.data, &pdu[2], 255) == 0);
 	/* 256 payload bytes: no 8-bit Length holds that, malformed */
-	CHECK(!ll_rxq_isr_put(L, pdu, 258));
+	CHECK(!ll_rxq_isr_put(L, pdu, 258, 0));
 	CHECK(ll_rxq_overflow_count(L) == 1);
 	CHECK(ll_rxq_get(L, &out) == LL_RXQ_EMPTY);
 }
@@ -707,6 +707,26 @@ static void test_room(void)
 	}
 }
 
+/* Each PDU carries the connection event it was received in (instants are
+ * judged against it, ll_conn.h), in order, also when the link encrypts. */
+static void test_event_kept(void)
+{
+	static const uint8_t d[2] = {0x0F, 0x01};
+	uint8_t pdu[4] = {0x03, 2, 0x0F, 0x01};
+	struct ll_rx_pdu out;
+
+	reset_all();
+	CHECK(ll_rxq_isr_put(L, pdu, sizeof(pdu), 2609));
+	CHECK(ll_rxq_isr_put(L, pdu, sizeof(pdu), 0xFFFF));
+	CHECK(ll_rxq_isr_put(L, pdu, sizeof(pdu), 0));
+	CHECK(ll_rxq_get(L, &out) == LL_RXQ_OK && out.event == 2609);
+	CHECK(out.len == 2 && memcmp(out.data, d, 2) == 0);
+	CHECK(ll_rxq_get(L, &out) == LL_RXQ_OK && out.event == 0xFFFF);
+	CHECK(ll_rxq_get(L, &out) == LL_RXQ_OK && out.event == 0);
+	CHECK(ll_rxq_get(L, &out) == LL_RXQ_EMPTY);
+	reset_all();
+}
+
 int main(void)
 {
 	L = 0;
@@ -718,11 +738,13 @@ int main(void)
 	test_crypt_per_link();
 	test_take_queued_any_link();
 	L = 0;
+	test_event_kept();
 	test_half_full();
 	test_long_pdus();
 	test_capacity_bytes();
 	test_room();
 	L = (uint8_t)(LL_MAX_CONN - 1);
+	test_event_kept();
 	test_half_full();
 	test_long_pdus();
 	test_capacity_bytes();

@@ -285,21 +285,43 @@ static void set_params(struct ll_link *c, const struct ll_conn_params *p)
 	c->widen_max_us = (uint32_t)p->interval * UNIT_US / 2u - LL_T_IFS_US;
 }
 
-/* Instants of the event about to be planned (counter == instant). Returns
- * true if one was applied. */
+/* The instant is event `counter` or lies before it: (counter - instant)
+ * mod 65536 <= INSTANT_PAST (check_instant accepts instants at most
+ * INSTANT_PAST events ahead, so a pending one is never mistaken for this). */
+static bool inst_due(uint16_t counter, uint16_t instant)
+{
+	return (uint16_t)(counter - instant) <= INSTANT_PAST;
+}
+
+/* A pending instant whose event lies before the one about to be planned:
+ * handled after its event went by (a late instant, see check_instant). */
+static bool instant_overdue(const struct ll_link *c)
+{
+	return (c->upd_pending && c->upd_instant != c->counter &&
+		inst_due(c->counter, c->upd_instant)) ||
+	       (c->chm_pending && c->chm_instant != c->counter &&
+		inst_due(c->counter, c->chm_instant));
+}
+
+/* Instants of the event about to be planned (counter == instant; a late
+ * one, counter past the instant, only from catch_up). Returns true if one
+ * was applied. */
 static bool apply_instants(struct ll_link *c)
 {
 	bool applied = false;
 
-	if (c->chm_pending && c->chm_instant == c->counter) {
+	if (c->chm_pending && inst_due(c->counter, c->chm_instant)) {
 		c->chm_pending = false;
 		ll_csa1_set_map(&c->csa, c->chm);
 		applied = true;
 	}
-	if (c->upd_pending && c->upd_instant == c->counter) {
+	if (c->upd_pending && inst_due(c->counter, c->upd_instant)) {
 		/* 5.1.1: the transmit window starts WinOffset after the anchor
-		 * the instant event would have had with the old parameters. */
-		uint32_t old_anchor = anchor_of(c, c->counter);
+		 * the instant event would have had with the old parameters
+		 * (signed: a late instant may lie before the last re-sync). */
+		int16_t back = (int16_t)(uint16_t)(c->upd_instant - c->ref_counter);
+		uint32_t old_anchor = c->ref_tick + (uint32_t)((int32_t)back *
+							       (int32_t)c->interval_ticks);
 		bool changed = c->upd_p.interval != c->p.interval ||
 			       c->upd_p.latency != c->p.latency ||
 			       c->upd_p.timeout != c->p.timeout;
@@ -307,7 +329,7 @@ static bool apply_instants(struct ll_link *c)
 		c->upd_pending = false;
 		applied = true;
 		c->ref_tick = old_anchor + (uint32_t)c->upd_win_offset * US(UNIT_US);
-		c->ref_counter = c->counter;
+		c->ref_counter = c->upd_instant;
 		c->win_us = (uint32_t)c->upd_win_size * UNIT_US;
 		c->sup_tick = old_anchor;
 		set_params(c, &c->upd_p);
@@ -336,7 +358,7 @@ static uint32_t open_of(const struct ll_link *c, uint16_t counter, uint32_t *wid
 static void plan_event(struct ll_link *c)
 {
 	uint32_t widen, margin;
-	bool chm_due = c->chm_pending && c->chm_instant == c->counter;
+	bool chm_due = c->chm_pending && inst_due(c->counter, c->chm_instant);
 
 	if (apply_instants(c)) {
 		c->inst_evt = true;
@@ -569,11 +591,19 @@ static void place_latest(struct ll_link *c, uint16_t lo, uint16_t hi)
 	yield_on(c, true);
 }
 
+static void catch_up(struct ll_link *c);
+
 /* Plan the next event, skipping idle events where allowed. */
 static void plan(struct ll_link *c)
 {
 	uint16_t n;
 
+	if (instant_overdue(c)) {
+		/* a late instant handled while its event was on air */
+		ST(c)->planned++;
+		catch_up(c);
+		return;
+	}
 	c->chm_win = false;
 	n = skip_count(c);
 	c->skip_base = c->counter;
@@ -807,7 +837,7 @@ static void on_rx(struct ll_link *c, const uint8_t *pdu, uint16_t len, uint32_t 
 	}
 	ST(c)->rx_pkts++;
 	ll_txq_rx(c->id, pdu[0]);
-	if (!ll_rxq_isr_put(c->id, pdu, len)) {
+	if (!ll_rxq_isr_put(c->id, pdu, len, c->counter)) {
 		/* The hardware has acked this data PDU already, so the central
 		 * will never resend it: it is lost for good, and continuing
 		 * would leave a hole in the L2CAP stream (and, encrypted, a
@@ -1010,28 +1040,90 @@ int ll_conn_start(const struct ll_connect_ind *ci, uint32_t connect_ind_end_tick
 	return c->id;
 }
 
-/* 0, or LL_ST_INSTANT_PASSED (connection ending). With a latency skip
- * planned, an instant for a skipped event whose anchor has gone by is
- * passed too (slice 7: the anchor, not the alarm time). A skipped instant
- * event whose alarm time is gone but whose anchor is not is still
- * honoured: instant_replan() plans it with a late alarm, prepare() issues
- * it if there is time left (LL_CONN_MIN_PREP_US), else it is a late miss;
- * either way the instant is applied when the event is planned. */
-static int check_instant(struct ll_link *c, uint16_t instant)
+/* Events a late instant may skip at most (catch_up): beyond the longest
+ * supervision timeout (32 s) at the shortest interval (7.5 ms) the link is
+ * lost anyway. */
+#define CATCH_UP_MAX 4300u
+
+/* A late instant (check_instant) is pending; counter is the first event
+ * not issued yet, csa its CSA#1 state, nothing planned. Step over the
+ * events that can no longer be prepared, applying each instant at its own
+ * event (the new map from it on, the new timing from its old anchor, 5.1.1),
+ * and plan the first one whose alarm is still ahead. The events stepped
+ * over count as missed: they ran on the old map or timing, which the
+ * central no longer used. */
+static void catch_up(struct ll_link *c)
+{
+	uint32_t now = ll_radio_now();
+
+	c->chm_win = false;
+	for (uint32_t i = 0; i < CATCH_UP_MAX; i++) {
+		if (apply_instants(c)) {
+			c->inst_evt = false;
+		}
+		if ((int32_t)(open_of(c, c->counter, NULL) - US(LL_CONN_ARM_LEAD_US) - now) > 0 &&
+		    !instant_overdue(c)) {
+			break;
+		}
+		(void)ll_csa1_next(&c->csa);
+		c->counter++;
+		ST(c)->missed++;
+	}
+	c->skip_base = c->counter;
+	c->skip_n = 0;
+	plan_event(c);
+	if (request(c) != 0) {
+		yield_on(c, true);
+	}
+}
+
+/* 0, or LL_ST_INSTANT_PASSED (connection ending): the instant is the event
+ * the PDU was received in (rx_event) or lies before it (5.1.1, 5.1.2: the
+ * instant is judged against connEventCounter at reception). The controller
+ * thread handles the PDU later, after decryption; when the instant's event
+ * has gone by meanwhile (*late) the instant is still honoured, late:
+ * applied from the first event that can be prepared (catch_up), the events
+ * in between are missed. *late is also set for an instant at the event on
+ * air (issued with the old values) and for a skipped instant event whose
+ * anchor has gone by (slice 7: the anchor, not the alarm time). A skipped
+ * instant event whose alarm time is gone but whose anchor is not is
+ * honoured as before: instant_replan() plans it with a late alarm,
+ * prepare() issues it if there is time left (LL_CONN_MIN_PREP_US), else it
+ * is a late miss; either way the instant is applied when the event is
+ * planned. */
+static int check_instant(struct ll_link *c, uint16_t rx_event, uint16_t instant, bool *late)
 {
 	uint16_t cur = c->planned ? c->skip_base : c->counter;
 	uint16_t d = (uint16_t)(instant - cur);
+	uint16_t d_rx = (uint16_t)(instant - rx_event);
 
-	/* d == 0 with the event already on air: its timing and channel were
-	 * issued with the old values, so the instant cannot be honoured any
-	 * more; treat it like a passed instant. */
-	if (d > INSTANT_PAST || (d == 0 && c->in_event) ||
-	    (c->planned && d < c->skip_n &&
-	     (int32_t)(anchor_of(c, instant) - ll_radio_now()) <= 0)) {
+	*late = d > INSTANT_PAST || (d == 0 && c->in_event) ||
+		(c->planned && d < c->skip_n &&
+		 (int32_t)(anchor_of(c, instant) - ll_radio_now()) <= 0);
+	if (d_rx == 0 || d_rx > INSTANT_PAST) {
 		request_end(c, LL_ST_INSTANT_PASSED);
 		return LL_ST_INSTANT_PASSED;
 	}
 	return 0;
+}
+
+/* A late instant was just made pending (check_instant). An event on air
+ * (issued with the old values) ends first: plan() catches up at its
+ * CONN_DONE. A planned one is not issued yet: from the first event not
+ * issued (skip_base; every event of the window lies after the last closed
+ * one), catch up now. */
+static void late_replan(struct ll_link *c)
+{
+	if (!c->planned) {
+		return;
+	}
+	chm_repend(c);
+	c->planned = false;
+	ST(c)->skipped -= c->skip_n;
+	c->csa = c->csa_base;
+	c->counter = c->skip_base;
+	c->skip_n = 0;
+	catch_up(c);
 }
 
 /* A new instant for the planned event or one of the skipped events before
@@ -1058,8 +1150,8 @@ static void instant_replan(struct ll_link *c, uint16_t instant)
 	}
 }
 
-int ll_conn_update_at(uint8_t link, uint16_t instant, uint8_t win_size, uint16_t win_offset,
-		      const struct ll_conn_params *p)
+int ll_conn_update_at(uint8_t link, uint16_t rx_event, uint16_t instant, uint8_t win_size,
+		      uint16_t win_offset, const struct ll_conn_params *p)
 {
 	struct ll_link *c = link_of(link);
 	unsigned int key = ll_plat_lock();
@@ -1068,7 +1160,9 @@ int ll_conn_update_at(uint8_t link, uint16_t instant, uint8_t win_size, uint16_t
 	if (!timing_valid(p->interval, p->latency, p->timeout, win_size, win_offset)) {
 		ret = LL_ST_INVALID_LL_PARAM;
 	} else if (c && c->active && !c->end_pending) {
-		ret = check_instant(c, instant);
+		bool late;
+
+		ret = check_instant(c, rx_event, instant, &late);
 		if (ret == 0) {
 			/* A second LL_CONNECTION_UPDATE_IND while one is
 			 * pending replaces it (instant and parameters). The
@@ -1081,26 +1175,36 @@ int ll_conn_update_at(uint8_t link, uint16_t instant, uint8_t win_size, uint16_t
 			c->upd_win_size = win_size;
 			c->upd_win_offset = win_offset;
 			c->upd_p = *p;
-			instant_replan(c, instant);
+			if (late) {
+				late_replan(c);
+			} else {
+				instant_replan(c, instant);
+			}
 		}
 	}
 	ll_plat_unlock(key);
 	return ret;
 }
 
-int ll_conn_chmap_at(uint8_t link, uint16_t instant, const uint8_t chm[5])
+int ll_conn_chmap_at(uint8_t link, uint16_t rx_event, uint16_t instant, const uint8_t chm[5])
 {
 	struct ll_link *c = link_of(link);
 	unsigned int key = ll_plat_lock();
 	int ret = LL_ST_DISALLOWED;
 
 	if (c && c->active && !c->end_pending) {
-		ret = check_instant(c, instant);
+		bool late;
+
+		ret = check_instant(c, rx_event, instant, &late);
 		if (ret == 0) {
 			c->chm_pending = true;
 			c->chm_instant = instant;
 			memcpy(c->chm, chm, sizeof(c->chm));
-			instant_replan(c, instant);
+			if (late) {
+				late_replan(c);
+			} else {
+				instant_replan(c, instant);
+			}
 		}
 	}
 	ll_plat_unlock(key);

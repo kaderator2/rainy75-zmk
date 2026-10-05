@@ -97,9 +97,11 @@ void ll_llcp_init(const struct ll_llcp_ops *ops);
  * clears ll_rxq's crypt pointer itself. Thread context. */
 void ll_llcp_reset(uint8_t link);
 /* One received LLID 3 PDU of the link (decrypted payload: opcode +
- * CtrData). Thread (controller thread, in the link's RX order). Ignored
+ * CtrData), received in connection event rx_event (ll_rx_pdu.event: the
+ * instants of LL_CONNECTION_UPDATE_IND / LL_CHANNEL_MAP_IND are judged
+ * against it). Thread (controller thread, in the link's RX order). Ignored
  * for an out-of-range link. */
-void ll_llcp_rx(uint8_t link, const uint8_t *payload, uint8_t len);
+void ll_llcp_rx(uint8_t link, const uint8_t *payload, uint8_t len, uint16_t rx_event);
 /* From HCI LE Long Term Key Request Reply / Negative Reply for the link
  * (ltk in HCI order, LSB first). Return an HCI status: LL_ST_SUCCESS, or
  * LL_ST_DISALLOWED when no LTK request is pending on the link (or the link

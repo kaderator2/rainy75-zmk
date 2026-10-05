@@ -1079,7 +1079,7 @@ static void instant_result(uint8_t link, int r)
 	}
 }
 
-static void rx_conn_update(uint8_t link, const uint8_t *p)
+static void rx_conn_update(uint8_t link, const uint8_t *p, uint16_t rx_event)
 {
 	struct ll_conn_params cp = {
 		.interval = ll_get_le16(&p[4]),
@@ -1092,13 +1092,13 @@ static void rx_conn_update(uint8_t link, const uint8_t *p)
 	 * the Connection Parameters Request procedure ends here (the instant
 	 * belongs to ll_conn; Connection Update has no response timer, 5.2) */
 	cpr_end(link);
-	instant_result(link, ll_conn_update_at(link, ll_get_le16(&p[10]), p[1],
+	instant_result(link, ll_conn_update_at(link, rx_event, ll_get_le16(&p[10]), p[1],
 						 ll_get_le16(&p[2]), &cp));
 }
 
 /* Channel map with at least 2 used channels (bits 0..36, Vol 6 Part B
  * 2.4.2.2), else the link ends with 0x1E. */
-static void rx_channel_map(uint8_t link, const uint8_t *p)
+static void rx_channel_map(uint8_t link, const uint8_t *p, uint16_t rx_event)
 {
 	unsigned int used = 0;
 
@@ -1109,7 +1109,7 @@ static void rx_channel_map(uint8_t link, const uint8_t *p)
 		ll_conn_end(link, LL_ST_INVALID_LL_PARAM);
 		return;
 	}
-	instant_result(link, ll_conn_chmap_at(link, ll_get_le16(&p[6]), &p[1]));
+	instant_result(link, ll_conn_chmap_at(link, rx_event, ll_get_le16(&p[6]), &p[1]));
 }
 
 /* length the request must have, 0 = not a request we answer by content */
@@ -1153,7 +1153,7 @@ static bool ignored(uint8_t op)
 	}
 }
 
-void ll_llcp_rx(uint8_t link, const uint8_t *payload, uint8_t len)
+void ll_llcp_rx(uint8_t link, const uint8_t *payload, uint8_t len, uint16_t rx_event)
 {
 	uint8_t op, want;
 
@@ -1196,10 +1196,10 @@ void ll_llcp_rx(uint8_t link, const uint8_t *payload, uint8_t len)
 	}
 	switch (op) {
 	case OP_CONN_UPDATE_IND:
-		rx_conn_update(link, payload);
+		rx_conn_update(link, payload, rx_event);
 		break;
 	case OP_CHANNEL_MAP_IND:
-		rx_channel_map(link, payload);
+		rx_channel_map(link, payload, rx_event);
 		break;
 	case OP_TERMINATE_IND:
 		ll_conn_end(link, payload[1]);

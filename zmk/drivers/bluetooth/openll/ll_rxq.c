@@ -76,6 +76,7 @@ struct rxq_ent {
 	uint16_t off;  /* record in the link's area */
 	uint8_t hdr0;
 	uint8_t len;   /* payload length as received (ciphertext + MIC if encrypted) */
+	uint16_t event; /* connection event it was received in */
 };
 
 static struct rxq_link {
@@ -197,7 +198,7 @@ void ll_rxq_set_crypt(uint8_t link, struct ll_crypt *c)
 	}
 }
 
-bool ll_rxq_isr_put(uint8_t link, const uint8_t *pdu, uint16_t len)
+bool ll_rxq_isr_put(uint8_t link, const uint8_t *pdu, uint16_t len, uint16_t event)
 {
 	struct rxq_link *q;
 	uint8_t head, tail, used;
@@ -241,6 +242,7 @@ bool ll_rxq_isr_put(uint8_t link, const uint8_t *pdu, uint16_t len)
 	e->off = (uint16_t)at;
 	e->hdr0 = pdu[0];
 	e->len = (uint8_t)paylen;
+	e->event = event;
 	ll_fifo_copy(&q->area[2 + at], &pdu[2], paylen);
 	RING_BARRIER();   /* publish: record complete before head moves */
 	q->head = (uint8_t)(head + 1);
@@ -283,6 +285,7 @@ enum ll_rxq_result ll_rxq_get(uint8_t link, struct ll_rx_pdu *out)
 		}
 		if (res == LL_RXQ_OK) {
 			out->hdr0 = e->hdr0;
+			out->event = e->event;
 			ll_fifo_copy(out->data, data, out->len);
 		}
 		RING_BARRIER();   /* release: record fully read before tail frees it */

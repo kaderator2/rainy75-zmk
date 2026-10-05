@@ -1006,7 +1006,7 @@ static void handle_rx_pdus(uint8_t link, bool *got)
 
 		if (llid == LL_LLID_CTRL) {
 			log_llcp_rx(link, pdu.data, pdu.len);
-			ll_llcp_rx(link, pdu.data, pdu.len);
+			ll_llcp_rx(link, pdu.data, pdu.len, pdu.event);
 			continue;
 		}
 		uint16_t n = ll_hci_acl_to_host(h4, link, llid, pdu.data, pdu.len);
