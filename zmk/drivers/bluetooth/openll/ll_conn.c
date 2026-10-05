@@ -107,6 +107,11 @@ struct ll_link {
 	uint8_t yield_run;    /* consecutive events yielded to the arbiter (STARVING priority) */
 	bool anchored;        /* the last closed event re-anchored (latency rule) */
 	bool holdoff_done;    /* LL_CONN_LATENCY_HOLDOFF_MS has passed (latched, see skip_count) */
+	/* RX data holdoff (LL_CONN_DATA_HOLDOFF_MS): a non-empty data PDU was
+	 * received at data_tick and its holdoff has not been seen to pass yet
+	 * (latched off in skip_count, like holdoff_done) */
+	bool data_hold;
+	uint32_t data_tick;
 	/* last event issued to the radio (listen gap stats) */
 	bool listen_seen;
 	uint16_t listen_counter;
@@ -460,6 +465,17 @@ static uint16_t skip_count(struct ll_link *c)
 			return 0;
 		}
 		c->holdoff_done = true;
+	}
+	/* RX data holdoff: the first candidate's anchor must lie at least
+	 * LL_CONN_DATA_HOLDOFF_MS after the last non-empty data PDU. The
+	 * anchor always lies after that packet (it was received in an
+	 * earlier event), so the unsigned age is exact; the flag is cleared
+	 * once it passed, so the age is never tested after a wrap. */
+	if (c->data_hold) {
+		if (anchor_of(c, c->counter) - c->data_tick < US(LL_CONN_DATA_HOLDOFF_MS * 1000u)) {
+			return 0;
+		}
+		c->data_hold = false;
 	}
 	if (n == 0 || !c->anchored || c->term_local || ll_txq_backlog(c->id) != 0 ||
 	    (ops.busy && ops.busy(c->id))) {
@@ -934,6 +950,13 @@ static void on_rx(struct ll_link *c, const uint8_t *pdu, uint16_t len, uint32_t 
 		ll_radio_conn_stop();
 	}
 	c->rx_this_event = true;
+	if (((pdu[0] & 0x03) == LL_LLID_CONT || (pdu[0] & 0x03) == LL_LLID_START) &&
+	    pdu[1] != 0) {
+		/* a non-empty L2CAP fragment (LLID 1 or 2): the hosts are in
+		 * an exchange, hold off latency (LL_CONN_DATA_HOLDOFF_MS) */
+		c->data_hold = true;
+		c->data_tick = tick;
+	}
 	first = !c->first_seen;
 	c->first_seen = true;
 	/* The hardware syncs the event's first packet only inside the RX

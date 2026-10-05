@@ -49,7 +49,11 @@
  *    LL_CONN_LATENCY_HOLDOFF_MS after the connection start (per link), so
  *    every event of the first second is listened to; with the busy rule
  *    above, skipping starts once the link is up that long and LLCP is
- *    idle.
+ *    idle;
+ *  - RX data holdoff: the first skipped event's anchor lies at least
+ *    LL_CONN_DATA_HOLDOFF_MS after the last non-empty data PDU (LLID 1 or
+ *    2) received from the central (per link, latched off once passed); LL
+ *    control and empty PDUs do not start it.
  * Skipped events still advance the event counter and CSA#1; window
  * widening uses the real time since the last anchor (at most 500 intervals
  * of growth, never reaching the clamp). New TX data calls ll_conn_kick().
@@ -99,6 +103,20 @@
  * end), so the central's early requests (feature exchange, encryption,
  * connection update) are answered at once. Per link. */
 #define LL_CONN_LATENCY_HOLDOFF_MS 1000
+/* RX data holdoff: no event is skipped while its anchor lies less than
+ * this after the last non-empty data PDU (LLID 1 or 2) received from the
+ * central on the link, so a request / response exchange of the hosts
+ * (SMP pairing and key distribution, GATT discovery, ATT writes) runs at
+ * one round trip per 2 intervals instead of one per latency window (up to
+ * 465 ms at interval 12 / latency 30). LL control PDUs (LE Ping, channel
+ * map, ...) and empty PDUs do not start it, so the idle cadence stays
+ * latency + 1 events. 1 s covers the central host's think time between
+ * the steps of such an exchange (a phone's SMP / GATT layer answers within
+ * tens to a few hundred ms) with margin, and costs at most 1 s of
+ * listening at every interval after the last data, which an idle link
+ * (a keyboard sends, the central rarely writes) almost never pays. Per
+ * link. */
+#define LL_CONN_DATA_HOLDOFF_MS 1000
 /* Starvation bound (arbiter priority STARVING): a link that yielded this
  * many events in a row (refused, displaced, or started without room)
  * requests its next events above ACTIVE until one is started. Without it

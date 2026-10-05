@@ -3225,6 +3225,265 @@ static void test_latency_holdoff_long_link(void)
 	}
 }
 
+/* ---------------- RX data holdoff ---------------- */
+
+/* A non-empty data PDU of the central (LLID 1 or 2) at the listened event
+ * EV(31) of a latency 30 link: every event whose anchor lies less than
+ * LL_CONN_DATA_HOLDOFF_MS after that packet is listened to (66 events at
+ * 15 ms), then skipping resumes. A second data PDU re-arms the holdoff.
+ * Once over, the link skips as before, also long after the 32-bit tick
+ * wrap of the packet's age. */
+static void test_latency_data_holdoff(void)
+{
+	struct ll_rx_pdu out;
+	struct ll_csa1 ref;
+	uint32_t a = start_lat(30, 400, &ref, false);
+	uint16_t last;
+	int gaps_bad = 0;
+
+	CHECK(LL_CONN_DATA_HOLDOFF_MS == 1000);
+	fire_alarm();
+	CHECK(ll_conn_event_counter(0) == EV(31));
+	a += T(15000) * 31u;
+	rx(a, LL_LLID_START, 11);   /* e.g. an SMP Pairing Confirm */
+	done(1);
+	CHECK(ll_rxq_get(0, &out) == LL_RXQ_OK);
+	/* k * 15 ms - 40 us < 1 s for k <= 66 */
+	for (uint16_t k = 1; k <= 66; k++) {
+		fire_alarm();
+		CHECK(ll_conn_event_counter(0) == EV(31 + k));
+		CHECK(rad.open == open_at(a, 1));
+		a += T(15000);
+		rx(a, 0x01, 0);
+		done(1);
+	}
+	fire_alarm();
+	CHECK(ll_conn_event_counter(0) == EV(31 + 66 + 31));
+	CHECK(rad.open == open_at(a, 31));
+	a += T(15000) * 31u;
+	/* a continuation fragment (LLID 1, non-empty) holds as well, and
+	 * re-arms: a second one 30 events later extends the holdoff */
+	rx(a, LL_LLID_CONT, 5);
+	done(1);
+	CHECK(ll_rxq_get(0, &out) == LL_RXQ_OK);
+	last = ll_conn_event_counter(0);   /* EV(129) */
+	for (uint16_t k = 1; k <= 30 + 66; k++) {
+		fire_alarm();
+		CHECK(ll_conn_event_counter(0) == (uint16_t)(last + k - 1));
+		a += T(15000);
+		if (k == 30) {
+			rx(a, LL_LLID_START, 7);
+			CHECK(ll_rxq_get(0, &out) == LL_RXQ_OK);
+		} else {
+			rx(a, 0x01, 0);
+		}
+		done(1);
+	}
+	fire_alarm();
+	CHECK(ll_conn_event_counter(0) == (uint16_t)(last + 30 + 66 + 30));
+	a += T(15000) * 31u;
+	rx(a, 0x01, 0);
+	done(1);
+	/* idle for 290 s (beyond the 2^32 tick wrap of the data age): every
+	 * listened event is 31 events after the previous one */
+	last = (uint16_t)(ll_conn_event_counter(0) - 1);
+	for (int i = 0; i < 624 && ll_conn_active(0); i++) {
+		uint16_t e;
+
+		fire_alarm();
+		e = ll_conn_event_counter(0);
+		if ((uint16_t)(e - last) != 31) {
+			gaps_bad++;
+		}
+		a += T(15000) * (uint16_t)(e - last);
+		last = e;
+		rx(a, 0x01, 0);
+		done(1);
+	}
+	CHECK(ll_conn_active(0));
+	CHECK(gaps_bad == 0);
+	ll_conn_end(0, LL_ST_REMOTE_TERM);
+}
+
+/* LL control PDUs (LE Ping, channel map, ...) and empty PDUs do not start
+ * the data holdoff: the idle cadence stays latency + 1 events. A Ping
+ * answer is listened for until acked (ll_txq_backlog), then skipping
+ * resumes at once. */
+static void test_latency_data_holdoff_ctrl(void)
+{
+	static const uint8_t ping_rsp[1] = {0x13};
+	struct ll_rx_pdu out;
+	struct ll_csa1 ref;
+	uint32_t a = start_lat(30, 400, &ref, false);
+
+	fire_alarm();
+	CHECK(ll_conn_event_counter(0) == EV(31));
+	a += T(15000) * 31u;
+	rx(a, LL_LLID_CTRL, 1);   /* LL_PING_REQ */
+	done(1);
+	CHECK(ll_rxq_get(0, &out) == LL_RXQ_OK);
+	fire_alarm();
+	CHECK(ll_conn_event_counter(0) == EV(62));
+	CHECK(rad.open == open_at(a, 31));
+	a += T(15000) * 31u;
+	rx(a, LL_LLID_CTRL, 1);
+	CHECK(ll_txq_push(0, LL_TXQ_CTRL, LL_LLID_CTRL, ping_rsp, 1, 0, true) == 0);
+	done(1);
+	CHECK(ll_rxq_get(0, &out) == LL_RXQ_OK);
+	/* the answer goes out at EV(63), acked there */
+	fire_alarm();
+	CHECK(ll_conn_event_counter(0) == EV(63));
+	a += T(15000);
+	rx(a, 0x01 | HDR_NESN, 0);
+	rad.rptr = rad.wptr;
+	done(1);
+	CHECK(ll_txq_backlog(0) == 0);
+	fire_alarm();
+	CHECK(ll_conn_event_counter(0) == EV(94));
+	CHECK(rad.open == open_at(a, 31));
+	done(0);
+	ll_conn_end(0, LL_ST_REMOTE_TERM);
+}
+
+/* SMP-like request / response at latency 30: the central's request at
+ * event E, our answer queued by the host right after it (kick), acked by
+ * the central at E + 1, the central's next request ready at E + 2. Each
+ * request is received 2 events after the previous one (round trip 2
+ * intervals, 30 ms) instead of waiting for the next latency window. */
+static void test_latency_data_holdoff_round_trip(void)
+{
+	static const uint8_t rsp[11] = {0x04};   /* SMP Pairing Confirm */
+	struct ll_rx_pdu out;
+	struct ll_csa1 ref;
+	uint32_t a = start_lat(30, 400, &ref, false);
+	uint8_t nesn = 0;
+	uint16_t req;
+
+	fire_alarm();
+	req = ll_conn_event_counter(0);
+	CHECK(req == EV(31));
+	a += T(15000) * 31u;
+	for (int i = 0; i < 6; i++) {
+		rx(a, LL_LLID_START | nesn, 11);
+		done(1);
+		CHECK(ll_rxq_get(0, &out) == LL_RXQ_OK);
+		CHECK(ll_txq_push(0, LL_TXQ_ACL, LL_LLID_START, rsp, sizeof(rsp), 0, true) == 0);
+		ll_conn_kick(0);
+		/* E + 1: our answer, acked */
+		fire_alarm();
+		CHECK(ll_conn_event_counter(0) == (uint16_t)(req + 1));
+		a += T(15000);
+		nesn ^= HDR_NESN;
+		rx(a, 0x01 | nesn, 0);
+		rad.rptr = rad.wptr;
+		done(1);
+		CHECK(ll_txq_backlog(0) == 0);
+		/* E + 2: the central's next request is heard at once */
+		fire_alarm();
+		CHECK(ll_conn_event_counter(0) == (uint16_t)(req + 2));
+		CHECK(rad.open == open_at(a, 1));
+		a += T(15000);
+		req = (uint16_t)(req + 2);
+	}
+	rx(a, 0x01 | nesn, 0);
+	done(1);
+	ll_conn_end(0, LL_ST_REMOTE_TERM);
+}
+
+/* Per link: links (30 ms interval, latency 30, started 305 ms apart, so
+ * anchors 5 ms apart) skip after their connect holdoff; link 0 receives one
+ * data PDU 1.5 s after the last start: only link 0 listens to every event
+ * for LL_CONN_DATA_HOLDOFF_MS, the others keep their cadence. */
+static void test_latency_data_holdoff_per_link(void)
+{
+	const uint32_t t0 = 1000000;
+	uint32_t start[LL_MAX_CONN];
+	int last[LL_MAX_CONN];
+	uint32_t last_anchor[LL_MAX_CONN];
+	int bad = 0, held = 0;
+	uint32_t data_at = 0;
+	bool data_sent = false;
+	uint8_t started = 0;
+	struct ll_rx_pdu out;
+
+	reset_all(false);
+	for (uint8_t k = 0; k < LL_MAX_CONN; k++) {
+		start[k] = t0 + T(305000) * k;
+		last[k] = -1;
+	}
+	while (now < start[LL_MAX_CONN - 1] + T(5000000)) {
+		if (started < LL_MAX_CONN && (sch.cb == NULL ||
+		    (int32_t)(sch.tick - start[started]) > 0)) {
+			struct ll_connect_ind ci = mk_ci_link(started);
+
+			ci.interval = 24;
+			ci.latency = 30;
+			if ((int32_t)(start[started] - now) > 0) {
+				now = start[started];
+			}
+			CHECK(ll_conn_start(&ci, start[started]) == started);
+			started++;
+			continue;
+		}
+		fire_alarm();
+		{
+			int k = -1;
+
+			for (uint8_t i = 0; i < LL_MAX_CONN; i++) {
+				struct ll_connect_ind ci = mk_ci_link(i);
+
+				if (ci.aa == rad.aa && ll_conn_active(i)) {
+					k = i;
+				}
+			}
+			CHECK(k >= 0);
+			if (k < 0) {
+				break;
+			}
+			uint32_t anchor = rad.open + T((rad.fst - LL_CONN_SYNC_US) / 2);
+			int e = ll_conn_event_counter((uint8_t)k);
+			/* the gap expected after the previous listen */
+			bool past_connect = last[k] >= 0 &&
+				(int32_t)(last_anchor[k] + T(30000) - start[k]) >=
+				(int32_t)T(LL_CONN_LATENCY_HOLDOFF_MS * 1000u);
+			bool in_data = k == 0 && data_sent && last[k] >= 0 &&
+				(int32_t)(last_anchor[k] + T(30000) - (data_at + T(LL_CONN_SYNC_US))) <
+				(int32_t)T(LL_CONN_DATA_HOLDOFF_MS * 1000u);
+
+			if (past_connect) {
+				int want = in_data ? 1 : 31;
+
+				if (e - last[k] != want) {
+					bad++;
+				}
+				if (in_data) {
+					held++;
+				}
+			}
+			last[k] = e;
+			last_anchor[k] = anchor;
+			if (k == 0 && !data_sent &&
+			    (int32_t)(now - (start[LL_MAX_CONN - 1] + T(1500000))) > 0) {
+				data_sent = true;
+				data_at = anchor;
+				rx(anchor, LL_LLID_START, 9);
+				CHECK(ll_rxq_get(0, &out) == LL_RXQ_OK);
+			} else {
+				rx(anchor, 0x01, 0);
+			}
+			done(1);
+		}
+	}
+	CHECK(started == LL_MAX_CONN);
+	CHECK(data_sent);
+	CHECK(bad == 0);
+	CHECK(held == 33);   /* 33 * 30 ms - 40 us < 1 s */
+	for (uint8_t k = 0; k < LL_MAX_CONN; k++) {
+		CHECK(ll_conn_active(k));
+		ll_conn_end(k, LL_ST_REMOTE_TERM);
+	}
+}
+
 /* Review minor: a skipped instant event whose alarm time is gone is planned
  * late; when another link's event is running then, the arbiter refuses it
  * and the link yields it (and the next ones) instead of ending with 0x28:
@@ -4489,5 +4748,9 @@ int main(void)
 	test_instant_late_update_resync_offset();
 	test_instant_late_follower_kept();
 	test_kick_during_other_event();
+	test_latency_data_holdoff();
+	test_latency_data_holdoff_ctrl();
+	test_latency_data_holdoff_round_trip();
+	test_latency_data_holdoff_per_link();
 	DONE();
 }
