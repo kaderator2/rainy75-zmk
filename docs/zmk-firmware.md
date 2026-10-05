@@ -1107,7 +1107,7 @@ period with log output and the port closed) failed with `NMP timeout`, the
 next one worked. Measured: after a reset and 30 s, a fresh open read exactly
 the 4096 backlog bytes and no response. `CONFIG_UART_MCUMGR_TX_WAIT_MS=500`
 (conf/app.conf) writes responses with `uart_fifo_fill()` and waits up to
-500 ms per write for the host to drain the ring; each frame also starts with a
+500 ms per frame for the host to drain the ring; each frame also starts with a
 newline, because the backlog before it ends mid-line. Measured: the response
 follows the 4096 backlog bytes on a line of its own, 3 of 3; the first
 `mcumgr image list` after a swap boot answers. The ota-bridge build
