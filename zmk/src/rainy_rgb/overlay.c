@@ -24,7 +24,7 @@ static const uint8_t fn_keys[] = {
 #define FN_KEYS_COUNT (sizeof(fn_keys) / sizeof(fn_keys[0]))
 
 /* BLE status keys (ble_status.h), keymap positions. KEYMAP-COUPLED:
- * F1..F3 = &bt BT_SEL 0..2, F4 = &out OUT_TOG on the Fn layer; the number
+ * F1..F3 = &bt_sel_ble 0..2, F4 = &out OUT_TOG on the Fn layer; the number
  * row 1..0 takes the passkey digits; Enter submits it. */
 #define BLE_POS_SLOT0    1    /* F1..F3 = positions 1..3 */
 #define BLE_POS_OUTPUT   4    /* F4 */

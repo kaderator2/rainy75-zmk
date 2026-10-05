@@ -148,7 +148,7 @@ at full scale and the background levels sit near the bottom (user tuning
 | host asks for the passkey | 1..0, Enter | number row dim white, keys 1..6 turn bright blue per digit typed, Enter pulses 1 Hz |
 | passkey submitted (Enter), host verifies it | 1..6, its F-key | bright blue chase 1 -> 6, one sweep per 0.6 s with a two-key trailing fade; the slot keeps its fast blink |
 | wrong passkey (FAILED after Enter) | 1..6, its F-key | keys 1..6 flash red 3x together with the slot, then normal |
-| empty slot selected, no host within 30 s (ZMK patch 0008) | old and returning F-key | the empty slot flashes red 3x, the returning slot shows the switch confirm |
+| empty slot selected, no host within 30 s (open profile timeout, our module) | old and returning F-key | the empty slot flashes red 3x, the returning slot shows the switch confirm |
 | Fn held | F1..F3 | active+connected full blue, other connected dim blue (~8 %), other paired very dim blue (~3 %), empty very dim white (~3 %); the active slot keeps blinking/breathing while not connected |
 | Fn held | F4 | white = USB output, cyan = BLE output (~40 %, distinct from the slot blue) |
 
@@ -171,11 +171,14 @@ timeout) flashes the slot only. ZMK
 keeps every key away from the hosts from the passkey request until the pairing
 ends (patch 0007), so a second Enter during the check does not reach the PC.
 Just Works pairings (no passkey request) never touch the number row. Selecting
-a slot (Fn+F1..F3) while the output is USB switches the output to BLE (ZMK
-patch 0006). Selecting an empty slot arms a 30 s timeout (ZMK patch 0008,
-`CONFIG_ZMK_BLE_OPEN_PROFILE_TIMEOUT`): without a new host, ZMK returns to the
-previously active slot if connected, else the most recently connected slot,
-else stays; a pairing connection pauses it, BT_CLR disarms it.
+a slot (Fn+F1..F3, the module behavior `&bt_sel_ble`) while the output is USB
+switches the output to BLE. Selecting an empty slot arms a 30 s timeout (our
+module, `CONFIG_RAINY75_BLE_OPEN_PROFILE_TIMEOUT`, see
+[BLE policy module](zmk-firmware.md#ble-policy-module)): without a new host,
+the keyboard returns to the previously active slot if connected, else the most
+recently connected slot, else stays; a pairing in progress (from the passkey
+request) pauses it, BT_CLR disarms it. Its event
+`rainy75_ble_open_profile_timeout` flashes the empty slot like FAILED.
 
 Fn-layer presses leave no reactive trace: while layer 1 is held,
 `rrgb_overlay_key_reactive()` is false and `rrgb_on_key()` skips the
@@ -219,11 +222,12 @@ it never paints any other key. Key positions (F1..F4 = 1..4, number row
 
 Inputs (`zmk_adapter.c`, only with `CONFIG_ZMK_BLE`): `zmk_ble_active_profile_changed`,
 `zmk_endpoint_changed`, `zmk_ble_auth_state_changed` (patch 0006, queued with
-its payload), the Bluetooth `connected`/`disconnected` callbacks (a background
+its payload), `rainy75_ble_open_profile_timeout` (our module, queued as FAILED
+for the open slot; only with `CONFIG_RAINY75_BLE_OPEN_PROFILE_TIMEOUT` > 0), the Bluetooth `connected`/`disconnected` callbacks (a background
 slot of a multilink setup changes without a ZMK event), key releases (the output
 toggle raises no event while the effective endpoint stays the same) and the
 settings commit at boot. Each trigger schedules one work item on the system
-workqueue, which applies the queued auth events and then polls slots 0..2
+workqueue, which applies the queued slot events and then polls slots 0..2
 (`zmk_ble_profile_is_open` / `is_connected`, active profile, output = preferred
 or selected transport is BLE); a poll without change is a no-op. LOST is
 detected in `ble_status` from the polls (CONNECTED -> PAIRED). Events are
@@ -431,7 +435,8 @@ which shipped USB work only) are omitted.
 
 - **unreleased**: BLE slot status on F1..F4 and passkey guidance on the number
   row (`ble_status`), fed by ZMK patch 0006; verify chase after Enter and red
-  digit flash on a wrong code (0006/0007), open slot timeout (0008). See
+  digit flash on a wrong code (0006/0007), open slot timeout (module event
+  `rainy75_ble_open_profile_timeout`, was patch 0008). See
   [BLE slot status](#ble-slot-status-and-passkey-guidance).
   The normal effect is off (0.1 s fade out, 0.5 s fade in) while any
   automatic BLE animation shows; presses meanwhile leave no reactive trace.

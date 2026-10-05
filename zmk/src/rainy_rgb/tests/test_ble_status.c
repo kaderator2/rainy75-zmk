@@ -741,8 +741,9 @@ static void test_just_works(void) {
 	CHECK(!rrgb_ble_active(ok + RRGB_BLE_CONN_SOLID + RRGB_BLE_CONN_FADE));
 }
 
-/* Open slot timeout (ZMK_BLE_AUTH_PAIRING_TIMEOUT maps to FAILED): the open
- * slot flashes red while the slot ZMK returns to shows the switch confirm. */
+/* Open slot timeout (the module event rainy75_ble_open_profile_timeout maps
+ * to FAILED): the open slot flashes red while the slot the keyboard returns
+ * to shows the switch confirm. */
 static void test_pairing_timeout(void) {
 	reset();
 	/* slot 0 connected, user selected the empty slot 1: fast blink */

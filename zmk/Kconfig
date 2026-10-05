@@ -48,6 +48,26 @@ config OPENLL_MGMT
 	  per-link counters and the advertising arbitration counters. Readable
 	  over BLE and USB SMP; see reverse/tools/openll_stats.py.
 
+config RAINY75_BLE_OPEN_PROFILE_TIMEOUT
+	int "Seconds an explicitly selected open BLE profile waits for a host (0 = off)"
+	default 30
+	range 0 3600
+	depends on ZMK_BLE
+	help
+	  When the user selects an open (unpaired) BLE profile and no host
+	  pairs within this time, the keyboard selects the previously active
+	  profile again if it is connected, else the most recently connected
+	  profile. If there is none, it stays. A pairing in progress (from the
+	  passkey request until it ends) pauses the timer; if it fails or the
+	  host leaves, the full timeout starts again. A plain connection does
+	  not pause it. A completed pairing, selecting a bonded profile and
+	  clearing bonds (BT_CLR: the user wants to pair on the active profile,
+	  BT_CLR_ALL) disarm it. The timer lives in RAM only: it does not
+	  survive a reboot or deep sleep wake, and selecting the already active
+	  open profile again does not restart it. The return keeps the output
+	  (USB or BLE) as it is. 0 compiles the feature out.
+	  src/ble_open_profile/, raises rainy75_ble_open_profile_timeout.
+
 config RAINY_RGB
 	bool "Rainy 75 out-of-tree RGB lighting engine"
 	depends on LED_STRIP_B91_SPI

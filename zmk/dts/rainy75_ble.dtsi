@@ -1,0 +1,11 @@
+/ {
+    behaviors {
+        /* &bt_sel_ble N: &bt BT_SEL N plus USB -> BLE output
+         * (src/behaviors/behavior_bt_sel_ble.c, built with CONFIG_ZMK_BLE) */
+        /omit-if-no-ref/ bt_sel_ble: bt_sel_ble {
+            compatible = "rainy,behavior-bt-sel-ble";
+            #binding-cells = <1>;
+            display-name = "BLE Profile + Output";
+        };
+    };
+};

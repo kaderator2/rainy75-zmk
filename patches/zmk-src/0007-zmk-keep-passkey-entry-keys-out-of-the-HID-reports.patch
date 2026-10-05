@@ -1,4 +1,4 @@
-From 0749e853c399094585bc8b66ecc746f93a31ade2 Mon Sep 17 00:00:00 2001
+From 8d2a0f57c8157f77a48e2bb9171cebf53e0415ae Mon Sep 17 00:00:00 2001
 From: scholzri <33288574+scholzri@users.noreply.github.com>
 Date: Mon, 5 Oct 2026 16:37:16 +0200
 Subject: [PATCH] zmk: keep passkey entry keys out of the HID reports
@@ -60,10 +60,10 @@ index 92b2107d..7337bc39 100644
  
  int zmk_ble_unpair_all(void);
 diff --git a/app/src/ble.c b/app/src/ble.c
-index 8c1d5a90..c5b32424 100644
+index 72ac59b9..6983254d 100644
 --- a/app/src/ble.c
 +++ b/app/src/ble.c
-@@ -44,11 +44,63 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
+@@ -43,11 +43,63 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
  
  #define PASSKEY_DIGITS 6
  
@@ -128,7 +128,7 @@ index 8c1d5a90..c5b32424 100644
  #endif /* IS_ENABLED(CONFIG_ZMK_BLE_PASSKEY_ENTRY) */
  
  enum advertising_type {
-@@ -590,6 +642,10 @@ static void disconnected(struct bt_conn *conn, uint8_t reason) {
+@@ -579,6 +631,10 @@ static void disconnected(struct bt_conn *conn, uint8_t reason) {
      bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
  
      LOG_DBG("Disconnected from %s (reason 0x%02x)", addr, reason);
@@ -139,7 +139,7 @@ index 8c1d5a90..c5b32424 100644
  
      bt_conn_get_info(conn, &info);
  
-@@ -617,6 +673,7 @@ static void security_changed(struct bt_conn *conn, bt_security_t level, enum bt_
+@@ -606,6 +662,7 @@ static void security_changed(struct bt_conn *conn, bt_security_t level, enum bt_
          LOG_DBG("Security changed: %s level %u", addr, level);
      } else {
          LOG_ERR("Security failed: %s level %u err %d", addr, level, err);
@@ -147,7 +147,7 @@ index 8c1d5a90..c5b32424 100644
          if (is_conn_peripheral(conn)) {
              raise_auth_state_changed(auth_profile_index(conn), ZMK_BLE_AUTH_FAILED, 0);
          }
-@@ -658,8 +715,12 @@ static void auth_passkey_entry(struct bt_conn *conn) {
+@@ -647,8 +704,12 @@ static void auth_passkey_entry(struct bt_conn *conn) {
  
      LOG_DBG("Passkey entry requested for %s", addr);
      ring_buf_reset(&passkey_entries);
@@ -161,7 +161,7 @@ index 8c1d5a90..c5b32424 100644
      raise_auth_state_changed(auth_passkey_entry_profile, ZMK_BLE_AUTH_PASSKEY_REQ, 0);
  }
  
-@@ -669,15 +730,7 @@ static void auth_cancel(struct bt_conn *conn) {
+@@ -658,15 +719,7 @@ static void auth_cancel(struct bt_conn *conn) {
      char addr[BT_ADDR_LE_STR_LEN];
  
      bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
@@ -178,7 +178,7 @@ index 8c1d5a90..c5b32424 100644
  
      LOG_DBG("Pairing cancelled: %s", addr);
      if (is_conn_peripheral(conn)) {
-@@ -712,6 +765,7 @@ static void auth_pairing_complete(struct bt_conn *conn, bool bonded) {
+@@ -701,6 +754,7 @@ static void auth_pairing_complete(struct bt_conn *conn, bool bonded) {
  
      bt_addr_le_to_str(dst, addr, sizeof(addr));
      bt_conn_get_info(conn, &info);
@@ -186,7 +186,7 @@ index 8c1d5a90..c5b32424 100644
  
      if (info.role != BT_CONN_ROLE_PERIPHERAL) {
          LOG_DBG("SKIPPING FOR ROLE %d", info.role);
-@@ -732,6 +786,7 @@ static void auth_pairing_complete(struct bt_conn *conn, bool bonded) {
+@@ -721,6 +775,7 @@ static void auth_pairing_complete(struct bt_conn *conn, bool bonded) {
  
  static void auth_pairing_failed(struct bt_conn *conn, enum bt_security_err reason) {
      LOG_DBG("Pairing failed: reason %d", reason);
@@ -194,7 +194,7 @@ index 8c1d5a90..c5b32424 100644
      if (is_conn_peripheral(conn)) {
          raise_auth_state_changed(auth_profile_index(conn), ZMK_BLE_AUTH_FAILED, 0);
      }
-@@ -843,7 +898,7 @@ static int zmk_ble_handle_key_user(struct zmk_keycode_state_changed *event) {
+@@ -832,7 +887,7 @@ static int zmk_ble_handle_key_user(struct zmk_keycode_state_changed *event) {
  
      LOG_DBG("key %d", key);
  
@@ -203,7 +203,7 @@ index 8c1d5a90..c5b32424 100644
          LOG_DBG("No connection for passkey entry");
          return ZMK_EV_EVENT_BUBBLE;
      }
-@@ -854,11 +909,21 @@ static int zmk_ble_handle_key_user(struct zmk_keycode_state_changed *event) {
+@@ -843,11 +898,21 @@ static int zmk_ble_handle_key_user(struct zmk_keycode_state_changed *event) {
      }
  
      if (key == HID_USAGE_KEY_KEYBOARD_ESCAPE) {
@@ -226,7 +226,7 @@ index 8c1d5a90..c5b32424 100644
          uint8_t digits[PASSKEY_DIGITS];
          uint32_t count = ring_buf_get(&passkey_entries, digits, PASSKEY_DIGITS);
  
-@@ -870,9 +935,8 @@ static int zmk_ble_handle_key_user(struct zmk_keycode_state_changed *event) {
+@@ -859,9 +924,8 @@ static int zmk_ble_handle_key_user(struct zmk_keycode_state_changed *event) {
          LOG_DBG("Final passkey: %d", passkey);
          // Before the entry: the result (FAILED/PAIRED_OK) must queue after it.
          raise_auth_state_changed(auth_passkey_entry_profile, ZMK_BLE_AUTH_PASSKEY_SUBMITTED, 0);
@@ -238,7 +238,7 @@ index 8c1d5a90..c5b32424 100644
          return ZMK_EV_EVENT_HANDLED;
      }
  
-@@ -892,8 +956,11 @@ static int zmk_ble_handle_key_user(struct zmk_keycode_state_changed *event) {
+@@ -881,8 +945,11 @@ static int zmk_ble_handle_key_user(struct zmk_keycode_state_changed *event) {
      ring_buf_put(&passkey_entries, &val, 1);
      LOG_DBG("value entered: %d, digits collected so far: %d", val,
              ring_buf_size_get(&passkey_entries));

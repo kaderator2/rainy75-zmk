@@ -54,7 +54,9 @@ endif()
 
 if(CONFIG_RAINY_RGB)
   zephyr_library_named(rainy_rgb)
-  zephyr_library_include_directories(${APPLICATION_SOURCE_DIR}/include)
+  zephyr_library_include_directories(
+    ${APPLICATION_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/include)
   zephyr_library_sources(
     src/behaviors/behavior_rainy_rgb.c
     src/rainy_rgb/color.c
@@ -67,6 +69,22 @@ if(CONFIG_RAINY_RGB)
     src/rainy_rgb/ble_status.c
     src/rainy_rgb/zmk_adapter.c
   )
+endif()
+
+# BLE policy on top of ZMK's public API: the &bt_sel_ble behavior and the
+# open profile timeout (see docs/zmk-firmware.md, "BLE policy module").
+if(CONFIG_ZMK_BLE)
+  zephyr_library_named(rainy75_ble)
+  zephyr_library_include_directories(
+    ${APPLICATION_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  zephyr_library_sources(src/behaviors/behavior_bt_sel_ble.c)
+  if(CONFIG_RAINY75_BLE_OPEN_PROFILE_TIMEOUT GREATER 0)
+    zephyr_library_sources(
+      src/ble_open_profile/open_profile.c
+      src/ble_open_profile/open_profile_timeout.c
+    )
+  endif()
 endif()
 
 # Embed git version at compile time

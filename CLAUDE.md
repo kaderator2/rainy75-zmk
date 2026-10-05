@@ -67,7 +67,10 @@ zmk/                             # Zephyr module — our custom firmware code
   src/openll_mgmt.c              # Custom mcumgr group 66: open controller power/link/adv/flash-window counters (reverse/tools/openll_stats.py)
   src/rainy_rgb/                 # rainy_rgb lighting engine (color/effects/engine/reactive/overlay/led_map/state/zmk_adapter) — see docs/rainy-rgb.md
   src/behaviors/behavior_rainy_rgb.c  # &rgb keymap behavior (toggle/effect/hue/bright/speed/battery)
-  dts/bindings/                  # DTS bindings: b91-usbd / b91-spi-led-strip / b91-battery-adc / b91-watchdog
+  src/behaviors/behavior_bt_sel_ble.c # &bt_sel_ble N: select BLE profile N and switch the output USB -> BLE (Fn+F1..F3)
+  src/ble_open_profile/          # open profile timeout (RAINY75_BLE_OPEN_PROFILE_TIMEOUT): pure open_profile.c + Zephyr adapter + host tests
+  include/rainy75/events/        # module ZMK events (rainy75_ble_open_profile_timeout)
+  dts/bindings/                  # DTS bindings: b91-usbd / b91-spi-led-strip / b91-battery-adc / b91-watchdog / rainy behaviors (rgb, bt-sel-ble)
   lib/liblt_9518_zephyr.a        # BLE controller blob (2.8 MB), opt-in (./build.sh --blob): proprietary/NDA, fetched by fetch_ble_blob.sh, gitignored (NOT committed)
 conf/                            # build configuration overlays
   app.conf                       # ZMK app config (BLE, USB, mcumgr, WDT, RGB)
