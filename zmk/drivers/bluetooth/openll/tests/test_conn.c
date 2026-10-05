@@ -4218,10 +4218,88 @@ static void test_instant_late_update_resync_offset(void)
 	ll_conn_end(0, LL_ST_REMOTE_TERM);
 }
 
-/* catch_up's event is refused by another link's running event: the link
- * yields to the next event (a collision), keeps the late map and stays up
- * (N >= 2; runs at N = 3 and 5). */
-static void test_instant_late_yield(void)
+/* Final review A-M1: a link kicked (new TX data) while another link's
+ * event runs. Its planned event was accepted before that event started
+ * (the running event's cap was clipped for it), so when every earlier
+ * window event is refused (inside the running span) it keeps the planned
+ * one: no yield, no collision, the event is listened to. Link 0 has
+ * latency 4 at 15 ms, link 1 a 60 ms interval, so link 1's events are long
+ * and cover link 0's window events. One kick per run, for several link 1
+ * offsets (N >= 2; runs at N = 3 and 5). */
+static void test_kick_during_other_event(void)
+{
+	const uint8_t pdu[2] = {0x01, 0x02};
+	int kicked = 0;
+
+	if (LL_MAX_CONN < 2) {
+		return;
+	}
+	for (uint32_t off = 1000; off <= 14000; off += 1000) {
+		struct ll_connect_ind ci0 = mk_ci_link(0), ci1 = mk_ci_link(1);
+		const uint32_t t0 = 1000000;
+		struct ll_conn_stats sa, sb;
+		int guard = 0;
+		bool seen0 = false;
+
+		ci0.latency = 4;
+		ci1.interval = 48;
+		reset_all(false);
+		CHECK(ll_conn_start(&ci0, t0) == 0);
+		CHECK(ll_conn_start(&ci1, t0 + T(off)) == 1);
+		/* past the latency holdoff */
+		while ((int32_t)(now - (t0 + T(1500000))) < 0 && guard++ < 1000) {
+			(void)ev_follow();
+		}
+		/* stop with link 1's event on air */
+		guard = 0;
+		do {
+			fire_alarm();
+			if (rad.aa == ci1.aa) {
+				break;
+			}
+			rx(rad.open + T((rad.fst - LL_CONN_SYNC_US) / 2), 0x01, 0);
+			done(1);
+		} while (guard++ < 100);
+		CHECK(rad.aa == ci1.aa);
+		ll_conn_get_stats(0, &sa);
+		CHECK(ll_txq_push(0, LL_TXQ_ACL, LL_LLID_START, pdu, sizeof(pdu), 0, true) == 0);
+		ll_conn_kick(0);
+		kicked++;
+		ll_conn_get_stats(0, &sb);
+		CHECK(sb.collisions == sa.collisions);
+		rx(rad.open + T((rad.fst - LL_CONN_SYNC_US) / 2), 0x01, 0);
+		done(1);
+		/* link 0 is listened to before link 1's next event (which
+		 * link 0's ACTIVE request may displace) */
+		guard = 0;
+		do {
+			fire_alarm();
+			if (rad.aa == ci0.aa) {
+				seen0 = true;
+			}
+			if (rad.aa == ci1.aa) {
+				break;
+			}
+			rx(rad.open + T((rad.fst - LL_CONN_SYNC_US) / 2), 0x01, 0);
+			done(1);
+		} while (!seen0 && guard++ < 100);
+		CHECK(seen0);
+		ll_conn_get_stats(0, &sb);
+		CHECK(sb.collisions == sa.collisions);
+		CHECK(ll_conn_active(0) && ll_conn_active(1) && cbs.disconnected == 0);
+		ll_conn_end(0, LL_ST_REMOTE_TERM);
+		ll_conn_end(1, LL_ST_REMOTE_TERM);
+	}
+	CHECK(kicked == 14);
+}
+
+/* A late map arrives while another link's event runs. catch_up's event
+ * is link 0's planned event, accepted before link 1's event started:
+ * link 1's cap was clipped to make room for it, so re-requesting it while
+ * link 1 runs is accepted (final review A-M1: the alarm lead used to count
+ * twice and the event was lost, a collision and a yield). Link 0 listens
+ * at it with the new map and stays up (N >= 2; runs at N = 3 and 5). */
+static void test_instant_late_follower_kept(void)
 {
 	struct ll_connect_ind ci0 = mk_ci_link(0), ci1 = mk_ci_link(1);
 	const uint32_t t0 = 1000000;
@@ -4254,14 +4332,15 @@ static void test_instant_late_yield(void)
 	ll_conn_get_stats(0, &sa);
 	CHECK(ll_conn_chmap_at(0, (uint16_t)(c0 - 3), (uint16_t)(c0 - 1), no0to9) == 0);
 	ll_conn_get_stats(0, &sb);
-	CHECK(sb.collisions - sa.collisions >= 1);
+	CHECK(sb.collisions == sa.collisions);
 	CHECK(ll_conn_active(0) && ll_conn_active(1));
 	rx(rad.open + T((rad.fst - LL_CONN_SYNC_US) / 2), 0x01, 0);
 	done(1);
 	for (int i = 0; i < 20; i++) {
 		fire_alarm();
 		if (rad.aa == ci0.aa) {
-			CHECK((uint16_t)(ll_conn_event_counter(0) - c0) >= 1);
+			/* the first one is event c0 itself, not lost */
+			CHECK(ev0 > 0 || ll_conn_event_counter(0) == c0);
 			CHECK(rad.ch >= 10);
 			ev0++;
 		}
@@ -4352,6 +4431,7 @@ int main(void)
 	test_instant_late_stats();
 	test_instant_late_update_window();
 	test_instant_late_update_resync_offset();
-	test_instant_late_yield();
+	test_instant_late_follower_kept();
+	test_kick_during_other_event();
 	DONE();
 }

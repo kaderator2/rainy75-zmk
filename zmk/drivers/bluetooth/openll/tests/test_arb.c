@@ -402,14 +402,20 @@ static void test_running(void)
 	fire_alarm();
 	CHECK(rec.starts == 1 && rec.start_id == A && rec.start_cap == 12000);
 	/* MUST cannot displace a running event, also past min_len, up to
-	 * the cap plus the clipping reserve (a request accepted while it runs
-	 * keeps SAFETY + LEAD between the cap and its own span) */
+	 * the cap plus the clipping reserve: a request accepted while it runs
+	 * opens its RX at least SAFETY + LEAD after the cap, the same distance
+	 * clip_cap() keeps before an accepted request (judged by the open, so
+	 * the request's own lead may reach into the reserve) */
 	CHECK(req(B, mk(t + T(1000), 0, 1000, 1000, LL_ARB_PRIO_MUST)) == -EBUSY);
 	CHECK(req(B, mk(t + T(11000), 0, 1000, 1000, LL_ARB_PRIO_MUST)) == -EBUSY);
-	CHECK(req(B, mk(t + T(12000 + reserve), 0, 1000, 1000, LL_ARB_PRIO_MUST)) == -EBUSY);
+	CHECK(req(B, mk(t + T(12000 + reserve) - 1, 0, 1000, 1000, LL_ARB_PRIO_MUST)) == -EBUSY);
+	CHECK(req(B, mk(t + T(12000 + reserve) - 1, 500, 1000, 1000, LL_ARB_PRIO_MUST)) ==
+	      -EBUSY);
 	CHECK(rec.bumps == 0);
-	CHECK(req(B, mk(t + T(12000 + reserve) + 1, 0, 1000, 1000, LL_ARB_PRIO_MUST)) == 0);
-	CHECK(ll_arb_gap(t, 0, 100) == t + T(13000 + reserve) + 2);
+	CHECK(req(B, mk(t + T(12000 + reserve), 500, 1000, 1000, LL_ARB_PRIO_MUST)) == 0);
+	CHECK(req(B, mk(t + T(12000 + reserve), 0, 1000, 1000, LL_ARB_PRIO_MUST)) == 0);
+	CHECK(rec.bumps == 0 && rec.starts == 1);
+	CHECK(ll_arb_gap(t, 0, 100) == t + T(13000 + reserve) + 1);
 	/* A's next request ends the running state */
 	CHECK(req(A, mk(t + T(30000), 500, 2000, 12000, LL_ARB_PRIO_IDLE)) == 0);
 	CHECK(ll_arb_gap(t, 0, 100) == t);
@@ -448,6 +454,15 @@ static void test_cap_clip(void)
 	/* the running span follows the clipped cap plus the reserve: it ends
 	 * exactly where B's open is (B's own span starts with its lead) */
 	CHECK(ll_arb_gap(t, 0, 1) == t + T(9000 + 2000) + 1);
+	/* B may re-request its own accepted event while A runs (a kick or an
+	 * instant re-plan of B during A's event must not lose it), and A
+	 * keeps running */
+	CHECK(req(B, mk(t + T(9000), 500, 2000, 14000, LL_ARB_PRIO_IDLE)) == 0);
+	CHECK(req(B, mk(t + T(9000), 500, 2000, 14000, LL_ARB_PRIO_MUST)) == 0);
+	CHECK(rec.bumps == 0 && rec.starts == 1);
+	/* one tick earlier would open inside A's reserve: refused */
+	CHECK(req(B, mk(t + T(9000) - 1, 500, 2000, 14000, LL_ARB_PRIO_MUST)) == -EBUSY);
+	CHECK(rec.bumps == 0);
 	/* far after: max stays */
 	arb_reset();
 	CHECK(req(A, mk(t, 500, 2000, 14000, LL_ARB_PRIO_IDLE)) == 0);

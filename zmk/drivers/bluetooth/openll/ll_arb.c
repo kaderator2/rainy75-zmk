@@ -173,7 +173,8 @@ static void alarm_fired(void)
 	s->running = true;
 	/* The event may use the cap; a request accepted while it runs must
 	 * still open its RX the clipping reserve after it (the same distance
-	 * clip_cap() keeps before an accepted request). */
+	 * clip_cap() keeps before an accepted request; ll_arb_request() tests
+	 * a running span against the request's open, not its alarm). */
 	s->run_end = s->r.open_tick + US(cap + CLIP_RESERVE_US > s->r.min_len_us ?
 					 cap + CLIP_RESERVE_US : s->r.min_len_us);
 	arm();
@@ -221,7 +222,23 @@ int ll_arb_request(uint8_t id, const struct ll_arb_req *r)
 		struct slot *o = &slots[i];
 		bool win;
 
-		if (i == id || !o->used || !overlap(a0, a1, o->r.alarm_tick, span_end(o))) {
+		if (i == id || !o->used) {
+			continue;
+		}
+		if (o->running) {
+			/* A running span ends at cap + CLIP_RESERVE_US, the
+			 * distance clip_cap() keeps before the next request's
+			 * open. Judged by the open as well (one tick before
+			 * run_end, so a request clip_cap() made room for fits
+			 * exactly): its alarm may lie in the reserve, as it did
+			 * for an accepted request. Judged by the alarm, the
+			 * lead would count twice and a request accepted before
+			 * the event started could not be re-requested while it
+			 * runs (a kick or instant re-plan would lose it). */
+			if (!overlap(r->open_tick, a1, o->r.alarm_tick, o->run_end - 1)) {
+				continue;
+			}
+		} else if (!overlap(a0, a1, o->r.alarm_tick, span_end(o))) {
 			continue;
 		}
 		collided = true;

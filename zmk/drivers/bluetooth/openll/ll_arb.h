@@ -14,8 +14,12 @@
  * (ll_conn: at CONN_DONE; ll_adv: at the end of the adv event); a running
  * span ends at open_tick + max(min_len_us, cap_us + LL_CONN_EVENT_SAFETY_US
  * + LL_CONN_ARM_LEAD_US) (the clipping reserve, so a request accepted while
- * it runs still opens its RX that long after the event's cap), and it can
- * neither be displaced nor overlapped. If the alarm of a request fires while another
+ * it runs still opens its RX that long after the event's cap, the distance
+ * the cap keeps before an accepted request), and it can neither be
+ * displaced nor overlapped. A new request is tested against a running span
+ * by its open_tick (its lead may lie in the reserve, as it does for a request
+ * accepted before the event started, which can therefore be re-requested
+ * while the event runs); ll_arb_gap() still uses the whole span. If the alarm of a request fires while another
  * request is still running (an event overran its cap), that request is
  * displaced (bumped) instead of started.
  *
