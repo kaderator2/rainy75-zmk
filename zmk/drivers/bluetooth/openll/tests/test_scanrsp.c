@@ -85,7 +85,15 @@ static void test_trigger(void)
 	uint32_t end = 100000, t = 0xdeadbeef;
 
 	/* 150 = (trigger - end) + settle + TX path */
-	CHECK(lead == US(41));
+#ifndef LL_TEST_SETTLE_OVERRIDE
+	/* default settle: the smallest TX settle hal_telink publishes for
+	 * BLE 1M (ext_rf.h LL_SCAN_TX_SETTLE / LL_TX_STL_TIFS_1M = 63) */
+	CHECK(LL_SCANRSP_SETTLE_US == 63);
+	CHECK(lead == US(28));
+#else
+	CHECK(lead == US(150 - LL_SCANRSP_SETTLE_US - 59));
+#endif
+	CHECK(LL_SCANRSP_TX_PATH_US == 59);
 	/* decided 15 us after the end: trigger 41 us after the end */
 	CHECK(ll_scanrsp_trigger(end, end + US(15), &t) && t == end + lead);
 	/* exactly the minimum lead is accepted, one tick less is not */

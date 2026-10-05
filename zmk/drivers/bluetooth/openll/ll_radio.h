@@ -170,7 +170,9 @@ struct ll_radio_stats {
 	uint32_t rx_crc;
 	uint32_t rx_timeout;
 	uint32_t rsp_tx;     /* SCAN_RSP TX triggered (not confirmed sent) */
-	uint32_t rsp_late;   /* SCAN_REQ for us not answered: the RX ISR ran too late */
+	/* SCAN_REQ for us not answered: the RX ISR was too late, or no adv
+	 * RX window was open / a response was in flight */
+	uint32_t rsp_late;
 	/* Connection mode */
 	uint32_t conn_events;   /* BRX commands issued */
 	uint32_t conn_rx;       /* CRC-valid packets (CRC-bad ones count in rx_crc) */

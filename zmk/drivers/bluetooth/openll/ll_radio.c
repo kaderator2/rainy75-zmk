@@ -42,8 +42,9 @@
  *   RX_TIMEOUT; a guard alarm on the stimer ends it if none of them comes.
  *
  * SCAN_RSP (slice 7 Task 2 item 1, ll_scanrsp.h): the RX ISR answers a
- * SCAN_REQ for us itself, first thing in the ISR, with a scheduled STX at
- * a 41 us trigger lead and a 50 us TX settle (first bit on air 150 us after
+ * SCAN_REQ for us itself, first thing in the ISR, with a scheduled STX
+ * (TX settle CONFIG_BT_HCI_B91_OPENLL_SCANRSP_SETTLE_US, default 63, trigger
+ * 150 - settle - 59 us after the request; first bit on air 150 us after
  * the request); the link layer callback only learns the decision
  * (ll_radio_tx_rsp_at). Through the callback chain the decision came 60..90
  * us after the request, too late for that (the former trigger, 72 us after
@@ -248,7 +249,8 @@ static void adv_guard(void);
 
 /* ---- advertising mode ISR ---- */
 
-static uint8_t *rx_entry(uint8_t idx)
+/* Inline into the RAM ISR: no flash fetch before the SCAN_RSP trigger. */
+static inline __attribute__((always_inline)) uint8_t *rx_entry(uint8_t idx)
 {
 	return &rx_buf[(idx & (RING_N - 1)) * RX_ENTRY_SIZE];
 }
@@ -256,12 +258,14 @@ static uint8_t *rx_entry(uint8_t idx)
 /* SCAN_REQ -> SCAN_RSP, first thing in the RF ISR (file header,
  * ll_scanrsp.h): a CRC-valid SCAN_REQ for the AdvA of the prepared SCAN_RSP
  * gets the STX at once, when the trigger can still be met; anything else,
- * and a late decision, gets nothing. The CPU then holds on the cycle counter
+ * and a late decision, gets nothing. A SCAN_REQ for us that arrives while
+ * no adv RX window is open or a response is in flight (can_answer false)
+ * is only counted in rsp_late. The CPU then holds on the cycle counter
  * until the response is on air: CPU work (flash fetches of the callback
  * chain) while the TX starts delays it by a few us, as in the connection
  * turnaround (slice 6b Task 4 review). Returns true if the response was
  * started; the adv guard covers it like any adv TX. */
-_attribute_ram_code_sec_noinline_ static bool adv_rsp_isr(void)
+_attribute_ram_code_sec_noinline_ static bool adv_rsp_isr(bool can_answer)
 {
 	uint8_t hw = rf_get_rx_wptr() & RX_WPTR_MASK;
 	uint8_t *p = rx_entry((uint8_t)(hw - 1));
@@ -271,6 +275,12 @@ _attribute_ram_code_sec_noinline_ static bool adv_rsp_isr(void)
 	if (rsp_len == 0 || hw == cn.rx_sw || !RF_BLE_PACKET_VALIDITY_CHECK(p) ||
 	    !ll_scanrsp_for_us(&rsp_buf[4], rsp_len, &p[DMA_RFRX_OFFSET_HEADER],
 			       (uint8_t)(plen + 2))) {
+		return false;
+	}
+	if (!can_answer) {
+		/* a SCAN_REQ for us outside an open adv RX window (or with a
+		 * response already in flight): not answered, counted */
+		atomic_inc(&cnt_rsp_late);
 		return false;
 	}
 	ts = ll_get_le32(&p[DMA_RFRX_OFFSET_TIME_STAMP(p)]);
@@ -293,8 +303,8 @@ _attribute_ram_code_sec_noinline_ static void adv_isr(uint16_t st)
 {
 	bool rsp = false;
 
-	if ((st & FLD_RF_IRQ_RX) && adv_open && !rsp_in_flight) {
-		rsp = adv_rsp_isr();
+	if (st & FLD_RF_IRQ_RX) {
+		rsp = adv_rsp_isr(adv_open && !rsp_in_flight);
 	}
 	rsp_started = rsp;
 	if (!rsp && adv_open &&

@@ -56,6 +56,21 @@ config BT_HCI_B91_OPENLL_MAX_CONN
 	  5 KB of RAM (TX and RX queues for 251-octet PDUs, slice 6b). 1
 	  behaves as the single-link controller of slice 5.
 
+config BT_HCI_B91_OPENLL_SCANRSP_SETTLE_US
+	int "Open link layer: SCAN_RSP TX settle (us)"
+	depends on BT_HCI_B91_CTLR_OPEN
+	range 30 87
+	default 63
+	help
+	  TX settle of the scheduled single TX that answers a SCAN_REQ
+	  (openll/ll_scanrsp.h). The trigger lies 150 - settle - 59 us
+	  after the request; the RX interrupt must decide before it, so a
+	  smaller settle answers more requests in time. The default 63 is
+	  the smallest TX settle hal_telink publishes for BLE 1M
+	  (ext_rf.h LL_SCAN_TX_SETTLE, LL_TX_STL_TIFS_1M). 40 and 50 worked
+	  with the sniffer and the tested scanner but are not spectrally
+	  verified.
+
 config BT_HCI_B91_OPENLL_STATS_LOG
 	bool "Open link layer: periodic radio/connection stats log"
 	depends on BT_HCI_B91_CTLR_OPEN

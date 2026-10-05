@@ -16,10 +16,11 @@
  * STX path is the reverse: no answer unless the CPU decided in time.
  *
  * Timing (device + sniffer, s7-task-2-report.md): the first bit is on air
- * at trigger + TX settle + LL_SCANRSP_TX_PATH_US. With settle 50 the trigger
- * lies 41 us after the request's end; the RX ISR has decided by then in
- * almost every case (ISR entry 10..20 us after the end, decision 10..30 us).
- * A later decision is not answered (the scanner retries; its backoff).
+ * at trigger + TX settle + LL_SCANRSP_TX_PATH_US. With the default settle 63
+ * the trigger lies 28 us after the request's end (settle 50: 41 us); the RX
+ * ISR decides 10..30 us after the end. A later decision is not answered
+ * (rsp_late; the scanner retries, SCAN_RSP is not needed for discovery: the
+ * name is in ADV_IND).
  * The previous trigger (settle 78 after a 72 us lead) put the SCAN_RSP on
  * air 209 us after the request, outside the scanner's window.
  *
@@ -37,15 +38,30 @@
 #include <stdint.h>
 #include "ll_defs.h"
 
-/* TX settle of the SCAN_RSP STX (us). */
-#define LL_SCANRSP_SETTLE_US    50
+/* TX settle of the SCAN_RSP STX (us): CONFIG_BT_HCI_B91_OPENLL_SCANRSP_SETTLE_US,
+ * default 63, the smallest TX settle hal_telink publishes for BLE 1M
+ * (tlsr9/drivers/B91/ext_driver/ext_rf.h: LL_SCAN_TX_SETTLE and
+ * LL_TX_STL_TIFS_1M = 63; LL_SCANRSP_TX_SETTLE 78, LL_TX_STL_ADV_1M 84,
+ * LL_SLAVE_TX_SETTLE 86). Smaller values worked on the sniffer and the
+ * tested scanner (40, 50) but are not spectrally verified. */
+#ifndef LL_SCANRSP_SETTLE_US
+#ifdef CONFIG_BT_HCI_B91_OPENLL_SCANRSP_SETTLE_US
+#define LL_SCANRSP_SETTLE_US    CONFIG_BT_HCI_B91_OPENLL_SCANRSP_SETTLE_US
+#else
+#define LL_SCANRSP_SETTLE_US    63
+#endif
+#endif
 /* Fixed delay from the end of the TX settle to the first bit on air (us),
- * measured on the B91 STX path (TX timestamp + sniffer). */
+ * measured on the B91 STX path (TX timestamp + sniffer) on one board
+ * (one unit); recheck on another unit. */
 #define LL_SCANRSP_TX_PATH_US   59
 /* A trigger closer than this to now is refused: the register writes after
  * the check must still land before the trigger tick (a trigger in the past
  * would leave the FSM waiting). */
 #define LL_SCANRSP_MIN_LEAD_US  3
+
+_Static_assert(LL_T_IFS_US - LL_SCANRSP_SETTLE_US - LL_SCANRSP_TX_PATH_US > LL_SCANRSP_MIN_LEAD_US,
+	       "SCAN_RSP settle leaves no trigger lead after the request");
 
 /* true if req (PDU header + payload, req_len bytes) is a SCAN_REQ for the
  * AdvA and TxAdd of rsp (the prepared SCAN_RSP PDU, rsp_len bytes). false
