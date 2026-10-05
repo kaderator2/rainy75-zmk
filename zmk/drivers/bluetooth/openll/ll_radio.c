@@ -139,6 +139,18 @@ BUILD_ASSERT(RING_N == 4, "the boot-time DMA geometry (tx_chn_dep 2) has 4 entri
  * whose T_IFS of about 209 us is explained by a fixed TX path delay. */
 #define RX_TS_TO_END_TICKS(plen) (((plen) + 2 + 3) * 8 * LL_TICKS_PER_US)
 
+/* RX timestamp of a DMA entry. Always inlined: the SCAN_RSP decision and
+ * the RX->TX turnaround hold run from the RAM RF ISR before the trigger /
+ * hold, where an out-of-line ll_get_le32() in XIP flash costs a cache miss
+ * (final review C-M1). */
+static ALWAYS_INLINE uint32_t rx_ts(const uint8_t *p)
+{
+	const uint8_t *t = &p[DMA_RFRX_OFFSET_TIME_STAMP(p)];
+
+	return (uint32_t)t[0] | ((uint32_t)t[1] << 8) | ((uint32_t)t[2] << 16) |
+	       ((uint32_t)t[3] << 24);
+}
+
 static uint8_t tx_buf[DMA_BUF_SIZE] __aligned(4);
 static uint8_t rsp_buf[DMA_BUF_SIZE] __aligned(4);
 static uint8_t rx_buf[RX_AREA_SIZE] __aligned(4);
@@ -286,7 +298,7 @@ _attribute_ram_code_sec_noinline_ static bool adv_rsp_isr(bool can_answer)
 		atomic_inc(&cnt_rsp_late);
 		return false;
 	}
-	ts = ll_get_le32(&p[DMA_RFRX_OFFSET_TIME_STAMP(p)]);
+	ts = rx_ts(p);
 	if (!ll_scanrsp_trigger(ts + RX_TS_TO_END_TICKS(plen), stimer_get_tick(), &trigger)) {
 		atomic_inc(&cnt_rsp_late);
 		return false;
@@ -402,7 +414,7 @@ _attribute_ram_code_sec_noinline_ static void adv_isr(uint16_t st)
 static bool hold_turnaround(const uint8_t *p)
 {
 	uint8_t plen = p[DMA_RFRX_OFFSET_RFLEN];
-	uint32_t ts = ll_get_le32(&p[DMA_RFRX_OFFSET_TIME_STAMP(p)]);
+	uint32_t ts = rx_ts(p);
 	uint32_t until = ts + RX_TS_TO_END_TICKS(plen) + HOLD_TO_US * LL_TICKS_PER_US;
 	int32_t left = (int32_t)(until - ll_radio_now());
 
@@ -412,8 +424,8 @@ static bool hold_turnaround(const uint8_t *p)
 	if (left <= 0) {
 		return true;    /* our TX has started already (late IRQ) */
 	}
-	atomic_inc(&cnt_holds);
 	hold_until(until);
+	atomic_inc(&cnt_holds);   /* after the hold: may be out of line in flash */
 	return true;
 }
 

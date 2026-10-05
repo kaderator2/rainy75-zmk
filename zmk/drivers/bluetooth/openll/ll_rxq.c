@@ -138,7 +138,11 @@ bool ll_rxq_isr_half_full(uint8_t link)
 		const struct rxq_ent *w = &q->ent[ENT(head - 1)];
 		uint32_t end = (uint32_t)w->off + ll_fifo_size(w->len);
 
-		/* the span from the oldest record to the end of the newest */
+		/* the span from the oldest record to the end of the newest;
+		 * after a wrap the unusable gap at the end of the area is not
+		 * counted, so "half full" may be reported late. Only the wake
+		 * heuristic uses it (room checks use ll_fifo_place, RX flow
+		 * control is exact). */
 		bytes = w->off >= o->off ? end - o->off : LL_RXQ_POOL_BYTES - o->off + end;
 	}
 	return 2u * used >= LL_RXQ_ENTRIES || 2u * bytes >= LL_RXQ_POOL_BYTES;

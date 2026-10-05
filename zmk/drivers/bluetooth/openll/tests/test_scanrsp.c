@@ -94,8 +94,11 @@ static void test_trigger(void)
 	CHECK(lead == US(150 - LL_SCANRSP_SETTLE_US - 59));
 #endif
 	CHECK(LL_SCANRSP_TX_PATH_US == 59);
-	/* decided 15 us after the end: trigger 41 us after the end */
-	CHECK(ll_scanrsp_trigger(end, end + US(15), &t) && t == end + lead);
+	/* decided 15 us after the end (when the settle leaves that much
+	 * lead: not at the Kconfig maximum 87, lead 4 us) */
+	if (lead >= US(15 + LL_SCANRSP_MIN_LEAD_US)) {
+		CHECK(ll_scanrsp_trigger(end, end + US(15), &t) && t == end + lead);
+	}
 	/* exactly the minimum lead is accepted, one tick less is not */
 	t = 0;
 	CHECK(ll_scanrsp_trigger(end, end + lead - US(LL_SCANRSP_MIN_LEAD_US), &t) &&
@@ -109,11 +112,14 @@ static void test_trigger(void)
 	CHECK(t == 0x1234);
 	/* 32-bit tick wrap between the end and the trigger, and between now
 	 * and the trigger */
-	end = 0xFFFFFFFFu - US(10);
-	CHECK(ll_scanrsp_trigger(end, end + US(5), &t) && t == end + lead && t < end);
+	end = 0xFFFFFFFFu - lead / 2u;
+	CHECK(ll_scanrsp_trigger(end, end, &t) && t == end + lead && t < end);
 	end = 0xFFFFFFFFu - US(50);
-	CHECK(ll_scanrsp_trigger(end, end + US(20), &t) && t == end + lead);
-	CHECK(!ll_scanrsp_trigger(end, end + US(40), &t));
+	CHECK(ll_scanrsp_trigger(end, end + lead - US(LL_SCANRSP_MIN_LEAD_US), &t) &&
+	      t == end + lead);
+	CHECK(!ll_scanrsp_trigger(end, end + lead - US(LL_SCANRSP_MIN_LEAD_US) + 1, &t));
+	end = 0xFFFFFFFFu - lead + US(1);   /* now before the wrap, trigger after it */
+	CHECK(ll_scanrsp_trigger(end, end, &t) && t == end + lead && t < end);
 	/* a request that "ends" in the future (bogus timestamp): the trigger
 	 * would lie more than T_IFS ahead; refused instead of arming the FSM
 	 * far ahead */

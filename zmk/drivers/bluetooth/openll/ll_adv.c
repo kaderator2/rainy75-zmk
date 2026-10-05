@@ -81,9 +81,11 @@ LOG_MODULE_DECLARE(openll, CONFIG_BT_HCI_DRIVER_LOG_LEVEL);
  *   T_IFS + SCAN_REQ (12-byte payload, 176 us) or CONNECT_IND
  *   (34-byte payload, 352 us)                               150 + 352
  *   SCAN_RSP: 150 us after the request ends + 376 us              526
- *   sum 2017 (SCAN_REQ: 1782; RX window only, no request: 1230)
+ *   worst case SCAN_REQ + SCAN_RSP 1782 (CONNECT_IND, no SCAN_RSP:
+ *   1432; RX window only, no request: 1230)
  * A CONNECT_IND ends the event (the link's first event lies at least
- * 1.25 ms later), so the SCAN_RSP case bounds the span: 2000 us
+ * 1.25 ms later) and is never followed by a SCAN_RSP, so the SCAN_RSP
+ * case bounds the span: 2000 us
  * (ADV_RX_WINDOW_US 300 > T_IFS + the 40 us until a request's access
  * address is in, so a channel without any request also fits). */
 #define ADV_CHAN_US          2000

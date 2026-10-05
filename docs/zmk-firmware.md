@@ -1089,6 +1089,10 @@ that the UART log backend also takes around each message (not in panic or ISR
 context). Measured on the stats-log image with the patch: 0..1 lost responses
 per upload (the first request, which waits for the slot erase), CLI uploads
 81..84 s, a minimal one-request-at-a-time SMP client 15 s instead of 85 s.
+The patch assumes deferred logging (`CONFIG_LOG_MODE_DEFERRED`, as in this
+build): in immediate mode the backend runs in the caller's context, possibly
+with interrupts locked, where the mutex must not be taken. Upstreaming it
+would need a skip of the lock in that case.
 
 **`drivers/console/uart_mcumgr.c` + `Kconfig`** (0011): the first mcumgr command after boot is answered **[VERIFIED]**
 
