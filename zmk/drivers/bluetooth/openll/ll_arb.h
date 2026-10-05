@@ -56,8 +56,10 @@ enum ll_arb_prio {                                    /* higher wins */
 	LL_ARB_PRIO_ADV = 0,
 	LL_ARB_PRIO_IDLE = 1,                         /* link without backlog */
 	LL_ARB_PRIO_ACTIVE = 2,                       /* TX backlog or ops.busy */
-	LL_ARB_PRIO_SUPERVISION = 3,                  /* next listen within 2 intervals of supervision timeout */
-	LL_ARB_PRIO_MUST = 4,                         /* transmit-window event or instant event */
+	LL_ARB_PRIO_STARVING = 3,                     /* yielded LL_CONN_STARVE_YIELDS events in a row */
+	/* next listen within 2 intervals of the supervision timeout */
+	LL_ARB_PRIO_SUPERVISION = 4,
+	LL_ARB_PRIO_MUST = 5,                         /* transmit-window event or instant event */
 };
 
 struct ll_arb_req {
@@ -97,7 +99,7 @@ void ll_arb_cancel(uint8_t id);
  * refused by it and then yielded via ll_arb_yield, or bumped at its alarm
  * by a running event of priority p). clipped: starts whose cap was cut
  * below max_len_us for a following request. */
-#define LL_ARB_PRIOS 5
+#define LL_ARB_PRIOS 6
 struct ll_arb_stats {
 	uint32_t lost[LL_ARB_PRIOS];
 	uint32_t clipped;

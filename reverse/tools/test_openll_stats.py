@@ -109,6 +109,10 @@ class T(unittest.TestCase):
         txt = o.format_stats(s)
         self.assertIn("gap max 33 ev / 495.0 ms (+2 beyond latency)  event max 6700 us"
                       "  clip 4  lost to adv 0 idle 5 active 3 sup 1 must 0", txt)
+        # firmware with the STARVING priority reports six entries
+        s["link"][0]["lost"] = [0, 5, 3, 2, 1, 0]
+        txt = o.format_stats(s)
+        self.assertIn("lost to adv 0 idle 5 active 3 starving 2 sup 1 must 0", txt)
 
     def test_format_old_firmware(self):
         # a slice 5 reply has neither "links" nor "link" nor "adv"

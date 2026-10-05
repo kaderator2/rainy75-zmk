@@ -24,6 +24,7 @@
 #include "../ll_arb.h"
 #include "../ll_conn.h"
 #include "../ll_csa1.h"
+#include "../ll_csa2.h"
 #include "../ll_defs.h"
 #include "../ll_flash.h"
 #include "../ll_plat.h"
@@ -640,7 +641,50 @@ static struct central {
 	uint32_t base;
 	uint32_t ival;
 	int32_t drift_milli;
+	/* the central's own channel sequence (CSA #1 or #2 by chsel) and its
+	 * pending map: a BRX on another channel receives nothing */
+	uint8_t chsel;
+	uint16_t chan_id;
+	struct ll_csa1 csa;
+	uint8_t chm[5];
+	int ev;          /* next event whose channel is not computed yet */
+	uint8_t ch;      /* channel of event ev - 1 */
+	bool map_pending;
+	uint16_t map_instant;
+	uint8_t map_new[5];
 } cen[LL_MAX_CONN];
+
+/* CHSel of the next sim_connect (0: CSA #1) */
+static uint8_t sim_chsel;
+
+static void cen_chan_init(uint8_t k, uint8_t chsel, uint32_t aa, uint8_t hop,
+			  const uint8_t chm[5])
+{
+	cen[k].chsel = chsel;
+	cen[k].chan_id = ll_csa2_chan_id(aa);
+	ll_csa1_init(&cen[k].csa, hop, chm);
+	memcpy(cen[k].chm, chm, 5);
+	cen[k].ev = 0;
+	cen[k].map_pending = false;
+}
+
+/* the central's channel of event e (e never decreases between calls) */
+static uint8_t cen_channel(uint8_t k, int e)
+{
+	while (cen[k].ev <= e) {
+		if (cen[k].map_pending && (uint16_t)cen[k].ev == cen[k].map_instant) {
+			cen[k].map_pending = false;
+			memcpy(cen[k].chm, cen[k].map_new, 5);
+			ll_csa1_set_map(&cen[k].csa, cen[k].chm);
+		}
+		cen[k].ch = ll_csa1_next(&cen[k].csa);
+		if (cen[k].chsel) {
+			cen[k].ch = ll_csa2_channel(cen[k].chan_id, (uint16_t)cen[k].ev, cen[k].chm);
+		}
+		cen[k].ev++;
+	}
+	return cen[k].ch;
+}
 
 static struct {
 	uint32_t busy_until;
@@ -660,6 +704,22 @@ static struct {
 	/* the next adv channel receives this CONNECT_IND instead of nothing */
 	const uint8_t *connect_pdu;
 	uint32_t connect_end;
+	/* MD burst: a received event of link k lasts this long after its
+	 * anchor (0: one 400 us exchange), cut by the radio guard at the cap */
+	uint32_t ev_us[LL_MAX_CONN];
+	/* LL_CHANNEL_MAP_IND of link k's central: sent from central event
+	 * chm_sent on (retransmitted every event until received), instant
+	 * chm_instant; delivered (ll_conn_chmap_at) after the first listened
+	 * event that receives it. chm_rx_margin_min: the least instant -
+	 * rx_event seen, chm_passed: deliveries refused with 0x28. */
+	bool chm_on[LL_MAX_CONN];
+	int chm_sent[LL_MAX_CONN];
+	uint16_t chm_instant[LL_MAX_CONN];
+	int chm_delivered[LL_MAX_CONN];
+	int chm_passed[LL_MAX_CONN];
+	int chm_rx_margin_min[LL_MAX_CONN];
+	/* BRX on another channel than the central's (must stay 0) */
+	int ch_wrong[LL_MAX_CONN];
 } sim;
 
 static const uint8_t all37[5] = {0xFF, 0xFF, 0xFF, 0xFF, 0x1F};
@@ -682,11 +742,13 @@ static void sim_reset(void)
 	ll_adv_init(adva, NULL);
 	ll_flash_reset();
 	sim_win_offset = 0;
+	sim_chsel = 0;
 	for (uint8_t i = 0; i < LL_MAX_CONN; i++) {
 		struct ll_conn_stats st;
 
 		ll_rxq_reset(i);
 		sim.last_ev[i] = -1;
+		sim.chm_rx_margin_min[i] = 1 << 30;
 		ll_conn_get_stats(i, &st);
 		coll_base[i] = st.collisions;
 	}
@@ -715,6 +777,7 @@ static int sim_connect(uint8_t k, uint32_t end, uint16_t interval, uint16_t late
 	memcpy(ci.chm, all37, 5);
 	ci.hop = 7;
 	ci.sca = 1;
+	ci.chsel = sim_chsel;
 	sim_run_until(end);
 	if ((int32_t)(now - end) > 0 && getenv("ARB_DBG")) {
 		printf("connect late: now %u end %u\n", (unsigned)now, (unsigned)end);
@@ -728,6 +791,7 @@ static int sim_connect(uint8_t k, uint32_t end, uint16_t interval, uint16_t late
 		cen[ret].base = end + T(1250 + 100) + T(1250u * sim_win_offset);
 		cen[ret].ival = T(1250u * interval);
 		cen[ret].drift_milli = drift_milli;
+		cen_chan_init((uint8_t)ret, sim_chsel, ci.aa, ci.hop, ci.chm);
 	}
 	return ret;
 }
@@ -787,20 +851,46 @@ static void sim_step(void)
 			sim.max_gap[k] = e - sim.last_ev[k];
 		}
 		sim.last_ev[k] = e;
-		if (cen[k].present && (int32_t)(a - rad.open) >= 0 &&
+		if (cen[k].present && cen_channel((uint8_t)k, e) != rad.ch) {
+			sim.ch_wrong[k]++;
+		}
+		if (cen[k].present && cen_channel((uint8_t)k, e) == rad.ch &&
+		    (int32_t)(a - rad.open) >= 0 &&
 		    (int32_t)(rad.open + T(rad.fst) - (a + T(LL_CONN_SYNC_US))) >= 0) {
 			uint8_t pdu[2] = {0x01, 0};
 			uint32_t open = rad.open, max_ev = rad.max_ev;
 
 			now = a + T(LL_CONN_SYNC_US);
 			ll_conn_radio_evt(LL_RADIO_CONN_RX, pdu, 2, now);
-			now += T(400);   /* our response, the event ends */
+			if (sim.ev_us[k] != 0) {
+				/* MD burst until the guard ends it at the cap */
+				now = a + T(sim.ev_us[k]);
+				if ((int32_t)(now - (open + T(max_ev))) > 0) {
+					now = open + T(max_ev);
+				}
+			} else {
+				now += T(400);   /* our response, the event ends */
+			}
 			if ((int32_t)(now - (open + T(max_ev))) > 0) {
 				sim.over_cap++;
 			}
 			sim.rx[k]++;
 			sim.last_rx[k] = a;
 			ll_conn_radio_evt(LL_RADIO_CONN_DONE, NULL, 1, now);
+			if (sim.chm_on[k] && e >= sim.chm_sent[k]) {
+				/* the controller thread handles the PDU after the event */
+				int m = (int)(uint16_t)(sim.chm_instant[k] - (uint16_t)e);
+
+				sim.chm_on[k] = false;
+				sim.chm_delivered[k]++;
+				if (m < sim.chm_rx_margin_min[k]) {
+					sim.chm_rx_margin_min[k] = m;
+				}
+				if (ll_conn_chmap_at((uint8_t)k, (uint16_t)e, sim.chm_instant[k],
+						     cen[k].map_new) == LL_ST_INSTANT_PASSED) {
+					sim.chm_passed[k]++;
+				}
+			}
 		} else {
 			now = rad.open + T(rad.fst);
 			ll_conn_radio_evt(LL_RADIO_CONN_DONE, NULL, 0, now);
@@ -1038,14 +1128,15 @@ static void test_window_wins(void)
 }
 
 /* An idle link overlapping an always-active link on every event loses
- * every tie of priorities, but its supervision priority wins before the
- * timeout: it never times out. */
+ * every tie of priorities until it has yielded LL_CONN_STARVE_YIELDS
+ * events in a row; its next event then asks at STARVING and wins (before
+ * the starvation bound it was rescued only by its supervision priority,
+ * 2 intervals before the timeout: gaps of up to 65 events here). The
+ * active link keeps two of every three events. */
 static void test_supervision_rescue(void)
 {
 	const uint32_t t0 = 2000000;
-	/* timeout 1 s at 15 ms: 66 events; supervision priority from 2
-	 * intervals before */
-	const uint16_t timeout = 100;
+	const uint16_t timeout = 100;   /* 1 s at 15 ms: 66 events */
 
 	if (LL_MAX_CONN < 2) {
 		return;
@@ -1060,10 +1151,10 @@ static void test_supervision_rescue(void)
 	       sim.listened[1], sim.max_gap[1], (unsigned)coll(0), (unsigned)coll(1));
 	CHECK(ll_conn_active(0) && ll_conn_active(1));
 	CHECK(disconnects[0] == 0 && disconnects[1] == 0);
-	CHECK(sim.listened[0] >= 2000 / 66);
-	CHECK(sim.max_gap[0] <= 66);
-	CHECK(sim.max_gap[0] > 2);       /* the active link really dominated */
-	CHECK(coll(0) > 1000);
+	CHECK(sim.max_gap[0] == LL_CONN_STARVE_YIELDS + 1);   /* the busy link wins the ties */
+	CHECK(sim.max_gap[1] <= 2);
+	CHECK(sim.listened[0] >= 2000 / (LL_CONN_STARVE_YIELDS + 1) - 2);
+	CHECK(sim.listened[1] >= 2000 * LL_CONN_STARVE_YIELDS / (LL_CONN_STARVE_YIELDS + 1) - 2);
 	CHECK(sim.overlaps == 0 && sim.over_cap == 0);
 }
 
@@ -1291,6 +1382,7 @@ static void test_adv_while_connected(void)
 	cen[1].aa = 0x50002222u;
 	cen[1].base = sim.connect_end + T(1250 + 100);
 	cen[1].ival = T(1250u * 12);
+	cen_chan_init(1, 0, cen[1].aa, 7, all37);
 	ev = sim.rx[1];
 	sim_run_link(1, 20);
 	CHECK(sim.rx[1] > ev + 10);           /* link 1 follows its central */
@@ -1559,6 +1651,99 @@ static void test_flash_adv(void)
 	CHECK(ll_adv_enable(false) == LL_ST_SUCCESS);
 }
 
+
+/* Starvation (first multi-host device test): link 0 (a PC at 7.5 ms,
+ * latency 0, timeout 420 ms, always busy, 251-octet data length, every
+ * event an MD burst up to its cap) fills almost every interval; link 1 (a
+ * phone at 15 ms, latency 30, timeout 4 s, idle, 251-octet data length)
+ * overlaps one or two of link 0's events with every event of its own.
+ * Its central sends an LL_CHANNEL_MAP_IND from a random event N on, with
+ * the instant latency + 1 + m events after N (m = 6..10: the spec's six
+ * listened events; the phone measured on the device used latency + 7).
+ * The background link must listen within two events beyond its latency
+ * window, so every map arrives before its instant (no 0x28), and the
+ * active link loses at most a few events per background listen. The same
+ * with link 0 idle (no backlog between bursts): link 1 overlaps two of its
+ * events and round-robin ties alternate, so it lost one of the two every
+ * time and starved the same way. */
+static void starve_run(uint16_t lat1, int maps, bool busy0, uint8_t chsel)
+{
+	const uint32_t t0 = 2000000;
+	int sent = 0, guard = 0;
+	uint32_t c0;
+
+	static const uint8_t maps_alt[2][5] = {{0x03, 0xFF, 0xFF, 0x73, 0x1F},
+						{0xFF, 0xF7, 0xFF, 0x9F, 0x1E}};
+
+	sim_reset();
+	sim_chsel = chsel;
+	busy[0] = busy0;
+	CHECK(sim_connect(0, t0, 6, 0, 42, 0) == 0);
+	ll_conn_set_dle_times(0, 2120, 2120);
+	CHECK(sim_connect(1, t0 + T(3100), 12, lat1, 400, 300) == 1);
+	ll_conn_set_dle_times(1, 2120, 2120);
+	sim.ev_us[0] = 20000;   /* every received event runs to its cap */
+	sim_run_link(1, 200);   /* past the latency holdoff */
+	sim.max_gap[0] = sim.max_gap[1] = 0;
+	c0 = coll(0);
+	while (sent < maps && ll_conn_active(1) && guard++ < 1000000) {
+		/* a new procedure once the central's last instant has passed */
+		if (!sim.chm_on[1] && !cen[1].map_pending) {
+			int n = ll_conn_event_counter(1) + (int)(ll_plat_rand32() % 40u);
+			int m = 6 + (int)(ll_plat_rand32() % 5u);
+
+			sim.chm_on[1] = true;
+			sim.chm_sent[1] = n;
+			sim.chm_instant[1] = (uint16_t)(n + lat1 + 1 + m);
+			cen[1].map_pending = true;
+			cen[1].map_instant = sim.chm_instant[1];
+			memcpy(cen[1].map_new, maps_alt[sent & 1], 5);
+			sent++;
+		}
+		sim_step();
+	}
+	/* until the last map is received and its instant has passed */
+	for (guard = 0; guard < 100000 && sim.chm_on[1] && ll_conn_active(1); guard++) {
+		sim_step();
+	}
+	sim_run_link(1, (uint16_t)(sim.chm_instant[1] + 2));
+	printf("  starve lat %u %s csa%d n%d: link 1 listened %d max gap %d (latency + 1 = %d), "
+	       "maps %d passed %d min margin %d; link 0 listened %d max gap %d coll %u\n", lat1,
+	       busy0 ? "busy" : "idle", chsel + 1, LL_MAX_CONN, sim.listened[1], sim.max_gap[1],
+	       lat1 + 1, sim.chm_delivered[1], sim.chm_passed[1], sim.chm_rx_margin_min[1],
+	       sim.listened[0], sim.max_gap[0], (unsigned)(coll(0) - c0));
+	CHECK(disconnects[0] == 0 && disconnects[1] == 0);
+	CHECK(ll_conn_active(0) && ll_conn_active(1));
+	CHECK(sim.chm_passed[1] == 0);
+	CHECK(sim.chm_delivered[1] == maps);
+	CHECK(sim.ch_wrong[0] == 0 && sim.ch_wrong[1] == 0);
+	CHECK(sim.max_gap[1] <= lat1 + 1 + 2);
+	/* The active link loses one or two events per background listen
+	 * (its span overlaps one or two of them), up to four in a row when an
+	 * instant event (MUST) of the background link follows a starving
+	 * one. With latency 30 that is a few per cent of its events; a
+	 * background link without latency whose 251-octet span overlaps
+	 * every event takes about a third of them. */
+	CHECK(sim.max_gap[0] <= 5);
+	CHECK((int)(coll(0) - c0) * (lat1 > 0 ? 10 : 1) <= sim.listened[0]);
+	CHECK(sim.overlaps == 0 && sim.over_cap == 0);
+}
+
+static void test_starve_background(void)
+{
+	if (LL_MAX_CONN < 2) {
+		return;
+	}
+	starve_run(30, 60, true, 0);
+	starve_run(0, 200, true, 0);
+	/* the device case: the PC link mostly idle between echoes (round-robin
+	 * ties: link 1 overlaps two of link 0's events and must win both) */
+	starve_run(30, 60, false, 0);
+	/* CSA #2 (both centrals on the device use it) */
+	starve_run(30, 60, false, 1);
+	starve_run(30, 60, true, 1);
+}
+
 int main(void)
 {
 	test_accept_refuse_prio();
@@ -1573,6 +1758,7 @@ int main(void)
 	test_dodge();
 	test_window_wins();
 	test_supervision_rescue();
+	test_starve_background();
 	test_adv_gaps();
 	test_adv_dropped();
 	test_adv_starve_boost();

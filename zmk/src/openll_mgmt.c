@@ -10,7 +10,7 @@
  *                       "link": [{"up": 0/1, "listen": uint, "skip": uint,
  *                                 "coll": uint, "miss": uint, "gmax": uint,
  *                                 "gus": uint, "gx": uint, "elen": uint,
- *                                 "clip": uint, "lost": [5 x uint]}, ...]
+ *                                 "clip": uint, "lost": [6 x uint]}, ...]
  *                       (per link id),
  *                       "adv": {"ev": uint, "slid": uint, "drop": uint,
  *                               "cut": uint, "stuck": uint},
@@ -27,8 +27,8 @@
  *   (coll: events yielded to the arbiter; gmax / gus / gx: longest listen
  *   gap in events / us / events beyond latency + 1, elen: longest event in
  *   us, all maxima since boot; clip: starts with a clipped cap; lost: events
- *   given up to a winner of arbiter priority ADV, IDLE, ACTIVE, SUPERVISION,
- *   MUST, see ll_arb.h); "adv" are the advertising
+ *   given up to a winner of arbiter priority ADV, IDLE, ACTIVE, STARVING,
+ *   SUPERVISION, MUST, see ll_arb.h); "adv" are the advertising
  *   arbitration counters (ll_adv_get_stats); "flash" the flash window
  *   (ll_flash.h: windows, waits for the links, forced opens, longest wait
  *   and longest window in us, connection events paused / cut / pulled in,

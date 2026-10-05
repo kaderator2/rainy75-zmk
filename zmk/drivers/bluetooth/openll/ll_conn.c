@@ -46,7 +46,9 @@
  * Arbitration (slice 6a, owner re-plan rule): each planned event is
  * requested with a priority (MUST: transmit-window or instant event;
  * SUPERVISION: its RX opens later than last RX + timeout - 2 * interval;
- * ACTIVE: TX backlog or ops.busy; else IDLE). If the arbiter refuses it,
+ * STARVING: the link yielded LL_CONN_STARVE_YIELDS events in a row since
+ * the arbiter last started one of its events; ACTIVE: TX backlog or
+ * ops.busy; else IDLE). If the arbiter refuses it,
  * or displaces it later (bumped), the link first dodges: it tries the
  * other events of its latency window, latest first at planning, earliest
  * first for a kick (no collision counted). Without latency freedom, or
@@ -102,6 +104,7 @@ struct ll_link {
 	bool first_seen;      /* the event's first packet (valid or not) was seen */
 	bool rx_stopped;      /* this event was stopped for lack of ll_rxq room */
 	uint16_t pause_run;   /* consecutive events not listened to (RX flow control) */
+	uint8_t yield_run;    /* consecutive events yielded to the arbiter (STARVING priority) */
 	bool anchored;        /* the last closed event re-anchored (latency rule) */
 	bool holdoff_done;    /* LL_CONN_LATENCY_HOLDOFF_MS has passed (latched, see skip_count) */
 	/* last event issued to the radio (listen gap stats) */
@@ -507,6 +510,9 @@ static uint8_t prio_of(struct ll_link *c)
 	if ((int32_t)(c->open_tick - deadline) > 0) {
 		return LL_ARB_PRIO_SUPERVISION;
 	}
+	if (c->yield_run >= LL_CONN_STARVE_YIELDS) {
+		return LL_ARB_PRIO_STARVING;
+	}
 	if (ll_txq_backlog(c->id) != 0 || (ops.busy && ops.busy(c->id))) {
 		return LL_ARB_PRIO_ACTIVE;
 	}
@@ -562,6 +568,15 @@ static void rebase(struct ll_link *c)
 	c->csa_base = c->csa_evt;
 }
 
+/* One more event yielded in a row (saturating; prio_of: STARVING from
+ * LL_CONN_STARVE_YIELDS on). */
+static void yielded_one(struct ll_link *c)
+{
+	if (c->yield_run < UINT8_MAX) {
+		c->yield_run++;
+	}
+}
+
 /* Yield the planned event and the following ones until the arbiter
  * accepts one (each counts as a collision, advances like a skip). Every
  * step applies the instants of the event it plans. commit: the planned
@@ -579,6 +594,7 @@ static void yield_on(struct ll_link *c, bool commit)
 	}
 	for (int i = 0; i < YIELD_MAX; i++) {
 		ST(c)->collisions++;
+		yielded_one(c);
 		if (commit) {
 			unsigned int key = ll_plat_lock();
 
@@ -771,9 +787,12 @@ static void prepare(struct ll_link *c, uint32_t cap_us)
 		ll_arb_yield(c->id);
 		ll_plat_unlock(key);
 		ST(c)->collisions++;
+		yielded_one(c);
 		event_closed(c, now);
 		return;
 	}
+	/* the arbiter gave the event: the link is not starving */
+	c->yield_run = 0;
 	c->anchored = false;
 	if (ll_flash_active()) {
 		/* a flash operation turns interrupts off (ll_flash.h): no event

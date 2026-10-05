@@ -17,8 +17,8 @@
  * not active do nothing (or return LL_ST_DISALLOWED / false / 0).
  *
  * Events are arbitrated (slice 6a Task 5): every planned event is an
- * ll_arb request with a priority (MUST > SUPERVISION > ACTIVE > IDLE, see
- * ll_conn.c); a refused or displaced event is moved to another event of
+ * ll_arb request with a priority (MUST > SUPERVISION > STARVING > ACTIVE >
+ * IDLE, see ll_conn.c); a refused or displaced event is moved to another event of
  * the latency window (dodge) or yielded (counter and CSA#1 advance as for
  * a skip, stats.collisions counts it, not a miss for the latency rule).
  *
@@ -99,6 +99,17 @@
  * end), so the central's early requests (feature exchange, encryption,
  * connection update) are answered at once. Per link. */
 #define LL_CONN_LATENCY_HOLDOFF_MS 1000
+/* Starvation bound (arbiter priority STARVING): a link that yielded this
+ * many events in a row (refused, displaced, or started without room)
+ * requests its next events above ACTIVE until one is started. Without it
+ * a busy link whose events overlap every event of an idle one starved the
+ * idle link up to its supervision priority (seconds), and an
+ * LL_CHANNEL_MAP_IND or LL_CONNECTION_UPDATE_IND of that link's central
+ * arrived after its instant (0x28, first multi-host test). With 2, a link
+ * listens at most 2 events beyond its latency window (latency + 3 events
+ * after its last listen); a central gives the peripheral at least 6
+ * listened events before an instant (5.1.1 / 5.1.2). */
+#define LL_CONN_STARVE_YIELDS 2
 
 struct ll_conn_params {
 	uint16_t interval;   /* 1.25 ms units */
