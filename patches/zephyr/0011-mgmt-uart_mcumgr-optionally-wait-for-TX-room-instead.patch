@@ -1,0 +1,96 @@
+From d22529bf7529c9107600ed57889afb720bb2bd43 Mon Sep 17 00:00:00 2001
+From: scholzri <33288574+scholzri@users.noreply.github.com>
+Date: Mon, 5 Oct 2026 06:21:40 +0200
+Subject: [PATCH] mgmt: uart_mcumgr: optionally wait for TX room instead of
+ dropping
+
+uart_poll_out() on CDC ACM discards bytes while the TX ring buffer is
+full. Log output fills that buffer while no host reads the port (the
+boot log alone does), so the first SMP response after the port is
+opened was dropped and the first mcumgr command timed out.
+
+UART_MCUMGR_TX_WAIT_MS > 0 writes responses with uart_fifo_fill() and
+waits up to that long per write for room, and starts each frame with a
+newline, since the output before it may have been cut mid-line. The
+default 0 keeps the old behaviour.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/console/Kconfig       | 14 ++++++++++++++
+ drivers/console/uart_mcumgr.c | 25 +++++++++++++++++++++++++
+ 2 files changed, 39 insertions(+)
+
+diff --git a/drivers/console/Kconfig b/drivers/console/Kconfig
+index 98ae6f7f84..1f73d6e07c 100644
+--- a/drivers/console/Kconfig
++++ b/drivers/console/Kconfig
+@@ -232,6 +232,20 @@ config UART_MCUMGR_RX_BUF_COUNT
+ 	  UART_MCUMGR_RX_BUF_COUNT * UART_MCUMGR_RX_BUF_SIZE >=
+ 	  MCUMGR_TRANSPORT_UART_MTU
+ 
++config UART_MCUMGR_TX_WAIT_MS
++	int "Wait for TX buffer room before dropping response bytes, in ms"
++	default 0
++	help
++	  0 writes responses with uart_poll_out(), as before. A value above 0
++	  writes them with uart_fifo_fill() and, while the driver's TX buffer
++	  is full, waits for room for up to this long per write before the
++	  rest is dropped. Only for UART drivers whose fifo_fill() may be
++	  called from a thread and only buffers (CDC ACM): there a buffer
++	  filled by log output while no host read the port otherwise makes
++	  poll_out() discard the first response after the port is opened.
++	  Each frame is also preceded by a newline, so that it starts a line
++	  even after output that was cut mid-line.
++
+ endif # UART_MCUMGR
+ 
+ config XTENSA_SIM_CONSOLE
+diff --git a/drivers/console/uart_mcumgr.c b/drivers/console/uart_mcumgr.c
+index b662a2d5fa..afaf2d30b6 100644
+--- a/drivers/console/uart_mcumgr.c
++++ b/drivers/console/uart_mcumgr.c
+@@ -205,9 +205,27 @@ static int uart_mcumgr_send_raw(const void *data, int len)
+ 	const uint8_t *u8p;
+ 
+ 	u8p = data;
++#if CONFIG_UART_MCUMGR_TX_WAIT_MS > 0
++	int64_t deadline = k_uptime_get() + CONFIG_UART_MCUMGR_TX_WAIT_MS;
++
++	while (len > 0) {
++		int n = uart_fifo_fill(uart_mcumgr_dev, u8p, len);
++
++		if (n > 0) {
++			u8p += n;
++			len -= n;
++			continue;
++		}
++		if (k_is_in_isr() || k_uptime_get() >= deadline) {
++			break;   /* nobody drains the buffer: drop the rest */
++		}
++		k_msleep(1);
++	}
++#else
+ 	while (len--) {
+ 		uart_poll_out(uart_mcumgr_dev, *u8p++);
+ 	}
++#endif
+ 
+ 	return 0;
+ }
+@@ -233,6 +251,13 @@ int uart_mcumgr_send(const uint8_t *data, int len)
+ 	 * message written concurrently interleaves with the frame.
+ 	 */
+ 	uart_mcumgr_tx_lock();
++#if CONFIG_UART_MCUMGR_TX_WAIT_MS > 0
++	/* Start the frame on a line of its own: other output on the UART may
++	 * have been cut mid-line when the TX buffer filled up, and line-based
++	 * clients only look for a frame start at the beginning of a line.
++	 */
++	(void)uart_mcumgr_send_raw("\n", 1);
++#endif
+ 	rc = mcumgr_serial_tx_pkt(data, len, uart_mcumgr_send_raw);
+ 	uart_mcumgr_tx_unlock();
+ 
+-- 
+2.53.0
+

@@ -440,7 +440,7 @@ These items were flagged during code review and need hardware validation:
 - [x] Boot log shows "Image confirmed — swap is now permanent" (first-time confirmation)
 - [x] `mcumgr image list` shows new hash in slot0, old hash in slot1
 
-**Note:** `mcumgr image upload` alone does NOT trigger a swap. Must use `mcumgr image test <hash>` to mark the slot1 image as pending, then `mcumgr reset`. First mcumgr command after fresh boot may timeout (CDC ACM not immediately ready) — retry after 1-2s.
+**Note:** `mcumgr image upload` alone does NOT trigger a swap. Must use `mcumgr image test <hash>` to mark the slot1 image as pending, then `mcumgr reset`. The first mcumgr command after a fresh boot used to time out (its response was dropped behind the boot log in the full CDC TX ring); fixed by zephyr patch 0011, see "Upstream Patches".
 
 #### 1d. Test MCUboot revert (WDT crash recovery) — PASSED
 
@@ -972,6 +972,7 @@ patches/
     0008-usb-device-expose-a-transfer-slot-s-work-item-for-di.patch
     0009-usb-device-do-not-re-init-transfer-slots-on-every-us.patch
     0010-mgmt-uart_mcumgr-keep-log-output-out-of-SMP-frames.patch
+    0011-mgmt-uart_mcumgr-optionally-wait-for-TX-room-instead.patch
   mcuboot/
     0001-b91-riscv-boot-fixes.patch
   hal_telink/
@@ -991,7 +992,7 @@ commands. The two waited on each other until the HCI command timeout
 asserted; the MCUboot test image then reverted, and the previous image went
 on advertising the public address.
 
-### Zephyr (10 patches)
+### Zephyr (11 patches)
 
 **`drivers/gpio/gpio_b91.c`** — WRITE_BIT double-BIT fix **[VERIFIED]**
 
@@ -1051,6 +1052,22 @@ that the UART log backend also takes around each message (not in panic or ISR
 context). Measured on the stats-log image with the patch: 0..1 lost responses
 per upload (the first request, which waits for the slot erase), CLI uploads
 81..84 s, a minimal one-request-at-a-time SMP client 15 s instead of 85 s.
+
+**`drivers/console/uart_mcumgr.c` + `Kconfig`** (0011) — the first mcumgr command after boot is answered **[VERIFIED]**
+
+`uart_poll_out()` on CDC ACM discards bytes while the 4 KB TX ring is full,
+and the log fills it whenever no host reads the port (the boot log alone is
+more than 4 KB). The first SMP response after the port was opened was
+therefore dropped: the first `mcumgr` command after a boot (or after a quiet
+period with log output and the port closed) failed with `NMP timeout`, the
+next one worked. Measured: after a reset and 30 s, a fresh open read exactly
+the 4096 backlog bytes and no response. `CONFIG_UART_MCUMGR_TX_WAIT_MS=500`
+(conf/app.conf) writes responses with `uart_fifo_fill()` and waits up to
+500 ms per write for the host to drain the ring; each frame also starts with a
+newline, because the backlog before it ends mid-line. Measured: the response
+follows the 4096 backlog bytes on a line of its own, 3 of 3; the first
+`mcumgr image list` after a swap boot answers. The ota-bridge build
+(conf/ota-bridge.conf) does not set the option.
 
 ### MCUboot (1 file, 1 patch)
 
