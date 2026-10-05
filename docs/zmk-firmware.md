@@ -656,8 +656,8 @@ Studio runs over BLE only (see `conf/app.conf`). With the open controller the AT
 
 | File | Role | Lines |
 |------|------|-------|
-| `hci_b91.c` | Zephyr HCI device driver — `open`/`send`/`close` + HCI packet parsing | 270 |
-| `b91_bt.c` | Shim — blob init, controller thread, IRQ handlers, FIFO management | 680 |
+| `hci_b91.c` | Zephyr HCI device driver: `open`/`send`/`close` + HCI packet parsing | 270 |
+| `b91_bt.c` | Shim: blob init, controller thread, IRQ handlers, FIFO management | 680 |
 | `b91_mac.c` | MAC address from flash (`0xFF000`) with random static fallback, shared by both controllers | 60 |
 | `b91_bt.h` | Public API — `controller_init`, `send_packet`, `callback_register` | 25 |
 
