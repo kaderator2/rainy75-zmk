@@ -3562,7 +3562,7 @@ static void fw_close(void)
 {
 	unsigned int k = ll_plat_lock();
 
-	ll_flash_close();
+	ll_flash_close(now);
 	ll_plat_unlock(k);
 }
 
@@ -3601,6 +3601,32 @@ static void test_flash_pause(void)
 	CHECK(st.flash_paused - st0.flash_paused == 2);
 	CHECK(st.flash_cut == st0.flash_cut);
 	ll_conn_end(0, LL_ST_REMOTE_TERM);
+}
+
+/* The longest window held (open to close) is recorded: the device's
+ * evidence that nothing stretches a window past one operation. */
+static void test_flash_hold_max(void)
+{
+	struct ll_flash_stats f;
+	uint32_t m0;
+
+	reset_all(false);
+	ll_flash_get_stats(&f);
+	m0 = f.hold_max_us;
+	now = 1000000;
+	CHECK(fw_open(0));
+	now += T(m0 + 1234);
+	fw_close();
+	ll_flash_get_stats(&f);
+	CHECK(f.hold_max_us == m0 + 1234);
+	CHECK(fw_open(0));
+	now += T(10);
+	fw_close();
+	ll_flash_get_stats(&f);
+	CHECK(f.hold_max_us == m0 + 1234);
+	fw_close();                        /* no window: nothing recorded */
+	ll_flash_get_stats(&f);
+	CHECK(f.hold_max_us == m0 + 1234);
 }
 
 /* Opening the window ends an open event through the radio (the radio
@@ -4024,6 +4050,7 @@ int main(void)
 	test_event_owner();
 	test_flash_pause();
 	test_flash_cut();
+	test_flash_hold_max();
 	test_flash_ready();
 	test_flash_ready_links();
 	test_instant_late_chmap();

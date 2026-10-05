@@ -1217,9 +1217,9 @@ static void report_stats(struct ll_radio_stats *last, struct ll_conn_stats *last
 		LOG_INF("conn: rx flow paused %u (longest run %u) stops %u (radio %u)",
 			cs.rx_paused, cs.rx_pause_streak_max, cs.rx_stops, st.conn_stopped);
 		ll_flash_get_stats(&fs);
-		LOG_INF("flash: windows %u waits %u forced %u wait max %u us, conn paused %u cut %u, adv %u, radio aborts %u",
-			fs.windows, fs.waits, fs.forced, fs.wait_max_us, cs.flash_paused,
-			cs.flash_cut, as.flash, st.flash_aborts);
+		LOG_INF("flash: windows %u waits %u forced %u wait max %u us hold max %u us, conn paused %u cut %u kicks %u, adv %u, radio aborts %u",
+			fs.windows, fs.waits, fs.forced, fs.wait_max_us, fs.hold_max_us,
+			cs.flash_paused, cs.flash_cut, cs.flash_kicks, as.flash, st.flash_aborts);
 		LOG_INF("adv: events %u slid %u dropped %u cut %u stuck %u adv_guard %u",
 			as.events, as.slid, as.dropped, as.cut, as.stuck, st.adv_guard);
 		LOG_INF("conn: acl in %u out %u drop %u frag %u evt_drop %u lock max %u us acl_tx %u us aes %u us",

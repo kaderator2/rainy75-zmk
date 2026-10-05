@@ -1429,6 +1429,7 @@ void ll_conn_get_stats_total(struct ll_conn_stats *s)
 		s->rx_stops += t->rx_stops;
 		s->flash_paused += t->flash_paused;
 		s->flash_cut += t->flash_cut;
+		s->flash_kicks += t->flash_kicks;
 		if (t->rx_pause_streak_max > s->rx_pause_streak_max) {
 			s->rx_pause_streak_max = t->rx_pause_streak_max;
 		}
@@ -1465,7 +1466,12 @@ void ll_conn_flash_kick(void)
 
 	for (uint8_t i = 0; i < LL_MAX_CONN; i++) {
 		if (!flash_ready(&links[i], now)) {
+			/* counted as flash_kicks, not as TX kicks */
+			uint32_t k0 = stats[i].kicks;
+
 			ll_conn_kick(i);
+			stats[i].flash_kicks += stats[i].kicks - k0;
+			stats[i].kicks = k0;
 		}
 	}
 }

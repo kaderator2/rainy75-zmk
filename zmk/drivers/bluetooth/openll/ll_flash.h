@@ -40,7 +40,9 @@
  * Context: ll_flash_open / ll_flash_close run in thread context with
  * ll_plat_lock() held (the B91 glue wraps the hal flash calls); never
  * from an ISR, and the window is never held across a sleep (the caller
- * waits before opening it). ll_flash_active() is read in ISR context.
+ * waits before opening it) nor across a preemption (the glue locks the
+ * scheduler from the open to the close). ll_flash_active() is read in ISR
+ * context.
  */
 #ifndef LL_FLASH_H_
 #define LL_FLASH_H_
@@ -48,9 +50,15 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-/* Longest flash operation with interrupts off that one window covers: a
- * 4 KB sector erase (measured 13..29 ms; block erases are split into
- * sectors by the glue). */
+/* Budget for one flash operation with interrupts off in the readiness
+ * rule: a 4 KB sector erase, measured 12..29 ms on this board (block
+ * erases are split into sectors by the glue). NOR datasheets allow much
+ * longer worst-case sector erases (hundreds of ms). The budget is not the
+ * safety margin: a ready link enters an operation with at least
+ * timeout / 2 left minus this budget, so it survives any single operation
+ * shorter than about timeout / 2 + LL_FLASH_OP_MAX_US (80 ms at the spec
+ * minimum timeout of 100 ms, 240 ms at mcumgr's 420 ms, 2 s at 4 s); a
+ * longer one costs the link as it would have without the window. */
 #define LL_FLASH_OP_MAX_US   30000u
 /* Longest wait for the links before a window opens anyway. */
 #define LL_FLASH_WAIT_MAX_US 100000u
@@ -64,8 +72,10 @@ bool ll_flash_active(void);
  * ll_flash_close(). Returns false after pulling the links' next events in:
  * the caller waits (interrupts on, about 1 ms) and calls again. */
 bool ll_flash_open(uint32_t now, uint32_t waited_us);
-/* Thread, ll_plat_lock() held. No-op without an open window. */
-void ll_flash_close(void);
+/* Thread, ll_plat_lock() held. now: as for ll_flash_open(); the time the
+ * window was held is recorded (hold_max_us). No-op without an open
+ * window. */
+void ll_flash_close(uint32_t now);
 /* Drops the window (controller init). Stats stay cumulative. */
 void ll_flash_reset(void);
 
@@ -74,6 +84,7 @@ struct ll_flash_stats {
 	uint32_t waits;       /* ll_flash_open() calls that asked the caller to wait */
 	uint32_t forced;      /* windows opened after LL_FLASH_WAIT_MAX_US with a link not ready */
 	uint32_t wait_max_us; /* longest wait before a window opened */
+	uint32_t hold_max_us; /* longest window, ll_flash_open() to ll_flash_close() */
 };
 void ll_flash_get_stats(struct ll_flash_stats *s);
 

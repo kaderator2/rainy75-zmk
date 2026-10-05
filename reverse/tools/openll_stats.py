@@ -21,8 +21,9 @@ the connection counters are sums over the links, and the reply adds links
 (links up), link (per link id: up, listen, skip, coll = events yielded to
 the arbiter, miss) and adv (advertising events, slid, drop, cut, stuck).
 Firmware with the flash window adds flash (win = flash operations covered,
-wait / force / wmax = waits for the links, force = opened without them,
-longest wait in us, pause / cut = connection events not issued / ended by
+wait = waits for the links, force = opened without them, wmax / hmax =
+longest wait / longest window in us (maxima, no deltas), pause / cut =
+connection events not issued / ended by it, fkick = events pulled in for
 it, abort = radio activity ended, pskip = RX DMA ring overruns, which must
 stay 0).
 Counters are uint32, cumulative since boot; deltas are computed modulo 2**32.
@@ -44,7 +45,9 @@ FIELDS = ("up", "idle", "plan", "listen", "skip", "kick", "ev", "miss", "wake", 
 COUNTERS = ("idle", "plan", "listen", "skip", "kick", "ev", "miss", "wake")
 LINK_COUNTERS = ("listen", "skip", "coll", "miss")
 ADV_COUNTERS = ("ev", "slid", "drop", "cut", "stuck")
-FLASH_COUNTERS = ("win", "wait", "force", "wmax", "pause", "cut", "abort", "pskip")
+FLASH_FIELDS = ("win", "wait", "force", "wmax", "hmax", "pause", "cut", "fkick", "abort", "pskip")
+# wmax / hmax are maxima since boot (longest wait, longest window): no deltas
+FLASH_COUNTERS = tuple(k for k in FLASH_FIELDS if k not in ("wmax", "hmax"))
 
 
 # --- pure helpers (unit tested) --------------------------------------------
@@ -104,7 +107,7 @@ def format_stats(s, d=None):
         line += "\n  adv: " + " ".join(f"{k} {a.get(k, 0)}" for k in ADV_COUNTERS)
     if isinstance(s.get("flash"), dict):
         f = s["flash"]
-        line += "\n  flash: " + " ".join(f"{k} {f.get(k, 0)}" for k in FLASH_COUNTERS)
+        line += "\n  flash: " + " ".join(f"{k} {f.get(k, 0)}" for k in FLASH_FIELDS)
     if d and d.get("up"):
         secs = d["up"] / 1000.0
         tot = d.get("listen", 0) + d.get("skip", 0)

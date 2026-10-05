@@ -638,8 +638,8 @@ void ll_radio_flash_abort(void)
 {
 	/* Advertising: first what the RF ISR would do with the status already
 	 * pending (a CONNECT_IND received just before is not lost). A
-	 * connection event needs no such step: the stop below drains every
-	 * packet the hardware has acked. conn_isr() is not called from here,
+	 * connection event needs only the NODATA note below: the stop drains
+	 * every packet the hardware has acked. conn_isr() is not called from here,
 	 * so it stays inlined into the RAM rf_isr with its helpers (a second
 	 * call site moved them to flash, slower in the T_IFS-critical path). */
 	if (mode == MODE_ADV) {
@@ -653,6 +653,18 @@ void ll_radio_flash_abort(void)
 		}
 	}
 	if (mode == MODE_CONN && cn.evt_open) {
+		/* A pending RX IRQ without a new ring entry before any entry of
+		 * the event is the central's retransmission of the anchor packet
+		 * (conn_rx_irq): note it as conn_rx_irq would, so the drain
+		 * reports NODATA first and a chained packet does not re-anchor.
+		 * (conn_rx_irq's other work, the turnaround hold, does not apply
+		 * to an event that is being stopped.) */
+		if ((reg_rf_irq_status & FLD_RF_IRQ_RX) && cn.n_any == 0 &&
+		    (rf_get_rx_wptr() & RX_WPTR_MASK) == cn.rx_sw) {
+			atomic_inc(&cnt_rx_ptr_odd);
+			cn.n_any++;
+			cn.nodata = true;
+		}
 		/* as conn_stop_now(), but the guard streak stays as it is (an
 		 * armed event that never started is no wedge sign either) */
 		atomic_inc(&cnt_flash_aborts);

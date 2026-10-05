@@ -133,8 +133,10 @@ void ll_radio_conn_stop(void);
 /* Flash window (ll_flash.h): end whatever is on air before a flash
  * operation turns interrupts off. An open or armed connection event is
  * stopped like ll_radio_conn_stop() (the packets in the RX ring are
- * delivered, then LL_RADIO_CONN_DONE; the guard streak is left as it is).
- * In advertising mode pending radio IRQ status is handled first (as the RF
+ * delivered, then LL_RADIO_CONN_DONE; the guard streak is left as it is);
+ * a pending RX IRQ of the anchor retransmission (no new RX entry before any
+ * entry of the event) is reported as LL_RADIO_CONN_RX_NODATA first, as the
+ * RF ISR would. In advertising mode pending radio IRQ status is handled first (as the RF
  * ISR would, but a SCAN_REQ is not answered any more), then an advertising
  * TX/RX or SCAN_RSP still on air is stopped and reported as
  * LL_RADIO_RX_TIMEOUT. Counted in

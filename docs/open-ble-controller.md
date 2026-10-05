@@ -284,9 +284,25 @@ since its last received packet. Otherwise the links' next events are pulled
 in (`ll_conn_kick()`) and the flash caller sleeps 1 ms and asks again (the
 window itself is never held across a sleep). A chain of back-to-back erases
 therefore lets an event through whenever a link needs one; after 100 ms of
-waiting the window opens anyway (`forced`). Cost: during a long chain of
-erases a link receives only about every half supervision timeout, so BLE
-throughput and key latency drop while the flash is busy.
+waiting the window opens anyway (`forced`); a caller that holds interrupts
+off does not wait at all. The scheduler is locked from the open to the close
+(the hal call never sleeps), so no other thread can stretch a window past its
+operation (longest window: `hmax` in group 66). The 30 ms budget is the
+measured sector erase, not the safety margin: a ready link starts an
+operation with half its supervision timeout left, so it survives any single
+operation shorter than about timeout / 2 + 30 ms (80 ms at the spec minimum of
+100 ms, 240 ms at mcumgr's 420 ms); NOR datasheets allow longer worst-case
+erases than that.
+
+Cost: during a long chain of erases a link receives only about every half
+supervision timeout, so BLE throughput and key latency drop while the flash
+is busy. Advertising sends nothing during back-to-back windows either: while
+a slot is erased sector by sector (a 456 KB slot is about 114 erases, over a
+second) no advertising event gets out. The Zephyr flash driver holds its
+write lock during the wait for the links (up to 100 ms per operation) and
+takes it without waiting, so a concurrent flash erase or write from another
+thread fails with -EACCES more often; NVS, settings and img_mgmt each write
+from one thread, and flash_mgmt reports the error to the host.
 
 Measured (default NOSLEEP image): before the fix, 10 of 10 USB image uploads
 lost the link (MIC failure 0x3D, `ptr_skip` 1 or 2) under a bursty BLE echo
@@ -310,9 +326,11 @@ deeper RX ring does not exist in hardware (the DMA geometry is fixed at 4
 entries), and the baseband acks every new packet by itself.
 
 Counters: `ll_flash_get_stats()` (windows, waits, forced, longest wait),
-`ll_conn_stats.flash_paused` / `flash_cut`, `ll_adv_stats.flash`,
+`ll_conn_stats.flash_paused` / `flash_cut` / `flash_kicks` (events pulled in
+for a window, not counted as TX kicks), `ll_adv_stats.flash`,
 `ll_radio_stats.flash_aborts`; the stats log line `flash: ...` and the `flash`
-map of mcumgr group 66 (with `pskip`, the RX ring overruns).
+map of mcumgr group 66 (with `hmax`, the longest window, and `pskip`, the RX
+ring overruns).
 
 ### LLCP (responder) and encryption
 
@@ -523,8 +541,9 @@ Reply fields: `up` (ms), `idle` (CPU idle ms, from
 (events without any CRC-valid packet, plus late alarms), `wake` (controller
 thread wakeups) and `mv` (battery millivolts, 0 if unavailable). Newer
 firmware adds per-link and advertising counters and the `flash` map (flash
-window: `win`, `wait`, `force`, `wmax`, `pause`, `cut`, `abort`, and `pskip`,
-the RX DMA ring overruns, which must stay 0). The tool prints deltas, idle
+window: `win`, `wait`, `force`, `wmax`, `hmax`, `pause`, `cut`, `fkick`,
+`abort`, and `pskip`, the RX DMA ring overruns, which must stay 0; `wmax` and
+`hmax` are maxima, the tool prints no deltas for them). The tool prints deltas, idle
 percentage and the share of skipped events. `ev`, `miss` and `skip` are counted
 when planned or closed, so `skip` may overstate by up to the latency when a
 link ends. Over BLE the read itself is traffic: the host raises the link to

@@ -25,11 +25,33 @@
  *   1.9 ms.)
  *
  * Waiting: ll_flash_open() refuses while a link needs an event first; the
- * caller then sleeps 1 ms (k_msleep, or k_busy_wait where it cannot
- * yield; interrupts stay on either way, the radio runs from ISRs) and asks
- * again. The window itself is only held across the hal call, never across
- * a sleep. In ISR context and before the controller is up (b91_mac reads
- * the MAC during init, MCUboot confirmation) the operation runs ungated.
+ * caller then sleeps 1 ms and asks again. k_msleep() also with the
+ * scheduler locked by the caller (the lock belongs to the sleeping thread;
+ * the radio runs from ISRs); k_busy_wait() only where k_can_yield() is false
+ * (idle thread). A caller that holds interrupts off cannot let any event
+ * through by waiting, so it does not wait: its window opens at once
+ * (counted as forced when a link is not ready).
+ *
+ * Hold time: the window is held only across the hal call, never across a
+ * sleep, and the scheduler is locked from the successful ll_flash_open()
+ * to ll_flash_close() (the hal call never sleeps): a higher-priority
+ * thread cannot preempt the flash caller in between and stretch the window
+ * past one operation, which the supervision rule relies on (ready links
+ * have timeout / 2 - LL_FLASH_OP_MAX_US of slack). ISRs still run (the
+ * paused events, the abort's completions). The longest window is in
+ * ll_flash_stats.hold_max_us (group 66 "hmax").
+ *
+ * In ISR context and before the controller is up (b91_mac reads the MAC
+ * during init, MCUboot confirmation) the operation runs ungated.
+ *
+ * Zephyr's flash driver holds its write_lock semaphore during the wait (up
+ * to LL_FLASH_WAIT_MAX_US per operation), and takes it with K_NO_WAIT, so
+ * a concurrent flash_erase / flash_write from another thread then fails
+ * with -EACCES more often. Before the window the semaphore was held for
+ * the operation itself (up to about 30 ms) and the same race existed; NVS
+ * and img_mgmt run their writes from one thread each, settings writes are
+ * serialized by the settings subsystem lock, and flash_mgmt (group 64)
+ * reports the error to the host.
  */
 #include <zephyr/kernel.h>
 
@@ -60,24 +82,43 @@ void ll_flash_wrap_enable(void)
 	gate_on = true;
 }
 
-/* true: a window is open and must be closed with win_exit() */
+static bool irqs_enabled(void)
+{
+	unsigned int key = irq_lock();
+	bool on = arch_irq_unlocked(key);
+
+	irq_unlock(key);
+	return on;
+}
+
+/* true: a window is open (and the scheduler locked); close it with
+ * win_exit() */
 static bool win_enter(void)
 {
 	uint32_t t0;
+	bool irqs_on;
 
 	if (!gate_on || k_is_in_isr()) {
 		return false;
 	}
+	irqs_on = irqs_enabled();
 	t0 = ll_radio_now();
 	for (;;) {
-		uint32_t waited = (ll_radio_now() - t0) / LL_TICKS_PER_US;
-		unsigned int key = ll_plat_lock();
-		bool ok = ll_flash_open(ll_radio_now(), waited);
+		/* interrupts off: no event can get through, open at once */
+		uint32_t waited = irqs_on ? (ll_radio_now() - t0) / LL_TICKS_PER_US
+					  : LL_FLASH_WAIT_MAX_US;
+		unsigned int key;
+		bool ok;
 
+		k_sched_lock();
+		key = ll_plat_lock();
+		ok = ll_flash_open(ll_radio_now(), waited);
 		ll_plat_unlock(key);
 		if (ok) {
-			return true;
+			return true;   /* scheduler stays locked until win_exit() */
 		}
+		k_sched_unlock();
+		__ASSERT(irqs_on, "flash window wait with interrupts off");
 		if (k_can_yield()) {
 			k_msleep(1);
 		} else {
@@ -91,8 +132,9 @@ static void win_exit(bool open)
 	if (open) {
 		unsigned int key = ll_plat_lock();
 
-		ll_flash_close();
+		ll_flash_close(ll_radio_now());
 		ll_plat_unlock(key);
+		k_sched_unlock();
 	}
 }
 

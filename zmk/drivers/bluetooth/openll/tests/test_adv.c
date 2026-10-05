@@ -548,7 +548,7 @@ static void test_flash_window(void)
 	ll_adv_get_stats(&a1);
 	CHECK(a1.flash - a0.flash == 2);
 	CHECK(sched_cb != NULL);
-	ll_flash_close();
+	ll_flash_close(now_tick);
 	now_tick = sched_tick;
 	fire_sched();
 	CHECK(txrx_calls == tx + 1 && radio_ch == 37);

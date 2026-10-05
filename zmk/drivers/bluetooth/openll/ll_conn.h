@@ -317,6 +317,9 @@ struct ll_conn_stats {
 	 * ll_radio_flash_abort when the window opened). */
 	uint32_t flash_paused;
 	uint32_t flash_cut;
+	/* re-plans by ll_conn_flash_kick() (not counted in kicks, which are
+	 * the TX kicks) */
+	uint32_t flash_kicks;
 };
 /* Per link, cumulative since boot (not reset per connection). Out-of-range
  * link: all zero. */

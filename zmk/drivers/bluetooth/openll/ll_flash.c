@@ -7,6 +7,7 @@
  * ll_adv channel start), which the lock keeps out while it changes.
  */
 #include "ll_conn.h"
+#include "ll_defs.h"
 #include "ll_flash.h"
 #include "ll_radio.h"
 
@@ -14,6 +15,7 @@ static volatile bool active;
 static struct ll_flash_stats stats;
 /* ll_flash_open() has asked the current operation to wait at least once */
 static bool waiting;
+static uint32_t open_tick;   /* when the open window was opened */
 
 bool ll_flash_active(void)
 {
@@ -40,13 +42,23 @@ bool ll_flash_open(uint32_t now, uint32_t waited_us)
 	waiting = false;
 	stats.windows++;
 	active = true;
+	open_tick = now;
 	/* nothing may stay on air: end it now, with interrupts still off */
 	ll_radio_flash_abort();
 	return true;
 }
 
-void ll_flash_close(void)
+void ll_flash_close(uint32_t now)
 {
+	uint32_t held;
+
+	if (!active) {
+		return;
+	}
+	held = (now - open_tick) / LL_TICKS_PER_US;
+	if (held > stats.hold_max_us) {
+		stats.hold_max_us = held;
+	}
 	active = false;
 }
 

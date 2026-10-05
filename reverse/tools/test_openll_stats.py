@@ -108,16 +108,21 @@ class T(unittest.TestCase):
     def test_format_flash(self):
         # flash window counters (and the RX ring overrun count) when present
         s = dict(zip(o.FIELDS, [10000, 9000, 1, 2, 3, 4, 5, 6, 7, 3900]))
-        s["flash"] = {"win": 120, "wait": 3, "force": 0, "wmax": 8000, "pause": 40,
-                      "cut": 2, "abort": 5, "pskip": 0}
+        s["flash"] = {"win": 120, "wait": 3, "force": 0, "wmax": 8000, "hmax": 13000,
+                      "pause": 40, "cut": 2, "fkick": 7, "abort": 5, "pskip": 0}
         txt = o.format_stats(s)
-        self.assertIn("flash: win 120 wait 3 force 0 wmax 8000 pause 40 cut 2 abort 5 pskip 0",
-                      txt)
-        old = dict(s, flash=dict(s["flash"], win=100, pskip=0))
+        self.assertIn("flash: win 120 wait 3 force 0 wmax 8000 hmax 13000 pause 40 cut 2 "
+                      "fkick 7 abort 5 pskip 0", txt)
+        old = dict(s, flash=dict(s["flash"], win=100, wmax=7000, hmax=12000, pskip=0))
         d = o.delta(s, old)
         self.assertEqual(d["flash"]["win"], 20)
+        # wmax / hmax are maxima since boot, not counters: no deltas
+        self.assertNotIn("wmax", d["flash"])
+        self.assertNotIn("hmax", d["flash"])
         d["up"] = 1000
-        self.assertIn("delta flash: win 20", o.format_stats(s, d))
+        txt = o.format_stats(s, d)
+        self.assertIn("delta flash: win 20", txt)
+        self.assertNotIn("delta flash: win 20 wait 0 force 0 wmax", txt)
         s2 = dict(zip(o.FIELDS, [10000, 9000, 1, 2, 3, 4, 5, 6, 7, 3900]))
         self.assertNotIn("flash:", o.format_stats(s2))
 

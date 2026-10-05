@@ -641,6 +641,7 @@ static struct {
 	 * activity seen meanwhile (must stay 0) */
 	bool in_op;
 	int radio_in_op;
+	uint32_t last_rx[LL_MAX_CONN];   /* anchor of each link's last received packet */
 	/* the next adv channel receives this CONNECT_IND instead of nothing */
 	const uint8_t *connect_pdu;
 	uint32_t connect_end;
@@ -783,6 +784,7 @@ static void sim_step(void)
 				sim.over_cap++;
 			}
 			sim.rx[k]++;
+			sim.last_rx[k] = a;
 			ll_conn_radio_evt(LL_RADIO_CONN_DONE, NULL, 1, now);
 		} else {
 			now = rad.open + T(rad.fst);
@@ -1316,6 +1318,7 @@ static void test_reset_consistent(void)
 /* ---------------- flash window (ll_flash.h) ---------------- */
 
 static uint32_t fw_wait_max_us;
+static uint32_t fw_age_max_us[LL_MAX_CONN];   /* link age at the start of an operation */
 
 static void sim_advance(uint32_t t)
 {
@@ -1346,13 +1349,25 @@ static void sim_flash_op(uint32_t op_us)
 	if (waited > fw_wait_max_us) {
 		fw_wait_max_us = waited;
 	}
+	/* the supervision bound (ll_flash.h): no active link enters an
+	 * operation more than timeout / 2 - LL_FLASH_OP_MAX_US after its last
+	 * received packet */
+	for (uint8_t k = 0; k < LL_MAX_CONN; k++) {
+		if (ll_conn_active(k) && sim.rx[k] > 0) {
+			uint32_t age = (now - sim.last_rx[k]) / LL_TICKS_PER_US;
+
+			if (age > fw_age_max_us[k]) {
+				fw_age_max_us[k] = age;
+			}
+		}
+	}
 	sim.in_op = true;
 	sim_advance(now + T(op_us));
 	sim.in_op = false;
 	{
 		unsigned int k = ll_plat_lock();
 
-		ll_flash_close();
+		ll_flash_close(now);
 		ll_plat_unlock(k);
 	}
 }
@@ -1368,12 +1383,19 @@ static void test_flash_chain(void)
 {
 	static const struct {
 		uint16_t interval, latency, timeout;
+		uint32_t erase_us;
 	} cfg[] = {
-		{6, 0, 42},
-		{12, 30, 100},
+		{6, 0, 42, 26000},
+		{12, 30, 100, 26000},
 		/* 940 ms: the latency window (465 ms) outlasts the ready limit
 		 * (470 - 30 ms), so a wait needs the kicked event */
-		{12, 30, 94},
+		{12, 30, 94, 26000},
+		/* the spec minimum supervision timeout, 100 ms */
+		{6, 0, 10, 26000},
+		/* an erase twice as long as the budget: half the timeout is the
+		 * margin (the link survives any operation shorter than about
+		 * timeout / 2 + LL_FLASH_OP_MAX_US) */
+		{6, 0, 42, 2 * LL_FLASH_OP_MAX_US},
 	};
 	uint8_t links = LL_MAX_CONN < 3 ? LL_MAX_CONN : 3;
 
@@ -1381,11 +1403,14 @@ static void test_flash_chain(void)
 		const uint32_t t0 = 2000000;
 		struct ll_flash_stats f0, f;
 		struct ll_conn_stats st;
-		uint32_t paused = 0;
+		uint32_t paused = 0, fkick = 0;
 		int rx0[LL_MAX_CONN];
+
+		uint32_t kicks0[LL_MAX_CONN], fkicks0[LL_MAX_CONN];
 
 		sim_reset();
 		fw_wait_max_us = 0;
+		memset(fw_age_max_us, 0, sizeof(fw_age_max_us));
 		ll_flash_get_stats(&f0);
 		for (uint8_t k = 0; k < links; k++) {
 			CHECK(sim_connect(k, t0 + T(2500) * k, cfg[c].interval, cfg[c].latency,
@@ -1394,9 +1419,12 @@ static void test_flash_chain(void)
 		sim_advance(t0 + T(1500000));      /* established, past the holdoff */
 		for (uint8_t k = 0; k < links; k++) {
 			rx0[k] = sim.rx[k];
+			ll_conn_get_stats(k, &st);
+			kicks0[k] = st.kicks;
+			fkicks0[k] = st.flash_kicks;
 		}
 		for (int i = 0; i < 300; i++) {
-			sim_flash_op(i % 3 == 0 ? 26000 : 2500);
+			sim_flash_op(i % 3 == 0 ? cfg[c].erase_us : 2500);
 		}
 		ll_flash_get_stats(&f);
 		for (uint8_t k = 0; k < links; k++) {
@@ -1404,10 +1432,10 @@ static void test_flash_chain(void)
 			paused += st.flash_paused;
 		}
 		printf("  flash_chain n%d cfg %u: windows %u waits %u forced %u wait max %u us, "
-		       "paused %u, link 0 rx %d\n", LL_MAX_CONN, c,
+		       "paused %u, link 0 rx %d age max %u us\n", LL_MAX_CONN, c,
 		       (unsigned)(f.windows - f0.windows), (unsigned)(f.waits - f0.waits),
 		       (unsigned)(f.forced - f0.forced), (unsigned)fw_wait_max_us,
-		       (unsigned)paused, sim.rx[0] - rx0[0]);
+		       (unsigned)paused, sim.rx[0] - rx0[0], (unsigned)fw_age_max_us[0]);
 		CHECK(sim.radio_in_op == 0);
 		CHECK(f.windows - f0.windows == 300);
 		CHECK(f.forced == f0.forced);
@@ -1422,6 +1450,13 @@ static void test_flash_chain(void)
 		for (uint8_t k = 0; k < links; k++) {
 			CHECK(ll_conn_active(k) && disconnects[k] == 0);
 			CHECK(sim.rx[k] > rx0[k]);
+			CHECK(fw_age_max_us[k] + LL_FLASH_OP_MAX_US <= 10000u * cfg[c].timeout / 2);
+			/* the window's pulls count apart from the TX kicks */
+			ll_conn_get_stats(k, &st);
+			CHECK(st.kicks == kicks0[k]);
+			if (cfg[c].timeout == 94) {
+				fkick += st.flash_kicks - fkicks0[k];
+			}
 		}
 		/* the links listen as before once the chain is over */
 		for (uint8_t k = 0; k < links; k++) {
@@ -1432,6 +1467,9 @@ static void test_flash_chain(void)
 			CHECK(sim.rx[k] > rx0[k]);
 		}
 		CHECK(sim.overlaps == 0 && sim.over_cap == 0);
+		if (cfg[c].timeout == 94) {
+			CHECK(fkick > 0);
+		}
 		for (uint8_t k = 0; k < links; k++) {
 			ll_conn_end(k, 0x13);
 		}

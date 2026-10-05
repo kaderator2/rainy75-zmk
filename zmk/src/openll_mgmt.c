@@ -12,7 +12,8 @@
  *                       "adv": {"ev": uint, "slid": uint, "drop": uint,
  *                               "cut": uint, "stuck": uint},
  *                       "flash": {"win": uint, "wait": uint, "force": uint,
- *                                 "wmax": uint, "pause": uint, "cut": uint,
+ *                                 "wmax": uint, "hmax": uint, "pause": uint,
+ *                                 "cut": uint, "fkick": uint,
  *                                 "abort": uint, "pskip": uint}}
  *   All counters are cumulative since boot and uint32 (wrap after 49 days).
  *   plan/listen/skip/kick/ev/miss are sums over all links of ll_conn_get_stats
@@ -23,7 +24,8 @@
  *   (coll: events yielded to the arbiter); "adv" are the advertising
  *   arbitration counters (ll_adv_get_stats); "flash" the flash window
  *   (ll_flash.h: windows, waits for the links, forced opens, longest wait
- *   in us, connection events paused / cut, radio aborts) and the RX DMA
+ *   and longest window in us, connection events paused / cut / pulled in,
+ *   radio aborts) and the RX DMA
  *   ring overruns (pskip, ll_radio_stats.rx_ptr_skip).
  *
  * "idle" is the CPU idle time (k_thread_runtime_stats_all_get); needs
@@ -152,16 +154,18 @@ static int openll_mgmt_stats(struct smp_streamer *ctxt)
 	/* flash window (ll_flash.h) and the RX ring overrun it prevents */
 	ll_flash_get_stats(&fs);
 	ll_radio_get_stats(&rs);
-	ok = ok && zcbor_tstr_put_lit(zse, "flash") && zcbor_map_start_encode(zse, 8) &&
+	ok = ok && zcbor_tstr_put_lit(zse, "flash") && zcbor_map_start_encode(zse, 10) &&
 	     zcbor_tstr_put_lit(zse, "win") && zcbor_uint32_put(zse, fs.windows) &&
 	     zcbor_tstr_put_lit(zse, "wait") && zcbor_uint32_put(zse, fs.waits) &&
 	     zcbor_tstr_put_lit(zse, "force") && zcbor_uint32_put(zse, fs.forced) &&
 	     zcbor_tstr_put_lit(zse, "wmax") && zcbor_uint32_put(zse, fs.wait_max_us) &&
+	     zcbor_tstr_put_lit(zse, "hmax") && zcbor_uint32_put(zse, fs.hold_max_us) &&
 	     zcbor_tstr_put_lit(zse, "pause") && zcbor_uint32_put(zse, s.flash_paused) &&
 	     zcbor_tstr_put_lit(zse, "cut") && zcbor_uint32_put(zse, s.flash_cut) &&
+	     zcbor_tstr_put_lit(zse, "fkick") && zcbor_uint32_put(zse, s.flash_kicks) &&
 	     zcbor_tstr_put_lit(zse, "abort") && zcbor_uint32_put(zse, rs.flash_aborts) &&
 	     zcbor_tstr_put_lit(zse, "pskip") && zcbor_uint32_put(zse, rs.rx_ptr_skip) &&
-	     zcbor_map_end_encode(zse, 8);
+	     zcbor_map_end_encode(zse, 10);
 	return ok ? MGMT_ERR_EOK : MGMT_ERR_EMSGSIZE;
 }
 
