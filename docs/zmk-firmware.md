@@ -1074,7 +1074,7 @@ Upstream reports 256B programming pages. MCUboot enumerates these as swap sector
 
 TLSR951x supports `sys_poweroff()` via deep retention sleep, but upstream never declared `HAS_POWEROFF`. Without it, `CONFIG_POWEROFF` (and thus `CONFIG_ZMK_SLEEP`) cannot be enabled.
 
-**`drivers/console/uart_mcumgr.c` + `subsys/logging/backends/log_backend_uart.c`** (0010) — log output never lands inside an SMP frame **[VERIFIED]**
+**`drivers/console/uart_mcumgr.c` + `subsys/logging/backends/log_backend_uart.c`** (0010): log output never lands inside an SMP frame **[VERIFIED]**
 
 The log console and mcumgr share the one CDC ACM port, and both write it with
 `uart_poll_out()` byte by byte (log thread vs SMP work queue). A log message
@@ -1090,7 +1090,7 @@ context). Measured on the stats-log image with the patch: 0..1 lost responses
 per upload (the first request, which waits for the slot erase), CLI uploads
 81..84 s, a minimal one-request-at-a-time SMP client 15 s instead of 85 s.
 
-**`drivers/console/uart_mcumgr.c` + `Kconfig`** (0011) — the first mcumgr command after boot is answered **[VERIFIED]**
+**`drivers/console/uart_mcumgr.c` + `Kconfig`** (0011): the first mcumgr command after boot is answered **[VERIFIED]**
 
 `uart_poll_out()` on CDC ACM discards bytes while the 4 KB TX ring is full,
 and the log fills it whenever no host reads the port (the boot log alone is

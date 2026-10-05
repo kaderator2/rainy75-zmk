@@ -903,7 +903,7 @@ The same code before the CPU hold: 48.6 / 49.0 / 2.36 % and 50.9 / 46.2 /
 | 33 min encrypted, SMP echo every 5 s, 15 / 7.5 ms intervals (slice 2) | 378 / 378 echoes, 0 disconnects, 756 connection updates |
 | 15 min, 251-octet echo every 0.5 s (slice 6b) | 1712 / 1712, 0 disconnects |
 | 10 min echo soak (slice 6d) | 1150 / 1150, 0 disconnects |
-| SMP echo latency, 300 echoes 50 ms apart (slice 7 HEAD) | median 24.5 ms, p95 25.3 ms, max 444 ms |
+| SMP echo latency, 300 echoes 50 ms apart (slice 7 HEAD) | median 24.5 ms, p95 25.3 ms, max 444 ms (first echo under latency 30, expected: see known limitations) |
 | 140 GATT client connects with the switch to 6 / 0 / 42 (slice 7) | 0 x 0x28, one 0x08 (see open items) |
 
 ### Idle cadence
@@ -1078,12 +1078,15 @@ documentation. They may help anyone writing a B91 link layer.
 - **One unexplained 0x08 in 140 client connects:** 5.4 s without any log output
   after a normal connection update, then the supervision timeout. Not seen again
   in 60 runs with a state sampler.
-- **Echo latency maximum about 444 ms.** Median 24.5 ms, p95 25.3 ms; the maximum
-  showed up in every run so far, on the first echo while latency 30 was in force
-  (central-to-peripheral data waits for our next listen; a kick only helps when we
-  have data to send). Whether other spikes come from cooperative host threads
-  (which hold the controller thread off for 70 to 220 ms at times) is under
-  investigation.
+- **Central-to-peripheral data waits for the next listen (expected).** With
+  peripheral latency the peripheral listens only every latency + 1 events, so data
+  from the central can wait up to (latency + 1) x interval: 465 ms at 12 / 30 / 400
+  (15 ms, latency 30). That is the echo maximum of about 444 ms (median 24.5 ms,
+  p95 25.3 ms): it is the first echo, sent while latency 30 is in force; mcumgr's
+  parameter request then moves the link to 6 / 0 / 42. It is not a host stall.
+  The same bound applies to other central-to-peripheral data, for example a Caps
+  Lock LED update from the host. Keypresses (peripheral to central) are not
+  affected: a TX push kicks the link to the next connection event.
 - **Zephyr host warning** "Controller to host flow control not supported" once
   per boot (see [HCI subset](#hci-subset)).
 - **HCI LE Connection Update (0x2013) not implemented** although feature bit 1
