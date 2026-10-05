@@ -1,4 +1,4 @@
-From 34df3e63520ab4e1b64713e2dc2b16c29ef00de6 Mon Sep 17 00:00:00 2001
+From ebb05cc856f4591b133812770725213b158d82c3 Mon Sep 17 00:00:00 2001
 From: scholzri <33288574+scholzri@users.noreply.github.com>
 Date: Mon, 5 Oct 2026 14:32:06 +0200
 Subject: [PATCH] zmk: raise BLE auth state events, select BLE output on
@@ -6,15 +6,18 @@ Subject: [PATCH] zmk: raise BLE auth state events, select BLE output on
 
 Add a zmk_ble_auth_state_changed event so status indicators can follow
 pairing: PASSKEY_REQ (passkey entry requested), PASSKEY_DIGITS (digits
-typed so far), PAIRED_OK (pairing complete), FAILED (auth cancel,
-security failure, pairing failed or a pairing on a taken profile) and
-CLEARED (bond cleared). The profile is the bonded profile of the peer,
-else the active profile, where new pairings happen.
+typed so far), PASSKEY_SUBMITTED (Enter, the host now verifies the
+passkey), PAIRED_OK (pairing complete), FAILED (auth cancel, security
+failure, pairing failed or a pairing on a taken profile) and CLEARED
+(bond cleared). The profile is the bonded profile of the peer, else the
+active profile, where new pairings happen.
 
 The auth and security callbacks run in the BT RX thread, so every
 event goes through a message queue drained by a work item, like the
 existing profile changed work item. Thread-context sources (digits,
-clear bonds) take the same path so all events stay in order.
+submit, clear bonds) take the same path so all events stay in order.
+PASSKEY_SUBMITTED is queued before the passkey goes to the stack, so
+the result of the check always follows it.
 
 zmk_ble_prof_select() now switches the preferred transport from USB to
 BLE: selecting a BLE profile means the user wants to type over BLE.
@@ -23,10 +26,10 @@ Connection events do not call it, so they never switch the output.
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
  app/CMakeLists.txt                            |  1 +
- .../zmk/events/ble_auth_state_changed.h       | 27 +++++++
- app/src/ble.c                                 | 75 +++++++++++++++++++
+ .../zmk/events/ble_auth_state_changed.h       | 29 +++++++
+ app/src/ble.c                                 | 77 +++++++++++++++++++
  app/src/events/ble_auth_state_changed.c       | 10 +++
- 4 files changed, 113 insertions(+)
+ 4 files changed, 117 insertions(+)
  create mode 100644 app/include/zmk/events/ble_auth_state_changed.h
  create mode 100644 app/src/events/ble_auth_state_changed.c
 
@@ -44,10 +47,10 @@ index cc38244a..9b0af61f 100644
      target_sources(app PRIVATE src/hog.c)
 diff --git a/app/include/zmk/events/ble_auth_state_changed.h b/app/include/zmk/events/ble_auth_state_changed.h
 new file mode 100644
-index 00000000..e1726dca
+index 00000000..08073065
 --- /dev/null
 +++ b/app/include/zmk/events/ble_auth_state_changed.h
-@@ -0,0 +1,27 @@
+@@ -0,0 +1,29 @@
 +/*
 + * Copyright (c) 2026 The ZMK Contributors
 + *
@@ -65,6 +68,8 @@ index 00000000..e1726dca
 +    ZMK_BLE_AUTH_PAIRED_OK,
 +    ZMK_BLE_AUTH_FAILED,
 +    ZMK_BLE_AUTH_CLEARED,
++    // The passkey was submitted (Enter): the host verifies it, PAIRED_OK or FAILED follows.
++    ZMK_BLE_AUTH_PASSKEY_SUBMITTED,
 +};
 +
 +struct zmk_ble_auth_state_changed {
@@ -76,7 +81,7 @@ index 00000000..e1726dca
 +
 +ZMK_EVENT_DECLARE(zmk_ble_auth_state_changed);
 diff --git a/app/src/ble.c b/app/src/ble.c
-index 2a59f95a..bb73490e 100644
+index 2a59f95a..8c1d5a90 100644
 --- a/app/src/ble.c
 +++ b/app/src/ble.c
 @@ -36,6 +36,8 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
@@ -254,7 +259,16 @@ index 2a59f95a..bb73490e 100644
  };
  
  static void zmk_ble_ready(int err) {
-@@ -817,6 +890,8 @@ static int zmk_ble_handle_key_user(struct zmk_keycode_state_changed *event) {
+@@ -795,6 +868,8 @@ static int zmk_ble_handle_key_user(struct zmk_keycode_state_changed *event) {
+         }
+ 
+         LOG_DBG("Final passkey: %d", passkey);
++        // Before the entry: the result (FAILED/PAIRED_OK) must queue after it.
++        raise_auth_state_changed(auth_passkey_entry_profile, ZMK_BLE_AUTH_PASSKEY_SUBMITTED, 0);
+         bt_conn_auth_passkey_entry(auth_passkey_entry_conn, passkey);
+         bt_conn_unref(auth_passkey_entry_conn);
+         auth_passkey_entry_conn = NULL;
+@@ -817,6 +892,8 @@ static int zmk_ble_handle_key_user(struct zmk_keycode_state_changed *event) {
      ring_buf_put(&passkey_entries, &val, 1);
      LOG_DBG("value entered: %d, digits collected so far: %d", val,
              ring_buf_size_get(&passkey_entries));
