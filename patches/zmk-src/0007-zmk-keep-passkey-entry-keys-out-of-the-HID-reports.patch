@@ -1,0 +1,94 @@
+From 82c84eeca6b97fbfab184aedd6d36f9522f18e1d Mon Sep 17 00:00:00 2001
+From: scholzri <33288574+scholzri@users.noreply.github.com>
+Date: Mon, 5 Oct 2026 16:37:16 +0200
+Subject: [PATCH] zmk: keep passkey entry keys out of the HID reports
+
+Event listeners run in link order (the .event_subscription section is
+not sorted), and hid_listener.c is linked before ble.c. So every key
+typed for a passkey was first reported to the host by hid_listener and
+only then consumed by the passkey listener in ble.c: the digits showed
+up on the USB host (the endpoint falls back to USB while the new
+profile is not connected yet) or on another BLE host.
+
+Add zmk_ble_passkey_entry_active() and check it in hid_listener: while
+a passkey is entered, drop presses and drop releases of keys that are
+not in the report. Releases of keys held from before the request still
+go out, so no key gets stuck. This does not depend on listener order.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ app/include/zmk/ble.h  |  5 +++++
+ app/src/ble.c          |  2 ++
+ app/src/hid_listener.c | 20 +++++++++++++++++++-
+ 3 files changed, 26 insertions(+), 1 deletion(-)
+
+diff --git a/app/include/zmk/ble.h b/app/include/zmk/ble.h
+index 92b2107d..9d02d69a 100644
+--- a/app/include/zmk/ble.h
++++ b/app/include/zmk/ble.h
+@@ -38,6 +38,11 @@ bool zmk_ble_profile_is_open(uint8_t index);
+ 
+ bool zmk_ble_active_profile_is_open(void);
+ bool zmk_ble_active_profile_is_connected(void);
++
++#if IS_ENABLED(CONFIG_ZMK_BLE_PASSKEY_ENTRY)
++// True while the keyboard collects a passkey for pairing: keys go to the passkey, not to a host.
++bool zmk_ble_passkey_entry_active(void);
++#endif
+ char *zmk_ble_active_profile_name(void);
+ 
+ int zmk_ble_unpair_all(void);
+diff --git a/app/src/ble.c b/app/src/ble.c
+index bb73490e..3a1ca046 100644
+--- a/app/src/ble.c
++++ b/app/src/ble.c
+@@ -49,6 +49,8 @@ static struct bt_conn *auth_passkey_entry_conn;
+ static uint8_t auth_passkey_entry_profile;
+ RING_BUF_DECLARE(passkey_entries, PASSKEY_DIGITS);
+ 
++bool zmk_ble_passkey_entry_active(void) { return auth_passkey_entry_conn != NULL; }
++
+ #endif /* IS_ENABLED(CONFIG_ZMK_BLE_PASSKEY_ENTRY) */
+ 
+ enum advertising_type {
+diff --git a/app/src/hid_listener.c b/app/src/hid_listener.c
+index cd463d8e..a3ff41d7 100644
+--- a/app/src/hid_listener.c
++++ b/app/src/hid_listener.c
+@@ -15,6 +15,22 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
+ #include <zmk/hid.h>
+ #include <dt-bindings/zmk/hid_usage_pages.h>
+ #include <zmk/endpoints.h>
++#if IS_ENABLED(CONFIG_ZMK_BLE)
++#include <zmk/ble.h>
++#endif
++
++// While a passkey is entered, the keys belong to the passkey and must not reach any host. The
++// passkey listener in ble.c sees them only after this one (listeners run in link order), so
++// check here: drop presses, and releases of keys that are not in the report. Releases of keys
++// held from before still go out, so nothing gets stuck.
++static bool hid_listener_passkey_entry_swallows(const struct zmk_keycode_state_changed *ev) {
++#if IS_ENABLED(CONFIG_ZMK_BLE) && IS_ENABLED(CONFIG_ZMK_BLE_PASSKEY_ENTRY)
++    return zmk_ble_passkey_entry_active() &&
++           (ev->state || !zmk_hid_is_pressed(ZMK_HID_USAGE(ev->usage_page, ev->keycode)));
++#else
++    return false;
++#endif
++}
+ 
+ static int hid_listener_keycode_pressed(const struct zmk_keycode_state_changed *ev) {
+     int err, explicit_mods_changed, implicit_mods_changed;
+@@ -99,7 +115,9 @@ static int hid_listener_keycode_released(const struct zmk_keycode_state_changed
+ int hid_listener(const zmk_event_t *eh) {
+     const struct zmk_keycode_state_changed *ev = as_zmk_keycode_state_changed(eh);
+     if (ev) {
+-        if (ev->state) {
++        if (hid_listener_passkey_entry_swallows(ev)) {
++            LOG_DBG("passkey entry: not reporting keycode 0x%02X", ev->keycode);
++        } else if (ev->state) {
+             hid_listener_keycode_pressed(ev);
+         } else {
+             hid_listener_keycode_released(ev);
+-- 
+2.53.0
+

@@ -1019,6 +1019,7 @@ patches/
     0004-zmk-drive-USB-remote-wakeup-from-the-HID-send-path.patch
     0005-zmk-start-BLE-advertising-from-the-workqueue-after-s.patch
     0006-zmk-raise-BLE-auth-state-events-select-BLE-output-on.patch
+    0007-zmk-keep-passkey-entry-keys-out-of-the-HID-reports.patch
 ```
 
 `zmk-src/0005` is needed for `--privacy`: ZMK started advertising inside the
@@ -1136,7 +1137,7 @@ BLE controller blob defines `sys_init()`, collides with hal_telink's `sys.c`. Re
 
 **0002** narrows this to the blob: `sys.c` is built unless `CONFIG_BT_HCI_B91_CTLR_BLOB` is selected, because the open controller needs the HAL's `sys_init`.
 
-### zmk-src (8 files, 6 patches)
+### zmk-src (10 files, 7 patches)
 
 **0001 — `app/Kconfig` + `app/src/activity.c`** — `ZMK_USB_NO_VBUS_DETECT` for boards without VBUS sensing
 
@@ -1151,6 +1152,8 @@ B91 has no USB VBUS detection pin. Without this patch, `is_usb_power_present()` 
 **0005, `app/src/ble.c`:** `zmk_ble_ready()` submits `update_advertising_work` instead of starting advertising inside the settings commit, so it runs after the host's pending IRK/identity stores. Fixes the `CONFIG_BT_PRIVACY` startup deadlock described above.
 
 **0006, `app/src/ble.c` + new `app/include/zmk/events/ble_auth_state_changed.h`, `app/src/events/ble_auth_state_changed.c`, `app/CMakeLists.txt`:** a new event `zmk_ble_auth_state_changed { profile, state, digits }` for pairing indicators (rainy_rgb BLE slot LEDs). States: `PASSKEY_REQ` (`auth_passkey_entry`), `PASSKEY_DIGITS` (each digit typed, `digits` = count so far, 1..6; `PASSKEY_REQ` means 0; the profile is the one stored at `PASSKEY_REQ`), `PAIRED_OK` (`auth_pairing_complete`), `FAILED` (`auth_cancel`, `security_changed` with an error, `pairing_failed`, or a pairing completed on a taken profile) and `CLEARED` (`zmk_ble_clear_bonds()`, and every profile in `zmk_ble_clear_all_bonds()`). `profile` is the bonded profile of the peer, else the active profile, where new pairings happen. The BT callbacks run in the BT RX thread, so every event goes through a small message queue (8 entries) drained by a work item on the system workqueue; the thread-context sources take the same path so the order is kept. One failed pairing usually produces two or three `FAILED` events within the same RX callback chain (Zephyr calls `security_changed`, `pairing_failed` and sometimes `cancel`); consumers treat them as one. After `BT_CLR` the old host usually still tries to reconnect with its stale keys, which gives `CLEARED` and then `FAILED` on the same slot (a red flash); this is expected. Only peripheral-role connections raise events. Also, `zmk_ble_prof_select()` (and so `&bt BT_SEL/BT_NXT/BT_PRV`, and `BT_CLR_ALL`, which selects profile 0) sets the preferred transport to BLE when it is USB (on a profile change only after the new profile is active, so the output never flips to the old profile): selecting a profile means the user wants to type over BLE. Connection events never call it, so they do not switch the output.
+
+**0007, `app/src/hid_listener.c` + `app/src/ble.c` + `app/include/zmk/ble.h`:** keys typed for a passkey no longer reach a host. ZMK event listeners run in link order (the `.event_subscription` linker section is not sorted), and `hid_listener.c` is linked before `ble.c`, so upstream ZMK reported every passkey key to the current endpoint before the passkey listener consumed it. On the device the digits appeared on the USB host, because the endpoint falls back to USB while the new BLE profile is not connected yet. `zmk_ble_passkey_entry_active()` (true while `auth_passkey_entry_conn` is set) is checked at the top of the HID listener: while a passkey is entered it drops presses and drops releases of keys that are not in the report; releases of keys held from before the request still go out, so nothing gets stuck. The check does not depend on listener order.
 
 ### Reverted fixes (proven unnecessary)
 
