@@ -420,6 +420,34 @@ window offset). During GATT/SMP activity the host asks for 7.5 ms, latency 0,
 and later returns to 15 ms. Both are applied at their instant; at 7.5 ms the
 link runs at 133 events per second with an RX in almost every event.
 
+### Late instants (0x28 after 6/0/42)
+
+The PC's controller does adaptive frequency hopping and sends
+LL_CHANNEL_MAP_IND every few seconds, also right after the switch to
+6/0/42: received two events after the update instant, with its own instant 6
+events (45 ms) later. LLCP PDUs are handled by the controller thread after
+decryption, and cooperative host work held that thread off for 70 to 220 ms
+at exactly that moment (a GATT client connect triggers settings stores whose
+NVS reads run in the system work queue, about 1 s later, when the update
+instant comes). Judged against the event counter at handling time, the
+instant had passed and the link ended with 0x28 (Instant Passed) in 8 of 19
+client connects (debug log: received in event 2609, instant 2615, handled
+with event 2619 planned).
+
+The spec judges an instant against the event the PDU was received in. ll_rxq
+keeps that event with every PDU (`ll_rx_pdu.event`), ll_llcp hands it to
+`ll_conn_update_at()` / `ll_conn_chmap_at()`, and 0x28 is reported only for an
+instant at or before that event. An instant whose event has gone by since the
+reception is applied late (`catch_up()` in `ll_conn.c`): the map from the
+instant event on, the new timing from the old anchor of the instant event
+plus WinOffset (the transmit window repeats every new interval), and the
+first event that can still be prepared is listened to; the events in between
+count as missed. After the fix: no 0x28 in 130 client connects (the late path
+was taken in 7 of 20 logged ones, handled 14 to 25 events after the
+reception), and none in 5 minutes of CCC toggles with SMP echo load. One of
+the 130 connects ended with 0x08 after 5.4 s without any log output; its
+cause is open.
+
 ### Late events
 
 Under traffic the stimer alarm often starts 150 to 270 us late, mostly because
