@@ -10,7 +10,10 @@
  *                       "link": [{"up": 0/1, "listen": uint, "skip": uint,
  *                                 "coll": uint, "miss": uint}, ...] (per link id),
  *                       "adv": {"ev": uint, "slid": uint, "drop": uint,
- *                               "cut": uint, "stuck": uint}}
+ *                               "cut": uint, "stuck": uint},
+ *                       "flash": {"win": uint, "wait": uint, "force": uint,
+ *                                 "wmax": uint, "pause": uint, "cut": uint,
+ *                                 "abort": uint, "pskip": uint}}
  *   All counters are cumulative since boot and uint32 (wrap after 49 days).
  *   plan/listen/skip/kick/ev/miss are sums over all links of ll_conn_get_stats
  *   (ev = events issued to the radio, miss = events without any CRC-valid
@@ -18,7 +21,10 @@
  *   peripheral latency active and idle, skip grows much faster than listen.
  *   "link" has one map per link id 0..CONFIG_BT_HCI_B91_OPENLL_MAX_CONN-1
  *   (coll: events yielded to the arbiter); "adv" are the advertising
- *   arbitration counters (ll_adv_get_stats).
+ *   arbitration counters (ll_adv_get_stats); "flash" the flash window
+ *   (ll_flash.h: windows, waits for the links, forced opens, longest wait
+ *   in us, connection events paused / cut, radio aborts) and the RX DMA
+ *   ring overruns (pskip, ll_radio_stats.rx_ptr_skip).
  *
  * "idle" is the CPU idle time (k_thread_runtime_stats_all_get); needs
  * CONFIG_THREAD_RUNTIME_STATS (about +290 B ROM, +240 B RAM, set in
@@ -42,6 +48,7 @@
 #include "ll_adv.h"
 #include "ll_conn.h"
 #include "ll_defs.h"
+#include "ll_flash.h"
 
 LOG_MODULE_REGISTER(openll_mgmt, LOG_LEVEL_INF);
 
@@ -94,6 +101,8 @@ static int openll_mgmt_stats(struct smp_streamer *ctxt)
 	zcbor_state_t *zse = ctxt->writer->zs;
 	struct ll_conn_stats s;
 	struct ll_adv_stats as;
+	struct ll_flash_stats fs;
+	struct ll_radio_stats rs;
 	uint32_t up = 0;
 
 	ll_conn_get_stats_total(&s);   /* aggregates: sums over the links */
@@ -140,6 +149,19 @@ static int openll_mgmt_stats(struct smp_streamer *ctxt)
 	     zcbor_tstr_put_lit(zse, "cut") && zcbor_uint32_put(zse, as.cut) &&
 	     zcbor_tstr_put_lit(zse, "stuck") && zcbor_uint32_put(zse, as.stuck) &&
 	     zcbor_map_end_encode(zse, 5);
+	/* flash window (ll_flash.h) and the RX ring overrun it prevents */
+	ll_flash_get_stats(&fs);
+	ll_radio_get_stats(&rs);
+	ok = ok && zcbor_tstr_put_lit(zse, "flash") && zcbor_map_start_encode(zse, 8) &&
+	     zcbor_tstr_put_lit(zse, "win") && zcbor_uint32_put(zse, fs.windows) &&
+	     zcbor_tstr_put_lit(zse, "wait") && zcbor_uint32_put(zse, fs.waits) &&
+	     zcbor_tstr_put_lit(zse, "force") && zcbor_uint32_put(zse, fs.forced) &&
+	     zcbor_tstr_put_lit(zse, "wmax") && zcbor_uint32_put(zse, fs.wait_max_us) &&
+	     zcbor_tstr_put_lit(zse, "pause") && zcbor_uint32_put(zse, s.flash_paused) &&
+	     zcbor_tstr_put_lit(zse, "cut") && zcbor_uint32_put(zse, s.flash_cut) &&
+	     zcbor_tstr_put_lit(zse, "abort") && zcbor_uint32_put(zse, rs.flash_aborts) &&
+	     zcbor_tstr_put_lit(zse, "pskip") && zcbor_uint32_put(zse, rs.rx_ptr_skip) &&
+	     zcbor_map_end_encode(zse, 8);
 	return ok ? MGMT_ERR_EOK : MGMT_ERR_EMSGSIZE;
 }
 

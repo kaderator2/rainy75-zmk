@@ -20,6 +20,11 @@ wakeups), mv (battery, 0 = unavailable). With multilink firmware (slice 6a)
 the connection counters are sums over the links, and the reply adds links
 (links up), link (per link id: up, listen, skip, coll = events yielded to
 the arbiter, miss) and adv (advertising events, slid, drop, cut, stuck).
+Firmware with the flash window adds flash (win = flash operations covered,
+wait / force / wmax = waits for the links, force = opened without them,
+longest wait in us, pause / cut = connection events not issued / ended by
+it, abort = radio activity ended, pskip = RX DMA ring overruns, which must
+stay 0).
 Counters are uint32, cumulative since boot; deltas are computed modulo 2**32.
 """
 
@@ -39,6 +44,7 @@ FIELDS = ("up", "idle", "plan", "listen", "skip", "kick", "ev", "miss", "wake", 
 COUNTERS = ("idle", "plan", "listen", "skip", "kick", "ev", "miss", "wake")
 LINK_COUNTERS = ("listen", "skip", "coll", "miss")
 ADV_COUNTERS = ("ev", "slid", "drop", "cut", "stuck")
+FLASH_COUNTERS = ("win", "wait", "force", "wmax", "pause", "cut", "abort", "pskip")
 
 
 # --- pure helpers (unit tested) --------------------------------------------
@@ -74,6 +80,8 @@ def delta(new, old):
         d["link"] = [_sub(n, p, LINK_COUNTERS) for n, p in zip(new["link"], old["link"])]
     if isinstance(new.get("adv"), dict) and isinstance(old.get("adv"), dict):
         d["adv"] = _sub(new["adv"], old["adv"], ADV_COUNTERS)
+    if isinstance(new.get("flash"), dict) and isinstance(old.get("flash"), dict):
+        d["flash"] = _sub(new["flash"], old["flash"], FLASH_COUNTERS)
     return d
 
 
@@ -94,6 +102,9 @@ def format_stats(s, d=None):
     if isinstance(s.get("adv"), dict):
         a = s["adv"]
         line += "\n  adv: " + " ".join(f"{k} {a.get(k, 0)}" for k in ADV_COUNTERS)
+    if isinstance(s.get("flash"), dict):
+        f = s["flash"]
+        line += "\n  flash: " + " ".join(f"{k} {f.get(k, 0)}" for k in FLASH_COUNTERS)
     if d and d.get("up"):
         secs = d["up"] / 1000.0
         tot = d.get("listen", 0) + d.get("skip", 0)
@@ -109,6 +120,9 @@ def format_stats(s, d=None):
         if "adv" in d:
             line += "\n  delta adv: " + " ".join(f"{k} {d['adv'].get(k, 0)}"
                                                  for k in ADV_COUNTERS)
+        if "flash" in d:
+            line += "\n  delta flash: " + " ".join(f"{k} {d['flash'].get(k, 0)}"
+                                                   for k in FLASH_COUNTERS)
     return line
 
 

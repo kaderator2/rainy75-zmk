@@ -105,6 +105,22 @@ class T(unittest.TestCase):
         txt = o.format_stats(s)
         self.assertNotIn("link 0", txt)
 
+    def test_format_flash(self):
+        # flash window counters (and the RX ring overrun count) when present
+        s = dict(zip(o.FIELDS, [10000, 9000, 1, 2, 3, 4, 5, 6, 7, 3900]))
+        s["flash"] = {"win": 120, "wait": 3, "force": 0, "wmax": 8000, "pause": 40,
+                      "cut": 2, "abort": 5, "pskip": 0}
+        txt = o.format_stats(s)
+        self.assertIn("flash: win 120 wait 3 force 0 wmax 8000 pause 40 cut 2 abort 5 pskip 0",
+                      txt)
+        old = dict(s, flash=dict(s["flash"], win=100, pskip=0))
+        d = o.delta(s, old)
+        self.assertEqual(d["flash"]["win"], 20)
+        d["up"] = 1000
+        self.assertIn("delta flash: win 20", o.format_stats(s, d))
+        s2 = dict(zip(o.FIELDS, [10000, 9000, 1, 2, 3, 4, 5, 6, 7, 3900]))
+        self.assertNotIn("flash:", o.format_stats(s2))
+
     def test_group_matches_firmware(self):
         with open(os.path.join(os.path.dirname(__file__), "../../zmk/src/openll_mgmt.c")) as f:
             src = f.read()
