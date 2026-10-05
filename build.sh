@@ -56,11 +56,15 @@ BUILD_DIR="${BUILD_DIR:-build}"   # app build directory
 # a patch that genuinely did not apply, which is how the bind-window grace
 # (zmk-src 0003) went missing from every build unnoticed.
 #
-# Missing patches are applied only when they are the tail of the series
-# (none applied yet after `west update`, or new patches appended). A gap (a
-# later patch is in the tree, an earlier one is not, e.g. a patch was
-# rewritten) stops the build: the tree carries an older series and needs
-# `git -C <tree> checkout --detach manifest-rev` first. This script never
+# An applied patch must also match its file (git patch-id), so a patch
+# rewritten in place under the same subject is caught. Missing patches are
+# applied only when they are the tail of the series (none applied yet after
+# `west update`, or new patches appended). A gap (a later patch is in the
+# tree, an earlier one is not or is outdated), a patch dropped from the
+# series (a commit beyond manifest-rev that the list does not know) or a
+# patch that did not end up in the tree stops the build: the tree carries
+# an older series and needs `git -C <tree> checkout --detach manifest-rev`
+# first. This script never
 # resets or cleans a tree itself, so uncommitted work there is never lost.
 #
 # A patch that truly fails is fatal: building without it silently produces
@@ -88,9 +92,25 @@ elif cmd == "subset":           # write a copy with only the given patches
 PYEOF
 }
 
+patch_subject() {
+    git mailinfo /dev/null /dev/null < "$1" 2>/dev/null | sed -n 's/^Subject: //p'
+}
+
+# Newest commit above manifest-rev with this subject (empty if none).
+patch_commit() {
+    [ -n "$2" ] || return 0
+    git -C "$1" log --format='%H %s' manifest-rev..HEAD 2>/dev/null |
+        awk -v s="$2" 'substr($0, 42) == s { print $1; exit }'
+}
+
+patch_id() {
+    git patch-id --stable | cut -d' ' -f1
+}
+
 check_patch_list() {
     local f listed
-    listed=$(patch_yml all-paths)
+    listed=$(patch_yml all-paths) && [ -n "$listed" ] ||
+        { echo "ERROR: cannot read $PATCH_YML" >&2; exit 1; }
     for f in patches/*/*.patch; do
         [ -f "$f" ] || continue
         if ! grep -Fxq "${f#patches/}" <<< "$listed"; then
@@ -101,43 +121,67 @@ check_patch_list() {
 }
 
 apply_patches() {
-    local dir="$1" path subject gap=0 tmp rebase
-    local -a missing=() subjects=()
+    local dir="$1" path subject commit gap=0 tmp rebase
+    local -a missing=() stale=() subjects=()
     # Neutral identity for `git am --abort`: these are throwaway commits in
     # fetched trees, and without an identity the abort fails and leaves a
     # half-finished rebase-apply behind, which breaks the *next* build with a
     # confusing "previous rebase directory still exists". The apply-command
     # in patches.yml sets the same identity for `git am`.
     local ident=(-c user.name="rainy75 build" -c user.email="build@localhost")
+    local paths
+    paths=$(patch_yml paths "$dir") || exit 1
+    [ -n "$paths" ] || { echo "ERROR: no patches listed for $dir" >&2; exit 1; }
     while IFS= read -r path; do
         [ -n "$path" ] || continue
-        subject=$(git mailinfo /dev/null /dev/null < "patches/$path" 2>/dev/null |
-                  sed -n 's/^Subject: //p')
+        subject=$(patch_subject "patches/$path")
         subjects+=("$subject")
-        if [ -n "$subject" ] &&
-           git -C "$dir" log --format=%s | grep -Fxq "$subject"; then
+        commit=$(patch_commit "$dir" "$subject")
+        if [ -n "$commit" ]; then
             [ ${#missing[@]} -gt 0 ] && gap=1
+            # Same subject, different content: the patch was rewritten in
+            # place, and this tree still builds the old version.
+            if [ "$(patch_id < "patches/$path")" != \
+                 "$(git -C "$dir" show "$commit" | patch_id)" ]; then
+                stale+=("$path")
+            fi
         else
             missing+=("$path")
         fi
-    done < <(patch_yml paths "$dir")
+    done <<< "$paths"
 
-    # Own commits on top are fine, but say so: a patch dropped from the
-    # series stays in a tree that has it until the tree is reset.
+    # A patch dropped from the series stays in a tree that has it until the
+    # tree is reset, so commits beyond manifest-rev that are not in the list
+    # stop the build. RAINY75_ALLOW_EXTRA_COMMITS=1 allows own work there.
     local extra
     extra=$(git -C "$dir" log --format=%s manifest-rev..HEAD 2>/dev/null |
             grep -Fxv -f <(printf '%s\n' "${subjects[@]}") || true)
     if [ -n "$extra" ]; then
-        echo "NOTE: $dir has commits beyond manifest-rev that are not in $PATCH_YML:" >&2
-        sed 's/^/        /' <<< "$extra" >&2
+        if [ "${RAINY75_ALLOW_EXTRA_COMMITS:-0}" = 1 ]; then
+            echo "NOTE: $dir has commits beyond manifest-rev that are not in $PATCH_YML:" >&2
+            sed 's/^/        /' <<< "$extra" >&2
+        else
+            echo "ERROR: $dir has commits beyond manifest-rev that are not in $PATCH_YML" >&2
+            echo "       (for example a patch that was dropped from the series):" >&2
+            sed 's/^/         /' <<< "$extra" >&2
+            echo "       Reset the tree (git -C $dir checkout --detach manifest-rev)," >&2
+            echo "       or set RAINY75_ALLOW_EXTRA_COMMITS=1 to build with own commits." >&2
+            exit 1
+        fi
     fi
 
-    [ ${#missing[@]} -eq 0 ] && return 0
+    if [ ${#stale[@]} -gt 0 ]; then
+        echo "ERROR: $dir carries an older version of these patches:" >&2
+        printf '         %s\n' "${stale[@]}" >&2
+        gap=1
+    fi
+
+    [ ${#missing[@]} -eq 0 ] && [ ${#stale[@]} -eq 0 ] && return 0
 
     if [ "$gap" -eq 1 ]; then
         echo "ERROR: $dir carries a different patch series than $PATCH_YML." >&2
-        echo "       Missing, while later patches are applied:" >&2
-        printf '         %s\n' "${missing[@]}" >&2
+        [ ${#missing[@]} -gt 0 ] && echo "       Missing, while later patches are applied:" >&2
+        [ ${#missing[@]} -gt 0 ] && printf '         %s\n' "${missing[@]}" >&2
         echo "       Commit or save any own work in $dir, then:" >&2
         echo "         git -C $dir checkout --detach manifest-rev   # or: west update" >&2
         echo "       and build again (the patches are re-applied)." >&2
@@ -159,10 +203,20 @@ apply_patches() {
         exit 1
     fi
     rm -f "$tmp"
+    # west patch skips a patch whose module path does not resolve, and git am
+    # --3way skips one that is already in the tree, both without failing.
+    for path in "${missing[@]}"; do
+        if [ -z "$(patch_commit "$dir" "$(patch_subject "patches/$path")")" ]; then
+            echo "ERROR: $path was not applied to $dir (see above)." >&2
+            exit 1
+        fi
+    done
 }
 
 check_patch_list
-mapfile -t PATCH_TREES < <(patch_yml modules)
+PATCH_TREE_LIST=$(patch_yml modules) && [ -n "$PATCH_TREE_LIST" ] ||
+    { echo "ERROR: cannot read the trees from $PATCH_YML" >&2; exit 1; }
+mapfile -t PATCH_TREES <<< "$PATCH_TREE_LIST"
 for tree in "${PATCH_TREES[@]}"; do
     apply_patches "$tree"
 done

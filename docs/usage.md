@@ -59,7 +59,7 @@ If you mistype, just type all six digits again (the last six count) before Enter
 cancels. A wrong code flashes keys 1 to 6 and the F-key red; start again from the host.
 
 If no host pairs within **30 seconds**, the keyboard gives up: the free profile flashes red
-and the keyboard returns to the host you used before (if one is connected).
+and the keyboard returns to the host you used before (or the last one that was connected).
 
 The profile must be free. To pair a host on a profile that is already taken, remove that
 pairing first (below).

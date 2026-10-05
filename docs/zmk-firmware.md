@@ -1005,11 +1005,11 @@ west patch -b ../patches clean                   # back to manifest-rev, see bel
 
 The apply-command is `git am --3way` with a neutral committer, so each patch becomes a commit with its subject. `west patch apply` applies every listed patch and is not idempotent: run it on trees fresh from `west update` (`git am --3way` happens to skip a patch whose change is already in the tree, but a stack that rewrites the same lines conflicts). `build.sh` therefore decides per tree itself:
 
-- A patch counts as applied when its commit subject is in the tree's history (the old, known-good rule; `git apply --reverse --check` fails for an earlier patch once a later one rewrites its lines).
+- A patch counts as applied when a commit above `manifest-rev` has its subject (the old, known-good rule; `git apply --reverse --check` fails for an earlier patch once a later one rewrites its lines), and that commit must match the file (`git patch-id --stable`): a patch rewritten in place under the same subject is reported as outdated.
 - All applied: nothing to do. Missing patches that are the tail of the series (none applied after `west update`, or new patches appended) go to `west patch apply` through a temporary copy of `patches.yml` with just those entries, so the sha256 check and the apply-command still come from `west patch`.
-- A gap (a later patch is in the tree, an earlier one is not, e.g. after a patch was rewritten) stops the build with the missing files and the fix: `git -C <tree> checkout --detach manifest-rev` (or `west update`), then build again.
-- A failed apply runs `git am --abort` and stops the build.
-- Commits beyond `manifest-rev` that are not in `patches.yml` are listed as a NOTE (own work is fine; a patch dropped from the series stays in a tree that has it).
+- A gap (a later patch is in the tree, an earlier one is missing or outdated) stops the build with the missing files and the fix: `git -C <tree> checkout --detach manifest-rev` (or `west update`), then build again.
+- A failed apply runs `git am --abort` and stops the build. After `west patch apply` every handed-over patch is checked again, because `west patch` skips a patch whose module path does not resolve and `git am --3way` skips one whose change is already there, both without an error.
+- Commits beyond `manifest-rev` that are not in `patches.yml` stop the build: a patch dropped from the series stays in a tree that has it. `RAINY75_ALLOW_EXTRA_COMMITS=1` turns this into a NOTE for own work in a tree.
 - A patch file in `patches/` that `patches.yml` does not list stops the build.
 
 `build.sh` never resets or cleans a tree, so uncommitted work there is never lost; a conflicting change makes `git am` fail, and the build stops. `west patch clean` runs `git checkout --detach manifest-rev` in each patched tree (`checkout-command` in `patches.yml`, `clean-command` empty): it drops the patch commits, leaves own commits behind (reflog) and refuses to overwrite conflicting uncommitted changes. The upstream defaults (`git checkout .`, `git clean -d -f -x`) would discard uncommitted work and keep the `git am` commits.

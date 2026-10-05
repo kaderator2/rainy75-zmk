@@ -29,8 +29,8 @@
  *    under a second) are not paused, and a NoInputNoOutput host, or a build
  *    without CONFIG_ZMK_BLE_PASSKEY_ENTRY, pairs Just Works without a pause.
  *    A Just Works pairing takes about a second; if the timeout hits it, ZMK
- *    rejects the result on the bonded profile (FAILED) and the host simply
- *    pairs again.
+ *    rejects the result on the bonded profile (FAILED); the host keeps the
+ *    keys it stored, so it must forget the keyboard and pair again.
  *  - Pairing end: ZMK_BLE_AUTH_PAIRED_OK, or ZMK_BLE_AUTH_FAILED, which ZMK
  *    raises for pairing_failed, security_changed with an error, cancel, a
  *    pairing completed on a taken profile, and (patch 0007) the disconnect
