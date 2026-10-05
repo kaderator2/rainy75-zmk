@@ -7,16 +7,16 @@ manifest:
   projects:
     - name: zmk
       remote: zmkfirmware
-      # Reachable upstream ZMK. Our one local change (ZMK_USB_NO_VBUS_DETECT, needed
-      # for battery deep sleep) is carried as patches/zmk-src/0001 and applied by
-      # build.sh — this pin + that patch == the exact source this firmware was built
-      # and tested against. Bump the two together if you move the pin.
+      # Reachable upstream ZMK. Our local changes are carried in patches/zmk-src/:
+      # this pin + those patches == the exact source this firmware was built and
+      # tested against. Bump them together if you move the pin.
       revision: 27afcb11efff6345d0ceb875e85c2de0673123f6
       path: zmk-src
       import: app/west.yml
     - name: hal_telink
       remote: zephyrproject-rtos
-      revision: main
+      # Pinned: patches/hal_telink/ is made against this commit. Bump them together.
+      revision: 4226c7fc17d5a34e557d026d428fc766191a0800
       path: modules/hal/hal_telink
     - name: mcuboot
       remote: zephyrproject-rtos

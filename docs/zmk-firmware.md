@@ -685,7 +685,7 @@ blob main loop → bltHci_txfifo → b91_bt_hci_tx_handler()
 | Symbols exported | 1438 (verified via `nm --defined-only`) |
 | Symbols needed from us | `swapN`, `swapX` (byte-swap utilities) |
 
-The blob also defines `sys_init` (from its LTO'd `ext_pm.c.o`), which conflicts with hal_telink's `drivers/B91/sys.c`. We patch hal_telink's `CMakeLists.txt` to skip `sys.c` when `CONFIG_BT_HCI_B91=y`, same as it already does for `CONFIG_BT_B91`.
+The blob also defines `sys_init` (from its LTO'd `ext_pm.c.o`), which conflicts with hal_telink's `drivers/B91/sys.c`. We patch hal_telink's `CMakeLists.txt` to skip `sys.c` when the blob is selected (`CONFIG_BT_HCI_B91_CTLR_BLOB=y`), same as it already does for `CONFIG_BT_B91`. The open controller needs the HAL `sys.c`.
 
 ### BLC init sequence
 
@@ -1010,8 +1010,7 @@ patches/
   mcuboot/
     0001-b91-riscv-boot-fixes.patch
   hal_telink/
-    0001-exclude-sys-for-BT_HCI_B91.patch
-    0002-build-sys.c-unless-the-blob-controller-is-selected.patch
+    0001-build-sys.c-unless-the-BLE-controller-blob-is-select.patch
   zmk-src/
     0001-zmk-usb-no-vbus-detect.patch
     0002-zmk-recover-a-dead-USB-bus-while-suspended-no-VBUS-d.patch

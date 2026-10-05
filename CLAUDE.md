@@ -79,7 +79,7 @@ conf/                            # build configuration overlays
   mcuboot.overlay                # MCUboot DTS overlay (disables peripherals)
 zmk-src/                         # ZMK upstream (fetched by west)
 zephyr/                          # Zephyr upstream (fetched by west)
-modules/hal/hal_telink/          # Telink HAL (fetched by west, patched for BT_HCI_B91: patches/hal_telink/0001 sys.c exclusion, 0002 sys.c for the open controller)
+modules/hal/hal_telink/          # Telink HAL (fetched by west, pinned in west.yml; patches/hal_telink/0001 builds sys.c unless the blob is selected)
 bootloader/mcuboot/              # MCUboot v2.2.0 (fetched by west)
 install_zmk.sh                   # stock → ZMK one-command installer (OTA bridge + flash_mgmt)
 restore_stock.sh                 # ZMK → stock one-command restorer (flash_mgmt + reset)

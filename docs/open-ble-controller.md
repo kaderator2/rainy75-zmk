@@ -260,7 +260,7 @@ Wiring:
   (`-Wl,--wrap`, see [Flash window](#flash-window)).
 - `b91_mac.c` holds the MAC-from-flash logic (read at `0xFF000`, random static
   fallback), shared by both controllers. Both derive the same public address.
-- `patches/hal_telink/0002-...` builds hal_telink's `sys.c` unless the blob is
+- `patches/hal_telink/0001-...` builds hal_telink's `sys.c` unless the blob is
   selected. The blob ships its own `sys_init`, the open controller needs the
   HAL one.
 - `zmk/src/openll_mgmt.c` serves the counters over mcumgr group 66
