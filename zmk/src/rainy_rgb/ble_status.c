@@ -17,9 +17,12 @@
  * Timing uses wrap-safe tick differences (int32). Expired animation kinds
  * and an expired s_pk_on are never cleared: harmless until the tick has
  * moved ~2^31 frames (~497 days at 50 FPS) past them, when the difference
- * turns negative (still off); only after ~2^32 frames could one reappear. Setters run on the ZMK event
- * thread, render/active on the render thread: single writer, single core,
- * a torn read is a one-frame glitch. */
+ * turns negative (still off); only after ~2^32 frames could one reappear.
+ *
+ * Threads: zmk_adapter.c calls the slot/output/event setters from one work
+ * item on the system workqueue and set_fn from the ZMK layer listener (each
+ * variable has one writer); render/active run on the render thread. Single
+ * core, so a torn read is a one-frame glitch. */
 
 enum anim_kind { ANIM_NONE = 0, ANIM_CONN, ANIM_FLASH };
 

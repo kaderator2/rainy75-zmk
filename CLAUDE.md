@@ -24,7 +24,7 @@ Fully reverse engineer the firmware and hardware of the Wobkey Rainy 75 Pro ISO 
 All technical findings are in `docs/`:
 - [docs/zmk-firmware.md](docs/zmk-firmware.md) — ZMK firmware build, BLE HCI driver, board definition, workspace layout
 - [docs/open-ble-controller.md](docs/open-ble-controller.md) — open BLE link layer (issue #13): architecture, build, status, sniffer workflow
-- [docs/rainy-rgb.md](docs/rainy-rgb.md) — rainy_rgb out-of-tree lighting engine: 12 effects + opt-in walker diagnostic, XY calibration, functional indicators (CapsLock/Fn-highlight/battery), controls, build/flash
+- [docs/rainy-rgb.md](docs/rainy-rgb.md) — rainy_rgb out-of-tree lighting engine: 12 effects + opt-in walker diagnostic, XY calibration, functional indicators (CapsLock/Fn-highlight/battery/BLE slot status + passkey guidance), controls, build/flash
 - [docs/architecture.md](docs/architecture.md) — MCU, USB, HID interfaces, RGB, battery, connection modes
 - [docs/gpio-matrix.md](docs/gpio-matrix.md) — GPIO pins, matrix scan, timing, keymap, Fn combos
 - [docs/firmware-analysis.md](docs/firmware-analysis.md) — Ghidra, 211 functions, key pipeline, SRAM buffers, decompilation

@@ -18,6 +18,10 @@ void rrgb_speed_step(int dir);
 void rrgb_on_key(uint32_t position, bool pressed);
 void rrgb_set_idle(bool idle);   /* activity-idle blank (CONFIG_RAINY_RGB_IDLE_BLANK) */
 void rrgb_battery_gauge_show(void);
+/* Current render frame (the overlay clock). It only advances while frames
+ * are drawn, so an event stamped with it shows from its start even when the
+ * strip was dark. */
+uint32_t rrgb_now(void);
 
 void rrgb_get_persist(struct rrgb_persist *out);
 void rrgb_set_persist(const struct rrgb_persist *in);

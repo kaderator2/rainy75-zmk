@@ -5,8 +5,8 @@
 #include "color.h"   /* struct rrgb */
 
 /* BLE profile slot status on F1..F4, the number row and Enter.
- * Pure, ZMK-free. Setters are called from the ZMK event thread (single
- * writer), render/active from the render thread (single-core benign races,
+ * Pure, ZMK-free. Each setter has a single writer thread (see ble_status.c),
+ * render/active run on the render thread (single-core benign races,
  * as in overlay.c). Time is the engine's 50 FPS frame counter. */
 
 enum rrgb_ble_slot { RRGB_BLE_EMPTY = 0, RRGB_BLE_PAIRED = 1, RRGB_BLE_CONNECTED = 2 };

@@ -16,12 +16,13 @@ Hardware-verified end to end on the physical keyboard (USB + BLE, mcuboot DFU).
 | `effects.{h,c}` | `struct rgb_frame`, the effect registry, and all effect render functions (12 display effects, plus an opt-in `walker` diagnostic). Pure. |
 | `engine.{h,c}` | Owns `pixels[83]` + a dedicated **50 FPS render thread**; runtime state; the FPS-independent speed model; settings load; dispatch (effect → overlay → strip). |
 | `reactive.{h,c}` | Lock-free **SPSC press queue** (event thread → render thread) feeding an 8-slot ripple pool + per-LED `key_heat[83]`. |
-| `overlay.{h,c}` | Functional indicators (CapsLock / Fn-highlight / battery gauge). Pure, ZMK-free. |
+| `overlay.{h,c}` | Functional indicators (CapsLock / Fn-highlight / battery gauge / BLE slot status). Pure, ZMK-free. Owns the keymap-coupled key tables. |
+| `ble_status.{h,c}` | BLE slot status on F1..F4, passkey guidance on the number row and Enter: state machine + renderer, timing and brightness constants. Pure, ZMK-free, host-tested. |
 | `led_map.{h,c}` | Calibrated `pos_to_led[83]` + `led_positions[83]` (XY) + lookups. ISO and ANSI table variants (`CONFIG_RAINY_RGB_ANSI_LEDMAP`, set by `./build.sh --ansi`). |
 | `state.c` | NVS persistence (`SETTINGS_STATIC_HANDLER`, subtree `rainy_rgb/`, 2 s debounce). |
-| `zmk_adapter.{h,c}` | **ZMK boundary**: led_strip wrap + `ZMK_LISTENER`/`ZMK_SUBSCRIPTION` for position/layer/hid-indicators/battery → neutral setters. |
+| `zmk_adapter.{h,c}` | **ZMK boundary**: led_strip wrap + `ZMK_LISTENER`/`ZMK_SUBSCRIPTION` for position/layer/hid-indicators/battery → neutral setters; BLE profile/endpoint/auth events and BT connection callbacks → `ble_status` (one work item). |
 | `../behaviors/behavior_rainy_rgb.c` | **ZMK boundary**: the `&rgb` keymap behavior → engine API. |
-| `tests/test_{color,effects,overlay}.c` | Host gcc unit tests (run `tests/run_host_tests.sh`). |
+| `tests/test_{color,effects,overlay,ble_status}.c` | Host gcc unit tests (run `tests/run_host_tests.sh`). |
 
 The board DTS exposes the strip as `chosen zmk,underglow = &led_strip` (driver
 `telink,b91-spi-led-strip`, PB7 MOSI, DMA ch4, ~6 MHz, GRB, PC2 = LED VCC MOSFET).
@@ -31,7 +32,8 @@ The board DTS exposes the strip as `chosen zmk,underglow = &led_strip` (driver
 ```
 reactive_tick (drain key presses → ripples + heat)
   → effect renders into pixels[]  (or black base if RGB toggled off)
-  → overlay_render  (Fn-highlight base-override, then CapsLock, then battery gauge)
+  → overlay_render  (Fn-highlight base-override, then CapsLock, then battery gauge,
+                     then BLE slot status last)
   → led_strip_update_rgb  (~2.66 ms DMA; render thread sleeps on the End-IRQ)
 ```
 
@@ -116,6 +118,56 @@ Rendered on top of the active effect — and **still shown when RGB is toggled o
 - **Battery gauge** (Fn+B) → a 10-segment bar on the number row, level-colored
   (green→red), ~3 s. **Approximate** — the battery-ADC pin/divider/Vref are not yet
   hardware-validated (see Open items).
+- **BLE slot status** (F1..F3 = BT profiles 1..3, F4 = output), see below.
+
+### BLE slot status and passkey guidance
+
+The three BT profile slots show their state on F1..F3, so pairing, connecting,
+switching and failures are visible without a host tool. Slot states: EMPTY (no
+bond), PAIRED (bond, not connected), CONNECTED. Colours use fixed levels
+(`RRGB_BLE_BRIGHT` / `DIM` / `VDIM` in `ble_status.h`, about 60 / 15 / 5 %),
+independent of the RGB brightness, and show with RGB off too.
+
+| When | Key | Shows |
+|---|---|---|
+| active slot EMPTY (advertising for pairing) | its F-key | bright blue fast blink, 4 Hz |
+| active slot PAIRED, not connected (connecting) | its F-key | bright blue breathing, 1 Hz |
+| slot becomes CONNECTED (or pairing completes) | its F-key | solid bright blue 2 s, fade 0.5 s |
+| connection lost, pairing failed or cancelled | its F-key | red flash 3x (about 1 s), then the steady animation |
+| bond cleared (Fn+Del = `BT_CLR`, clears the active slot) | its F-key | red flash 3x, then fast blink |
+| host asks for the passkey | 1..0, Enter | number row dim white, keys 1..6 turn bright blue per digit typed, Enter pulses 1 Hz |
+| Fn held | F1..F3 | active+connected bright blue, other connected dim blue, other paired very dim blue, empty very dim white; the active slot keeps blinking/breathing while not connected |
+| Fn held | F4 | white = USB output, blue = BLE output |
+
+Blink and breathing (steady animations) show without Fn only while the output
+is BLE and for 30 s (`RRGB_BLE_STEADY_HOLD_FRAMES`) after the slot's last event
+(boot/wake, profile select, state change, end of a red flash); after that the key
+stays dark and Fn shows the state. Event animations (red flash, connected fade,
+passkey guidance) always show. The newest event per slot wins; several slots can
+animate at once (multilink). The passkey guidance ends on pairing complete or
+failure, and at the latest 60 s after the last passkey event. Selecting a slot
+(Fn+F1..F3) while the output is USB switches the output to BLE (ZMK patch 0006).
+
+Render order: `ble_status` is drawn last, so F1..F4 replace the Fn-highlight
+white and the passkey guidance wins over the battery gauge on the number row;
+it never paints any other key. Key positions (F1..F4 = 1..4, number row
+16..25, Enter 43 on ISO / 56 on ANSI) are **keymap-coupled** constants in
+`overlay.c` (resolved to LED indices with `rrgb_led_for_position()` at boot).
+
+Inputs (`zmk_adapter.c`, only with `CONFIG_ZMK_BLE`): `zmk_ble_active_profile_changed`,
+`zmk_endpoint_changed`, `zmk_ble_auth_state_changed` (patch 0006, queued with
+its payload), the Bluetooth `connected`/`disconnected` callbacks (a background
+slot of a multilink setup changes without a ZMK event), key releases (the output
+toggle raises no event while the effective endpoint stays the same) and the
+settings commit at boot. Each trigger schedules one work item on the system
+workqueue, which applies the queued auth events and then polls slots 0..2
+(`zmk_ble_profile_is_open` / `is_connected`, active profile, output = preferred
+or selected transport is BLE); a poll without change is a no-op. LOST is
+detected in `ble_status` from the polls (CONNECTED -> PAIRED). Events are
+stamped with the render frame counter (`rrgb_now()`), which stands still while
+the strip is dark, so an animation that starts on a dark strip plays from its
+first frame. The work item logs `ble leds: slots a/b/c active n out ble|usb`
+on every polled change and `ble leds: <event> slot n digits d` per auth event.
 
 ## Activity-idle blank (opt-in)
 
@@ -201,7 +253,9 @@ distrobox enter arch -- bash -c "./zmk/src/rainy_rgb/tests/run_host_tests.sh"  #
 
 Render thread owns `pixels[]`, the ripple pool, and `key_heat[]`. The ZMK event
 thread only **produces** (SPSC press queue append; single-byte/word `volatile`
-overlay state writes). Single-core RISC-V → benign races by design, no locks.
+overlay state writes). `ble_status` setters run in one system-workqueue work
+item (slots, output, auth events) and the layer listener (Fn); each variable has
+one writer. Single-core RISC-V → benign races by design, no locks.
 The host direct-pixel buffer follows the same pattern: the mcumgr (SMP) thread
 writes `host_px[]` + a `volatile` flag, the render thread copies it per frame —
 a torn write is a one-frame glitch at 50 FPS.
@@ -309,6 +363,10 @@ already satisfies that. Requests larger than one ATT MTU rely on
 Notable `rainy_rgb` fixes and features, most recent first; see the linked
 sections above for mechanism detail. Releases with no engine changes (v0.2.0,
 which shipped USB work only) are omitted.
+
+- **unreleased**: BLE slot status on F1..F4 and passkey guidance on the number
+  row (`ble_status`), fed by ZMK patch 0006. See
+  [BLE slot status](#ble-slot-status-and-passkey-guidance).
 
 - **v0.2.2** — Root-cause correction for the dark-strip bug (#30): it's a stack
   overflow. The B91 has no PMP stack guard and the BLE RX stack sits directly

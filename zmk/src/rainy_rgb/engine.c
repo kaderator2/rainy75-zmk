@@ -440,6 +440,8 @@ void rrgb_on_key(uint32_t position, bool pressed) {
 
 void rrgb_battery_gauge_show(void) { rrgb_overlay_battery_show(rt.tick); }
 
+uint32_t rrgb_now(void) { return rt.tick; }
+
 void rrgb_engine_init(void) {
     if (rrgb_strip_init() != 0) { return; }
     /* Persisted state is restored by state.c's SETTINGS_STATIC_HANDLER when ZMK
