@@ -14,7 +14,9 @@
  *      switch confirm end);
  *   3. with Fn held: the overview colour.
  * F4 shows the output (white USB / cyan BLE) only with Fn held. The passkey
- * guidance owns the number row and Enter while the host waits for the code.
+ * guidance owns the number row and Enter while the host waits for the code;
+ * after Enter, keys 1..6 run the verify chase (the pairing slot keeps its
+ * blink meanwhile), and a FAILED then flashes them red with the slot.
  *
  * Timing uses wrap-safe tick differences (int32). Expired animation kinds
  * and an expired s_pk_on are never cleared: harmless until the tick has
@@ -48,6 +50,12 @@ static volatile uint8_t s_pk_digits;
 static volatile uint32_t s_pk_t0;        /* Enter pulse origin */
 static volatile uint32_t s_pk_last;      /* last passkey event, for the safety end */
 
+static volatile bool s_vf_on;            /* passkey submitted, the host verifies it */
+static volatile uint8_t s_vf_slot;
+static volatile uint32_t s_vf_t0;
+static volatile bool s_df_on;            /* keys 1..6 red flash after a failed verify */
+static volatile uint32_t s_df_t0;
+
 static int32_t since(uint32_t tick, uint32_t t0) { return (int32_t)(tick - t0); }
 
 static struct rrgb blue(uint8_t v)  { return (struct rrgb){0, 0, v}; }
@@ -77,6 +85,16 @@ static bool pk_running(uint32_t tick) {
 	return s_pk_on && dt >= 0 && dt < RRGB_BLE_PASSKEY_MAX;
 }
 
+static bool vf_running(uint32_t tick) {
+	int32_t dt = since(tick, s_vf_t0);
+	return s_vf_on && dt >= 0 && dt < RRGB_BLE_VERIFY_MAX;
+}
+
+static bool df_running(uint32_t tick) {
+	int32_t dt = since(tick, s_df_t0);
+	return s_df_on && dt >= 0 && dt < RRGB_BLE_FLASH_TOTAL;
+}
+
 /* Steady phase origin: the last steady event, or the end of a later red
  * flash or switch confirm on the slot (that comes first, then the steady
  * animation). */
@@ -93,6 +111,9 @@ static uint32_t steady_origin(uint8_t s) {
 
 /* Slot s shows its steady (blink/breathe) animation this frame. */
 static bool steady_shown(uint8_t s, uint32_t tick) {
+	if (s == s_vf_slot && vf_running(tick) && s_state[s] != RRGB_BLE_CONNECTED) {
+		return true;   /* verifying: the pairing slot keeps blinking */
+	}
 	if (s != s_active || s_state[s] == RRGB_BLE_CONNECTED) { return false; }
 	if (s_fn) { return true; }
 	int32_t dt = since(tick, steady_origin(s));
@@ -117,6 +138,8 @@ void rrgb_ble_init(const struct rrgb_ble_keys *keys) {
 	s_fn = false;
 	s_pk_on = false;
 	s_pk_digits = 0;
+	s_vf_on = false;
+	s_df_on = false;
 }
 
 void rrgb_ble_set_slots(const uint8_t state[3], uint8_t active, uint32_t tick) {
@@ -152,21 +175,39 @@ static void pk_end(uint8_t slot) {
 	if (s_pk_on && s_pk_slot == slot) { s_pk_on = false; }
 }
 
+/* Ends the verify chase of slot; returns true if it was running. */
+static bool vf_end(uint8_t slot, uint32_t tick) {
+	bool was = vf_running(tick) && s_vf_slot == slot;
+	if (s_vf_on && s_vf_slot == slot) { s_vf_on = false; }
+	return was;
+}
+
 void rrgb_ble_event(enum rrgb_ble_ev ev, uint8_t slot, uint8_t arg, uint32_t tick) {
 	if (slot >= RRGB_BLE_SLOTS) { return; }
 	switch (ev) {
 	case RRGB_BLE_EV_LOST:
+		pk_end(slot);
+		vf_end(slot, tick);
+		start_anim(slot, ANIM_FLASH, tick);
+		break;
 	case RRGB_BLE_EV_FAILED:
 		pk_end(slot);
+		if (vf_end(slot, tick)) {   /* wrong passkey: keys 1..6 flash with the slot */
+			s_df_t0 = tick;
+			s_df_on = true;
+		}
 		start_anim(slot, ANIM_FLASH, tick);
 		break;
 	case RRGB_BLE_EV_CLEARED:
 		pk_end(slot);
+		vf_end(slot, tick);
 		s_state[slot] = RRGB_BLE_EMPTY;
 		if (slot == s_active) { s_steady_t0 = tick; }
 		start_anim(slot, ANIM_FLASH, tick);
 		break;
 	case RRGB_BLE_EV_PASSKEY_REQ:
+		s_vf_on = false;
+		s_df_on = false;
 		s_pk_slot = slot;
 		s_pk_digits = 0;
 		s_pk_t0 = tick;
@@ -182,8 +223,16 @@ void rrgb_ble_event(enum rrgb_ble_ev ev, uint8_t slot, uint8_t arg, uint32_t tic
 		s_pk_digits = arg > RRGB_BLE_PASSKEY_LEN ? RRGB_BLE_PASSKEY_LEN : arg;
 		s_pk_last = tick;
 		break;
+	case RRGB_BLE_EV_PASSKEY_SUBMITTED:
+		pk_end(slot);
+		s_vf_slot = slot;
+		s_vf_t0 = tick;
+		s_vf_on = true;
+		s_df_on = false;
+		break;
 	case RRGB_BLE_EV_PAIRED_OK:
 		pk_end(slot);
+		vf_end(slot, tick);
 		s_state[slot] = RRGB_BLE_CONNECTED;   /* the following poll does not restart it */
 		start_anim(slot, ANIM_CONN, tick);
 		break;
@@ -191,7 +240,7 @@ void rrgb_ble_event(enum rrgb_ble_ev ev, uint8_t slot, uint8_t arg, uint32_t tic
 }
 
 bool rrgb_ble_active(uint32_t tick) {
-	if (s_fn || pk_running(tick)) { return true; }
+	if (s_fn || pk_running(tick) || vf_running(tick) || df_running(tick)) { return true; }
 	for (uint8_t s = 0; s < RRGB_BLE_SLOTS; s++) {
 		if (anim_running(s, tick)) { return true; }
 	}
@@ -265,6 +314,22 @@ bool rrgb_ble_render(struct rrgb *px, uint16_t n, uint32_t tick) {
 		}
 		painted |= put(px, n, s_keys.enter,
 			       white(tri(since(tick, s_pk_t0), RRGB_BLE_ENTER_PERIOD)));
+	} else if (vf_running(tick)) {
+		/* chase 1 -> 6: head bright, two keys of trailing fade, rest dark */
+		uint32_t dt = (uint32_t)since(tick, s_vf_t0);
+		uint8_t head = (uint8_t)((dt % RRGB_BLE_VERIFY_PERIOD) / RRGB_BLE_VERIFY_STEP);
+		for (uint8_t k = 0; k < RRGB_BLE_PASSKEY_LEN; k++) {
+			uint8_t d = (uint8_t)((head + RRGB_BLE_PASSKEY_LEN - k) % RRGB_BLE_PASSKEY_LEN);
+			uint8_t v = d == 0 ? RRGB_BLE_BRIGHT : d == 1 ? RRGB_BLE_WAVE_TAIL1
+				  : d == 2 ? RRGB_BLE_WAVE_TAIL2 : 0;
+			painted |= put(px, n, s_keys.numrow[k], blue(v));
+		}
+	} else if (df_running(tick)) {
+		uint32_t dt = (uint32_t)since(tick, s_df_t0);
+		bool on = dt % (RRGB_BLE_FLASH_ON + RRGB_BLE_FLASH_OFF) < RRGB_BLE_FLASH_ON;
+		for (uint8_t k = 0; k < RRGB_BLE_PASSKEY_LEN; k++) {
+			painted |= put(px, n, s_keys.numrow[k], red(on ? RRGB_BLE_BRIGHT : 0));
+		}
 	}
 	return painted;
 }

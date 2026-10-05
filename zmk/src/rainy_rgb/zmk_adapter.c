@@ -66,7 +66,8 @@ K_MSGQ_DEFINE(rrgb_ble_evq, sizeof(struct zmk_ble_auth_state_changed), 8, 4);
 static const char *const auth_name[] = {
     [ZMK_BLE_AUTH_PASSKEY_REQ] = "passkey req", [ZMK_BLE_AUTH_PASSKEY_DIGITS] = "digits",
     [ZMK_BLE_AUTH_PAIRED_OK] = "paired",        [ZMK_BLE_AUTH_FAILED] = "failed",
-    [ZMK_BLE_AUTH_CLEARED] = "cleared",
+    [ZMK_BLE_AUTH_CLEARED] = "cleared",         [ZMK_BLE_AUTH_PASSKEY_SUBMITTED] = "submitted",
+    [ZMK_BLE_AUTH_PAIRING_TIMEOUT] = "pairing timeout",
 };
 
 static void rrgb_ble_auth(const struct zmk_ble_auth_state_changed *a, uint32_t tick) {
@@ -78,6 +79,10 @@ static void rrgb_ble_auth(const struct zmk_ble_auth_state_changed *a, uint32_t t
     case ZMK_BLE_AUTH_PAIRED_OK:      ev = RRGB_BLE_EV_PAIRED_OK; break;
     case ZMK_BLE_AUTH_FAILED:         ev = RRGB_BLE_EV_FAILED; break;
     case ZMK_BLE_AUTH_CLEARED:        ev = RRGB_BLE_EV_CLEARED; break;
+    case ZMK_BLE_AUTH_PASSKEY_SUBMITTED: ev = RRGB_BLE_EV_PASSKEY_SUBMITTED; break;
+    /* the open slot flashes red; the return to the previous slot then
+     * shows the switch confirm (active slot change) */
+    case ZMK_BLE_AUTH_PAIRING_TIMEOUT: ev = RRGB_BLE_EV_FAILED; break;
     default:                          return;
     }
     LOG_INF("ble leds: %s slot %u digits %u @%u", auth_name[a->state], a->profile,

@@ -427,6 +427,161 @@ static void test_passkey(void) {
 	CHECK(!frame(QUIET + RRGB_BLE_PASSKEY_MAX));
 }
 
+/* Chase on the passkey progress keys (1..6) while the host verifies. */
+static struct rrgb chase(uint32_t dt, int k) {
+	int head = (int)((dt % RRGB_BLE_VERIFY_PERIOD) / RRGB_BLE_VERIFY_STEP);
+	int d = (head - k + RRGB_BLE_PASSKEY_LEN) % RRGB_BLE_PASSKEY_LEN;
+	return blue(d == 0 ? RRGB_BLE_BRIGHT : d == 1 ? RRGB_BLE_WAVE_TAIL1
+		    : d == 2 ? RRGB_BLE_WAVE_TAIL2 : 0);
+}
+
+/* The slot key blinks at 4 Hz over one blink period (phase free). */
+static int slot_blinks(uint8_t slot, uint32_t t) {
+	int on = 0, off = 0;
+	for (uint32_t dt = 0; dt < RRGB_BLE_BLINK_PERIOD; dt++) {
+		frame(t + dt);
+		if (eq(px[F(slot)], blue(RRGB_BLE_BRIGHT))) { on++; }
+		else if (eq(px[F(slot)], BLACK)) { off++; }
+	}
+	return on == RRGB_BLE_BLINK_ON && off == RRGB_BLE_BLINK_PERIOD - RRGB_BLE_BLINK_ON;
+}
+
+/* Passkey submitted (Enter): the number row guidance ends, keys 1..6 run a
+ * chase 1 -> 6 while the slot keeps its fast blink, until PAIRED_OK (slot
+ * solid + fade, number row back) or FAILED (slot and keys 1..6 flash red). */
+static void test_verifying(void) {
+	CHECK(RRGB_BLE_VERIFY_PERIOD == 30);           /* one sweep per 0.6 s */
+	CHECK(RRGB_BLE_VERIFY_STEP * RRGB_BLE_PASSKEY_LEN == RRGB_BLE_VERIFY_PERIOD);
+	CHECK(RRGB_BLE_WAVE_TAIL1 < RRGB_BLE_BRIGHT && RRGB_BLE_WAVE_TAIL2 < RRGB_BLE_WAVE_TAIL1);
+	CHECK(RRGB_BLE_VERIFY_MAX == 2000);            /* safety end 40 s */
+
+	reset();
+	uint32_t t0 = 40000;
+	slots(RRGB_BLE_CONNECTED, RRGB_BLE_EMPTY, RRGB_BLE_EMPTY, 1, t0 - 2000);
+	rrgb_ble_event(RRGB_BLE_EV_PASSKEY_REQ, 1, 0, t0);
+	rrgb_ble_event(RRGB_BLE_EV_PASSKEY_DIGITS, 1, 6, t0 + 50);
+	uint32_t ts = t0 + 60;
+	rrgb_ble_event(RRGB_BLE_EV_PASSKEY_SUBMITTED, 1, 0, ts);
+	/* USB output and the steady hold long over: the blink still shows */
+	rrgb_ble_set_output_ble(false);
+	CHECK(rrgb_ble_active(ts));
+	for (uint32_t dt = 0; dt < 2 * RRGB_BLE_VERIFY_PERIOD; dt++) {
+		CHECK(frame(ts + dt));
+		for (int k = 0; k < RRGB_BLE_PASSKEY_LEN; k++) { CHECK(eq(px[NUM(k)], chase(dt, k))); }
+		for (int k = RRGB_BLE_PASSKEY_LEN; k < 10; k++) { CHECK(eq(px[NUM(k)], SENT)); }
+		CHECK(eq(px[ENTER], SENT));                 /* Enter pulse ended */
+	}
+	frame(ts);
+	const uint8_t owned[] = {NUM(0), NUM(1), NUM(2), NUM(3), NUM(4), NUM(5), F(1)};
+	CHECK(only_touched(owned, 7));
+	CHECK(slot_blinks(1, ts + 7));
+	CHECK(slot_blinks(1, ts + RRGB_BLE_STEADY_HOLD_FRAMES + 40));
+	CHECK(rrgb_ble_active(ts + RRGB_BLE_VERIFY_MAX - 1));
+
+	/* PAIRED_OK: chase ends, slot solid then fade, number row back */
+	uint32_t ok = ts + 300;
+	rrgb_ble_event(RRGB_BLE_EV_PAIRED_OK, 1, 0, ok);
+	for (uint32_t dt = 0; dt < RRGB_BLE_CONN_SOLID; dt += 7) {
+		frame(ok + dt);
+		CHECK(eq(px[F(1)], blue(RRGB_BLE_BRIGHT)));
+		for (int k = 0; k < 10; k++) { CHECK(eq(px[NUM(k)], SENT)); }
+	}
+	CHECK(!rrgb_ble_active(ok + RRGB_BLE_CONN_SOLID + RRGB_BLE_CONN_FADE));
+
+	/* FAILED (wrong code): slot and keys 1..6 flash red together 3x, then
+	 * the number row is back and the active empty slot blinks */
+	reset();
+	slots(RRGB_BLE_CONNECTED, RRGB_BLE_EMPTY, RRGB_BLE_EMPTY, 1, QUIET);
+	rrgb_ble_event(RRGB_BLE_EV_PASSKEY_REQ, 1, 0, QUIET + 10);
+	rrgb_ble_event(RRGB_BLE_EV_PASSKEY_SUBMITTED, 1, 0, QUIET + 20);
+	uint32_t tf = QUIET + 40;
+	rrgb_ble_event(RRGB_BLE_EV_FAILED, 1, 0, tf);
+	for (uint32_t dt = 0; dt < RRGB_BLE_FLASH_TOTAL; dt++) {
+		CHECK(frame(tf + dt));
+		uint32_t p = dt % (RRGB_BLE_FLASH_ON + RRGB_BLE_FLASH_OFF);
+		struct rrgb want = p < RRGB_BLE_FLASH_ON ? red(RRGB_BLE_BRIGHT) : BLACK;
+		CHECK(eq(px[F(1)], want));
+		for (int k = 0; k < RRGB_BLE_PASSKEY_LEN; k++) { CHECK(eq(px[NUM(k)], want)); }
+		for (int k = RRGB_BLE_PASSKEY_LEN; k < 10; k++) { CHECK(eq(px[NUM(k)], SENT)); }
+	}
+	frame(tf + RRGB_BLE_FLASH_TOTAL);
+	for (int k = 0; k < 10; k++) { CHECK(eq(px[NUM(k)], SENT)); }
+	CHECK(slot_blinks(1, tf + RRGB_BLE_FLASH_TOTAL));
+	rrgb_ble_set_output_ble(false);
+	CHECK(!rrgb_ble_active(tf + RRGB_BLE_FLASH_TOTAL + RRGB_BLE_STEADY_HOLD_FRAMES));
+
+	/* a FAILED for another slot leaves the chase running */
+	reset();
+	slots(RRGB_BLE_CONNECTED, RRGB_BLE_EMPTY, RRGB_BLE_EMPTY, 1, QUIET);
+	rrgb_ble_event(RRGB_BLE_EV_PASSKEY_SUBMITTED, 1, 0, QUIET);
+	rrgb_ble_event(RRGB_BLE_EV_FAILED, 2, 0, QUIET + 3);
+	frame(QUIET + 3);
+	CHECK(eq(px[NUM(0)], chase(3, 0)));
+	CHECK(eq(px[F(2)], red(RRGB_BLE_BRIGHT)));
+
+	/* connection lost while verifying: chase ends, slot red flash only */
+	reset();
+	slots(RRGB_BLE_CONNECTED, RRGB_BLE_EMPTY, RRGB_BLE_EMPTY, 2, QUIET);
+	rrgb_ble_event(RRGB_BLE_EV_PASSKEY_SUBMITTED, 2, 0, QUIET + 5);
+	rrgb_ble_event(RRGB_BLE_EV_LOST, 2, 0, QUIET + 9);
+	check_red_flash(2, QUIET + 9);
+	frame(QUIET + 9);
+	for (int k = 0; k < 10; k++) { CHECK(eq(px[NUM(k)], SENT)); }
+
+	/* safety end: no answer within RRGB_BLE_VERIFY_MAX */
+	reset();
+	slots(RRGB_BLE_CONNECTED, RRGB_BLE_EMPTY, RRGB_BLE_EMPTY, 1, QUIET);
+	uint32_t tv = QUIET + 100;
+	rrgb_ble_event(RRGB_BLE_EV_PASSKEY_SUBMITTED, 1, 0, tv);
+	rrgb_ble_set_output_ble(false);   /* no steady animation behind it */
+	CHECK(rrgb_ble_active(tv + RRGB_BLE_VERIFY_MAX - 1));
+	CHECK(!rrgb_ble_active(tv + RRGB_BLE_VERIFY_MAX));
+	CHECK(!frame(tv + RRGB_BLE_VERIFY_MAX));
+
+	/* out of range slot ignored */
+	reset();
+	rrgb_ble_event(RRGB_BLE_EV_PASSKEY_SUBMITTED, 3, 0, QUIET);
+	CHECK(!rrgb_ble_active(QUIET));
+}
+
+/* Just Works (host without display, no passkey request): fast blink goes
+ * straight to PAIRED_OK solid + fade, the number row and Enter untouched. */
+static void test_just_works(void) {
+	reset();
+	slots(RRGB_BLE_CONNECTED, RRGB_BLE_EMPTY, RRGB_BLE_EMPTY, 1, QUIET);
+	CHECK(slot_blinks(1, QUIET + SEL + 1));
+	uint32_t ok = QUIET + 300;
+	rrgb_ble_event(RRGB_BLE_EV_PAIRED_OK, 1, 0, ok);
+	slots(RRGB_BLE_CONNECTED, RRGB_BLE_CONNECTED, RRGB_BLE_EMPTY, 1, ok + 3);
+	for (uint32_t t = QUIET; t < ok + RRGB_BLE_CONN_SOLID + RRGB_BLE_CONN_FADE; t++) {
+		frame(t);
+		for (int k = 0; k < 10; k++) { CHECK(eq(px[NUM(k)], SENT)); }
+		CHECK(eq(px[ENTER], SENT));
+		if (t >= ok && t < ok + RRGB_BLE_CONN_SOLID) { CHECK(eq(px[F(1)], blue(RRGB_BLE_BRIGHT))); }
+	}
+	CHECK(!rrgb_ble_active(ok + RRGB_BLE_CONN_SOLID + RRGB_BLE_CONN_FADE));
+}
+
+/* Open slot timeout (ZMK_BLE_AUTH_PAIRING_TIMEOUT maps to FAILED): the open
+ * slot flashes red while the slot ZMK returns to shows the switch confirm. */
+static void test_pairing_timeout(void) {
+	reset();
+	/* slot 0 connected, user selected the empty slot 1: fast blink */
+	slots(RRGB_BLE_CONNECTED, RRGB_BLE_EMPTY, RRGB_BLE_EMPTY, 1, QUIET);
+	uint32_t t = QUIET + 1500;   /* 30 s later */
+	rrgb_ble_event(RRGB_BLE_EV_FAILED, 1, 0, t);
+	slots(RRGB_BLE_CONNECTED, RRGB_BLE_EMPTY, RRGB_BLE_EMPTY, 0, t);
+	for (uint32_t dt = 0; dt < RRGB_BLE_FLASH_TOTAL; dt++) {
+		frame(t + dt);
+		uint32_t p = dt % (RRGB_BLE_FLASH_ON + RRGB_BLE_FLASH_OFF);
+		CHECK(eq(px[F(1)], p < RRGB_BLE_FLASH_ON ? red(RRGB_BLE_BRIGHT) : BLACK));
+		if (dt < RRGB_BLE_SELECT_SOLID) { CHECK(eq(px[F(0)], blue(RRGB_BLE_BRIGHT))); }
+	}
+	/* afterwards: the open slot is no longer active, so it stays dark */
+	CHECK(!rrgb_ble_active(t + SEL));
+	CHECK(!frame(t + SEL));
+}
+
 static void test_multi_slot(void) {
 	reset();
 	uint32_t t0 = 40000;
@@ -680,6 +835,9 @@ int main(void) {
 	test_connected_solid_fade();
 	test_red_flash();
 	test_passkey();
+	test_verifying();
+	test_just_works();
+	test_pairing_timeout();
 	test_multi_slot();
 	test_active_exact();
 	test_bounds();

@@ -145,6 +145,9 @@ at full scale and the background levels sit near the bottom (user tuning
 | connection lost, pairing failed or cancelled | its F-key | red flash 3x (about 1 s), then the steady animation |
 | bond cleared (Fn+Del = `BT_CLR`, clears the active slot) | its F-key | red flash 3x, then fast blink |
 | host asks for the passkey | 1..0, Enter | number row dim white, keys 1..6 turn bright blue per digit typed, Enter pulses 1 Hz |
+| passkey submitted (Enter), host verifies it | 1..6, its F-key | bright blue chase 1 -> 6, one sweep per 0.6 s with a two-key trailing fade; the slot keeps its fast blink |
+| wrong passkey (FAILED after Enter) | 1..6, its F-key | keys 1..6 flash red 3x together with the slot, then normal |
+| empty slot selected, no host within 30 s (ZMK patch 0008) | old and returning F-key | the empty slot flashes red 3x, the returning slot shows the switch confirm |
 | Fn held | F1..F3 | active+connected full blue, other connected dim blue (~8 %), other paired very dim blue (~3 %), empty very dim white (~3 %); the active slot keeps blinking/breathing while not connected |
 | Fn held | F4 | white = USB output, cyan = BLE output (~40 %, distinct from the slot blue) |
 
@@ -153,10 +156,21 @@ is BLE and for 30 s (`RRGB_BLE_STEADY_HOLD_FRAMES`) after the slot's last event
 (boot/wake, profile select, state change, end of a red flash or of the switch
 confirm, which comes first); after that the key
 stays dark and Fn shows the state. Event animations (red flash, connected fade,
-passkey guidance) always show. The newest event per slot wins; several slots can
-animate at once (multilink). The passkey guidance ends on pairing complete or
-failure, and at the latest 60 s after the last passkey event. Selecting a slot
-(Fn+F1..F3) while the output is USB switches the output to BLE (ZMK patch 0006).
+passkey guidance, verify chase) always show. The newest event per slot wins; several slots can
+animate at once (multilink). The passkey guidance ends on Enter (passkey
+submitted), on pairing complete or failure, and at the latest 60 s after the
+last passkey event. After Enter the verify chase runs until pairing complete
+(slot solid + fade), failure (red flash on the slot and keys 1..6) or a lost
+connection, at the latest 40 s (`RRGB_BLE_VERIFY_MAX`, the SMP timeout is 30 s);
+meanwhile the pairing slot blinks regardless of output and hold window. ZMK
+keeps every key away from the hosts from the passkey request until the pairing
+ends (patch 0007), so a second Enter during the check does not reach the PC.
+Just Works pairings (no passkey request) never touch the number row. Selecting
+a slot (Fn+F1..F3) while the output is USB switches the output to BLE (ZMK
+patch 0006). Selecting an empty slot arms a 30 s timeout (ZMK patch 0008,
+`CONFIG_ZMK_BLE_OPEN_PROFILE_TIMEOUT`): without a new host, ZMK returns to the
+previously active slot if connected, else the most recently connected slot,
+else stays; a pairing connection pauses it, BT_CLR disarms it.
 
 Fn-layer presses leave no reactive trace: while layer 1 is held,
 `rrgb_overlay_key_reactive()` is false and `rrgb_on_key()` skips the
@@ -381,7 +395,8 @@ sections above for mechanism detail. Releases with no engine changes (v0.2.0,
 which shipped USB work only) are omitted.
 
 - **unreleased**: BLE slot status on F1..F4 and passkey guidance on the number
-  row (`ble_status`), fed by ZMK patch 0006. See
+  row (`ble_status`), fed by ZMK patch 0006; verify chase after Enter and red
+  digit flash on a wrong code (0006/0007), open slot timeout (0008). See
   [BLE slot status](#ble-slot-status-and-passkey-guidance).
 
 - **v0.2.2** — Root-cause correction for the dark-strip bug (#30): it's a stack

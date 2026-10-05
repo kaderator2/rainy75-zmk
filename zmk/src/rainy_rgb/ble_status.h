@@ -18,6 +18,7 @@ enum rrgb_ble_ev {
 	RRGB_BLE_EV_PASSKEY_REQ,   /* host asks for the passkey on this slot */
 	RRGB_BLE_EV_PASSKEY_DIGITS,/* arg = digits typed so far (0..6) */
 	RRGB_BLE_EV_PAIRED_OK,
+	RRGB_BLE_EV_PASSKEY_SUBMITTED, /* Enter: passkey sent, the host verifies it */
 };
 
 #define RRGB_BLE_SLOTS   3
@@ -36,6 +37,9 @@ enum rrgb_ble_ev {
 #define RRGB_BLE_ENTER_PERIOD    50    /* Enter pulse 1 Hz               */
 #define RRGB_BLE_PASSKEY_MAX   3000    /* safety: guidance ends 60 s after the last passkey event */
 #define RRGB_BLE_PASSKEY_LEN      6    /* progress keys on the number row */
+#define RRGB_BLE_VERIFY_PERIOD   30    /* passkey submitted: chase 1 -> 6, one sweep per 0.6 s, */
+#define RRGB_BLE_VERIFY_STEP      5    /* 5 frames per key (PERIOD / PASSKEY_LEN) */
+#define RRGB_BLE_VERIFY_MAX    2000    /* until PAIRED_OK/FAILED, safety end 40 s (SMP timeout 30 s) */
 #define RRGB_BLE_STEADY_HOLD_FRAMES 1500 /* blink/breathe shown 30 s after the slot's last event */
 
 /* Profile switch confirm: the newly active slot shows solid SELECT_SOLID
@@ -54,6 +58,8 @@ enum rrgb_ble_ev {
 #define RRGB_BLE_BG      20   /* ~8 %: background connected slot (Fn overview) */
 #define RRGB_BLE_VDIM     8   /* ~3 %: paired-not-connected (blue) / empty (white) slot */
 #define RRGB_BLE_OUT    102   /* ~40 %: F4 output, white = USB, cyan = BLE */
+#define RRGB_BLE_WAVE_TAIL1 80 /* verify chase: the key behind the head ... */
+#define RRGB_BLE_WAVE_TAIL2 20 /* ... and the one behind that (trailing fade) */
 
 /* LED indices (not keymap positions), provided by overlay.c which resolves
  * its keymap-coupled positions with rrgb_led_for_position(). An index of
@@ -76,7 +82,13 @@ void rrgb_ble_init(const struct rrgb_ble_keys *keys);
  * flashes. The first call after init (boot/wake), an active slot change and a
  * state change of the active slot restart the steady hold window. An active
  * slot change after the first call (an explicit profile switch) also starts
- * the switch confirm on the new slot (unless it is in its connected solid). */
+ * the switch confirm on the new slot (unless it is in its connected solid).
+ * PASSKEY_SUBMITTED ends the slot's passkey guidance; keys 1..6 then run a
+ * chase while the slot keeps its fast blink (shown regardless of output and
+ * hold window). PAIRED_OK ends it (slot solid + fade), FAILED ends it with a
+ * red flash on the slot and keys 1..6 together, LOST/CLEARED end it with the
+ * slot's red flash only. A pairing without passkey (Just Works) never touches
+ * the number row. */
 void rrgb_ble_set_slots(const uint8_t state[3], uint8_t active, uint32_t tick);
 void rrgb_ble_set_output_ble(bool ble);
 void rrgb_ble_set_fn(bool held);
