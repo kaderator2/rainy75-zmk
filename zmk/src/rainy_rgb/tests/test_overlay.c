@@ -191,6 +191,18 @@ static void test_effect_gain(void) {
     CHECK(rrgb_effect_gain_next(g, true) < g);
 }
 
+/* Frames without a drawn effect layer (RGB off, render loop stopped) snap
+ * the gain to its target, so it never freezes mid fade: RGB toggled on
+ * shows the effect at full gain, or stays dark while still suppressed. */
+static void test_effect_gain_frame(void) {
+    CHECK(rrgb_effect_gain_frame(128, false, false) == 255);
+    CHECK(rrgb_effect_gain_frame(128, true, false) == 0);
+    CHECK(rrgb_effect_gain_frame(0, false, false) == 255);
+    /* drawn: the normal fade step */
+    CHECK(rrgb_effect_gain_frame(128, true, true) == rrgb_effect_gain_next(128, true));
+    CHECK(rrgb_effect_gain_frame(128, false, true) == rrgb_effect_gain_next(128, false));
+}
+
 int main(void) {
     struct rrgb px[83];
 
@@ -255,5 +267,6 @@ int main(void) {
 
     test_ble();
     test_effect_gain();
+    test_effect_gain_frame();
     DONE();
 }

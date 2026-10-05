@@ -80,6 +80,16 @@ uint8_t rrgb_effect_gain_next(uint8_t gain, bool suppress) {
     return gain < 255 - GAIN_IN_STEP ? (uint8_t)(gain + GAIN_IN_STEP) : 255;
 }
 
+uint8_t rrgb_effect_gain_frame(uint8_t gain, bool suppress, bool drawn) {
+    if (!drawn) {
+        return suppress ? 0 : 255;
+    }
+    return rrgb_effect_gain_next(gain, suppress);
+}
+
+/* Called from the key event thread with the render thread's tick: a
+ * deliberately unlocked cross-thread read (a 32-bit load, at worst one frame
+ * stale, which moves the suppression edge by one frame). */
 bool rrgb_overlay_key_reactive(uint32_t position, uint32_t tick) {
     (void)position;   /* every Fn-layer press is a command, not only F1..F4 */
     return !s_fn && !rrgb_overlay_suppress_effect(tick);

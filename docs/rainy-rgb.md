@@ -197,7 +197,10 @@ only because Fn is held) does not count. The engine keeps an effect gain
 (`rrgb_effect_gain_next()`): down to 0 over 0.1 s
 (`RRGB_EFFECT_FADE_OUT_FRAMES`), then the effect is not rendered at all, and
 back to full over 0.5 s (`RRGB_EFFECT_FADE_IN_FRAMES`) once no BLE animation
-shows. Suppression implies `rrgb_overlay_active()`, so the frame loop and the
+shows. While RGB is off, and when the frame loop stops, the gain snaps to its
+target instead (`rrgb_effect_gain_frame()`: 0 while suppressed, else full), so
+it never freezes mid fade and RGB toggled on starts at the right level.
+Suppression implies `rrgb_overlay_active()`, so the frame loop and the
 LED rail stay on through the window also with RGB toggled off. Key presses
 while suppressed leave no reactive trace (`rrgb_overlay_key_reactive()` is
 false, like with Fn held): the passkey digits typed during pairing would

@@ -57,7 +57,10 @@ static uint8_t tri(uint32_t dt, uint32_t period) {
 static void reset(void) {
 	rrgb_ble_init(&KEYS);
 	rrgb_ble_set_output_ble(true);   /* steady animations need BLE output */
-	/* reach a quiet baseline: slot 0 connected and its solid/fade over */
+	/* reach a quiet baseline: slot 0 connected and its solid/fade over.
+	 * Slot 0 connects at tick 0 (the boot poll), so its connected
+	 * animation, and with it rrgb_ble_suppress_effect(), runs from tick 0
+	 * and has ended by QUIET. */
 	slots(RRGB_BLE_CONNECTED, RRGB_BLE_EMPTY, RRGB_BLE_EMPTY, 0, 0);
 }
 static void boot(void) {

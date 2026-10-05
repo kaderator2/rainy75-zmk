@@ -113,7 +113,8 @@ static uint32_t steady_origin(uint8_t s) {
 /* Slot s shows its steady (blink/breathe) animation this frame without Fn. */
 static bool steady_auto(uint8_t s, uint32_t tick) {
 	if (s == s_vf_slot && vf_running(tick)) {
-		return true;   /* verifying: the pairing slot blinks, also on a re-pair over a bond */
+		/* verifying: the pairing slot blinks, also on a re-pair over a bond */
+		return true;
 	}
 	if (s != s_active || s_state[s] == RRGB_BLE_CONNECTED) { return false; }
 	int32_t dt = since(tick, steady_origin(s));

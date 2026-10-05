@@ -38,6 +38,11 @@ bool rrgb_overlay_suppress_effect(uint32_t tick);
 #define RRGB_EFFECT_FADE_OUT_FRAMES  5    /* 0.1 s at 50 FPS */
 #define RRGB_EFFECT_FADE_IN_FRAMES  25    /* 0.5 s */
 uint8_t rrgb_effect_gain_next(uint8_t gain, bool suppress);
+/* Per frame: rrgb_effect_gain_next() while the effect layer is drawn
+ * (drawn = RGB on); otherwise the gain is invisible and snaps to its target
+ * (0 while suppressed, else 255), so it never freezes mid fade while RGB is
+ * off or the render loop is stopped. */
+uint8_t rrgb_effect_gain_frame(uint8_t gain, bool suppress, bool drawn);
 
 /* False while the Fn layer is held: Fn combinations are commands (BT slots,
  * output, media, RGB controls), not typing, so they leave no reactive

@@ -195,8 +195,8 @@ static void render_once(void) {
     /* BLE connecting / switching / pairing: the effect is off, the board
      * shows only the BLE status and the other overlays. Host direct mode is
      * not affected: an explicit host frame, not the normal effect. */
-    effect_gain = rrgb_effect_gain_next(effect_gain,
-                                        rrgb_overlay_suppress_effect(rt.tick));
+    effect_gain = rrgb_effect_gain_frame(effect_gain,
+                                         rrgb_overlay_suppress_effect(rt.tick), rt.on);
     if (host_mode) {
         /* Host direct mode: the host's buffer replaces the effect layer. */
         for (uint16_t i = 0; i < RRGB_N; i++) { pixels[i] = host_px[i]; }
@@ -327,6 +327,10 @@ static void rrgb_loop(void *a, void *b, void *c) {
                                  * still up; the rail is cut only after the
                                  * hold-off below */
                 was_lit = false;
+                /* render_once() stops stepping the gain: snap it to its
+                 * target so the effect does not resume mid fade */
+                effect_gain = rrgb_effect_gain_frame(
+                        effect_gain, rrgb_overlay_suppress_effect(rt.tick), false);
             }
             if (rail_on && ++dark_ticks >= RRGB_RAIL_OFF_TICKS) {
                 rrgb_strip_power(false);
