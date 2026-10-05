@@ -119,9 +119,12 @@ enum ll_conn_evt {
 };
 
 /* ISR context (radio/stimer path), or thread context with ll_plat_lock()
- * held when the event results from a thread call (ll_conn_start,
- * ll_conn_end, ll_conn_update_at/chmap_at with an instant in the past).
- * link: the link the event belongs to. */
+ * held when the event results from a thread call: ll_conn_start,
+ * ll_conn_end, ll_conn_update_at/chmap_at (an instant in the past, or a
+ * re-plan that applies the update), ll_conn_kick and ll_conn_flash_kick
+ * (a re-plan that yields: LL_CONN_EVT_UPDATED when it plans the instant
+ * event, LL_CONN_EVT_DISCONNECTED after YIELD_MAX yields or a supervision
+ * timeout). link: the link the event belongs to. */
 typedef void (*ll_conn_evt_cb_t)(uint8_t link, enum ll_conn_evt what, const void *arg);
 
 struct ll_conn_ops {
@@ -210,7 +213,9 @@ uint8_t ll_conn_count(void);
  * LL_CONN_EVT_DISCONNECTED; the id may be reused. No-op for a link that is
  * not awaiting release. Takes ll_plat_lock(). */
 void ll_conn_release(uint8_t link);
-/* Counter of the next connection event not yet completed (the one on air,
+/* Test and diagnostic accessor (no production caller: instants are judged
+ * against the event their PDU was received in). Counter of the next
+ * connection event not yet completed (the one on air,
  * if any). While a latency skip is planned this is the first skipped event
  * (an instant for a skipped event re-plans the listen to the first
  * reachable event, or to the instant if that comes first; slice 7: an
@@ -222,7 +227,11 @@ void ll_conn_release(uint8_t link);
 uint16_t ll_conn_event_counter(uint8_t link);
 /* Instants of the link not yet reached (slice 6d Task 2, procedure
  * collisions, Vol 6 Part B 5.3): LL_CONN_PENDING_UPDATE while an
- * LL_CONNECTION_UPDATE_IND waits for its instant, LL_CONN_PENDING_CHMAP
+ * LL_CONNECTION_UPDATE_IND waits for its instant event to be planned (an
+ * update is applied, and LL_CONN_EVT_UPDATED reported, when that event is
+ * planned, up to one old interval before its anchor; the central starts no
+ * new procedure before its own instant, so the difference does not show),
+ * LL_CONN_PENDING_CHMAP
  * while an LL_CHANNEL_MAP_IND does (also while its instant was applied to a
  * planned event of a skip window that has not come yet). 0 for an inactive
  * or out-of-range link. ISR-safe; takes ll_plat_lock(). */
@@ -288,7 +297,8 @@ struct ll_conn_stats {
 	uint32_t first_outside; /* first delivered packet after the RX window (no re-anchor) */
 	/* Peripheral latency (slice 5). planned: listen alarms armed (a
 	 * re-plan of the same listen counts once); planned - listened = late
-	 * events + plans ended by the link end. listened: alias of events
+	 * events + plans ended by the link end + events not listened to for
+	 * rx_paused / flash_paused + yields at start. listened: alias of events
 	 * (events issued to the radio), named for the power counters. skipped:
 	 * events skipped by latency, net of kick / instant re-plans; counted
 	 * when planned, so it may overstate by up to latency when the link ends

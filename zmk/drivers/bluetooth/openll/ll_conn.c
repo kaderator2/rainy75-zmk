@@ -542,9 +542,7 @@ static void set_window(struct ll_link *c, uint16_t k)
 {
 	chm_repend(c);
 	c->csa = c->csa_base;
-	for (uint16_t i = 0; i < k; i++) {
-		(void)ll_csa1_next(&c->csa);
-	}
+	ll_csa1_skip(&c->csa, k);   /* O(1): called under the lock, k up to 499 */
 	c->counter = (uint16_t)(c->skip_base + k);
 	c->skip_n = k;
 	plan_event(c);
@@ -565,9 +563,16 @@ static void rebase(struct ll_link *c)
  * step applies the instants of the event it plans. commit: the planned
  * event was refused by the arbiter at its last request (not displaced), so
  * giving it up is committed to the fairness flags (ll_arb_yield); a
- * displaced event was committed by the arbiter already. */
+ * displaced event was committed by the arbiter already. The supervision
+ * timeout is checked as at a closed event: a link bumped again and again
+ * closes no event (final review A-M4). */
 static void yield_on(struct ll_link *c, bool commit)
 {
+	if (c->established &&
+	    (int32_t)(ll_radio_now() - c->sup_tick) >= (int32_t)c->sup_ticks) {
+		end(c, LL_ST_CONN_TIMEOUT);
+		return;
+	}
 	for (int i = 0; i < YIELD_MAX; i++) {
 		ST(c)->collisions++;
 		if (commit) {
@@ -660,9 +665,7 @@ static void replan_to(struct ll_link *c, uint16_t target)
 	chm_repend(c);
 	c->planned = false;
 	c->csa = c->csa_base;
-	for (uint16_t i = 0; i < k; i++) {
-		(void)ll_csa1_next(&c->csa);
-	}
+	ll_csa1_skip(&c->csa, k);
 	ST(c)->skipped -= (uint32_t)(c->skip_n - k);
 	c->skip_n = 0;
 	c->counter = target;
@@ -1068,10 +1071,11 @@ int ll_conn_start(const struct ll_connect_ind *ci, uint32_t connect_ind_end_tick
 	return c->id;
 }
 
-/* open_of() evaluations per first_ahead(): after the arithmetic jump the
- * event reached may still be unreachable, the next one may be (widening +
- * margin + lead), the one after that never is (widening <= interval / 2 -
- * T_IFS, margin + lead < interval / 2 + T_IFS for every valid interval). */
+/* open_of() evaluations per first_ahead(): the jump uses the anchor plus
+ * the lead, open_of() the anchor minus widening and margin, so the lead
+ * cancels out: the event reached may still be unreachable by widening +
+ * margin, and widening + margin < interval makes event k + 2 always
+ * reachable. So at most 3 evaluations are needed; 4 is a safe bound. */
 #define CATCH_UP_STEPS 4u
 
 /* Events from c->counter to the first one whose alarm is still ahead under
@@ -1347,6 +1351,9 @@ void ll_conn_terminate(uint8_t link, uint8_t reason)
 	if (ops.ctrl_tx) {
 		(void)ops.ctrl_tx(link, pdu, sizeof(pdu));
 	} else {
+		/* without the hook (host tests only; the device always has
+		 * ll_llcp's, which kicks): no ll_conn_kick(), the PDU waits
+		 * for the next planned listen */
 		key = ll_plat_lock();
 		(void)ll_txq_push(link, LL_TXQ_CTRL, LL_LLID_CTRL, pdu, sizeof(pdu),
 				  OP_TERMINATE_IND, true);
@@ -1552,16 +1559,24 @@ void ll_conn_get_stats_total(struct ll_conn_stats *s)
 }
 
 /* Flash window (ll_flash.h): one flash operation without radio leaves the
- * link at least half its supervision timeout. */
+ * link at least half its supervision timeout. sup_tick may lie up to one
+ * interval ahead (an update instant applied when its event is planned
+ * sets it to the instant's old anchor): that is age 0. */
 static bool flash_ready(const struct ll_link *c, uint32_t now)
 {
+	int32_t age;
+
 	if (!c->active) {
 		return true;
 	}
 	if (!c->established) {
 		return false;
 	}
-	return (uint32_t)(now - c->sup_tick) + US(LL_FLASH_OP_MAX_US) <= c->sup_ticks / 2u;
+	age = (int32_t)(now - c->sup_tick);
+	if (age < 0) {
+		age = 0;
+	}
+	return (uint32_t)age + US(LL_FLASH_OP_MAX_US) <= c->sup_ticks / 2u;
 }
 
 bool ll_conn_flash_ready(uint32_t now)

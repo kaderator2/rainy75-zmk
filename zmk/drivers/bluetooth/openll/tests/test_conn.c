@@ -3736,6 +3736,60 @@ static void test_flash_ready(void)
 	auto_release = true;
 }
 
+/* Final review A-M3: a connection update applied when its instant event
+ * is planned sets sup_tick to the instant's old anchor, up to one interval
+ * ahead. A supervision reference in the future is a fresh link (age 0),
+ * not one that is far past its timeout (with an interval above
+ * LL_FLASH_OP_MAX_US the unsigned age did not even wrap back). */
+static void test_flash_ready_future_sup(void)
+{
+	struct ll_connect_ind ci = mk_ci(40, 400, 1, 1, 0);   /* 50 ms, 4 s */
+	struct ll_conn_params np = {.interval = 24, .latency = 0, .timeout = 400};
+	uint32_t a = 500000 + T(1250 + 300);
+	uint16_t c;
+
+	reset_all(false);
+	CHECK(ll_conn_start(&ci, 500000) == 0);
+	for (int k = 0; k < 5; k++) {
+		ev_rx(a);
+		a += T(50000);
+	}
+	c = ll_conn_event_counter(0);
+	/* instant = the next event: applied when it is planned, at this
+	 * CONN_DONE, before its anchor */
+	CHECK(ll_conn_update_at(0, (uint16_t)(c - 1), (uint16_t)(c + 1), 1, 0, &np) == 0);
+	ev_rx(a);
+	CHECK(cbs.updated == 1);
+	CHECK(ll_conn_flash_ready(now));
+	ll_conn_end(0, LL_ST_REMOTE_TERM);
+}
+
+/* Final review A-M4: a yield checks the supervision timeout as a closed
+ * event does. A link that is bumped again and again never closes an
+ * event, so without this only YIELD_MAX would end it. */
+static void test_yield_supervision(void)
+{
+	struct ll_connect_ind ci = mk_ci(12, 100, 1, 1, 0);   /* 15 ms, 1 s */
+	uint32_t a = 500000 + T(1250 + 300);
+
+	reset_all(false);
+	CHECK(ll_conn_start(&ci, 500000) == 0);
+	for (int k = 0; k < 3; k++) {
+		ev_rx(a);
+		a += T(15000);
+	}
+	/* bumped within the timeout: yields, stays up */
+	now = a - T(15000) + T(500000);
+	ll_conn_arb_bumped(0);
+	CHECK(ll_conn_active(0) && cbs.disconnected == 0);
+	/* bumped after the timeout without a received packet: ends 0x08 */
+	now = a - T(15000) + T(1000000);
+	ll_conn_arb_bumped(0);
+	CHECK(!ll_conn_active(0));
+	CHECK(cbs.disconnected == 1 && cbs.reason == LL_ST_CONN_TIMEOUT);
+	CHECK(sch.cb == NULL);
+}
+
 /* N >= 2: the window waits while any link is not ready. */
 static void test_flash_ready_links(void)
 {
@@ -4421,6 +4475,8 @@ int main(void)
 	test_flash_cut();
 	test_flash_hold_max();
 	test_flash_ready();
+	test_flash_ready_future_sup();
+	test_yield_supervision();
 	test_flash_ready_links();
 	test_instant_late_chmap();
 	test_instant_late_update();
