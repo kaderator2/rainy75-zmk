@@ -544,6 +544,37 @@ static void test_verifying(void) {
 	CHECK(!rrgb_ble_active(QUIET));
 }
 
+/* Review fixes: re-pair over a bonded slot blinks during verify; repeated
+ * FAILED events keep the digit flash in sync with the slot flash. */
+static void test_verify_review(void) {
+	/* re-pair over a PAIRED slot (host reconnects, polled CONNECTED) */
+	reset();
+	slots(RRGB_BLE_PAIRED, RRGB_BLE_EMPTY, RRGB_BLE_EMPTY, 0, QUIET);
+	rrgb_ble_event(RRGB_BLE_EV_PASSKEY_REQ, 0, 0, QUIET + 10);
+	slots(RRGB_BLE_CONNECTED, RRGB_BLE_EMPTY, RRGB_BLE_EMPTY, 0, QUIET + 11);
+	rrgb_ble_event(RRGB_BLE_EV_PASSKEY_SUBMITTED, 0, 0, QUIET + 20);
+	uint32_t t = QUIET + 11 + RRGB_BLE_CONN_SOLID + RRGB_BLE_CONN_FADE;  /* conn anim over */
+	CHECK(slot_blinks(0, t));
+	slots(RRGB_BLE_PAIRED, RRGB_BLE_EMPTY, RRGB_BLE_EMPTY, 0, t + 20);   /* polled PAIRED */
+	CHECK(slot_blinks(0, t + 20 + RRGB_BLE_FLASH_TOTAL));                /* blink, not breathe */
+
+	/* FAILED twice (same tick, then tick + 1): digits stay in sync with the slot */
+	for (uint32_t gap = 0; gap <= 1; gap++) {
+		reset();
+		slots(RRGB_BLE_CONNECTED, RRGB_BLE_EMPTY, RRGB_BLE_EMPTY, 1, QUIET);
+		rrgb_ble_event(RRGB_BLE_EV_PASSKEY_SUBMITTED, 1, 0, QUIET + 5);
+		uint32_t tf = QUIET + 40;
+		rrgb_ble_event(RRGB_BLE_EV_FAILED, 1, 0, tf);
+		rrgb_ble_event(RRGB_BLE_EV_FAILED, 1, 0, tf + gap);
+		for (uint32_t dt = gap; dt < RRGB_BLE_FLASH_TOTAL + 10; dt++) {
+			frame(tf + dt);
+			for (int k = 0; k < RRGB_BLE_PASSKEY_LEN; k++) {
+				CHECK(eq(px[NUM(k)], dt < RRGB_BLE_FLASH_TOTAL + gap ? px[F(1)] : SENT));
+			}
+		}
+	}
+}
+
 /* Just Works (host without display, no passkey request): fast blink goes
  * straight to PAIRED_OK solid + fade, the number row and Enter untouched. */
 static void test_just_works(void) {
@@ -837,6 +868,7 @@ int main(void) {
 	test_passkey();
 	test_verifying();
 	test_just_works();
+	test_verify_review();
 	test_pairing_timeout();
 	test_multi_slot();
 	test_active_exact();

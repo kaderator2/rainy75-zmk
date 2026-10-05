@@ -162,7 +162,9 @@ submitted), on pairing complete or failure, and at the latest 60 s after the
 last passkey event. After Enter the verify chase runs until pairing complete
 (slot solid + fade), failure (red flash on the slot and keys 1..6) or a lost
 connection, at the latest 40 s (`RRGB_BLE_VERIFY_MAX`, the SMP timeout is 30 s);
-meanwhile the pairing slot blinks regardless of output and hold window. ZMK
+meanwhile the pairing slot blinks regardless of output and hold window, also
+on a re-pair over a bonded slot. The red digit flash mirrors the slot's flash
+(same start), so repeated `FAILED` events keep both in sync. ZMK
 keeps every key away from the hosts from the passkey request until the pairing
 ends (patch 0007), so a second Enter during the check does not reach the PC.
 Just Works pairings (no passkey request) never touch the number row. Selecting
