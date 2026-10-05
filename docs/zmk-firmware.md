@@ -8,7 +8,7 @@ Custom ZMK firmware for the Wobkey Rainy 75 Pro ISO DE keyboard, targeting the T
 |-----------|--------|-------|
 | Build infrastructure | **Done** | west workspace, Zephyr module, CMake/Kconfig |
 | Board definition | **Done** | HWMv2 format, DTS, keymap, defconfig |
-| BLE HCI driver | **Done** | Real blob linked, Zephyr v4.1 device-model API |
+| BLE HCI driver | **Done** | Zephyr v4.1 device-model API; open link layer by default (no blob), Telink blob opt-in (`--blob`) |
 | USB DC driver | **Done** | Legacy `usb_dc.h` API; polled suspend + ISR resume, dead-bus reconnect recovery (`CONFIG_ZMK_USB_SUSPEND_REATTACH`) |
 | RGB LED strip | **Done** | WS2812 via PSPI + DMA ch4, PB7 MOSI, 83 per-key LEDs, ZMK underglow enabled |
 | Battery ADC sensor | **Done** | SAR ADC driver, PD1 channel 0x0A, 1/2 divider, BLE battery service |
@@ -17,13 +17,15 @@ Custom ZMK firmware for the Wobkey Rainy 75 Pro ISO DE keyboard, targeting the T
 | MCUboot DFU | **Done** | mcumgr USB UART (primary) + BLE SMP (backup), swap-using-move, WDT crash revert |
 | Watchdog | **Done** | B91 HW WDT driver, MCUboot image confirmation |
 
-**Build output (all stages enabled):**
+**Build output (all stages enabled, ISO, `./build.sh -p --iso`):**
 
-| Region | Used | Total | Usage |
-|--------|------|-------|-------|
-| ROM | 304 KB | 448 KB | 68% |
-| RAM (DLM) | 71 KB | 128 KB | 56% |
-| RAM (ILM) | 39 KB | 128 KB | 31% |
+| Region | Open controller (default) | Blob (`--blob`) | Total |
+|--------|------|------|-------|
+| ROM | 303474 B (66%) | 328120 B (72%) | 448 KB |
+| RAM (DLM) | 105764 B (81%) | 85436 B (65%) | 128 KB |
+| RAM (ILM) | 7726 B (6%) | 40288 B (31%) | 128 KB |
+
+The open build's extra DLM is mostly its 251-octet queues for 3 links (about 5 KB per link) and the larger host ACL/ATT buffers.
 
 **MCUboot bootloader (separate build):**
 
@@ -58,7 +60,7 @@ Custom ZMK firmware for the Wobkey Rainy 75 Pro ISO DE keyboard, targeting the T
         Battery ADC (PD1)    Deep sleep (sys_poweroff)
 ```
 
-The BLE controller blob (`liblt_9518_zephyr.a`) is a precompiled binary from Telink that implements the BLE link layer, HCI, and RF control. It is **proprietary** (confidential / non-transferable / NDA — see [NOTICE](../NOTICE)) and is **not committed** to this repo; `fetch_ble_blob.sh` downloads it (pinned commit + SHA-256 verified) from Telink's public repository at build time. Our shim (`b91_bt.c`) bridges it to Zephyr without including the SDK's conflicting headers. Deep sleep uses `z_sys_poweroff()` (cold boot via DEEPSLEEP_MODE 0x30) in `zmk/src/poweroff.c`.
+The BLE controller is our open link layer (`zmk/drivers/bluetooth/openll/`, see [open-ble-controller.md](open-ble-controller.md)) by default. The alternative, opt-in with `./build.sh --blob`, is the Telink controller blob (`liblt_9518_zephyr.a`), a precompiled binary that implements the BLE link layer, HCI, and RF control. It is **proprietary** (confidential / non-transferable / NDA, see [NOTICE](../NOTICE)) and is **not committed** to this repo; `fetch_ble_blob.sh` downloads it (pinned commit + SHA-256 verified) from Telink's public repository at build time, only for `--blob` builds. Our shim (`b91_bt.c`) bridges it to Zephyr without including the SDK's conflicting headers. Deep sleep uses `z_sys_poweroff()` (cold boot via DEEPSLEEP_MODE 0x30) in `zmk/src/poweroff.c`.
 
 ## Workspace Layout
 
@@ -67,10 +69,10 @@ rainy75/                            # workspace root
 ├── zmk/                            # our Zephyr module (manifest repo)
 │   ├── west.yml                    # manifest: fetches ZMK + hal_telink + mcuboot
 │   ├── zephyr/module.yml           # registers as Zephyr module
-│   ├── CMakeLists.txt              # top-level: includes drivers, links blob
+│   ├── CMakeLists.txt              # top-level: includes drivers, links the blob (--blob only)
 │   ├── Kconfig                     # top-level: rsource driver Kconfigs
 │   ├── lib/
-│   │   └── liblt_9518_zephyr.a     # BLE controller blob (2.8 MB)
+│   │   └── liblt_9518_zephyr.a     # BLE controller blob (2.8 MB, fetched for --blob, gitignored)
 │   ├── src/
 │   │   └── mcuboot_confirm.c       # MCUboot image confirmation + WDT safety net
 │   ├── boards/rainy75/             # HWMv2 board definition
@@ -93,7 +95,7 @@ rainy75/                            # workspace root
 │       │   ├── b91_bt.h            # shim API header
 │       │   ├── b91_bt.c            # shim: blob bridge + init + thread + PM hooks
 │       │   ├── b91_mac.c / .h      # MAC from flash, shared by blob and open controller
-│       │   ├── openll/             # open link layer, blob-free (--openll)
+│       │   ├── openll/             # open link layer, blob-free (the default controller)
 │       │   ├── hci_b91.c           # Zephyr HCI device-model driver
 │       │   ├── Kconfig
 │       │   └── CMakeLists.txt
@@ -117,6 +119,10 @@ rainy75/                            # workspace root
 │           └── CMakeLists.txt
 ├── conf/                           # build configuration overlays
 │   ├── app.conf                    # ZMK app config (BLE, USB, mcumgr, RGB, Studio, sleep)
+│   ├── openll.conf                 # open controller (default): counters, 251-octet buffers, CCC at boot
+│   ├── blob.conf                   # Telink blob controller (./build.sh --blob)
+│   ├── privacy.conf                # BT_PRIVACY, open controller only (./build.sh --privacy)
+│   ├── ota-bridge.conf             # OTA bridge (./build.sh -b)
 │   ├── mcuboot.conf                # MCUboot bootloader config
 │   ├── mcuboot.overlay             # MCUboot DTS overlay (disables peripherals, adds CDC ACM)
 │   └── mcumgr.overlay              # App DTS overlay (CDC ACM for mcumgr SMP transport)
@@ -165,7 +171,19 @@ west update
 ./build.sh --iso       # app only (incremental)
 ./build.sh -p --iso    # app pristine (after Kconfig/DTS changes)
 ./build.sh -pa --ansi  # full pristine rebuild, ANSI layout
+./build.sh -b          # OTA bridge only (build-bridge/, for install_zmk.sh)
 ```
+
+BLE controller options (app builds):
+
+| Option | Controller | Extra config |
+|---|---|---|
+| (default) | open link layer, no blob fetched or linked | `conf/openll.conf` |
+| `--blob` | Telink blob, `fetch_ble_blob.sh` runs first | `conf/blob.conf` (no openll.conf) |
+| `--privacy` | open link layer with a resolvable private address; every host must be paired again; refused with `--blob` | `conf/openll.conf` + `conf/privacy.conf` |
+| `--openll` | accepted no-op alias (prints a note) | |
+
+`grep -c liblt build/zephyr/zmk.map` gives 0 for the open controller and 48 for the blob.
 
 `build.sh` handles venv activation, SDK path, patch application, DTS overlays, and combined image creation.
 The layout flag passes `-DDTS_EXTRA_CPPFLAGS=-DRAINY75_ANSI` for ANSI; `mcuboot`/`bridge`-only builds need no flag.
@@ -180,8 +198,9 @@ export ZEPHYR_SDK_INSTALL_DIR=$(pwd)/toolchain/zephyr-sdk-0.17.0
 west build -b rainy75 zmk-src/app -- \
   -DZMK_CONFIG="$(pwd)/zmk/boards/rainy75" \
   -DZMK_EXTRA_MODULES="$(pwd)/zmk" \
-  -DEXTRA_CONF_FILE="$(pwd)/conf/app.conf" \
+  -DEXTRA_CONF_FILE="$(pwd)/conf/app.conf;$(pwd)/conf/openll.conf" \
   -DEXTRA_DTC_OVERLAY_FILE="$(pwd)/zmk/boards/rainy75/rainy75.keymap;$(pwd)/conf/mcumgr.overlay"
+# (blob instead: conf/app.conf;conf/blob.conf, after ./fetch_ble_blob.sh)
 
 # MCUboot
 west build -b rainy75 -d build-mcuboot bootloader/mcuboot/boot/zephyr -- \
@@ -199,7 +218,7 @@ west build -b rainy75 -d build-mcuboot bootloader/mcuboot/boot/zephyr -- \
 
 ### Config split
 
-Board defconfig (`rainy75_defconfig`) contains only hardware-essential configs (GPIO, flash, heap) shared by both MCUboot and the application. Application-specific configs (BLE, USB, ZMK, mcumgr, WDT, RGB) are in `conf/app.conf`, passed via `EXTRA_CONF_FILE`. This allows MCUboot to build cleanly against the same board definition.
+Board defconfig (`rainy75_defconfig`) contains only hardware-essential configs (GPIO, flash, heap) shared by both MCUboot and the application. Application-specific configs (BLE, USB, ZMK, mcumgr, WDT, RGB) are in `conf/app.conf`, passed via `EXTRA_CONF_FILE` together with the controller overlay (`conf/openll.conf` or `conf/blob.conf`, plus `conf/privacy.conf` for `--privacy`). This allows MCUboot to build cleanly against the same board definition.
 
 ## Hardware Bring-Up Checklist
 
@@ -516,7 +535,7 @@ Verify:
 
 **Blob bugs found:**
 - **2M PHY disabled** — `blc_ll_init2MPhyCodedPhy_feature()` must NOT be called. After the central requests PHY update to 2M, the blob's radio loses packets, causing LL Response Timeout (0x22) exactly 40 seconds later. 1M PHY works perfectly.
-- **BT_PRIVACY incompatible** — `CONFIG_BT_PRIVACY=y` hangs during `bt_enable()`. Blob doesn't support `LE_Set_Random_Address` HCI command.
+- **BT_PRIVACY hang (most likely not the blob):** `CONFIG_BT_PRIVACY=y` hung during startup, which was blamed on the blob lacking LE Set Random Address. The same hang later showed up with the open controller and turned out to be a ZMK deadlock (advertising started inside the settings commit while the host's IRK store waited for the settings lock), fixed by `patches/zmk-src/0005`. The blob was not retested with the patch, so whether it supports LE Set Random Address is unknown; `--privacy` stays limited to the open controller.
 - **First connection 0x3E** — first BLE connection after boot fails with "Connection Failed to be Established" in ~30ms. Benign — automatic retry succeeds within 300ms.
 
 ### Stage 3: RGB Underglow (via mcumgr DFU) — COMPLETE
@@ -614,9 +633,24 @@ We revive this functionality with a clean implementation:
 2. **Our own shim** (`b91_bt.c`) that declares blob functions as `extern` with standard C types — no SDK headers needed
 3. **Zephyr v4.1 device-model API** (`DEVICE_API(bt_hci, ...)`) instead of the removed legacy API
 
-### Open controller (experimental)
+### Open controller (default)
 
-An open-source link layer (`zmk/drivers/bluetooth/openll/`) can replace the blob behind the same `b91_bt.h` seam. It is selected with `CONFIG_BT_HCI_B91_CTLR_OPEN=y` (`./build.sh -p --iso --openll`) and does not link `liblt_9518_zephyr.a`. It works end to end: advertising, connections (hardware BRX turnaround, CSA #1, connection and channel map updates), LLCP, ACL with HCI flow control and link encryption with the existing bond, so BLE typing works. A 33-minute encrypted soak under traffic ended with 0 disconnects. The blob stays the default until power management (sleep between connection events, deep-sleep coordination) is done; only a Linux/BlueZ central is tested so far. Architecture, measurements, build and flash steps, hardware findings and roadmap: [open-ble-controller.md](open-ble-controller.md).
+The open-source link layer (`zmk/drivers/bluetooth/openll/`) replaces the blob behind the same `b91_bt.h` seam and is the default controller (`CONFIG_BT_HCI_B91_CTLR_OPEN=y`, `conf/openll.conf`). It does not link `liblt_9518_zephyr.a`. Features: legacy advertising (also while connected), up to 3 peripheral links (`CONFIG_BT_HCI_B91_OPENLL_MAX_CONN`), CSA #1 and #2, peripheral latency, responder LLCP incl. encryption, Data Length Extension to 251 octets, LE Ping, Connection Parameters Request (responder), 1M PHY only, opt-in privacy, deep sleep coordination and power counters over mcumgr group 66. Only a Linux/BlueZ central is tested so far. Architecture, measurements, build and flash steps, hardware findings and open items: [open-ble-controller.md](open-ble-controller.md). The sections below describe the blob shim (`./build.sh --blob`).
+
+### BLE profiles with the open controller
+
+The keymap binds three profiles (Fn+F1/F2/F3 = `BT_SEL 0..2`, Fn+Del clears the active profile's bond). ZMK's host side keeps up to 5 connections and pairings; the open controller keeps up to 3 links, one per profile:
+
+- A profile switch does not disconnect the old host. ZMK starts connectable advertising whenever the active profile is open or not connected, also while other profiles are connected; the controller advertises in the gaps between connection events (with the blob, too, but it kept only one connection).
+- With the other hosts still connected, switching back is instant (no reconnect); HID reports go only to the active profile's host.
+- With all 3 links taken, connectable advertising is refused (0x09, Connection Limit Exceeded).
+- After a deep-sleep wake (cold boot) ZMK reconnects the active profile's host; the other hosts reconnect when their profile is selected (upstream ZMK behaviour).
+
+Status: advertising while connected and the multilink controller are device-tested with one real central; the switch between several real hosts is not tested yet (open item, see [open-ble-controller.md](open-ble-controller.md#known-limitations-and-open-items)).
+
+### ZMK Studio over BLE
+
+Studio runs over BLE only (see `conf/app.conf`). With the open controller the ATT MTU is 247 (`CONFIG_BT_L2CAP_TX_MTU=247`, 251-octet ACL buffers, Data Length Extension), so a 244-byte RPC frame fits one PDU: 22.6 Studio RPCs per s instead of 10.3 with 27-octet PDUs and ATT MTU 65 (open controller before Data Length Extension; the blob build was not measured). "zmk_studio: Failed to select a transport!" at boot is normal: the BLE RPC transport is selected only once the BLE endpoint is ("Endpoint changed: BLE:0"); while the endpoint is USB, Studio over BLE pauses.
 
 ### Driver architecture
 
@@ -673,7 +707,7 @@ Ported from hal_telink's `b91_bt_init.c`, peripheral-only (0 masters, 1 slave):
 - **IRQ 1** (SYSTIMER) and **IRQ 15** (RF/ZB_RT) — both call `blc_sdk_irq_handler()`
 - Controller thread: runs `blc_sdk_main_loop()` every 2 ms
 - Thread stack: `CONFIG_BT_HCI_B91_RX_STACK_SIZE` (set to 2048; default 1024 is tight per hal_telink references)
-- Thread priority: `CONFIG_BT_HCI_B91_RX_PRIO` (default 7)
+- Thread priority: `CONFIG_BT_HCI_B91_RX_PRIO` (default 2)
 
 ### Weak stubs
 
@@ -881,7 +915,7 @@ Implemented in `zmk/src/poweroff.c` as `z_sys_poweroff()`, triggered by ZMK afte
 
 **GPIO wakeup config:** 6 row pins (PD2-PD6, PE0) via `pm_set_gpio_wakeup()`. SDK register layout: 0x41-0x45 = polarity (SET = LOW-level), 0x46-0x4A = enable. Wakeup status register 0x64 guards entry — all rows must be HIGH (no key pressed) to enter sleep.
 
-With the open BLE controller (`./build.sh --openll`), `z_sys_poweroff()` first calls `b91_bt_controller_poweroff()`, which quiesces the link layer scheduler and the radio (both interrupt sources off). Deep sleep and the 15 minute timeout work unchanged, including wake and automatic reconnect to the bonded host. See [open-ble-controller.md](open-ble-controller.md#power-management).
+With the open BLE controller (the default build), `z_sys_poweroff()` first calls `b91_bt_controller_poweroff()`, which quiesces the link layer scheduler and the radio (both interrupt sources off). Deep sleep and the 15 minute timeout work unchanged, including wake and automatic reconnect to the bonded host. See [open-ble-controller.md](open-ble-controller.md#power-management).
 
 ## MCUboot DFU
 
@@ -906,9 +940,7 @@ USB-based firmware updates via mcumgr, with watchdog-based crash revert.
 
 ```bash
 # 1. Build new firmware
-ZEPHYR_SDK_INSTALL_DIR=$(pwd)/toolchain/zephyr-sdk-0.17.0 \
-  west build -b rainy75 -s zmk-src/app --pristine \
-  -- -DEXTRA_CONF_FILE=$(pwd)/conf/app.conf
+./build.sh -p --iso
 
 # 2. Upload via mcumgr (over USB serial)
 mcumgr --conntype serial --connstring /dev/ttyACM0,baud=115200 \
@@ -920,6 +952,8 @@ mcumgr --conntype serial --connstring /dev/ttyACM0 image list
 # 4. Reset (triggers swap)
 mcumgr --conntype serial --connstring /dev/ttyACM0 reset
 ```
+
+**One reader on the CDC port.** The log console and mcumgr share the one CDC ACM port. Close every other reader first (`cat`, a serial logger, a stuck script): a second reader takes SMP responses away from mcumgr, which then fails with NMP timeouts or stalled uploads. During the open controller work a leftover logger looked exactly like "mcumgr over USB is unreliable" until it was killed. Extra log traffic (e.g. `CONFIG_BT_HCI_B91_OPENLL_STATS_LOG`) also slows uploads; zephyr patches 0010 and 0011 make mcumgr robust against the log itself. Measured on the default image with a free port: 10 of 10 USB uploads OK, about 80 s each (3.6 KiB/s), `image list` right after each. Device reboots in the middle of a USB upload were seen two or three times before those patches (possibly misread stalls followed by a reset) and were not reproduced in about 45 uploads afterwards; the cause is unknown.
 
 ### Image confirmation flow
 
@@ -977,6 +1011,7 @@ patches/
     0001-b91-riscv-boot-fixes.patch
   hal_telink/
     0001-exclude-sys-for-BT_HCI_B91.patch
+    0002-build-sys.c-unless-the-blob-controller-is-selected.patch
   zmk-src/
     0001-zmk-usb-no-vbus-detect.patch
     0002-zmk-recover-a-dead-USB-bus-while-suspended-no-VBUS-d.patch
@@ -990,7 +1025,9 @@ settings commit (settings lock held), while the host had queued storing the
 newly generated IRK on the system workqueue, which also transmits the HCI
 commands. The two waited on each other until the HCI command timeout
 asserted; the MCUboot test image then reverted, and the previous image went
-on advertising the public address.
+on advertising the public address. This is most likely also what the old
+"BT_PRIVACY hangs bt_enable() with the blob" note was (not retested with the
+blob).
 
 ### Zephyr (11 patches)
 
@@ -1069,6 +1106,10 @@ follows the 4096 backlog bytes on a line of its own, 3 of 3; the first
 `mcumgr image list` after a swap boot answers. The ota-bridge build
 (conf/ota-bridge.conf) does not set the option.
 
+The two patches work together: 0011's frame write runs under 0010's mutex, so
+a waiting response cannot be interleaved with a log message either. Neither
+helps against a second program reading the port (see "MCUboot DFU").
+
 ### MCUboot (1 file, 1 patch)
 
 **`boot/zephyr/main.c`** — B91 RISC-V boot fixes **[VERIFIED]**
@@ -1077,7 +1118,7 @@ follows the 4096 backlog bytes on a line of its own, 3 of 3; the first
 - **boot_console_init early**: moved before DFU wait guard — USB init side effects (clock/DMA) needed by flash controller for image hash verification.
 - **fence.i**: flush instruction cache before jumping to app (generic RISC-V, guarded by `CONFIG_RISCV`).
 
-### hal_telink (1 file, 1 patch)
+### hal_telink (1 file, 2 patches)
 
 **`tlsr9/CMakeLists.txt`** — BT_HCI_B91 guard **[DEFERRED: Stage 2 BLE]**
 
@@ -1088,7 +1129,9 @@ follows the 4096 backlog bytes on a line of its own, 3 of 3; the first
 
 BLE controller blob defines `sys_init()`, collides with hal_telink's `sys.c`. Required when `CONFIG_BT_HCI_B91=y`.
 
-### zmk-src (3 files, 4 patches)
+**0002** narrows this to the blob: `sys.c` is built unless `CONFIG_BT_HCI_B91_CTLR_BLOB` is selected, because the open controller needs the HAL's `sys_init`.
+
+### zmk-src (4 files, 5 patches)
 
 **0001 — `app/Kconfig` + `app/src/activity.c`** — `ZMK_USB_NO_VBUS_DETECT` for boards without VBUS sensing
 
@@ -1098,7 +1141,9 @@ B91 has no USB VBUS detection pin. Without this patch, `is_usb_power_present()` 
 
 **0003 — `app/src/usb.c`** — bind-window grace: failed HID sends within 5 s of a completed enumeration no longer count toward the starvation verdict, so an ordinary wake does not trigger a second, needless re-attach. From PR #20.
 
-**0004 — `app/src/usb_hid.c`** — ask for USB remote wakeup from the HID send path, falling back to re-presenting only when the request is refused or a driven wakeup did not resume the bus. See [USB Remote Wakeup](#usb-remote-wakeup).
+**0004, `app/src/usb_hid.c` + `app/src/usb.c`:** ask for USB remote wakeup from the HID send path, falling back to re-presenting only when the request is refused or a driven wakeup did not resume the bus. See [USB Remote Wakeup](#usb-remote-wakeup). The patch changed `zmk_usb_user_activity_while_suspended()` to return `int`; its `#else` stub (used when `CONFIG_ZMK_USB_SUSPEND_REATTACH` is off, i.e. the OTA bridge and therefore `./build.sh -a` / `-b`) still returned `void` and broke those builds until it was fixed to return `-ENOTSUP` (hotfix PR #35 on main).
+
+**0005, `app/src/ble.c`:** `zmk_ble_ready()` submits `update_advertising_work` instead of starting advertising inside the settings commit, so it runs after the host's pending IRK/identity stores. Fixes the `CONFIG_BT_PRIVACY` startup deadlock described above.
 
 ### Reverted fixes (proven unnecessary)
 
@@ -1153,12 +1198,12 @@ GPIO patches 0001+0002 fix real bugs in Zephyr's B91 GPIO driver (`WRITE_BIT` do
 
 | Limitation | Root Cause | Impact |
 |---|---|---|
-| No BLE Privacy | Blob doesn't support `LE_Set_Random_Address` — hangs `bt_enable()` | Public MAC address exposed during advertising |
-| 1M PHY only | Blob's 2M PHY loses packets → LL Response Timeout 0x22 after 40s | Slightly lower throughput (irrelevant for HID) |
-| Single BLE connection | Blob is single-conn (`blc_ll_setMaxConnectionNumber(0, 1)`) | No multi-profile BLE |
+| BLE privacy opt-in only | Default builds keep the public identity address (bonds survive); `--privacy` (open controller) needs every host to pair again | Public MAC address visible during advertising by default |
+| 1M PHY only | Open controller: no open 2M register source exists. Blob: its 2M PHY loses packets, LL Response Timeout 0x22 after 40 s | Slightly lower throughput (irrelevant for HID) |
+| BLE links | Open controller: up to 3 links (one per profile). Blob: single connection (`blc_ll_setMaxConnectionNumber(0, 1)`) | Blob: only one profile connected at a time |
 | USB SRAM = 256 bytes | B91 hardware, 8-bit addressing only | Max 1 CDC ACM + HID |
 | Cold boot wakeup (~1–2s) | Retention mode incompatible with MCUboot (boot ROM overwrites ILM) | Slower wake from deep sleep |
 | No 2.4 GHz wireless | Would need dongle firmware + proprietary RF protocol | Original has 3 modes; we have USB + BLE |
-| First BLE conn fails (0x3E) | Blob boot timing issue — second attempt always succeeds | Benign, 300ms delay on first connect |
+| First BLE conn fails (0x3E) | Blob only: boot timing issue, the second attempt always succeeds | Benign, 300ms delay on first connect |
 | No image signing | MCUboot validates SHA-256 only, no cryptographic signature | Acceptable for consumer keyboard (no secrets on-device) |
 | `west.yml` floats on `main` | ZMK and hal_telink not pinned | Future `west update` could introduce breaking changes |

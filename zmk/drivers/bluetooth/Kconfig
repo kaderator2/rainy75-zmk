@@ -8,7 +8,7 @@ config BT_HCI_B91
 	  controller behind it is chosen below: either our shim around the
 	  BLE controller blob (liblt_9518_zephyr.a) from
 	  telink-semi/zephyr_hal_telink_b91_ble_lib, or the open-source link
-	  layer in openll/ (experimental, no binary blobs).
+	  layer in openll/ (the default, no binary blobs).
 
 config BT_HCI_B91_RX_STACK_SIZE
 	int "B91 BLE RX thread stack size"
@@ -35,9 +35,13 @@ config BT_HCI_B91_CTLR_OPEN
 	bool "Open-source link layer (default)"
 	help
 	  Our own peripheral-only link layer on hal_telink rf.c: legacy
-	  advertising, one connection (CSA#1, 1M PHY, peripheral latency),
-	  responder LL control procedures, ACL data and LE link encryption
-	  (AES-CCM on the hal AES engine). No binary blobs are linked.
+	  advertising (also while connected), up to
+	  BT_HCI_B91_OPENLL_MAX_CONN links (CSA#1/#2, 1M PHY, peripheral
+	  latency, Data Length Extension to 251 octets), responder LL
+	  control procedures incl. LE Ping and Connection Parameters
+	  Request, ACL data and LE link encryption (AES-CCM on the hal AES
+	  engine). No binary blobs are linked. See
+	  docs/open-ble-controller.md.
 
 endchoice
 

@@ -42,7 +42,20 @@ zmk/                             # Zephyr module — our custom firmware code
   boards/rainy75/                # HWMv2 board definition (DTS, keymap, defconfig)
   drivers/bluetooth/             # BLE HCI driver (b91_bt.c shim) + deep sleep PM hooks
     b91_mac.c                    # MAC from flash (0xFF000) or random static fallback, shared by blob and open controller
-    openll/                      # open BLE link layer (BT_HCI_B91_CTLR_OPEN, ./build.sh --openll): HCI subset, legacy adv, rf.c wrapper; host tests in tests/
+    openll/                      # open BLE link layer, the DEFAULT controller (BT_HCI_B91_CTLR_OPEN); see docs/open-ble-controller.md
+      ll_glue.c                  # b91_bt.h seam: init, controller thread (links round-robin), ACL, HCI flow control, stats log
+      ll_hci.c/.h ll_pdu.c/.h    # HCI commands/events, ACL framing + fragmentation; adv PDUs, SCAN_REQ/CONNECT_IND parsing
+      ll_adv.c/.h ll_scanrsp.h   # advertising (also while connected, random AdvA); SCAN_RSP decision in the RAM RF ISR
+      ll_arb.c/.h                # event arbiter: one main alarm, priorities MUST > SUPERVISION > ACTIVE > IDLE > ADV
+      ll_conn.c/.h               # per-link connection state: timing, latency rules, instants (late catch-up), RX flow control
+      ll_csa1.c/.h ll_csa2.c/.h  # channel selection algorithms #1 and #2
+      ll_txq.c/.h ll_rxq.c/.h ll_fifo.h  # per-link TX ring model (rebuild per event, placeholder rule) / RX queue; byte-area records
+      ll_llcp.c/.h ll_crypt.c/.h # responder LLCP (enc, LENGTH, PHY 1M, Ping, conn param req, owed PDUs); AES-CCM
+      ll_credit.c/.h             # per-link host credits (NOCP) and connection generation
+      ll_radio.c/.h ll_radio_mode.c/.h  # the only RF code (BRX, STX2RX, CPU hold, per-event link switch); adv register snapshot
+      ll_sched.c/.h              # stimer main + guard alarm
+      ll_flash.c/.h ll_flash_wrap.c  # flash window: no radio activity during hal flash erase/write (link-time --wrap)
+      ll_defs.h ll_plat.h tests/ # constants (LL_MAX_CONN, features 0x37/0x40); platform hooks; host tests (41 binaries)
   drivers/usb/                   # USB DC driver (legacy usb_dc.h API, linked and enabled)
   drivers/led_strip/             # WS2812 LED strip driver (PSPI + DMA, b91_pspi.h registers)
   drivers/sensor/                # Battery ADC driver (SAR ADC sensor + channel scanner)
@@ -51,13 +64,16 @@ zmk/                             # Zephyr module — our custom firmware code
   src/boot_diag.c + .h           # Boot diagnostic: .noinit SRAM buffer + PD7 GPIO heartbeat + PA7 SWS restore
   src/poweroff.c                 # Deep sleep: z_sys_poweroff() — deep retention 64K with GPIO wakeup
   src/flash_mgmt.c               # Custom mcumgr group 64: raw flash erase/write/read/commit + RAM trampoline
+  src/openll_mgmt.c              # Custom mcumgr group 66: open controller power/link/adv/flash-window counters (reverse/tools/openll_stats.py)
   src/rainy_rgb/                 # rainy_rgb lighting engine (color/effects/engine/reactive/overlay/led_map/state/zmk_adapter) — see docs/rainy-rgb.md
   src/behaviors/behavior_rainy_rgb.c  # &rgb keymap behavior (toggle/effect/hue/bright/speed/battery)
   dts/bindings/                  # DTS bindings: b91-usbd / b91-spi-led-strip / b91-battery-adc / b91-watchdog
-  lib/liblt_9518_zephyr.a        # BLE controller blob (2.8 MB) — proprietary/NDA, fetched by fetch_ble_blob.sh, gitignored (NOT committed)
+  lib/liblt_9518_zephyr.a        # BLE controller blob (2.8 MB), opt-in (./build.sh --blob): proprietary/NDA, fetched by fetch_ble_blob.sh, gitignored (NOT committed)
 conf/                            # build configuration overlays
   app.conf                       # ZMK app config (BLE, USB, mcumgr, WDT, RGB)
-  openll.conf                    # selects the open BLE controller (CONFIG_BT_HCI_B91_CTLR_OPEN=y), added by ./build.sh --openll
+  openll.conf                    # open BLE controller (default): CTLR_OPEN, group 66 counters, 251-octet ACL/ATT MTU 247, CCC load at boot
+  blob.conf                      # Telink blob controller instead (./build.sh --blob)
+  privacy.conf                   # BT_PRIVACY (RPA), open controller only (./build.sh --privacy); every host must pair again
   ota-bridge.conf                # OTA bridge config (monolithic, USB+mcumgr+flash_mgmt)
   mcuboot.conf                   # MCUboot bootloader config
   mcuboot.overlay                # MCUboot DTS overlay (disables peripherals)
@@ -67,7 +83,7 @@ modules/hal/hal_telink/          # Telink HAL (fetched by west, patched for BT_H
 bootloader/mcuboot/              # MCUboot v2.2.0 (fetched by west)
 install_zmk.sh                   # stock → ZMK one-command installer (OTA bridge + flash_mgmt)
 restore_stock.sh                 # ZMK → stock one-command restorer (flash_mgmt + reset)
-build/zephyr/zmk.elf             # app build output (~304 KB ROM, all stages)
+build/zephyr/zmk.elf             # app build output (open controller: ~296 KB ROM, ~103 KB RAM; blob: ~320 KB ROM, ~83 KB RAM)
 build-mcuboot/zephyr/zephyr.elf  # MCUboot build output (~51 KB ROM, 64KB boot partition)
 build-bridge/zephyr/zmk.bin      # OTA bridge output (~83 KB, monolithic)
 reverse/
@@ -240,22 +256,27 @@ reverse/
   - **Serial recovery**: `CONFIG_BOOT_SERIAL_NO_APPLICATION=y` only (GPIO entrance abandoned — matrix diodes + WRITE_BIT bug)
   - **Build**: `./build.sh -a` (all: MCUboot + app + combined), `./build.sh -p` (app pristine). Flash: `sws_flash.sh flash build/combined.bin <<< "y"`
   - **mcumgr**: `~/go/bin/mcumgr --conntype serial --connstring "dev=/dev/ttyACM0,baud=115200" image upload build/zephyr/zmk.signed.bin`
-- **Stage 2 (COMPLETE)**: BLE advertising, pairing (Passkey Entry, Security Level 4), HID over GATT, BLE HID input, reconnection — all working. "Rainy 75 Pro" at XX:XX:XX:XX:XX:XX, Fn+F4 endpoint toggle (`&out OUT_TOG`). Blob bugs found: (1) IRQ_CONNECT multi-level encoding (stimer→0x020B, RF→0x100B), (2) 2M PHY causes LL Response Timeout 0x22 after 40s — disabled, 1M works fine, (3) BT_PRIVACY hangs bt_enable() — blob doesn't support LE_Set_Random_Address. First connection after boot fails with 0x3E (benign, retries succeed). SWS reads interfere with BLE — don't activate SWS while BLE running.
+- **Stage 2 (COMPLETE)**: BLE advertising, pairing (Passkey Entry, Security Level 4), HID over GATT, BLE HID input, reconnection: all working. "Rainy 75 Pro" at XX:XX:XX:XX:XX:XX, Fn+F4 endpoint toggle (`&out OUT_TOG`). Blob bugs found: (1) IRQ_CONNECT multi-level encoding (stimer→0x020B, RF→0x100B), (2) 2M PHY causes LL Response Timeout 0x22 after 40s, disabled, 1M works fine, (3) BT_PRIVACY hung at startup, blamed on the blob lacking LE_Set_Random_Address; the same hang with the open controller was a ZMK settings-lock deadlock (fixed by zmk-src 0005), so most likely that, but the blob was not retested. First connection after boot fails with 0x3E (benign, retries succeed). SWS reads interfere with BLE: don't activate SWS while BLE running.
 - **Stage 3 (COMPLETE)**: RGB underglow — 83 WS2812 per-key LEDs via PSPI+DMA, all effects working (solid, breathe, spectrum, swirl), Fn-layer RGB controls, PC2 HIGH LED power, NVS persistence. GPIO bit-bang failed for LED 1 (first-bit jitter) → PSPI+DMA fixed it. PB5 is matrix column 13, not PSPI CLK.
 - **Stage 4 (COMPLETE)**: battery ADC on PD1 (channel 0x0A, 1/2 divider), ZMK battery reporting, BLE battery service
 - **Stage 5 (COMPLETE)**: Deep sleep — `DEEPSLEEP_MODE` (0x30, cold boot on wakeup), GPIO keypress wakeup. `z_sys_poweroff()` in `zmk/src/poweroff.c`: RGB off, USB detach, analog pull-downs on columns (100K) + pull-ups on rows (1M), `pm_set_gpio_wakeup()` on all 6 row pins. Wakeup on any keypress → cold boot through MCUboot (~1-2s). Retention mode (0x03) incompatible with MCUboot (boot ROM overwrites retained ILM). Patches: 0004 (HAS_POWEROFF Kconfig) + 0005 (start.S retention skip, dead code). `CONFIG_ZMK_SLEEP=y`, 15min idle timeout.
 
 ### Next — Open BLE Controller (issue #13)
-Own peripheral-only link layer behind the `b91_bt.h` seam on hal_telink `rf.c` (Apache-2.0); the blob is the only prebuilt binary in the image.
+Own peripheral-only link layer behind the `b91_bt.h` seam on hal_telink `rf.c` (Apache-2.0). Since slice 7 it is the DEFAULT build (`./build.sh -p --iso`, 0 `liblt` in the map); the blob is opt-in with `--blob`, `--openll` is a no-op alias. Full design and numbers: [docs/open-ble-controller.md](docs/open-ble-controller.md).
 - **Slice 0 (DONE)**: nRF52840 dongle flashed with nRF Sniffer 4.1.1 via `nrfutil device program`, captures with `nrfutil ble-sniffer sniff` (tshark -i blocked in distrobox), blob reference captures (`reverse/captures/`, gitignored), `reverse/tools/ble_adv_report.py`. CLI follow mode unreliable (about 1 in 9 tries).
-- **Slice 1 (DONE)**: blob-free build (`./build.sh -p --iso --openll`, 0 `liblt` in map vs 48). `bt_enable()` OK on first flash. ADV_IND on air with AdvData byte-identical to the blob, interval 100 ms + 0..10 ms (mean 105.07 ms; blob uses 150 ms). Scanners show "Rainy 75 Pro" (name in ADV_IND). CONNECT_IND decoded (Interval 12, Latency 30, Timeout 400, static fields match the sniffer); AA-matched sniffer/log pair still missing. SCAN_RSP on air but T_IFS about 209 us (59 us late): software-triggered TX cannot meet T_IFS, so slice 2 must use hardware brx/btx turnaround. Open issues for slice 2: ChSel 0 vs blob's 1, about 6 % log-clock vs wall-clock discrepancy. Blob regression passed: default blob build reconnects to the bonded host by itself and BLE typing works. See [docs/open-ble-controller.md](docs/open-ble-controller.md)
+- **Slice 1 (DONE)**: blob-free build (`./build.sh -p --iso --openll`, 0 `liblt` in map vs 48). `bt_enable()` OK on first flash. ADV_IND on air with AdvData byte-identical to the blob, interval 100 ms + 0..10 ms (mean 105.07 ms; blob uses 150 ms). Scanners show "Rainy 75 Pro" (name in ADV_IND). CONNECT_IND decoded (Interval 12, Latency 30, Timeout 400, static fields match the sniffer); AA-matched sniffer/log pair still missing. SCAN_RSP on air but T_IFS about 209 us (59 us late): software-triggered TX cannot meet T_IFS, so slice 2 must use hardware brx/btx turnaround. Open issues then (all resolved later: ChSel 1 + CSA#2 in 6b, kernel tick fix `fa1fda0`, SCAN_RSP at T_IFS in slice 7): ChSel 0 vs blob's 1, about 6 % log-clock vs wall-clock discrepancy. Blob regression passed: default blob build reconnects to the bonded host by itself and BLE typing works. See [docs/open-ble-controller.md](docs/open-ble-controller.md)
 - **Slice 2 (DONE)**: connection follow on the hardware BRX turnaround (TX settle 86 us, on-air T_IFS 148/149 us mode, 86.7 % <= 150 us), anchor rule (first packet only, not after a CRC-bad or acked-retransmission first packet), widening, CSA#1, SN/NESN init per BRX, 5-bit FIFO pointers, guard alarm, alarm lead 500 us; return to advertising without reboot (rptr not resettable but adv works once the DMA is configured only at boot)
 - **Slice 3 (DONE)**: responder LLCP (FEATURE/VERSION/CONN_UPDATE/CHANNEL_MAP/TERMINATE, UNKNOWN_RSP for PING/LENGTH/PHY/...), ACL both ways with Number Of Completed Packets, TX FIFO placeholder rule verified under forced NACKs (2686/2686 encrypted echoes), RX retransmissions filtered in hardware (data-only RX ring, overflow ends the link 0x08); 756 connection updates in the soak
 - **Slice 4 (DONE)**: AES-CCM on the hal AES block (Core Spec sample data, 31-43 us per block), encryption with the existing bond, encrypt outside the IRQ lock under a TX mutex (IRQ lock 360-398 -> 42-86 us). User types over BLE with no blob; 33-min encrypted soak 0 disconnects. See [docs/open-ble-controller.md](docs/open-ble-controller.md)
 - **Slice 5 (DONE)**: power management without SoC suspend: peripheral latency with skip rules, `ll_conn_kick()` on every TX push (kick to air < 1 interval), event-driven controller thread, power counters over mcumgr group 66 (`reverse/tools/openll_stats.py`), deep sleep coordination (`b91_bt_controller_poweroff()`). Deep sleep now works with the open controller, no nosleep overlay needed. Measured: we answer every 31st event when idle (96-97 % skipped, 0.0-0.2 wakeups/s), 30 min soak 0 disconnects, wake by keypress reconnects the bonded host by itself in about 13 s. Stats log is opt-in (`BT_HCI_B91_OPENLL_STATS_LOG`). See [docs/open-ble-controller.md](docs/open-ble-controller.md)
-- **Slice 5b (TODO, issue after merge)**: overnight battery comparison blob vs open, SoC suspend between events; also ~8 % central-side misses and latency from event 1 (early central requests may wait up to 465 ms)
-- **Slice 6**: privacy (LE Set Random Address/RPA), optional 2M PHY, Data Length Extension
-- Parallel: email Telink for blob redistribution permission
+- **Slice 5b (TODO, issue after merge)**: overnight battery comparison blob vs open, SoC suspend between events; also ~8 % central-side misses (latency from event 1 was addressed by the 1 s holdoff in slice 7)
+- **Slice 6a (DONE except Task 7)**: multilink, `BT_HCI_B91_OPENLL_MAX_CONN` default 3 (one link per ZMK profile, ~5 KB RAM each): per-link conn/txq/rxq/llcp/crypt/credit state, HCI handle = link id, event arbiter `ll_arb` (MUST > SUPERVISION > ACTIVE > IDLE > ADV, dodge/yield, round-robin ties), per-event radio switch (TX ring rebuilt at rptr per event; S1/S2 spikes 0 lost PDUs), advertising while connected (empty TX FIFO before STX2RX or the FSM wedges; slicing into gaps, starvation boost; connectable adv with all links taken = 0x09, also at MAX_CONN 1). Device: echo 725/725, 736 ADV_IND in 32 s while connected, 10 min echo with adv 5463/5463. **Task 7 (several real hosts, Fn+F1..F3 switching, phone) pending, needs the user.**
+- **Slice 6b (DONE)**: CSA#2 (ChSel 1 in ADV_IND, sniffer 179/179 events match), DLE to 251 octets (272-byte TX/RX DMA entries, fragmentation, TX limit by octets and time, MIC not in octets), 1M-only PHY procedure (2M impossible: no open register source, see `.superpowers/sdd/2m-source-research.md` locally). BLE upload 122 s -> 25 s, Studio RPC 10.3 -> 22.6/s (ATT MTU 247). CPU hold in the RX->TX turnaround: on-air T_IFS > 152 us 2.4-2.9 % -> 0.00-0.03 % (cost ~160 us CPU per received event, upload 27 s)
+- **Slice 6c (DONE)**: opt-in privacy `./build.sh --privacy` (LE Set Random Address, own address type random; host-side RPA). Needs re-pairing (bonds without our IRK do not reconnect); RPA rotation verified (60 s test timeout). Root cause of the privacy boot hang: ZMK settings-lock deadlock, fixed by `patches/zmk-src/0005`. Re-paired reconnect not tested yet
+- **Slice 6d (DONE)**: LE Ping (optional; PC now pings every ~15 s, our 30 s timer never expires, cost in the noise) + Read/Write Authenticated Payload Timeout + Event Mask Page 2; Connection Parameters Request responder (feature bit 1; ZMK's L2CAP requests now arrive as LL_CONNECTION_PARAM_REQ, same final parameters). Known gap: HCI LE Connection Update 0x2013 (C.62) must be implemented before claiming feature bit 3 / 0x2016
+- **Slice 7 (DONE except item 4)**: open controller is the default build (`conf/blob.conf` for `--blob`); Host NCP 0x0C35 accepted silently; latency holdoff 1 s after connect; channel-map-instant skip rule (idle 93-95 % -> 96.4 % under PC AFH); owed LLCP PDUs retried; SCAN_RSP at T_IFS 150 us from the RAM RF ISR (settle Kconfig default 63, rsp_late 3.4 % idle / 35 % loaded); RX flow control (27-octet upload no longer drops the link); flash window (hal flash erase/write wrapped: 10/10 USB uploads under BLE load without the 0x3D MIC loss); late instants judged vs the RX event with bounded catch-up (0x28 after 6/0/42: 11/28 -> 0/140); CCC load at boot (connect -> encryption 1.1 s -> 0.12 s); USB mcumgr fixes (zephyr 0010/0011). **Item 4 (reconnect speed after wake) pending, needs a keypress.**
+- **Open items**: one unexplained 0x08 in 140 connects; echo latency max ~444 ms (first echo under latency 30; host cooperative threads under investigation); Zephyr "Controller to host flow control not supported" boot warning; only BlueZ/Intel central tested
+- Parallel: email Telink for blob redistribution permission (and the 2M register sequence)
 
 ### Next — Other
 - Continue SRAM variable analysis (~216 gp refs remain as Tier-4 annotations, 7 `DAT_ram_` unnamed — 75% coverage)
@@ -268,5 +289,5 @@ Own peripheral-only link layer behind the `b91_bt.h` seam on hal_telink `rf.c` (
 - OTA protocol is write-only — SWS via Burning EVK is the only way to read flash
 - For bigger research tasks, the user has an external deep-research LLM available — provide a prompt and the user will return the research results
 - Ghidra headless Java scripts are broken in 12.0.1 (OSGi error) — use PyGhidra instead
-- **ZMK build**: requires Zephyr SDK 0.17.0 (not 0.17.4), set `ZEPHYR_SDK_INSTALL_DIR=$(pwd)/toolchain/zephyr-sdk-0.17.0`, pass `-DEXTRA_CONF_FILE=$(pwd)/conf/app.conf` — see [docs/zmk-firmware.md](docs/zmk-firmware.md)
+- **ZMK build**: `./build.sh -p --iso` (open controller by default; `--blob` for the Telink blob, `--privacy` for RPA). Requires Zephyr SDK 0.17.0 (not 0.17.4), set `ZEPHYR_SDK_INSTALL_DIR=$(pwd)/toolchain/zephyr-sdk-0.17.0`; manual builds pass `-DEXTRA_CONF_FILE="$(pwd)/conf/app.conf;$(pwd)/conf/openll.conf"` (see [docs/zmk-firmware.md](docs/zmk-firmware.md))
 - **Environment**: Arch Linux distrobox, use `pacman` not `dnf`

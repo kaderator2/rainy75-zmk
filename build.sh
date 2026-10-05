@@ -124,8 +124,8 @@ fi
 # blob build exactly as before (no openll.conf, blob selected explicitly).
 if [ "$USE_BLOB" -eq 1 ]; then
     if [ "$USE_PRIVACY" -eq 1 ]; then
-        echo "Error: --privacy cannot be combined with --blob (the Telink blob does not" >&2
-        echo "       support LE Set Random Address). Drop --blob to use the open controller." >&2
+        echo "Error: --privacy cannot be combined with --blob (privacy is only tested with" >&2
+        echo "       the open controller). Drop --blob to use the open controller." >&2
         exit 1
     fi
     APP_CONF="$APP_CONF;$(pwd)/conf/blob.conf"
