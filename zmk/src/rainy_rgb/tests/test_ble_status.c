@@ -608,6 +608,118 @@ static void test_digit_flash_once(void) {
 	CHECK(eq(px[NUM(0)], SENT));
 }
 
+/* The normal effect is off whenever an automatic BLE animation is visible
+ * (no Fn needed): switch confirm, connected solid + fade, red flashes,
+ * blink/breathe of the active slot while shown (BLE output, hold window),
+ * passkey guidance, verify chase, digit flash. The Fn overview alone and
+ * gated (not shown) steady animations keep it. */
+static void test_suppress_effect(void) {
+	#define SUP(t) rrgb_ble_suppress_effect(t)
+	rrgb_ble_init(&KEYS);
+	CHECK(!SUP(0));
+
+	/* baseline: slot 0 connects at 0, solid + fade, then the effect returns */
+	reset();
+	CHECK(SUP(0) && SUP(RRGB_BLE_CONN_SOLID + RRGB_BLE_CONN_FADE - 1));
+	CHECK(!SUP(RRGB_BLE_CONN_SOLID + RRGB_BLE_CONN_FADE) && !SUP(QUIET));
+	for (uint32_t t = 0; t < QUIET; t += 7) { CHECK(SUP(t) == rrgb_ble_active(t)); }
+
+	/* Fn overview alone: no suppression */
+	rrgb_ble_set_fn(true);
+	CHECK(rrgb_ble_active(QUIET) && !SUP(QUIET));
+	rrgb_ble_set_fn(false);
+
+	/* switch to an empty slot: confirm, then pairing blink for the hold
+	 * window; off the whole time, back after the window */
+	uint32_t ts = QUIET;
+	slots(RRGB_BLE_CONNECTED, RRGB_BLE_EMPTY, RRGB_BLE_EMPTY, 1, ts);
+	CHECK(SUP(ts) && SUP(ts + SEL - 1) && SUP(ts + SEL));
+	uint32_t hold_end = ts + SEL + RRGB_BLE_STEADY_HOLD_FRAMES;
+	CHECK(SUP(hold_end - 1) && !SUP(hold_end));
+	/* Fn after the window shows the blink again, but that is not automatic */
+	rrgb_ble_set_fn(true);
+	CHECK(rrgb_ble_active(hold_end) && !SUP(hold_end));
+	rrgb_ble_set_fn(false);
+
+	/* connecting breathe (PAIRED active) on BLE output: off while shown */
+	reset();
+	slots(RRGB_BLE_CONNECTED, RRGB_BLE_PAIRED, RRGB_BLE_EMPTY, 0, QUIET);
+	slots(RRGB_BLE_CONNECTED, RRGB_BLE_PAIRED, RRGB_BLE_EMPTY, 1, QUIET + 100);
+	CHECK(SUP(QUIET + 100 + SEL + 500));
+	/* ... gated on USB output: only the switch confirm suppresses */
+	rrgb_ble_set_output_ble(false);
+	CHECK(!SUP(QUIET + 100 + SEL + 500));
+	slots(RRGB_BLE_CONNECTED, RRGB_BLE_PAIRED, RRGB_BLE_EMPTY, 2, QUIET + 1000);
+	CHECK(SUP(QUIET + 1000 + SEL - 1) && !SUP(QUIET + 1000 + SEL));
+
+	/* full passkey pairing on an empty slot: off from the blink through the
+	 * request, digits, chase, until PAIRED_OK solid + fade ended */
+	reset();
+	slots(RRGB_BLE_CONNECTED, RRGB_BLE_EMPTY, RRGB_BLE_EMPTY, 1, QUIET);
+	uint32_t t = QUIET + 100;
+	rrgb_ble_event(RRGB_BLE_EV_PASSKEY_REQ, 1, 0, t);
+	CHECK(SUP(t) && SUP(t + 500));
+	rrgb_ble_event(RRGB_BLE_EV_PASSKEY_DIGITS, 1, 6, t + 600);
+	rrgb_ble_event(RRGB_BLE_EV_PASSKEY_SUBMITTED, 1, 0, t + 700);
+	/* the chase outlasts the hold window (shown regardless of it) */
+	CHECK(SUP(t + 700) && SUP(QUIET + SEL + RRGB_BLE_STEADY_HOLD_FRAMES + 10));
+	uint32_t ok = QUIET + SEL + RRGB_BLE_STEADY_HOLD_FRAMES + 20;
+	rrgb_ble_event(RRGB_BLE_EV_PAIRED_OK, 1, 0, ok);
+	slots(RRGB_BLE_CONNECTED, RRGB_BLE_CONNECTED, RRGB_BLE_EMPTY, 1, ok + 3);
+	CHECK(SUP(ok + RRGB_BLE_CONN_SOLID + RRGB_BLE_CONN_FADE - 1));
+	CHECK(!SUP(ok + RRGB_BLE_CONN_SOLID + RRGB_BLE_CONN_FADE));
+
+	/* wrong code: off until the red flash (slot + keys 1..6) ended; a
+	 * duplicate FAILED one frame later extends it with the flash; the slot
+	 * blink after the flash is still within its hold window */
+	reset();
+	rrgb_ble_set_output_ble(false);   /* no steady: isolate the flash */
+	slots(RRGB_BLE_CONNECTED, RRGB_BLE_EMPTY, RRGB_BLE_EMPTY, 1, QUIET);
+	rrgb_ble_event(RRGB_BLE_EV_PASSKEY_REQ, 1, 0, QUIET + 10);
+	rrgb_ble_event(RRGB_BLE_EV_PASSKEY_SUBMITTED, 1, 0, QUIET + 20);
+	uint32_t tf = QUIET + 140;
+	rrgb_ble_event(RRGB_BLE_EV_FAILED, 1, 0, tf);
+	rrgb_ble_event(RRGB_BLE_EV_FAILED, 1, 0, tf + 1);
+	CHECK(SUP(tf + RRGB_BLE_FLASH_TOTAL));
+	CHECK(!SUP(tf + 1 + RRGB_BLE_FLASH_TOTAL));
+	rrgb_ble_set_output_ble(true);
+	CHECK(SUP(tf + 1 + RRGB_BLE_FLASH_TOTAL));   /* BLE: the blink follows */
+
+	/* passkey timeout / Esc (FAILED during the request) */
+	reset();
+	rrgb_ble_event(RRGB_BLE_EV_PASSKEY_REQ, 2, 0, QUIET);
+	rrgb_ble_event(RRGB_BLE_EV_FAILED, 2, 0, QUIET + 50);
+	CHECK(SUP(QUIET + 50 + RRGB_BLE_FLASH_TOTAL - 1));
+	CHECK(!SUP(QUIET + 50 + RRGB_BLE_FLASH_TOTAL));
+
+	/* every red flash, also on a background slot: lost, cleared */
+	reset();
+	slots(RRGB_BLE_CONNECTED, RRGB_BLE_CONNECTED, RRGB_BLE_EMPTY, 0, QUIET);
+	uint32_t tl = QUIET + RRGB_BLE_CONN_SOLID + RRGB_BLE_CONN_FADE;
+	CHECK(!SUP(tl));
+	slots(RRGB_BLE_CONNECTED, RRGB_BLE_PAIRED, RRGB_BLE_EMPTY, 0, tl);   /* LOST */
+	CHECK(SUP(tl) && SUP(tl + RRGB_BLE_FLASH_TOTAL - 1) && !SUP(tl + RRGB_BLE_FLASH_TOTAL));
+	rrgb_ble_event(RRGB_BLE_EV_CLEARED, 1, 0, tl + 500);
+	CHECK(SUP(tl + 500) && !SUP(tl + 500 + RRGB_BLE_FLASH_TOTAL));
+
+	/* Just Works: blink, then PAIRED_OK solid + fade */
+	reset();
+	slots(RRGB_BLE_CONNECTED, RRGB_BLE_EMPTY, RRGB_BLE_EMPTY, 1, QUIET);
+	rrgb_ble_event(RRGB_BLE_EV_PAIRED_OK, 1, 0, QUIET + 300);
+	slots(RRGB_BLE_CONNECTED, RRGB_BLE_CONNECTED, RRGB_BLE_EMPTY, 1, QUIET + 302);
+	CHECK(SUP(QUIET + 300 + RRGB_BLE_CONN_SOLID + RRGB_BLE_CONN_FADE - 1));
+	CHECK(!SUP(QUIET + 300 + RRGB_BLE_CONN_SOLID + RRGB_BLE_CONN_FADE));
+
+	/* safety ends */
+	reset();
+	rrgb_ble_event(RRGB_BLE_EV_PASSKEY_REQ, 0, 0, QUIET);
+	CHECK(SUP(QUIET + RRGB_BLE_PASSKEY_MAX - 1) && !SUP(QUIET + RRGB_BLE_PASSKEY_MAX));
+	reset();
+	rrgb_ble_event(RRGB_BLE_EV_PASSKEY_SUBMITTED, 0, 0, QUIET);
+	CHECK(SUP(QUIET + RRGB_BLE_VERIFY_MAX - 1) && !SUP(QUIET + RRGB_BLE_VERIFY_MAX));
+	#undef SUP
+}
+
 /* Just Works (host without display, no passkey request): fast blink goes
  * straight to PAIRED_OK solid + fade, the number row and Enter untouched. */
 static void test_just_works(void) {
@@ -903,6 +1015,7 @@ int main(void) {
 	test_just_works();
 	test_verify_review();
 	test_digit_flash_once();
+	test_suppress_effect();
 	test_pairing_timeout();
 	test_multi_slot();
 	test_active_exact();

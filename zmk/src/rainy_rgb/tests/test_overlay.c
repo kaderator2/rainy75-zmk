@@ -119,11 +119,11 @@ static void test_ble(void) {
 
     /* reactive presses: suppressed while the Fn layer is held */
     rrgb_overlay_set_fn(true);
-    CHECK(!rrgb_overlay_key_reactive(POS_F(0)));
-    CHECK(!rrgb_overlay_key_reactive(31));
+    CHECK(!rrgb_overlay_key_reactive(POS_F(0), t + RRGB_BLE_SELECT_TOTAL));
+    CHECK(!rrgb_overlay_key_reactive(31, t + RRGB_BLE_SELECT_TOTAL));
     rrgb_overlay_set_fn(false);
-    CHECK(rrgb_overlay_key_reactive(POS_F(0)));
-    CHECK(rrgb_overlay_key_reactive(31));
+    CHECK(rrgb_overlay_key_reactive(POS_F(0), t + RRGB_BLE_SELECT_TOTAL));
+    CHECK(rrgb_overlay_key_reactive(31, t + RRGB_BLE_SELECT_TOTAL));
 
     /* build without BLE: ble owns nothing, Fn-highlight unchanged */
     rrgb_overlay_init(false);
@@ -136,6 +136,59 @@ static void test_ble(void) {
     CHECK(eq(at(px, POS_NUM(0)), white(0)));
     rrgb_overlay_set_fn(false);
     CHECK(!rrgb_overlay_active(t));         /* ble state ignored without BLE */
+    CHECK(!rrgb_overlay_suppress_effect(t));
+
+    rrgb_ble_event(RRGB_BLE_EV_FAILED, 0, 0, t);
+    CHECK(!rrgb_overlay_suppress_effect(t));   /* nor its flashes */
+
+    /* with BLE: any automatic BLE animation turns the effect off, and the
+     * overlay stays active meanwhile (rail on even with RGB off) */
+    rrgb_overlay_init(true);
+    CHECK(!rrgb_overlay_suppress_effect(t));
+    CHECK(rrgb_overlay_key_reactive(31, t));
+    rrgb_ble_event(RRGB_BLE_EV_PASSKEY_REQ, 1, 0, t);
+    CHECK(rrgb_overlay_suppress_effect(t));
+    CHECK(rrgb_overlay_active(t));
+    /* presses while suppressed leave no reactive trace (typed digits) */
+    CHECK(!rrgb_overlay_key_reactive(31, t));
+    rrgb_ble_event(RRGB_BLE_EV_FAILED, 1, 0, t + 1);
+    CHECK(rrgb_overlay_suppress_effect(t + RRGB_BLE_FLASH_TOTAL));
+    CHECK(rrgb_overlay_active(t + RRGB_BLE_FLASH_TOTAL));
+    CHECK(!rrgb_overlay_suppress_effect(t + 1 + RRGB_BLE_FLASH_TOTAL));
+    CHECK(rrgb_overlay_key_reactive(31, t + 1 + RRGB_BLE_FLASH_TOTAL));
+    /* suppress implies active, frame by frame, through a switch + blink */
+    const uint8_t one_empty[3] = {RRGB_BLE_CONNECTED, RRGB_BLE_EMPTY, RRGB_BLE_EMPTY};
+    rrgb_ble_set_output_ble(true);
+    rrgb_ble_set_slots(one_empty, 0, t + 100);
+    rrgb_ble_set_slots(one_empty, 1, t + 300);
+    for (uint32_t k = t; k < t + 3000; k++) {
+        if (rrgb_overlay_suppress_effect(k)) { CHECK(rrgb_overlay_active(k)); }
+    }
+    CHECK(rrgb_overlay_suppress_effect(t + 400));
+}
+
+/* Effect gain: fast fade out when suppressed, smooth fade back in. */
+static void test_effect_gain(void) {
+    uint8_t g = 255;
+    int n = 0;
+    while (g > 0) { g = rrgb_effect_gain_next(g, true); n++; CHECK(n < 100); }
+    CHECK(n >= RRGB_EFFECT_FADE_OUT_FRAMES - 1 && n <= RRGB_EFFECT_FADE_OUT_FRAMES);
+    CHECK(rrgb_effect_gain_next(0, true) == 0);
+    n = 0;
+    uint8_t prev = 0;
+    while (g < 255) {
+        g = rrgb_effect_gain_next(g, false);
+        CHECK(g > prev);
+        prev = g;
+        n++;
+        CHECK(n < 100);
+    }
+    CHECK(n >= RRGB_EFFECT_FADE_IN_FRAMES - 1 && n <= RRGB_EFFECT_FADE_IN_FRAMES);
+    CHECK(rrgb_effect_gain_next(255, false) == 255);
+    /* suppression mid fade-in turns around from where it is */
+    g = rrgb_effect_gain_next(0, false);
+    g = rrgb_effect_gain_next(g, false);
+    CHECK(rrgb_effect_gain_next(g, true) < g);
 }
 
 int main(void) {
@@ -201,5 +254,6 @@ int main(void) {
     CHECK(!rrgb_overlay_active(100));          /* nothing active */
 
     test_ble();
+    test_effect_gain();
     DONE();
 }

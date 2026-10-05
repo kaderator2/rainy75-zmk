@@ -130,6 +130,10 @@ static struct rrgb_runtime rt = {
 };
 static struct rrgb pixels[RRGB_N];
 static uint32_t anim_phase_q8;   /* .8 fixed-point animation phase accumulator */
+/* Effect layer gain (render thread only): faded to 0 while ble_status shows
+ * an automatic BLE animation (connecting / switching / pairing, see
+ * rrgb_overlay_suppress_effect), back to 255 after. */
+static uint8_t effect_gain = 255;
 
 /* Render-loop liveness beat (see rrgb_heartbeat). Written by the render thread,
  * read from the mcumgr (SMP) thread; a 32-bit aligned load is atomic on this
@@ -188,13 +192,26 @@ static void render_once(void) {
         .ripple_count = rrgb_ripple_pool_size(),
         .key_heat = rrgb_key_heat(),
     };
+    /* BLE connecting / switching / pairing: the effect is off, the board
+     * shows only the BLE status and the other overlays. Host direct mode is
+     * not affected: an explicit host frame, not the normal effect. */
+    effect_gain = rrgb_effect_gain_next(effect_gain,
+                                        rrgb_overlay_suppress_effect(rt.tick));
     if (host_mode) {
         /* Host direct mode: the host's buffer replaces the effect layer. */
         for (uint16_t i = 0; i < RRGB_N; i++) { pixels[i] = host_px[i]; }
-    } else if (rt.on) {
+    } else if (rt.on && effect_gain > 0) {
         rrgb_effects[rt.effect].render(&f);
+        if (effect_gain < 255) {
+            for (uint16_t i = 0; i < RRGB_N; i++) {
+                pixels[i].r = scale8(pixels[i].r, effect_gain);
+                pixels[i].g = scale8(pixels[i].g, effect_gain);
+                pixels[i].b = scale8(pixels[i].b, effect_gain);
+            }
+        }
     } else {
-        /* RGB toggled off: black base so functional overlays still show. */
+        /* RGB toggled off or effect suppressed: black base so functional
+         * overlays still show. */
         for (uint16_t i = 0; i < RRGB_N; i++) { pixels[i] = (struct rrgb){0, 0, 0}; }
     }
     rrgb_overlay_render(pixels, RRGB_N, rt.tick);
@@ -432,9 +449,10 @@ void rrgb_set_idle(bool idle) {
     }
 }
 void rrgb_on_key(uint32_t position, bool pressed) {
-    /* Fn-layer presses (BT slot, output, media, RGB controls) leave no
+    /* Fn-layer presses (BT slot, output, media, RGB controls) and presses
+     * while the effect is suppressed for BLE (passkey digits) leave no
      * reactive trace: see rrgb_overlay_key_reactive(). */
-    if (pressed && rrgb_overlay_key_reactive(position)) {
+    if (pressed && rrgb_overlay_key_reactive(position, rt.tick)) {
         rt.last_press_tick = rt.tick;
         rrgb_reactive_on_press(position, rt.tick);
     }

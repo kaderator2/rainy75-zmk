@@ -66,9 +66,23 @@ void rrgb_overlay_set_fn(bool active)      { s_fn = active; rrgb_ble_set_fn(acti
 void rrgb_overlay_set_battery(uint8_t pct) { s_battery = pct; }
 void rrgb_overlay_battery_show(uint32_t tick) { s_bat_until = tick + BAT_SHOW_FRAMES; }
 
-bool rrgb_overlay_key_reactive(uint32_t position) {
+bool rrgb_overlay_suppress_effect(uint32_t tick) {
+    return s_ble && rrgb_ble_suppress_effect(tick);
+}
+
+#define GAIN_OUT_STEP ((255 + RRGB_EFFECT_FADE_OUT_FRAMES - 1) / RRGB_EFFECT_FADE_OUT_FRAMES)
+#define GAIN_IN_STEP  ((255 + RRGB_EFFECT_FADE_IN_FRAMES - 1) / RRGB_EFFECT_FADE_IN_FRAMES)
+
+uint8_t rrgb_effect_gain_next(uint8_t gain, bool suppress) {
+    if (suppress) {
+        return gain > GAIN_OUT_STEP ? (uint8_t)(gain - GAIN_OUT_STEP) : 0;
+    }
+    return gain < 255 - GAIN_IN_STEP ? (uint8_t)(gain + GAIN_IN_STEP) : 255;
+}
+
+bool rrgb_overlay_key_reactive(uint32_t position, uint32_t tick) {
     (void)position;   /* every Fn-layer press is a command, not only F1..F4 */
-    return !s_fn;
+    return !s_fn && !rrgb_overlay_suppress_effect(tick);
 }
 
 bool rrgb_overlay_active(uint32_t tick) {

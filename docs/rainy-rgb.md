@@ -31,7 +31,8 @@ The board DTS exposes the strip as `chosen zmk,underglow = &led_strip` (driver
 
 ```
 reactive_tick (drain key presses → ripples + heat)
-  → effect renders into pixels[]  (or black base if RGB toggled off)
+  → effect renders into pixels[]  (or black base if RGB toggled off; scaled by the
+                                    effect gain, black while a BLE animation shows)
   → overlay_render  (Fn-highlight base-override, then CapsLock, then battery gauge,
                      then BLE slot status last)
   → led_strip_update_rgb  (~2.66 ms DMA; render thread sleeps on the End-IRQ)
@@ -182,6 +183,31 @@ ripple/heat and `last_press_tick` for every press, not only F1..F4. All Fn
 combinations are commands (BT slots, output, media, RGB controls), and without
 this a quickly released Fn left the reactive afterglow on the pressed F-key.
 
+**Effect off during BLE connecting / switching / pairing.** While
+`ble_status` shows any automatic animation (no Fn needed), the normal effect is
+off and the board is dark except the BLE indicators and the other functional
+overlays (CapsLock, Fn-highlight, battery gauge): the switch confirm, the
+connected solid + fade, every red flash (lost, failed, cleared, open slot
+timeout, also on a background slot), the active slot's fast blink or breathe
+only while it is shown (BLE output, 30 s hold window, as gated above), the
+passkey guidance, the verify chase and the red digit flash.
+`rrgb_ble_suppress_effect(tick)` answers this; `rrgb_overlay_suppress_effect()`
+adds the BLE build check. The Fn overview alone (including the blink shown
+only because Fn is held) does not count. The engine keeps an effect gain
+(`rrgb_effect_gain_next()`): down to 0 over 0.1 s
+(`RRGB_EFFECT_FADE_OUT_FRAMES`), then the effect is not rendered at all, and
+back to full over 0.5 s (`RRGB_EFFECT_FADE_IN_FRAMES`) once no BLE animation
+shows. Suppression implies `rrgb_overlay_active()`, so the frame loop and the
+LED rail stay on through the window also with RGB toggled off. Key presses
+while suppressed leave no reactive trace (`rrgb_overlay_key_reactive()` is
+false, like with Fn held): the passkey digits typed during pairing would
+otherwise bump the heat map, start ripples and step the walker invisibly, and
+the reactive effects would pop with that stale state when the effect returns.
+The reactive state itself keeps decaying every frame meanwhile (frames run
+during the window), so older presses are gone by then too. Host direct mode
+(`rgb_mgmt`) is not suppressed: its frame is an explicit host request, not the
+normal effect; the BLE indicators still render on top of it.
+
 Render order: `ble_status` is drawn last, so F1..F4 replace the Fn-highlight
 white and the passkey guidance wins over the battery gauge on the number row;
 it never paints any other key. Key positions (F1..F4 = 1..4, number row
@@ -309,7 +335,9 @@ same SMP transport as DFU (USB CDC-ACM serial). Group 65, four commands:
 Positions are **keymap positions** (0..82, row-major), translated through
 `led_map` on the device — the same host code works on ISO and ANSI boards.
 Host mode is not persisted (reboot/deep sleep return to the normal effect),
-functional overlays (CapsLock / Fn-highlight / battery) still render on top,
+functional overlays (CapsLock / Fn-highlight / battery / BLE status) still
+render on top, host frames are not blanked during BLE connecting or pairing
+(only the normal effect is),
 and **any physical Fn+RGB control exits host mode** — a stray script can never
 lock the user out of their lighting.
 
@@ -402,6 +430,8 @@ which shipped USB work only) are omitted.
   row (`ble_status`), fed by ZMK patch 0006; verify chase after Enter and red
   digit flash on a wrong code (0006/0007), open slot timeout (0008). See
   [BLE slot status](#ble-slot-status-and-passkey-guidance).
+  The normal effect is off (0.1 s fade out, 0.5 s fade in) while any
+  automatic BLE animation shows; presses meanwhile leave no reactive trace.
 
 - **v0.2.2** — Root-cause correction for the dark-strip bug (#30): it's a stack
   overflow. The B91 has no PMP stack guard and the BLE RX stack sits directly

@@ -25,9 +25,26 @@ void rrgb_overlay_render(struct rrgb *px, uint16_t n, uint32_t tick);
  * renders indicators even when the decorative RGB is toggled off. */
 bool rrgb_overlay_active(uint32_t tick);
 
+/* True while ble_status shows an automatic BLE animation (connecting,
+ * switching, pairing, see rrgb_ble_suppress_effect): the engine renders the
+ * effect layer black (fading), the overlays still render on top. Always
+ * false in a build without BLE. Implies rrgb_overlay_active(tick), so the
+ * LED rail stays on with RGB off. */
+bool rrgb_overlay_suppress_effect(uint32_t tick);
+
+/* Effect layer gain 0..255 for the next frame: down to 0 over
+ * RRGB_EFFECT_FADE_OUT_FRAMES while suppressed, back to 255 over
+ * RRGB_EFFECT_FADE_IN_FRAMES after. Pure, the engine keeps the value. */
+#define RRGB_EFFECT_FADE_OUT_FRAMES  5    /* 0.1 s at 50 FPS */
+#define RRGB_EFFECT_FADE_IN_FRAMES  25    /* 0.5 s */
+uint8_t rrgb_effect_gain_next(uint8_t gain, bool suppress);
+
 /* False while the Fn layer is held: Fn combinations are commands (BT slots,
  * output, media, RGB controls), not typing, so they leave no reactive
- * afterglow or ripple; the indicators own those keys. */
-bool rrgb_overlay_key_reactive(uint32_t position);
+ * afterglow or ripple; the indicators own those keys. Also false while the
+ * effect is suppressed (tick = current render frame): the passkey digits
+ * typed during pairing would otherwise leave invisible reactive state
+ * (heat, ripples, the walker's step) that pops when the effect returns. */
+bool rrgb_overlay_key_reactive(uint32_t position, uint32_t tick);
 
 #endif

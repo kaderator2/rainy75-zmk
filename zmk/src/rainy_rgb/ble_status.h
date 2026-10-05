@@ -100,4 +100,13 @@ bool rrgb_ble_render(struct rrgb *px, uint16_t n, uint32_t tick);
 /* Anything to draw (keeps the frame loop alive with RGB off). */
 bool rrgb_ble_active(uint32_t tick);
 
+/* An automatic animation is visible this frame (no Fn needed): a switch
+ * confirm, connected solid + fade or red flash on any slot, the active
+ * slot's blink/breathe while shown without Fn (BLE output, hold window),
+ * the passkey guidance, the verify chase or the digit flash. The engine
+ * turns the normal effect off meanwhile (the board stays dark except the
+ * functional overlays). The Fn overview alone does not count. Implies
+ * rrgb_ble_active(tick). */
+bool rrgb_ble_suppress_effect(uint32_t tick);
+
 #endif

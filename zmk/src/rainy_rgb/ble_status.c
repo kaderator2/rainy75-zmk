@@ -110,15 +110,20 @@ static uint32_t steady_origin(uint8_t s) {
 	return origin;
 }
 
-/* Slot s shows its steady (blink/breathe) animation this frame. */
-static bool steady_shown(uint8_t s, uint32_t tick) {
+/* Slot s shows its steady (blink/breathe) animation this frame without Fn. */
+static bool steady_auto(uint8_t s, uint32_t tick) {
 	if (s == s_vf_slot && vf_running(tick)) {
 		return true;   /* verifying: the pairing slot blinks, also on a re-pair over a bond */
 	}
 	if (s != s_active || s_state[s] == RRGB_BLE_CONNECTED) { return false; }
-	if (s_fn) { return true; }
 	int32_t dt = since(tick, steady_origin(s));
 	return s_output_ble && dt >= 0 && dt < RRGB_BLE_STEADY_HOLD_FRAMES;
+}
+
+/* Slot s shows its steady animation this frame (Fn held: always). */
+static bool steady_shown(uint8_t s, uint32_t tick) {
+	if (steady_auto(s, tick)) { return true; }
+	return s_fn && s == s_active && s_state[s] != RRGB_BLE_CONNECTED;
 }
 
 static void start_anim(uint8_t s, uint8_t kind, uint32_t tick) {
@@ -252,6 +257,14 @@ bool rrgb_ble_active(uint32_t tick) {
 		if (anim_running(s, tick)) { return true; }
 	}
 	return s_active < RRGB_BLE_SLOTS && steady_shown(s_active, tick);
+}
+
+bool rrgb_ble_suppress_effect(uint32_t tick) {
+	if (pk_running(tick) || vf_running(tick) || df_running(tick)) { return true; }
+	for (uint8_t s = 0; s < RRGB_BLE_SLOTS; s++) {
+		if (anim_running(s, tick)) { return true; }
+	}
+	return s_active < RRGB_BLE_SLOTS && steady_auto(s_active, tick);
 }
 
 static bool put(struct rrgb *px, uint16_t n, uint8_t led, struct rrgb c) {
