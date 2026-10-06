@@ -72,6 +72,7 @@ static struct usb_dc_b91_state state;
 #define USB_SRAM_SIZE 256
 
 static uint8_t usb_sram_next;  /* next free byte in USB SRAM (bump allocator) */
+static uint8_t iso_mode_shadow; /* B91_USB_ISO_MODE as written: bit set = ISO EP */
 
 /* ========================================================================== *
  *  USB Diagnostic Event Ring                                                  *
@@ -913,6 +914,11 @@ int usb_dc_attach(void)
 		usb_write8(B91_USB_EP_BUF_ADDR(i), 0);
 	}
 
+	/* 6c. No ISO EPs until one is configured as such: the register
+	 * resets to 0xC0 (EP6/EP7 isochronous), see usb_dc_ep_configure(). */
+	iso_mode_shadow = 0;
+	usb_write8(B91_USB_ISO_MODE, iso_mode_shadow);
+
 	/* 7. Timing calibration (required per SDK/original firmware) */
 	usb_write8(B91_USB_SUPS_CYC_CALI, B91_USB_TIMING_CALIB);
 
@@ -1381,6 +1387,26 @@ int usb_dc_ep_configure(const struct usb_dc_ep_cfg_data *const cfg)
 	state.ep[n].type = cfg->ep_type;
 
 	/*
+	 * Transfer mode per EP.  The ISO mode register resets to 0xC0: EP6
+	 * (OUT) and EP7 (IN) come up isochronous, meant for audio.  A bulk or
+	 * interrupt EP there would run without handshakes: the first packets
+	 * get through, then flow control breaks (seen with a second CDC ACM
+	 * port on EP6/EP7).  Set the bit from the EP type instead.  Written
+	 * from a shadow that attach clears before enumeration: a variant that
+	 * read-modify-wrote the register here, at SET_CONFIGURATION only, once
+	 * delivered garbled string descriptors (EP0 repeated a packet); this
+	 * version gave 20 of 20 clean enumerations.
+	 */
+	if (n >= 1 && n <= 7) {
+		if (cfg->ep_type == USB_DC_EP_ISOCHRONOUS) {
+			iso_mode_shadow |= b91_ep_bit(n);
+		} else {
+			iso_mode_shadow &= ~b91_ep_bit(n);
+		}
+		usb_write8(B91_USB_ISO_MODE, iso_mode_shadow);
+	}
+
+	/*
 	 * Note: EP_MAX_SIZE is a GLOBAL register (applies to all data EPs).
 	 * It is set once to 64 bytes in usb_dc_attach() and must not be
 	 * overwritten here — a later ep_configure with a smaller MPS would
@@ -1403,7 +1429,10 @@ int usb_dc_ep_configure(const struct usb_dc_ep_cfg_data *const cfg)
 		bool is_out = !(cfg->ep_addr & 0x80); /* bit 7 = IN */
 		uint8_t buf_size = is_out ? 64 : ROUND_UP(cfg->ep_mps, 8);
 
-		if (is_out && cfg->ep_type == USB_DC_EP_BULK) {
+		/* The first bulk OUT EP is the console/mcumgr CDC ACM; a
+		 * second one (Studio CDC ACM) is not watched for starvation. */
+		if (is_out && cfg->ep_type == USB_DC_EP_BULK &&
+		    (diag_bulk_out_ep == 0 || diag_bulk_out_ep == n)) {
 			diag_bulk_out_ep = n;
 		}
 
