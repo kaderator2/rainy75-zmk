@@ -124,8 +124,10 @@ locks Studio again.
 1. Open **[zmk.studio](https://zmk.studio)**, choose **Connect → USB**.
 2. The keyboard has two serial ports. Pick the **Studio** one: with the included udev rules
    (`99-rainy75-zmk.rules`) Linux shows it as **"Rainy 75 Pro Studio"**; without them, or on
-   other systems, it's the second Rainy port (USB interface 3, the higher port number). The
-   other port is the log console and firmware updates.
+   other systems, it's the second Rainy port (USB interface 3, usually the higher port
+   number). On Windows both show as "USB Serial Device (COMx)"; Device Manager → Properties
+   → Details → Hardware IDs shows `MI_03` for the Studio port and `MI_00` for the other one.
+   The other port is the log console and firmware updates; picking it just doesn't connect.
 3. Press **`Fn + ESC`** on the keyboard to **unlock** editing.
 
 Over USB Studio is fast: about 300 requests per second (about 25 over Bluetooth).
