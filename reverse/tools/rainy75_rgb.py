@@ -160,6 +160,18 @@ def _cbor_decode(data, offset=0):
         ln, offset = arg(offset, minor)
         raw = data[offset:offset + ln]
         return (raw.decode() if major == 3 else raw), offset + ln
+    if major == 4:
+        result = []
+        if minor == 31:  # indefinite (zcbor non-canonical lists)
+            while offset < len(data) and data[offset] != 0xFF:
+                v, offset = _cbor_decode(data, offset)
+                result.append(v)
+            return result, offset + 1
+        cnt, offset = arg(offset, minor)
+        for _ in range(cnt):
+            v, offset = _cbor_decode(data, offset)
+            result.append(v)
+        return result, offset
     if major == 5:
         if minor == 31:  # indefinite
             result = {}

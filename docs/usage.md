@@ -12,10 +12,10 @@ combos below.
 | Combo | Action |
 |-------|--------|
 | **Fn + ESC** | ZMK Studio **unlock** (allow live keymap editing) |
-| **Fn + F1 / F2 / F3** | Select **Bluetooth profile 1 / 2 / 3** |
+| **Fn + F1 / F2 / F3** | Select **Bluetooth profile 1 / 2 / 3** (also switches from USB to Bluetooth) |
 | **Fn + F4** (or Fn + Home) | Toggle output **USB ↔ Bluetooth** |
 | **Fn + F5 … F12** | Media: prev · next · mute · vol− · vol+ · play/pause · bright− · bright+ |
-| **Fn + Del** | **Clear the current BT profile's bond** (then re-pair) |
+| **Fn + Del** | **Remove the selected Bluetooth profile's pairing** (then re-pair) |
 | **Fn + Backspace** | RGB on/off |
 | **Fn + Enter** | RGB: next effect |
 | **Fn + # (key left of Enter)** | RGB: cycle hue |
@@ -25,22 +25,90 @@ combos below.
 
 Full RGB details: [rainy-rgb.md](rainy-rgb.md).
 
-## Bluetooth
+## Bluetooth and USB
 
-This firmware keeps **three independent BLE profiles** (so you can pair three hosts and
-switch between them).
+The keyboard remembers **three Bluetooth hosts** (profiles 1, 2 and 3 on F1, F2 and F3)
+plus USB. Up to three hosts can stay connected at the same time; the keys go to the one
+you selected.
 
-- **Switch host:** `Fn + F1 / F2 / F3`.
-- **Pair a new host:** select a free profile (`Fn + F1/F2/F3`) — the keyboard advertises as
-  **"Rainy 75 Pro"** — then pair it from the host's Bluetooth settings.
-- **Wired vs wireless:** `Fn + F4` toggles the output between USB and BLE.
-- **Reset / re-pair a profile:** on the active profile, press **`Fn + Del`** — it clears
-  that bond and starts advertising again, so you can pair fresh. (Clear all three by doing
-  `Fn+F1 → Fn+Del`, `Fn+F2 → Fn+Del`, `Fn+F3 → Fn+Del`.)
-- **Radio on/off:** there's a physical wireless switch **under the CapsLock keycap**.
+### Quick reference
 
-> First connection after a cold boot can fail once and succeed on retry (a quirk of the
-> Telink BLE controller) — just reconnect.
+| I want to... | Do this |
+|---|---|
+| Pair a new host | `Fn + F1/F2/F3` on a free profile, pair "Rainy 75 Pro" on the host, type the code it shows, `Enter` |
+| Switch to another Bluetooth host | `Fn + F1 / F2 / F3` |
+| Switch to USB (cable plugged in) | `Fn + F4` (toggles USB and Bluetooth) |
+| Back to Bluetooth from USB | `Fn + F1/F2/F3` (switches to Bluetooth by itself) or `Fn + F4` |
+| Remove a pairing | `Fn + F1/F2/F3` to select it, then `Fn + Del`, and remove the keyboard on the host too |
+| See which profiles are paired | Hold `Fn` and look at F1 to F4 |
+
+Make sure the wireless switch **under the CapsLock keycap** is on.
+
+### Pair a new host
+
+1. Press `Fn + F1`, `Fn + F2` or `Fn + F3` to select a **free** profile. Its F-key
+   blinks blue fast: the keyboard is waiting for a new host.
+2. On the host, open the Bluetooth settings and pick **"Rainy 75 Pro"**.
+3. The host shows a **6-digit code**. The number row lights up dim white on the keyboard.
+   Type the code on the number row (keys 1 to 6 turn blue as you type) and press **Enter**.
+   The digits are not typed into any computer.
+4. Keys 1 to 6 run a blue chase while the host checks the code. When it is accepted the
+   F-key stays blue for 2 seconds and fades: done.
+
+If you mistype, just type all six digits again (the last six count) before Enter. `Esc`
+cancels. A wrong code flashes keys 1 to 6 and the F-key red; start again from the host.
+
+If no host pairs within **30 seconds**, the keyboard gives up: the free profile flashes red
+and the keyboard returns to the host you used before (or the last one that was connected).
+
+The profile must be free. To pair a host on a profile that is already taken, remove that
+pairing first (below).
+
+### Switch hosts, or between USB and Bluetooth
+
+- `Fn + F1 / F2 / F3` selects a Bluetooth host. Its F-key lights blue briefly. If that host
+  is not connected yet, the key breathes slowly until it connects (after a few seconds,
+  or once the host wakes up).
+- `Fn + F4` toggles between **USB** and **Bluetooth**. Selecting a Bluetooth profile while
+  on USB switches to Bluetooth by itself.
+- With the cable unplugged the keyboard always types over Bluetooth.
+
+While the keyboard connects, switches or pairs, the normal lighting effect turns off so the
+status lights are easy to see; it comes back by itself.
+
+### Remove a pairing
+
+1. `Fn + F1/F2/F3` to select the profile you want to free.
+2. `Fn + Del`. The F-key flashes red, then blinks fast: the profile is free and ready to pair.
+3. On the host, **remove / forget "Rainy 75 Pro"** in the Bluetooth settings. Without this
+   step the host keeps old keys and cannot pair again.
+
+Repeat for each profile to remove all of them.
+
+### What the F1 to F4 lights mean
+
+Hold **Fn** for an overview:
+
+| Key | Colour | Meaning |
+|---|---|---|
+| F1 to F3 | bright blue | selected profile, connected |
+| F1 to F3 | bright blue, blinking fast | selected profile, free, waiting for a new host |
+| F1 to F3 | bright blue, breathing | selected profile, paired, connecting |
+| F1 to F3 | dim blue | another host, connected in the background |
+| F1 to F3 | very dim blue | paired, not connected |
+| F1 to F3 | very dim white | free profile |
+| F4 | white | typing over USB |
+| F4 | cyan | typing over Bluetooth |
+
+Without Fn, the F-keys only light up when something happens: blinking or breathing while
+pairing or connecting (for up to 30 seconds), blue then fade when a host connects, and three
+red flashes when a connection is lost, a pairing fails or a pairing is removed. The full
+LED reference is in [rainy-rgb.md](rainy-rgb.md#ble-slot-status-and-passkey-guidance).
+
+### Waking up
+
+After 15 minutes without a keypress the keyboard sleeps. Press any key to wake it; it
+reconnects to the selected host within a few seconds (about 5 s measured).
 
 ## ZMK Studio (live keymap editing)
 

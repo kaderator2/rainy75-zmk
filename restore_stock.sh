@@ -34,7 +34,7 @@ header() { echo -e "\n${BOLD}$*${NC}"; }
 
 # ── Defaults ─────────────────────────────────────────────────
 FIRMWARE="reverse/firmware/firmware_ota.bin"
-SERIAL_PORT="${SERIAL_PORT:-/dev/ttyACM0}"
+SERIAL_PORT="${SERIAL_PORT:-}"   # empty: found by USB name, see resolve_serial_port
 EXTRA_ARGS=""
 AUTO_YES=0
 STOCK_VID="320f"
@@ -57,6 +57,19 @@ while [[ $# -gt 0 ]]; do
 done
 
 # ── Helpers ──────────────────────────────────────────────────
+# The keyboard's CDC ACM port: --port / SERIAL_PORT, else found by its USB
+# name (ZMK and the bridge both enumerate as "ZMK Project Rainy 75 ..."), so
+# another CDC ACM device (an nRF sniffer, a dev board) on /dev/ttyACM0 is
+# never written to.
+resolve_serial_port() {
+    [[ -n "$SERIAL_PORT" ]] && return 0
+    local link
+    for link in /dev/serial/by-id/usb-ZMK_Project_Rainy_75*; do
+        [[ -e "$link" ]] && { SERIAL_PORT=$(readlink -f "$link"); return 0; }
+    done
+    SERIAL_PORT=/dev/ttyACM0
+}
+
 check_usb() {
     lsusb -d "$1:$2" >/dev/null 2>&1
 }
@@ -93,6 +106,7 @@ if ! check_usb "$ZMK_VID" "$ZMK_PID"; then
 fi
 
 info "ZMK firmware detected."
+resolve_serial_port
 info "  Firmware: $FIRMWARE ($(wc -c < "$FIRMWARE" | tr -d ' ') bytes)"
 info "  Port: $SERIAL_PORT"
 

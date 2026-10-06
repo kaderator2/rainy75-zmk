@@ -21,6 +21,7 @@
 #include <string.h>
 
 #include "b91_bt.h"
+#include "b91_mac.h"
 
 #define LOG_LEVEL CONFIG_BT_HCI_DRIVER_LOG_LEVEL
 #include <zephyr/logging/log.h>
@@ -51,15 +52,6 @@ typedef int32_t  s32;
  * before yielding so BLE timing events fire during k_sleep(). */
 #define B91_PLIC_IRQ_EN0        0xe4002000UL
 #define B91_IRQ1_SYSTIMER       1
-
-/* Analog register serial interface (shared with USB driver).
- * Layout from SDK analog_reg.h: addr +0, ctrl +2, len +3, data +4. */
-#define B91_ANA_ADDR_REG        0x80140180UL
-#define B91_ANA_CTRL_REG        0x80140182UL
-#define B91_ANA_LEN_REG         0x80140183UL
-#define B91_ANA_DATA_REG        0x80140184UL
-#define B91_ANA_CTRL_CYC        BIT(6)  /* cycle/trigger */
-#define B91_ANA_CTRL_BUSY       BIT(7)  /* busy status */
 
 /* PM wakeup status (read from analog reg 0x64) */
 #define B91_WAKEUP_STATUS_TIMER BIT(1)
@@ -156,10 +148,6 @@ extern void rf_drv_ble_init(void);
 extern void trng_init(void);
 extern void rf_set_power_level_index(int level);
 
-/* Flash */
-extern void flash_read_page(u32 addr, u32 len, u8 *buf);
-extern void flash_write_page(u32 addr, u32 len, u8 *buf);
-
 /* Random */
 extern void generateRandomNum(int len, u8 *data);
 
@@ -179,11 +167,8 @@ extern void blc_ll_setAclConnMaxOctetsNumber(int maxRxOct, int maxMasTxOct, int 
 
 /* Connection config */
 extern void blc_ll_setMaxConnectionNumber(int masterNum, int slaveNum);
-extern void blc_ll_setAclMasterConnectionInterval(int intervalIdx);
-extern void blc_ll_setCreateConnectionTimeout(int timeoutMs);
 
 /* PHY / CSA */
-extern void blc_ll_init2MPhyCodedPhy_feature(void);
 extern void blc_ll_initChannelSelectionAlgorithm_2_feature(void);
 
 /* HCI FIFO init */
@@ -304,9 +289,6 @@ static u8 app_hci_rxAclfifo[HCI_RX_ACL_FIFO_SIZE * HCI_RX_ACL_FIFO_NUM];
 /* 32k RC calibration interval (seconds) */
 #define RC_CAL_INTERVAL_SEC   10
 
-/* MAC address flash offset — 1MB flash uses 0xFF000 */
-#define MAC_FLASH_ADDR 0xFF000
-
 #define BLE_SUCCESS 0
 
 #define BYTES_TO_UINT16(n, p) do { (n) = ((u16)(p)[0] + ((u16)(p)[1] << 8)); } while (0)
@@ -315,56 +297,6 @@ static u8 app_hci_rxAclfifo[HCI_RX_ACL_FIFO_SIZE * HCI_RX_ACL_FIFO_NUM];
 static struct {
 	b91_bt_host_callback_t callbacks;
 } b91_ctrl;
-
-/* -------------------------------------------------------------------------
- * MAC address init — ported from hal_telink b91_bt_init.c
- * ----------------------------------------------------------------------- */
-static void b91_bt_blc_mac_init(int flash_addr, u8 *mac_public,
-				u8 *mac_random_static)
-{
-	if (flash_addr == 0) {
-		return;
-	}
-
-	u8 mac_read[8];
-
-	flash_read_page(flash_addr, 8, mac_read);
-
-	u8 value_rand[5];
-
-	generateRandomNum(5, value_rand);
-
-	u8 ff_six_byte[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
-
-	if (memcmp(mac_read, ff_six_byte, 6)) {
-		memcpy(mac_public, mac_read, 6);
-	} else {
-		mac_public[0] = value_rand[0];
-		mac_public[1] = value_rand[1];
-		mac_public[2] = value_rand[2];
-		mac_public[3] = 0x38; /* company id: 0xA4C138 */
-		mac_public[4] = 0xC1;
-		mac_public[5] = 0xA4;
-
-		flash_write_page(flash_addr, 6, mac_public);
-	}
-
-	mac_random_static[0] = mac_public[0];
-	mac_random_static[1] = mac_public[1];
-	mac_random_static[2] = mac_public[2];
-	mac_random_static[5] = 0xC0; /* random static marker */
-
-	u16 high_2_byte = (mac_read[6] | mac_read[7] << 8);
-
-	if (high_2_byte != 0xFFFF) {
-		memcpy(&mac_random_static[3], &mac_read[6], 2);
-	} else {
-		mac_random_static[3] = value_rand[3];
-		mac_random_static[4] = value_rand[4];
-
-		flash_write_page(flash_addr + 6, 2, &mac_random_static[3]);
-	}
-}
 
 /* -------------------------------------------------------------------------
  * HCI TX handler — blob calls this to send data to host
@@ -413,25 +345,6 @@ static int b91_bt_hci_rx_handler(void)
 	}
 
 	return 0;
-}
-
-/* -------------------------------------------------------------------------
- * Analog register access (serial interface, not memory-mapped)
- * ----------------------------------------------------------------------- */
-
-static u8 b91_analog_read(u8 addr)
-{
-	unsigned int key = irq_lock();
-
-	sys_write8(addr, B91_ANA_ADDR_REG);
-	sys_write8(1, B91_ANA_LEN_REG);
-	sys_write8(B91_ANA_CTRL_CYC, B91_ANA_CTRL_REG);
-	while (sys_read8(B91_ANA_CTRL_REG) & B91_ANA_CTRL_BUSY) {
-	}
-	u8 val = sys_read8(B91_ANA_DATA_REG);
-
-	irq_unlock(key);
-	return val;
 }
 
 #ifdef CONFIG_POWEROFF
@@ -509,7 +422,7 @@ static int b91_bt_blc_init(void *prx, void *ptx)
 	u8 mac_public[6];
 	u8 mac_random_static[6];
 
-	b91_bt_blc_mac_init(MAC_FLASH_ADDR, mac_public, mac_random_static);
+	b91_mac_init(B91_MAC_FLASH_ADDR, generateRandomNum, mac_public, mac_random_static);
 
 	/* Core init */
 	blc_ll_initBasicMCU();
@@ -724,6 +637,11 @@ void b91_bt_host_send_packet(uint8_t type, uint8_t *data, uint16_t len)
 /* Deep sleep entry is handled by z_sys_poweroff() in poweroff.c.
  * The old pm_state_set/pm_state_exit_post_ops stubs were removed —
  * ZMK uses sys_poweroff() (not Zephyr idle PM) for deep sleep. */
+
+void b91_bt_controller_poweroff(void)
+{
+	/* Blob: nothing to do (kept identical to the behaviour before the hook). */
+}
 
 void b91_bt_host_callback_register(const b91_bt_host_callback_t *pcb)
 {

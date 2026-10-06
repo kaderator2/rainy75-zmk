@@ -1,0 +1,126 @@
+From c3b0194a254f71c2b0857c489be2e345cc060232 Mon Sep 17 00:00:00 2001
+From: scholzri <33288574+scholzri@users.noreply.github.com>
+Date: Mon, 5 Oct 2026 05:43:46 +0200
+Subject: [PATCH] mgmt: uart_mcumgr: keep log output out of SMP frames
+
+On a UART shared by the log and mcumgr (a CDC ACM console that also
+carries SMP), both write with uart_poll_out() byte by byte, from the
+log thread and the SMP work queue. A log message written while a
+response frame is going out lands inside the frame; the host drops the
+frame and the request times out. With a periodic log this costs one
+response every few seconds, and the windowed upload of the mcumgr CLI
+can then stall for good.
+
+Write a whole SMP frame under a mutex, and take the same mutex around
+each log message in the UART log backend (not in panic or ISR context).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/console/uart_mcumgr.c                | 24 +++++++++++++++++++-
+ include/zephyr/drivers/console/uart_mcumgr.h | 13 +++++++++++
+ subsys/logging/backends/log_backend_uart.c   | 19 ++++++++++++++++
+ 3 files changed, 55 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/console/uart_mcumgr.c b/drivers/console/uart_mcumgr.c
+index 2b068e6810..b662a2d5fa 100644
+--- a/drivers/console/uart_mcumgr.c
++++ b/drivers/console/uart_mcumgr.c
+@@ -212,9 +212,31 @@ static int uart_mcumgr_send_raw(const void *data, int len)
+ 	return 0;
+ }
+ 
++static K_MUTEX_DEFINE(uart_mcumgr_tx_mutex);
++
++void uart_mcumgr_tx_lock(void)
++{
++	(void)k_mutex_lock(&uart_mcumgr_tx_mutex, K_FOREVER);
++}
++
++void uart_mcumgr_tx_unlock(void)
++{
++	(void)k_mutex_unlock(&uart_mcumgr_tx_mutex);
++}
++
+ int uart_mcumgr_send(const uint8_t *data, int len)
+ {
+-	return mcumgr_serial_tx_pkt(data, len, uart_mcumgr_send_raw);
++	int rc;
++
++	/* One frame at a time with respect to other writers on this UART:
++	 * uart_poll_out() goes byte by byte, so without the lock a log
++	 * message written concurrently interleaves with the frame.
++	 */
++	uart_mcumgr_tx_lock();
++	rc = mcumgr_serial_tx_pkt(data, len, uart_mcumgr_send_raw);
++	uart_mcumgr_tx_unlock();
++
++	return rc;
+ }
+ 
+ 
+diff --git a/include/zephyr/drivers/console/uart_mcumgr.h b/include/zephyr/drivers/console/uart_mcumgr.h
+index 4950ed4a97..b7f602b6a4 100644
+--- a/include/zephyr/drivers/console/uart_mcumgr.h
++++ b/include/zephyr/drivers/console/uart_mcumgr.h
+@@ -68,6 +68,19 @@ void uart_mcumgr_free_rx_buf(struct uart_mcumgr_rx_buf *rx_buf);
+  */
+ void uart_mcumgr_register(uart_mcumgr_recv_fn *cb);
+ 
++/**
++ * @brief Serialize output on the mcumgr UART with other writers.
++ *
++ * uart_mcumgr_send() writes a whole SMP frame under this lock. Another
++ * writer that shares the UART (the UART log backend) takes it around each
++ * message, so its bytes cannot land inside an SMP frame (the receiver drops
++ * a frame that has foreign bytes in it). Must not be called from an ISR.
++ */
++void uart_mcumgr_tx_lock(void);
++
++/** @brief Release the lock taken by uart_mcumgr_tx_lock(). */
++void uart_mcumgr_tx_unlock(void);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/subsys/logging/backends/log_backend_uart.c b/subsys/logging/backends/log_backend_uart.c
+index ffc72bcb86..d976a76467 100644
+--- a/subsys/logging/backends/log_backend_uart.c
++++ b/subsys/logging/backends/log_backend_uart.c
+@@ -17,6 +17,9 @@
+ #include <zephyr/sys/__assert.h>
+ #include <zephyr/pm/device.h>
+ #include <zephyr/pm/device_runtime.h>
++#if defined(CONFIG_UART_MCUMGR)
++#include <zephyr/drivers/console/uart_mcumgr.h>
++#endif
+ LOG_MODULE_REGISTER(log_uart);
+ 
+ struct lbu_data {
+@@ -130,8 +133,24 @@ static void process(const struct log_backend *const backend,
+ 	struct lbu_data *data = ctx->data;
+ 	uint32_t flags = log_backend_std_get_flags();
+ 	log_format_func_t log_output_func = log_format_func_t_get(data->log_format_current);
++#if defined(CONFIG_UART_MCUMGR)
++	/* The log and mcumgr may share the UART (a CDC ACM console that also
++	 * carries SMP): write the whole message outside any SMP frame. Not in
++	 * panic or ISR context, where blocking is not allowed.
++	 */
++	bool lock = !data->in_panic && !k_is_in_isr();
++
++	if (lock) {
++		uart_mcumgr_tx_lock();
++	}
++#endif
+ 
+ 	log_output_func(ctx->output, &msg->log, flags);
++#if defined(CONFIG_UART_MCUMGR)
++	if (lock) {
++		uart_mcumgr_tx_unlock();
++	}
++#endif
+ }
+ 
+ static int format_set(const struct log_backend *const backend, uint32_t log_type)
+-- 
+2.53.0
+

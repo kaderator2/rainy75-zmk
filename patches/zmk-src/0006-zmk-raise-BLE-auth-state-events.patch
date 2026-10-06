@@ -1,0 +1,267 @@
+From 56d2dfa19b3f440b7c5fc895039d42e837271db0 Mon Sep 17 00:00:00 2001
+From: scholzri <33288574+scholzri@users.noreply.github.com>
+Date: Mon, 5 Oct 2026 14:32:06 +0200
+Subject: [PATCH] zmk: raise BLE auth state events
+
+Add a zmk_ble_auth_state_changed event so status indicators can follow
+pairing: PASSKEY_REQ (passkey entry requested), PASSKEY_DIGITS (digits
+typed so far), PASSKEY_SUBMITTED (Enter, the host now verifies the
+passkey), PAIRED_OK (pairing complete), FAILED (auth cancel, security
+failure, pairing failed or a pairing on a taken profile) and CLEARED
+(bond cleared). The profile is the bonded profile of the peer, else the
+active profile, where new pairings happen.
+
+The auth and security callbacks run in the BT RX thread, so every
+event goes through a message queue drained by a work item, like the
+existing profile changed work item. Thread-context sources (digits,
+submit, clear bonds) take the same path so all events stay in order.
+PASSKEY_SUBMITTED is queued before the passkey goes to the stack, so
+the result of the check always follows it.
+
+The event only reports: it changes no ZMK behaviour, so a board module
+can build its own policy (indicators, timeouts) on top of it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ app/CMakeLists.txt                            |  1 +
+ .../zmk/events/ble_auth_state_changed.h       | 29 ++++++++
+ app/src/ble.c                                 | 66 +++++++++++++++++++
+ app/src/events/ble_auth_state_changed.c       | 10 +++
+ 4 files changed, 106 insertions(+)
+ create mode 100644 app/include/zmk/events/ble_auth_state_changed.h
+ create mode 100644 app/src/events/ble_auth_state_changed.c
+
+diff --git a/app/CMakeLists.txt b/app/CMakeLists.txt
+index cc38244a..9b0af61f 100644
+--- a/app/CMakeLists.txt
++++ b/app/CMakeLists.txt
+@@ -82,6 +82,7 @@ if ((NOT CONFIG_ZMK_SPLIT) OR CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
+ 
+   if (CONFIG_ZMK_BLE)
+     target_sources(app PRIVATE src/events/ble_active_profile_changed.c)
++    target_sources(app PRIVATE src/events/ble_auth_state_changed.c)
+     target_sources(app PRIVATE src/behaviors/behavior_bt.c)
+     target_sources(app PRIVATE src/ble.c)
+     target_sources(app PRIVATE src/hog.c)
+diff --git a/app/include/zmk/events/ble_auth_state_changed.h b/app/include/zmk/events/ble_auth_state_changed.h
+new file mode 100644
+index 00000000..08073065
+--- /dev/null
++++ b/app/include/zmk/events/ble_auth_state_changed.h
+@@ -0,0 +1,29 @@
++/*
++ * Copyright (c) 2026 The ZMK Contributors
++ *
++ * SPDX-License-Identifier: MIT
++ */
++
++#pragma once
++
++#include <zephyr/kernel.h>
++#include <zmk/event_manager.h>
++
++enum zmk_ble_auth_state {
++    ZMK_BLE_AUTH_PASSKEY_REQ,
++    ZMK_BLE_AUTH_PASSKEY_DIGITS,
++    ZMK_BLE_AUTH_PAIRED_OK,
++    ZMK_BLE_AUTH_FAILED,
++    ZMK_BLE_AUTH_CLEARED,
++    // The passkey was submitted (Enter): the host verifies it, PAIRED_OK or FAILED follows.
++    ZMK_BLE_AUTH_PASSKEY_SUBMITTED,
++};
++
++struct zmk_ble_auth_state_changed {
++    uint8_t profile;
++    enum zmk_ble_auth_state state;
++    // Passkey digits entered so far, only meaningful for ZMK_BLE_AUTH_PASSKEY_DIGITS.
++    uint8_t digits;
++};
++
++ZMK_EVENT_DECLARE(zmk_ble_auth_state_changed);
+diff --git a/app/src/ble.c b/app/src/ble.c
+index 2a59f95a..72ac59b9 100644
+--- a/app/src/ble.c
++++ b/app/src/ble.c
+@@ -36,6 +36,7 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
+ #include <zmk/split/bluetooth/uuid.h>
+ #include <zmk/event_manager.h>
+ #include <zmk/events/ble_active_profile_changed.h>
++#include <zmk/events/ble_auth_state_changed.h>
+ 
+ #if IS_ENABLED(CONFIG_ZMK_BLE_PASSKEY_ENTRY)
+ #include <zmk/events/keycode_state_changed.h>
+@@ -43,6 +44,8 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
+ #define PASSKEY_DIGITS 6
+ 
+ static struct bt_conn *auth_passkey_entry_conn;
++// Profile the passkey entry belongs to, set when the passkey is requested.
++static uint8_t auth_passkey_entry_profile;
+ RING_BUF_DECLARE(passkey_entries, PASSKEY_DIGITS);
+ 
+ #endif /* IS_ENABLED(CONFIG_ZMK_BLE_PASSKEY_ENTRY) */
+@@ -94,6 +97,31 @@ static void raise_profile_changed_event_callback(struct k_work *work) {
+ 
+ K_WORK_DEFINE(raise_profile_changed_event_work, raise_profile_changed_event_callback);
+ 
++// Auth callbacks run in the BT RX thread, so the events are queued and raised from the workqueue.
++// All auth events take this path, which keeps them in order.
++K_MSGQ_DEFINE(auth_state_msgq, sizeof(struct zmk_ble_auth_state_changed), 8, 4);
++
++static void raise_auth_state_changed_callback(struct k_work *work) {
++    struct zmk_ble_auth_state_changed ev;
++
++    while (k_msgq_get(&auth_state_msgq, &ev, K_NO_WAIT) == 0) {
++        raise_zmk_ble_auth_state_changed(ev);
++    }
++}
++
++K_WORK_DEFINE(raise_auth_state_changed_work, raise_auth_state_changed_callback);
++
++static void raise_auth_state_changed(uint8_t profile, enum zmk_ble_auth_state state,
++                                     uint8_t digits) {
++    struct zmk_ble_auth_state_changed ev = {.profile = profile, .state = state, .digits = digits};
++
++    if (k_msgq_put(&auth_state_msgq, &ev, K_NO_WAIT) != 0) {
++        LOG_WRN("Dropping BLE auth state %d for profile %d", state, profile);
++        return;
++    }
++    k_work_submit(&raise_auth_state_changed_work);
++}
++
+ bool zmk_ble_active_profile_is_open(void) { return zmk_ble_profile_is_open(active_profile); }
+ 
+ bool zmk_ble_profile_is_open(uint8_t index) {
+@@ -235,6 +263,7 @@ void zmk_ble_clear_bonds(void) {
+ 
+     clear_profile_bond(active_profile);
+     update_advertising();
++    raise_auth_state_changed(active_profile, ZMK_BLE_AUTH_CLEARED, 0);
+ };
+ 
+ void zmk_ble_clear_all_bonds(void) {
+@@ -243,6 +272,7 @@ void zmk_ble_clear_all_bonds(void) {
+     // Unpair all profiles
+     for (int i = 0; i < ZMK_BLE_PROFILE_COUNT; i++) {
+         clear_profile_bond(i);
++        raise_auth_state_changed(i, ZMK_BLE_AUTH_CLEARED, 0);
+     }
+ 
+     // Automatically switch to profile 0
+@@ -497,6 +527,20 @@ static bool is_conn_active_profile(const struct bt_conn *conn) {
+     return bt_addr_le_cmp(bt_conn_get_dst(conn), &profiles[active_profile].peer) == 0;
+ }
+ 
++static bool is_conn_peripheral(struct bt_conn *conn) {
++    struct bt_conn_info info;
++
++    return bt_conn_get_info(conn, &info) == 0 && info.role == BT_CONN_ROLE_PERIPHERAL;
++}
++
++// The profile a pairing or security procedure belongs to: the bonded profile of the peer, else
++// the active profile (new pairings only happen on the active profile).
++static uint8_t auth_profile_index(struct bt_conn *conn) {
++    int index = zmk_ble_profile_index(bt_conn_get_dst(conn));
++
++    return index >= 0 ? index : active_profile;
++}
++
+ static void connected(struct bt_conn *conn, uint8_t err) {
+     char addr[BT_ADDR_LE_STR_LEN];
+     struct bt_conn_info info;
+@@ -562,6 +606,9 @@ static void security_changed(struct bt_conn *conn, bt_security_t level, enum bt_
+         LOG_DBG("Security changed: %s level %u", addr, level);
+     } else {
+         LOG_ERR("Security failed: %s level %u err %d", addr, level, err);
++        if (is_conn_peripheral(conn)) {
++            raise_auth_state_changed(auth_profile_index(conn), ZMK_BLE_AUTH_FAILED, 0);
++        }
+     }
+ }
+ 
+@@ -601,6 +648,8 @@ static void auth_passkey_entry(struct bt_conn *conn) {
+     LOG_DBG("Passkey entry requested for %s", addr);
+     ring_buf_reset(&passkey_entries);
+     auth_passkey_entry_conn = bt_conn_ref(conn);
++    auth_passkey_entry_profile = auth_profile_index(conn);
++    raise_auth_state_changed(auth_passkey_entry_profile, ZMK_BLE_AUTH_PASSKEY_REQ, 0);
+ }
+ 
+ #endif
+@@ -620,6 +669,9 @@ static void auth_cancel(struct bt_conn *conn) {
+ #endif
+ 
+     LOG_DBG("Pairing cancelled: %s", addr);
++    if (is_conn_peripheral(conn)) {
++        raise_auth_state_changed(auth_profile_index(conn), ZMK_BLE_AUTH_FAILED, 0);
++    }
+ }
+ 
+ static bool pairing_allowed_for_current_profile(struct bt_conn *conn) {
+@@ -658,13 +710,22 @@ static void auth_pairing_complete(struct bt_conn *conn, bool bonded) {
+     if (!pairing_allowed_for_current_profile(conn)) {
+         LOG_ERR("Pairing completed but current profile is not open: %s", addr);
+         bt_unpair(BT_ID_DEFAULT, dst);
++        raise_auth_state_changed(active_profile, ZMK_BLE_AUTH_FAILED, 0);
+         return;
+     }
+ 
+     set_profile_address(active_profile, dst);
+     update_advertising();
++    raise_auth_state_changed(active_profile, ZMK_BLE_AUTH_PAIRED_OK, 0);
+ };
+ 
++static void auth_pairing_failed(struct bt_conn *conn, enum bt_security_err reason) {
++    LOG_DBG("Pairing failed: reason %d", reason);
++    if (is_conn_peripheral(conn)) {
++        raise_auth_state_changed(auth_profile_index(conn), ZMK_BLE_AUTH_FAILED, 0);
++    }
++}
++
+ static struct bt_conn_auth_cb zmk_ble_auth_cb_display = {
+     .pairing_accept = auth_pairing_accept,
+ // .passkey_display = auth_passkey_display,
+@@ -677,6 +738,7 @@ static struct bt_conn_auth_cb zmk_ble_auth_cb_display = {
+ 
+ static struct bt_conn_auth_info_cb zmk_ble_auth_info_cb_display = {
+     .pairing_complete = auth_pairing_complete,
++    .pairing_failed = auth_pairing_failed,
+ };
+ 
+ static void zmk_ble_ready(int err) {
+@@ -795,6 +857,8 @@ static int zmk_ble_handle_key_user(struct zmk_keycode_state_changed *event) {
+         }
+ 
+         LOG_DBG("Final passkey: %d", passkey);
++        // Before the entry: the result (FAILED/PAIRED_OK) must queue after it.
++        raise_auth_state_changed(auth_passkey_entry_profile, ZMK_BLE_AUTH_PASSKEY_SUBMITTED, 0);
+         bt_conn_auth_passkey_entry(auth_passkey_entry_conn, passkey);
+         bt_conn_unref(auth_passkey_entry_conn);
+         auth_passkey_entry_conn = NULL;
+@@ -817,6 +881,8 @@ static int zmk_ble_handle_key_user(struct zmk_keycode_state_changed *event) {
+     ring_buf_put(&passkey_entries, &val, 1);
+     LOG_DBG("value entered: %d, digits collected so far: %d", val,
+             ring_buf_size_get(&passkey_entries));
++    raise_auth_state_changed(auth_passkey_entry_profile, ZMK_BLE_AUTH_PASSKEY_DIGITS,
++                             ring_buf_size_get(&passkey_entries));
+ 
+     return ZMK_EV_EVENT_HANDLED;
+ }
+diff --git a/app/src/events/ble_auth_state_changed.c b/app/src/events/ble_auth_state_changed.c
+new file mode 100644
+index 00000000..ec634f7f
+--- /dev/null
++++ b/app/src/events/ble_auth_state_changed.c
+@@ -0,0 +1,10 @@
++/*
++ * Copyright (c) 2026 The ZMK Contributors
++ *
++ * SPDX-License-Identifier: MIT
++ */
++
++#include <zephyr/kernel.h>
++#include <zmk/events/ble_auth_state_changed.h>
++
++ZMK_EVENT_IMPL(zmk_ble_auth_state_changed);
+-- 
+2.53.0
+

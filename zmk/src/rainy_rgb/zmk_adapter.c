@@ -1,3 +1,4 @@
+#include <string.h>
 #include <zephyr/device.h>
 #include <zephyr/drivers/led_strip.h>
 #include <zephyr/logging/log.h>
@@ -15,6 +16,20 @@
 #include <zmk/events/activity_state_changed.h>
 #include "engine.h"
 #include "overlay.h"
+
+#if IS_ENABLED(CONFIG_ZMK_BLE)
+#include <zephyr/bluetooth/conn.h>
+#include <zephyr/settings/settings.h>
+#include <zmk/ble.h>
+#include <zmk/endpoints.h>
+#include <zmk/events/ble_active_profile_changed.h>
+#include <zmk/events/endpoint_changed.h>
+#include <zmk/events/ble_auth_state_changed.h>
+#if CONFIG_RAINY75_BLE_OPEN_PROFILE_TIMEOUT > 0
+#include <rainy75/events/ble_open_profile_timeout.h>
+#endif
+#include "ble_status.h"
+#endif
 
 LOG_MODULE_REGISTER(rrgb_adapter, CONFIG_LOG_DEFAULT_LEVEL);
 
@@ -36,9 +51,156 @@ int rrgb_strip_init(void) {
     return 0;
 }
 
+#if IS_ENABLED(CONFIG_ZMK_BLE)
+/* --- BLE slot status (ble_status.c) ---------------------------------------
+ * Every ble_status slot/output/event setter runs in one work item on the
+ * system workqueue (single writer). Triggers only schedule it: ZMK's profile
+ * and endpoint events, the auth events from patch 0006 and the open profile
+ * timeout event of our module (both queued with their payload), the
+ * Bluetooth connection callbacks (a background slot of a
+ * multilink setup connects or drops without a ZMK event), key releases (the
+ * output toggle and a re-select of the active slot raise no event when the
+ * effective endpoint does not change) and the settings commit at boot (the
+ * profiles are loaded then). Each run polls slots 0..2 again; an unchanged
+ * poll is a no-op in ble_status. */
+#define RRGB_BLE_SETTLE_MS 50   /* after conn callbacks / key releases */
+
+/* A slot event waiting for the work item, in ble_status terms. */
+struct rrgb_ble_qev {
+    const char *what;   /* for the log */
+    uint8_t ev;         /* enum rrgb_ble_ev */
+    uint8_t slot;
+    uint8_t digits;
+};
+K_MSGQ_DEFINE(rrgb_ble_evq, sizeof(struct rrgb_ble_qev), 8, 4);
+
+static void rrgb_ble_queue(const char *what, enum rrgb_ble_ev ev, uint8_t slot, uint8_t digits) {
+    struct rrgb_ble_qev q = { .what = what, .ev = ev, .slot = slot, .digits = digits };
+
+    if (k_msgq_put(&rrgb_ble_evq, &q, K_NO_WAIT) != 0) {
+        LOG_WRN("ble leds: dropped %s slot %u", what, slot);
+    }
+}
+
+static void rrgb_ble_auth(const struct zmk_ble_auth_state_changed *a) {
+    switch (a->state) {
+    case ZMK_BLE_AUTH_PASSKEY_REQ:
+        rrgb_ble_queue("passkey req", RRGB_BLE_EV_PASSKEY_REQ, a->profile, a->digits); break;
+    case ZMK_BLE_AUTH_PASSKEY_DIGITS:
+        rrgb_ble_queue("digits", RRGB_BLE_EV_PASSKEY_DIGITS, a->profile, a->digits); break;
+    case ZMK_BLE_AUTH_PAIRED_OK:
+        rrgb_ble_queue("paired", RRGB_BLE_EV_PAIRED_OK, a->profile, a->digits); break;
+    case ZMK_BLE_AUTH_FAILED:
+        rrgb_ble_queue("failed", RRGB_BLE_EV_FAILED, a->profile, a->digits); break;
+    case ZMK_BLE_AUTH_CLEARED:
+        rrgb_ble_queue("cleared", RRGB_BLE_EV_CLEARED, a->profile, a->digits); break;
+    case ZMK_BLE_AUTH_PASSKEY_SUBMITTED:
+        rrgb_ble_queue("submitted", RRGB_BLE_EV_PASSKEY_SUBMITTED, a->profile, a->digits); break;
+    default:
+        break;
+    }
+}
+
+static void rrgb_ble_refresh(struct k_work *work) {
+    static uint8_t last_st[RRGB_BLE_SLOTS] = {0xFF, 0xFF, 0xFF};
+    static uint8_t last_active = 0xFE;
+    static int last_out = -1;
+    struct rrgb_ble_qev q;
+    uint32_t tick = rrgb_now();
+    ARG_UNUSED(work);
+
+    while (k_msgq_get(&rrgb_ble_evq, &q, K_NO_WAIT) == 0) {
+        LOG_INF("ble leds: %s slot %u digits %u @%u", q.what, q.slot, q.digits, tick);
+        rrgb_ble_event((enum rrgb_ble_ev)q.ev, q.slot, q.digits, tick);
+    }
+
+    uint8_t st[RRGB_BLE_SLOTS];
+    for (uint8_t i = 0; i < RRGB_BLE_SLOTS; i++) {
+        if (i >= ZMK_BLE_PROFILE_COUNT || zmk_ble_profile_is_open(i)) {
+            st[i] = RRGB_BLE_EMPTY;
+        } else {
+            st[i] = zmk_ble_profile_is_connected(i) ? RRGB_BLE_CONNECTED : RRGB_BLE_PAIRED;
+        }
+    }
+    int idx = zmk_ble_active_profile_index();
+    uint8_t active = (idx >= 0 && idx < RRGB_BLE_SLOTS) ? (uint8_t)idx : RRGB_BLE_NONE;
+    /* BLE output: the user chose BLE, or the board types over BLE anyway
+     * (USB preferred but not ready). Preferred BLE with the slot still
+     * connecting falls back to USB in ZMK; it still counts as BLE here, so
+     * the connecting animation shows. */
+    bool out_ble = zmk_endpoint_get_preferred_transport() == ZMK_TRANSPORT_BLE ||
+                   zmk_endpoint_get_selected().transport == ZMK_TRANSPORT_BLE;
+
+    if (memcmp(st, last_st, sizeof(st)) != 0 || active != last_active ||
+        (int)out_ble != last_out) {
+        LOG_INF("ble leds: slots %u/%u/%u active %d out %s @%u", st[0], st[1], st[2],
+                active == RRGB_BLE_NONE ? -1 : active, out_ble ? "ble" : "usb", tick);
+        memcpy(last_st, st, sizeof(st));
+        last_active = active;
+        last_out = out_ble;
+    }
+    rrgb_ble_set_output_ble(out_ble);
+    rrgb_ble_set_slots(st, active, tick);
+}
+static K_WORK_DELAYABLE_DEFINE(rrgb_ble_work, rrgb_ble_refresh);
+
+static void rrgb_ble_kick(void) { k_work_reschedule(&rrgb_ble_work, K_NO_WAIT); }
+/* Deferred trigger: never postpones an already scheduled run. */
+static void rrgb_ble_kick_later(void) { k_work_schedule(&rrgb_ble_work, K_MSEC(RRGB_BLE_SETTLE_MS)); }
+
+static void rrgb_ble_conn_changed(struct bt_conn *conn, uint8_t reason) {
+    ARG_UNUSED(conn); ARG_UNUSED(reason);
+    rrgb_ble_kick_later();
+}
+BT_CONN_CB_DEFINE(rrgb_ble_conn_cb) = {
+    .connected = rrgb_ble_conn_changed,
+    .disconnected = rrgb_ble_conn_changed,
+};
+
+static int rrgb_ble_settings_commit(void) {
+    rrgb_ble_kick();   /* profiles and the preferred transport are loaded */
+    return 0;
+}
+SETTINGS_STATIC_HANDLER_DEFINE(rrgb_ble, "rrgb_ble", NULL, NULL, rrgb_ble_settings_commit, NULL);
+
+static int rrgb_ble_listener(const zmk_event_t *eh) {
+    const struct zmk_ble_auth_state_changed *a = as_zmk_ble_auth_state_changed(eh);
+    if (a) { rrgb_ble_auth(a); }
+#if CONFIG_RAINY75_BLE_OPEN_PROFILE_TIMEOUT > 0
+    /* The open slot flashes red like FAILED. The event comes right before
+     * the profile change, so the run then sees the returning slot as the
+     * new active one and shows its switch confirm. */
+    const struct rainy75_ble_open_profile_timeout *t = as_rainy75_ble_open_profile_timeout(eh);
+    if (t) { rrgb_ble_queue("open slot timeout", RRGB_BLE_EV_FAILED, t->profile, 0); }
+#endif
+    rrgb_ble_kick();
+    return ZMK_EV_EVENT_BUBBLE;
+}
+ZMK_LISTENER(rrgb_ble_listener, rrgb_ble_listener);
+ZMK_SUBSCRIPTION(rrgb_ble_listener, zmk_ble_active_profile_changed);
+ZMK_SUBSCRIPTION(rrgb_ble_listener, zmk_endpoint_changed);
+ZMK_SUBSCRIPTION(rrgb_ble_listener, zmk_ble_auth_state_changed);
+#if CONFIG_RAINY75_BLE_OPEN_PROFILE_TIMEOUT > 0
+ZMK_SUBSCRIPTION(rrgb_ble_listener, rainy75_ble_open_profile_timeout);
+#endif
+#endif /* CONFIG_ZMK_BLE */
+
+/* Resolve the BLE status key table before any event can arrive (the ZMK
+ * events start at APPLICATION level). */
+static int rrgb_overlay_early_init(void) {
+    rrgb_overlay_init(IS_ENABLED(CONFIG_ZMK_BLE));
+    return 0;
+}
+SYS_INIT(rrgb_overlay_early_init, POST_KERNEL, 99);
+
 static int rrgb_event_listener(const zmk_event_t *eh) {
     const struct zmk_position_state_changed *ev = as_zmk_position_state_changed(eh);
-    if (ev) { rrgb_on_key(ev->position, ev->state); }
+    if (ev) {
+        rrgb_on_key(ev->position, ev->state);
+#if IS_ENABLED(CONFIG_ZMK_BLE)
+        if (!ev->state) { rrgb_ble_kick_later(); }
+#endif
+    }
 
     const struct zmk_layer_state_changed *lev = as_zmk_layer_state_changed(eh);
     if (lev) { rrgb_overlay_set_fn(zmk_keymap_layer_active(1)); }

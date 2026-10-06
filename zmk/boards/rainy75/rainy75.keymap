@@ -1,5 +1,6 @@
 #include <behaviors.dtsi>
 #include <rainy_rgb.dtsi>
+#include <rainy75_ble.dtsi>
 #include <dt-bindings/rainy_rgb.h>
 #include <dt-bindings/zmk/keys.h>
 #include <dt-bindings/zmk/bt.h>
@@ -60,7 +61,7 @@
 
 		fn_layer {
 			/* Fn Layer — Layer 1
-			 * Fn+F1/F2/F3 = BT profile 1/2/3
+			 * Fn+F1/F2/F3 = BT profile 1/2/3, also switches the output from USB to BLE
 			 * Fn+F4 = Output toggle (USB/BLE)
 			 * Fn+F5-F12 = Media keys
 			 * Fn+ESC = Studio unlock (press to allow ZMK Studio keymap editing)
@@ -71,7 +72,7 @@
 			 * Fn+←/→ = RGB speed down/up
 			 */
 			bindings = <
-				&studio_unlock &bt BT_SEL 0 &bt BT_SEL 1 &bt BT_SEL 2 &out OUT_TOG &kp C_PREV &kp C_NEXT &kp C_MUTE &kp C_VOL_DN &kp C_VOL_UP &kp C_PP &kp C_BRI_DN &kp C_BRI_UP &bt BT_CLR &out OUT_TOG
+				&studio_unlock &bt_sel_ble 0 &bt_sel_ble 1 &bt_sel_ble 2 &out OUT_TOG &kp C_PREV &kp C_NEXT &kp C_MUTE &kp C_VOL_DN &kp C_VOL_UP &kp C_PP &kp C_BRI_DN &kp C_BRI_UP &bt BT_CLR &out OUT_TOG
 				&trans &trans &trans &trans &trans &trans &trans &trans &trans &trans &trans &trans &trans &rgb RGB_TOG &trans
 				&trans &trans &trans &trans &trans &trans &trans &trans &trans &trans &trans &trans &trans &rgb RGB_EFF
 				&trans &trans &trans &trans &trans &trans &trans &trans &trans &trans &trans &trans &rgb RGB_HUI        &trans &trans

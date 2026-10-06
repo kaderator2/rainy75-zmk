@@ -1,0 +1,247 @@
+# Upstream patches of this workspace, for Zephyr's `west patch`
+# (schema: zephyr/scripts/schemas/patch-schema.yml).
+#
+# The patch files stay in <workspace>/patches/<repo>/, so every call needs the
+# patch base relative to this module (zmk/):
+#
+#     west update && west patch -b ../patches apply
+#
+# build.sh applies them itself (only the ones whose commit subject is missing
+# in the tree, through `west patch` with a filtered copy of this file); see
+# docs/zmk-firmware.md "Applying the patches".
+#
+# module: path relative to the west workspace (not the west project name: the
+# ZMK project is named "zmk", which is also the directory of this module).
+# apply-command: git am, so every patch becomes a commit with its own subject;
+# that subject is how build.sh recognises an applied patch.
+# After editing a patch file, update its sha256sum (sha256sum patches/...).
+
+# `west patch clean` moves each patched tree back to the revision of the last
+# `west update`. That drops our patch commits (they live in the patch files,
+# and in the reflog) and refuses to run over conflicting uncommitted changes.
+# The upstream defaults ("git checkout ." and "git clean -d -f -x") would
+# instead discard uncommitted work and keep the patch commits.
+checkout-command: git checkout --detach manifest-rev
+clean-command: ""
+
+patches:
+
+  # --- zephyr ---
+  - path: zephyr/0001-gpio-b91-fix-WRITE_BIT-double-BIT.patch
+    sha256sum: 68092be4a6c96762a77ddc25dedc9e520b53da91f4dcb4cbe281f4a4910033f3
+    module: zephyr
+    author: scholzri
+    email: 33288574+scholzri@users.noreply.github.com
+    date: 2026-03-01
+    upstreamable: true
+    apply-command: git -c "user.name=rainy75 build" -c user.email=build@localhost am --3way
+    comments: >-
+      B91 GPIO: WRITE_BIT already applies BIT(), so BIT(BIT(pin)) broke pins >= 3. Real upstream
+      bug.
+  - path: zephyr/0002-gpio-b91-fix-interrupt-support.patch
+    sha256sum: df488302f43aee11d26ff63ba3a94d7eedf68af0ad2080885be783a5ff3e430d
+    module: zephyr
+    author: scholzri
+    email: 33288574+scholzri@users.noreply.github.com
+    date: 2026-03-01
+    upstreamable: true
+    apply-command: git -c "user.name=rainy75 build" -c user.email=build@localhost am --3way
+    comments: >-
+      B91 GPIO interrupts with the multi-level PLIC (truncated IRQ number, no irq_enable, POR
+      per-pin enables). Real upstream bug.
+  - path: zephyr/0003-flash-b91-report-erase-sectors.patch
+    sha256sum: 3366c2968412d43a12c992820287d7b2c3b9817d96af860348ee733bce067c95
+    module: zephyr
+    author: scholzri
+    email: 33288574+scholzri@users.noreply.github.com
+    date: 2026-03-01
+    upstreamable: true
+    apply-command: git -c "user.name=rainy75 build" -c user.email=build@localhost am --3way
+    comments: >-
+      B91 flash page layout in 4 KB erase sectors, so MCUboot's sector table fits. Real upstream
+      bug.
+  - path: zephyr/0004-usb-device-fix-transfer-slot-leak-on-cancel-resubmit.patch
+    sha256sum: 430f5a551d9c3933b4da32c71979632e32979645622c8a7ee22ee76d4b4752e0
+    module: zephyr
+    author: Micheal Waltz
+    email: micheal@ecliptik.com
+    date: 2026-07-23
+    upstreamable: true
+    apply-command: git -c "user.name=rainy75 build" -c user.email=build@localhost am --3way
+    comments: >-
+      USB device stack: transfer slot leak on cancel/resubmit races.
+  - path: zephyr/0005-usb-cdc_acm-retry-RX-transfer-restart-instead-of-dro.patch
+    sha256sum: 159cf159522be3bb30576754ba5a30d87646dae2ff385610cb073982ede818c1
+    module: zephyr
+    author: Micheal Waltz
+    email: micheal@ecliptik.com
+    date: 2026-07-23
+    upstreamable: true
+    apply-command: git -c "user.name=rainy75 build" -c user.email=build@localhost am --3way
+    comments: >-
+      CDC ACM: retry the RX transfer restart instead of dropping it.
+  - path: zephyr/0006-usb-device-add-transfer-slot-diagnostic-snapshot.patch
+    sha256sum: 43a2205b479e33169a903e1d44b92726ae2d1ceb6050e1551ff9207e7f2507e1
+    module: zephyr
+    author: Micheal Waltz
+    email: micheal@ecliptik.com
+    date: 2026-07-23
+    upstreamable: false
+    apply-command: git -c "user.name=rainy75 build" -c user.email=build@localhost am --3way
+    comments: >-
+      Diagnostic snapshot of the transfer slots for our USB wedge investigation
+      (b91_usb_diag.h). Not for upstream.
+  - path: zephyr/0007-usb-device-reclaim-transfer-slots-whose-completion-n.patch
+    sha256sum: 7b5453796ddc305c613bb34df1ada3405e69e7971589695a3d74da1d91c9c808
+    module: zephyr
+    author: Micheal Waltz
+    email: micheal@ecliptik.com
+    date: 2026-07-24
+    upstreamable: true
+    apply-command: git -c "user.name=rainy75 build" -c user.email=build@localhost am --3way
+    comments: >-
+      USB device stack: reclaim transfer slots whose completion never runs (completes 0004).
+  - path: zephyr/0008-usb-device-expose-a-transfer-slot-s-work-item-for-di.patch
+    sha256sum: 93b409f3ec8cec79161e800843bf3db1a661c74f68c9b83db45fd1876c040b1d
+    module: zephyr
+    author: Micheal Waltz
+    email: micheal@ecliptik.com
+    date: 2026-07-24
+    upstreamable: false
+    apply-command: git -c "user.name=rainy75 build" -c user.email=build@localhost am --3way
+    comments: >-
+      Exposes a slot's work item for the diagnostics of 0006. Not for upstream.
+  - path: zephyr/0009-usb-device-do-not-re-init-transfer-slots-on-every-us.patch
+    sha256sum: d2613404d6612e6b99b88b6b087de38c77cfea6f0ea2df9fd47da717da6fbb30
+    module: zephyr
+    author: Micheal Waltz
+    email: micheal@ecliptik.com
+    date: 2026-07-24
+    upstreamable: true
+    apply-command: git -c "user.name=rainy75 build" -c user.email=build@localhost am --3way
+    comments: >-
+      USB device stack: do not re-init transfer slots on every usb_enable().
+  - path: zephyr/0010-mgmt-uart_mcumgr-keep-log-output-out-of-SMP-frames.patch
+    sha256sum: 7fb67513b61a6b33d3db88d2bb21312cc56301735d8ecf1ba12162b7b8008d7c
+    module: zephyr
+    author: scholzri
+    email: 33288574+scholzri@users.noreply.github.com
+    date: 2026-10-05
+    upstreamable: true
+    apply-command: git -c "user.name=rainy75 build" -c user.email=build@localhost am --3way
+    comments: >-
+      uart_mcumgr + UART log backend: no log output inside SMP frames. Upstream would need to
+      skip the lock in immediate log mode.
+  - path: zephyr/0011-mgmt-uart_mcumgr-optionally-wait-for-TX-room-instead.patch
+    sha256sum: 347c09a040e788006f08b4c388d3fbafa55afceadf21b72e4ea1c84195cf0e1a
+    module: zephyr
+    author: scholzri
+    email: 33288574+scholzri@users.noreply.github.com
+    date: 2026-10-05
+    upstreamable: true
+    apply-command: git -c "user.name=rainy75 build" -c user.email=build@localhost am --3way
+    comments: >-
+      uart_mcumgr: optional wait for CDC ACM TX room (CONFIG_UART_MCUMGR_TX_WAIT_MS), so the
+      first response after boot is not dropped. Runs under the 0010 mutex.
+
+  # --- bootloader/mcuboot ---
+  - path: mcuboot/0001-b91-riscv-boot-fixes.patch
+    sha256sum: 7805e148536a9981e5c657815755d89b3570843c396f73638b798ef5e6e45bd9
+    module: bootloader/mcuboot
+    author: scholzri
+    email: 33288574+scholzri@users.noreply.github.com
+    date: 2026-04-03
+    upstreamable: false
+    apply-command: git -c "user.name=rainy75 build" -c user.email=build@localhost am --3way
+    comments: >-
+      B91 RISC-V boot: XIP do_boot (merged in MCUboot main as 2750a58c, not in a release), early
+      boot_console_init (B91 workaround), fence.i before the jump.
+
+  # --- modules/hal/hal_telink ---
+  - path: hal_telink/0001-build-sys.c-unless-the-BLE-controller-blob-is-select.patch
+    sha256sum: 855f1278a646c4f3d4fef46b34225bfaff1207a77cbc4fa198e11e8054e78bbf
+    module: modules/hal/hal_telink
+    author: scholzri
+    email: 33288574+scholzri@users.noreply.github.com
+    date: 2026-10-05
+    upstreamable: false
+    apply-command: git -c "user.name=rainy75 build" -c user.email=build@localhost am --3way
+    comments: >-
+      Build sys.c unless our out-of-tree blob controller (BT_HCI_B91_CTLR_BLOB) is selected: the
+      blob defines sys_init(), the open controller needs the HAL one. Specific to this repo.
+
+  # --- zmk-src ---
+  - path: zmk-src/0001-zmk-usb-no-vbus-detect.patch
+    sha256sum: db0fca78bfa092fe2b790187bb5ae939070ed7e9db49f97f9bcb1362a743d345
+    module: zmk-src
+    author: Richard
+    email: 33288574+scholzri@users.noreply.github.com
+    date: 2026-03-05
+    upstreamable: true
+    apply-command: git -c "user.name=rainy75 build" -c user.email=build@localhost am --3way
+    comments: >-
+      ZMK_USB_NO_VBUS_DETECT for boards without VBUS sensing (B91), so idle sleep can trigger.
+      Upstream hook.
+  - path: zmk-src/0002-zmk-recover-a-dead-USB-bus-while-suspended-no-VBUS-d.patch
+    sha256sum: 158549941167bcc99fdec4a8ae27091b6114ae306ac0967a883497e2a54a4fc9
+    module: zmk-src
+    author: Micheal Waltz
+    email: micheal@ecliptik.com
+    date: 2026-07-16
+    upstreamable: true
+    apply-command: git -c "user.name=rainy75 build" -c user.email=build@localhost am --3way
+    comments: >-
+      Recover a dead USB bus while suspended on boards without VBUS detection.
+  - path: zmk-src/0003-zmk-don-t-re-attach-USB-during-the-host-s-HID-bind-w.patch
+    sha256sum: 0ab684c32244bf4a57e34a534f5c427345e86733226777a78019c0fc77a88a30
+    module: zmk-src
+    author: Micheal Waltz
+    email: micheal@ecliptik.com
+    date: 2026-07-25
+    upstreamable: true
+    apply-command: git -c "user.name=rainy75 build" -c user.email=build@localhost am --3way
+    comments: >-
+      No USB re-attach during the host's HID bind window (from PR #20).
+  - path: zmk-src/0004-zmk-drive-USB-remote-wakeup-from-the-HID-send-path.patch
+    sha256sum: e36eeb8276acc1242693a325d91f3c23a8b0df64a08e3eaabb824be25f706cac
+    module: zmk-src
+    author: scholzri
+    email: 33288574+scholzri@users.noreply.github.com
+    date: 2026-07-25
+    upstreamable: true
+    apply-command: git -c "user.name=rainy75 build" -c user.email=build@localhost am --3way
+    comments: >-
+      Drive USB remote wakeup from the HID send path.
+  - path: zmk-src/0005-zmk-start-BLE-advertising-from-the-workqueue-after-s.patch
+    sha256sum: 74dcde48bb04fb0274f5bafdddde31b89dda5269fdc1e5d9bae6e198605ad5bd
+    module: zmk-src
+    author: scholzri
+    email: 33288574+scholzri@users.noreply.github.com
+    date: 2026-10-04
+    upstreamable: true
+    apply-command: git -c "user.name=rainy75 build" -c user.email=build@localhost am --3way
+    comments: >-
+      Start BLE advertising from the workqueue after settings load: fixes the CONFIG_BT_PRIVACY
+      settings-lock deadlock. Real upstream bug.
+  - path: zmk-src/0006-zmk-raise-BLE-auth-state-events.patch
+    sha256sum: 74fc81af49d4a32f391a44f1c9a43dbf0ec1a4bd16ca5e242f32ce3a291a6708
+    module: zmk-src
+    author: scholzri
+    email: 33288574+scholzri@users.noreply.github.com
+    date: 2026-10-05
+    upstreamable: true
+    apply-command: git -c "user.name=rainy75 build" -c user.email=build@localhost am --3way
+    comments: >-
+      New event zmk_ble_auth_state_changed (pairing states for indicators). A reporting hook
+      only; the policy built on it is in our module (behavior_bt_sel_ble.c, ble_open_profile/).
+  - path: zmk-src/0007-zmk-keep-passkey-entry-keys-out-of-the-HID-reports.patch
+    sha256sum: 5ca8a75bad18954e1948d7141ad3b6fa8e0005bbcb2da9a29655ff5bed84ed56
+    module: zmk-src
+    author: scholzri
+    email: 33288574+scholzri@users.noreply.github.com
+    date: 2026-10-05
+    upstreamable: true
+    apply-command: git -c "user.name=rainy75 build" -c user.email=build@localhost am --3way
+    comments: >-
+      Keep passkey entry keys out of the HID reports (listener order bug) and end a stale
+      passkey entry on every pairing end. Real upstream bug.

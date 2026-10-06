@@ -1,7 +1,207 @@
 #include "../overlay.h"
 #include "../led_map.h"
+#include "../ble_status.h"
 #include "test.h"
 #include <string.h>
+
+static int eq(struct rrgb a, struct rrgb b) { return a.r == b.r && a.g == b.g && a.b == b.b; }
+static struct rrgb blue(uint8_t v)  { return (struct rrgb){0, 0, v}; }
+static struct rrgb white(uint8_t v) { return (struct rrgb){v, v, v}; }
+static struct rrgb at(const struct rrgb *px, int pos) { return px[rrgb_led_for_position((uint32_t)pos)]; }
+
+#define POS_F(i)  (1 + (i))   /* F1..F3 = positions 1..3 */
+#define POS_F4    4
+#define POS_F5    5
+#define POS_NUM(i) (16 + (i)) /* number row 1..0 */
+#ifdef CONFIG_RAINY_RGB_ANSI_LEDMAP
+#define POS_ENTER 56          /* ANSI wide Enter */
+#else
+#define POS_ENTER 43          /* ISO Enter */
+#endif
+
+/* ble_status integration: render order, ownership, overlay_active. */
+static void test_ble(void) {
+    struct rrgb px[83];
+    const uint8_t all_empty[3] = {RRGB_BLE_EMPTY, RRGB_BLE_EMPTY, RRGB_BLE_EMPTY};
+
+    rrgb_overlay_init(true);
+    rrgb_overlay_set_caps(false);
+    rrgb_overlay_set_fn(false);
+    rrgb_overlay_set_battery(0);
+    rrgb_overlay_battery_show(0);
+    uint32_t t = 1000;                          /* past the battery window */
+
+    /* idle: nothing to draw, nothing touched */
+    CHECK(!rrgb_overlay_active(t));
+    for (int i = 0; i < 83; i++) { px[i] = (struct rrgb){7, 7, 7}; }
+    rrgb_overlay_render(px, 83, t);
+    for (int i = 0; i < 83; i++) { CHECK(eq(px[i], (struct rrgb){7, 7, 7})); }
+
+    /* Fn held, all slots EMPTY, output USB: ble owns F1..F4, the rest of the
+     * Fn-highlight stays white (ble does not paint keys it does not own). */
+    rrgb_overlay_set_fn(true);
+    CHECK(rrgb_overlay_active(t));
+    for (int i = 0; i < 83; i++) { px[i] = (struct rrgb){50, 50, 50}; }
+    rrgb_overlay_render(px, 83, t);
+    for (int s = 0; s < 3; s++) { CHECK(eq(at(px, POS_F(s)), white(RRGB_BLE_VDIM))); }
+    CHECK(eq(at(px, POS_F4), white(RRGB_BLE_OUT)));
+    CHECK(eq(at(px, 0), white(255)));            /* ESC: Fn white */
+    CHECK(eq(at(px, POS_F5), white(255)));       /* F5: Fn white */
+    CHECK(eq(at(px, 13), white(255)));           /* BT_CLR key: Fn white */
+    CHECK(eq(at(px, 31), white(0)));             /* Q: black */
+
+    /* slot states through the overlay: active connected / other paired, BLE output */
+    const uint8_t mixed[3] = {RRGB_BLE_CONNECTED, RRGB_BLE_PAIRED, RRGB_BLE_EMPTY};
+    rrgb_ble_set_output_ble(true);
+    rrgb_ble_set_slots(mixed, 0, t);
+    t += RRGB_BLE_CONN_SOLID + RRGB_BLE_CONN_FADE;   /* connected solid+fade over */
+    rrgb_overlay_render(px, 83, t);
+    CHECK(eq(at(px, POS_F(0)), blue(RRGB_BLE_BRIGHT)));
+    CHECK(eq(at(px, POS_F(1)), blue(RRGB_BLE_VDIM)));
+    CHECK(eq(at(px, POS_F(2)), white(RRGB_BLE_VDIM)));
+    CHECK(!eq(at(px, POS_F4), at(px, POS_F(0))));              /* F4 distinct from the slot */
+    CHECK(eq(at(px, POS_F4), (struct rrgb){0, RRGB_BLE_OUT, RRGB_BLE_OUT}));   /* cyan */
+    CHECK(eq(at(px, POS_F5), white(255)));
+
+    /* Fn released, everything connected and settled: nothing to draw */
+    rrgb_overlay_set_fn(false);
+    CHECK(!rrgb_overlay_active(t));
+    for (int i = 0; i < 83; i++) { px[i] = (struct rrgb){7, 7, 7}; }
+    rrgb_overlay_render(px, 83, t);
+    CHECK(eq(at(px, POS_F(0)), (struct rrgb){7, 7, 7}));
+
+    /* CapsLock and a ble animation at the same time: both show */
+    rrgb_overlay_set_caps(true);
+    rrgb_ble_event(RRGB_BLE_EV_FAILED, 1, 0, t);
+    CHECK(rrgb_overlay_active(t));
+    rrgb_overlay_render(px, 83, t);
+    CHECK(eq(at(px, 44), white(255)));                          /* CapsLock */
+    CHECK(eq(at(px, POS_F(1)), (struct rrgb){RRGB_BLE_BRIGHT, 0, 0}));   /* red flash on */
+    rrgb_overlay_set_caps(false);
+    t += RRGB_BLE_FLASH_TOTAL;
+
+    /* passkey guidance wins over the battery gauge on the number row */
+    rrgb_overlay_set_battery(100);
+    rrgb_overlay_battery_show(t);
+    rrgb_ble_event(RRGB_BLE_EV_PASSKEY_REQ, 2, 0, t);
+    rrgb_ble_event(RRGB_BLE_EV_PASSKEY_DIGITS, 2, 2, t);
+    for (int i = 0; i < 83; i++) { px[i] = (struct rrgb){7, 7, 7}; }
+    rrgb_overlay_render(px, 83, t);
+    CHECK(eq(at(px, POS_NUM(0)), blue(RRGB_BLE_BRIGHT)));
+    CHECK(eq(at(px, POS_NUM(1)), blue(RRGB_BLE_BRIGHT)));
+    for (int k = 2; k < 10; k++) { CHECK(eq(at(px, POS_NUM(k)), white(RRGB_BLE_DIM))); }
+    CHECK(eq(at(px, POS_ENTER), white(RRGB_BLE_BRIGHT)));       /* Enter pulse, phase 0 */
+    CHECK(eq(at(px, 15), (struct rrgb){7, 7, 7}));              /* ` untouched */
+    CHECK(eq(at(px, 26), (struct rrgb){7, 7, 7}));              /* - untouched */
+
+    /* guidance over: the gauge shows again in its window */
+    rrgb_ble_event(RRGB_BLE_EV_PAIRED_OK, 2, 0, t + 1);
+    rrgb_overlay_render(px, 83, t + 1);
+    CHECK(at(px, POS_NUM(9)).g > 30);                           /* 100 % green */
+
+    /* RGB off with only a ble animation: overlay_active keeps the loop alive */
+    t += 1000;                                                  /* all settled */
+    CHECK(!rrgb_overlay_active(t));
+    rrgb_ble_set_slots(all_empty, 0, t);                        /* active slot 0 cleared */
+    CHECK(rrgb_overlay_active(t));                              /* blinking */
+    for (int i = 0; i < 83; i++) { px[i] = (struct rrgb){0, 0, 0}; }
+    rrgb_overlay_render(px, 83, t);
+    CHECK(eq(at(px, POS_F(0)), blue(RRGB_BLE_BRIGHT)));
+    rrgb_ble_set_output_ble(false);
+    CHECK(!rrgb_overlay_active(t));                             /* USB: steady gated */
+
+    /* explicit profile switch: confirm flash on the new slot, also on USB */
+    rrgb_ble_set_slots(all_empty, 2, t);
+    CHECK(rrgb_overlay_active(t));
+    rrgb_overlay_render(px, 83, t);
+    CHECK(eq(at(px, POS_F(2)), blue(RRGB_BLE_BRIGHT)));
+    CHECK(!rrgb_overlay_active(t + RRGB_BLE_SELECT_TOTAL));    /* then gated (USB) */
+
+    /* reactive presses: suppressed while the Fn layer is held */
+    rrgb_overlay_set_fn(true);
+    CHECK(!rrgb_overlay_key_reactive(POS_F(0), t + RRGB_BLE_SELECT_TOTAL));
+    CHECK(!rrgb_overlay_key_reactive(31, t + RRGB_BLE_SELECT_TOTAL));
+    rrgb_overlay_set_fn(false);
+    CHECK(rrgb_overlay_key_reactive(POS_F(0), t + RRGB_BLE_SELECT_TOTAL));
+    CHECK(rrgb_overlay_key_reactive(31, t + RRGB_BLE_SELECT_TOTAL));
+
+    /* build without BLE: ble owns nothing, Fn-highlight unchanged */
+    rrgb_overlay_init(false);
+    rrgb_overlay_set_fn(true);
+    rrgb_ble_event(RRGB_BLE_EV_PASSKEY_REQ, 0, 0, t);
+    for (int i = 0; i < 83; i++) { px[i] = (struct rrgb){50, 50, 50}; }
+    rrgb_overlay_render(px, 83, t);
+    for (int s = 0; s < 3; s++) { CHECK(eq(at(px, POS_F(s)), white(255))); }
+    CHECK(eq(at(px, POS_F4), white(255)));
+    CHECK(eq(at(px, POS_NUM(0)), white(0)));
+    rrgb_overlay_set_fn(false);
+    CHECK(!rrgb_overlay_active(t));         /* ble state ignored without BLE */
+    CHECK(!rrgb_overlay_suppress_effect(t));
+
+    rrgb_ble_event(RRGB_BLE_EV_FAILED, 0, 0, t);
+    CHECK(!rrgb_overlay_suppress_effect(t));   /* nor its flashes */
+
+    /* with BLE: any automatic BLE animation turns the effect off, and the
+     * overlay stays active meanwhile (rail on even with RGB off) */
+    rrgb_overlay_init(true);
+    CHECK(!rrgb_overlay_suppress_effect(t));
+    CHECK(rrgb_overlay_key_reactive(31, t));
+    rrgb_ble_event(RRGB_BLE_EV_PASSKEY_REQ, 1, 0, t);
+    CHECK(rrgb_overlay_suppress_effect(t));
+    CHECK(rrgb_overlay_active(t));
+    /* presses while suppressed leave no reactive trace (typed digits) */
+    CHECK(!rrgb_overlay_key_reactive(31, t));
+    rrgb_ble_event(RRGB_BLE_EV_FAILED, 1, 0, t + 1);
+    CHECK(rrgb_overlay_suppress_effect(t + RRGB_BLE_FLASH_TOTAL));
+    CHECK(rrgb_overlay_active(t + RRGB_BLE_FLASH_TOTAL));
+    CHECK(!rrgb_overlay_suppress_effect(t + 1 + RRGB_BLE_FLASH_TOTAL));
+    CHECK(rrgb_overlay_key_reactive(31, t + 1 + RRGB_BLE_FLASH_TOTAL));
+    /* suppress implies active, frame by frame, through a switch + blink */
+    const uint8_t one_empty[3] = {RRGB_BLE_CONNECTED, RRGB_BLE_EMPTY, RRGB_BLE_EMPTY};
+    rrgb_ble_set_output_ble(true);
+    rrgb_ble_set_slots(one_empty, 0, t + 100);
+    rrgb_ble_set_slots(one_empty, 1, t + 300);
+    for (uint32_t k = t; k < t + 3000; k++) {
+        if (rrgb_overlay_suppress_effect(k)) { CHECK(rrgb_overlay_active(k)); }
+    }
+    CHECK(rrgb_overlay_suppress_effect(t + 400));
+}
+
+/* Effect gain: fast fade out when suppressed, smooth fade back in. */
+static void test_effect_gain(void) {
+    uint8_t g = 255;
+    int n = 0;
+    while (g > 0) { g = rrgb_effect_gain_next(g, true); n++; CHECK(n < 100); }
+    CHECK(n >= RRGB_EFFECT_FADE_OUT_FRAMES - 1 && n <= RRGB_EFFECT_FADE_OUT_FRAMES);
+    CHECK(rrgb_effect_gain_next(0, true) == 0);
+    n = 0;
+    uint8_t prev = 0;
+    while (g < 255) {
+        g = rrgb_effect_gain_next(g, false);
+        CHECK(g > prev);
+        prev = g;
+        n++;
+        CHECK(n < 100);
+    }
+    CHECK(n >= RRGB_EFFECT_FADE_IN_FRAMES - 1 && n <= RRGB_EFFECT_FADE_IN_FRAMES);
+    CHECK(rrgb_effect_gain_next(255, false) == 255);
+    /* suppression mid fade-in turns around from where it is */
+    g = rrgb_effect_gain_next(0, false);
+    g = rrgb_effect_gain_next(g, false);
+    CHECK(rrgb_effect_gain_next(g, true) < g);
+}
+
+/* Frames without a drawn effect layer (RGB off, render loop stopped) snap
+ * the gain to its target, so it never freezes mid fade: RGB toggled on
+ * shows the effect at full gain, or stays dark while still suppressed. */
+static void test_effect_gain_frame(void) {
+    CHECK(rrgb_effect_gain_frame(128, false, false) == 255);
+    CHECK(rrgb_effect_gain_frame(128, true, false) == 0);
+    CHECK(rrgb_effect_gain_frame(0, false, false) == 255);
+    /* drawn: the normal fade step */
+    CHECK(rrgb_effect_gain_frame(128, true, true) == rrgb_effect_gain_next(128, true));
+    CHECK(rrgb_effect_gain_frame(128, false, true) == rrgb_effect_gain_next(128, false));
+}
 
 int main(void) {
     struct rrgb px[83];
@@ -65,5 +265,8 @@ int main(void) {
     rrgb_overlay_set_fn(false);
     CHECK(!rrgb_overlay_active(100));          /* nothing active */
 
+    test_ble();
+    test_effect_gain();
+    test_effect_gain_frame();
     DONE();
 }

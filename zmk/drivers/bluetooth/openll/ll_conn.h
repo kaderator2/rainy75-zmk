@@ -1,0 +1,402 @@
+/*
+ * Copyright (c) 2026 scholzri
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Connection state (peripheral, LL_MAX_CONN links, slice 6a): transmit
+ * window, window widening, anchor re-sync, CSA#1 or CSA#2 (CSA#2 when the
+ * CONNECT_IND has ChSel 1, ll_csa2.h), event counter, instants,
+ * supervision timeout, termination, per link. Drives the radio via
+ * ll_radio.h, requests its events from the arbiter (ll_arb.h), and calls
+ * the ll_txq / ll_rxq
+ * per-event hooks of the link that owns the event.
+ *
+ * Link ids: uint8_t link, 0 <= link < LL_MAX_CONN (== the HCI connection
+ * handle). A link is free, active, or ended and awaiting
+ * ll_conn_release() (the consumer thread resets the link's ll_rxq and
+ * ll_llcp state first). Calls with an id out of range or of a link that is
+ * not active do nothing (or return LL_ST_DISALLOWED / false / 0).
+ *
+ * Events are arbitrated (slice 6a Task 5): every planned event is an
+ * ll_arb request with a priority (MUST > SUPERVISION > STARVING > ACTIVE >
+ * IDLE, see ll_conn.c); a refused or displaced event is moved to another event of
+ * the latency window (dodge) or yielded (counter and CSA#1 advance as for
+ * a skip, stats.collisions counts it, not a miss for the latency rule).
+ *
+ * Timing uses stimer ticks only (LL_TICKS_PER_US). Window widening above
+ * connInterval / 2 - T_IFS is clamped; the supervision timeout then ends
+ * the link.
+ *
+ * Peripheral latency (Vol 6 Part B 4.5.1, 4.5.7; slice 5): after an event
+ * the next one is planned up to connPeripheralLatency events ahead (the
+ * latency from CONNECT_IND or the last applied connection update) when all
+ * of these hold, else the next event is listened to:
+ *  - ll_txq_backlog(link) == 0 (nothing queued, nothing unacked);
+ *  - ops.busy(link) is false (no LLCP procedure waiting) and no local
+ *    termination is running;
+ *  - no connection update instant is pending in the candidate window
+ *    [next, next + latency] (no skip at all until it was listened to);
+ *    a channel map instant in the window ends the skip at the instant
+ *    event, which is listened to (the map only changes the channel, so
+ *    the events before it are skipped with the old map; a re-plan to an
+ *    earlier event of the window makes the instant pending again);
+ *  - the event just closed re-anchored (its first packet was received in
+ *    the RX window): never skip after a miss, a late alarm or a first
+ *    packet that was not the anchor;
+ *  - the listened event's anchor stays <= last RX + connSupervisionTimeout
+ *    - 2 * connInterval (defensive: with spec-valid parameters, timeout >
+ *    (1 + latency) * interval * 2, this never limits the skip);
+ *  - slice 7 holdoff: the first skipped event's anchor lies at least
+ *    LL_CONN_LATENCY_HOLDOFF_MS after the connection start (per link), so
+ *    every event of the first second is listened to; with the busy rule
+ *    above, skipping starts once the link is up that long and LLCP is
+ *    idle;
+ *  - RX data holdoff: the first skipped event's anchor lies at least
+ *    LL_CONN_DATA_HOLDOFF_MS after the last non-empty data PDU (LLID 1 or
+ *    2) received from the central (per link, latched off once passed); LL
+ *    control and empty PDUs do not start it.
+ * Skipped events still advance the event counter and CSA#1; window
+ * widening uses the real time since the last anchor (at most 500 intervals
+ * of growth, never reaching the clamp). New TX data calls ll_conn_kick().
+ */
+#ifndef LL_CONN_H_
+#define LL_CONN_H_
+
+#include <stdbool.h>
+#include <stdint.h>
+
+#include "ll_pdu.h"
+#include "ll_radio.h"
+#include "ll_txq.h"
+
+/* Timing constants (us). The RX window of an event opens at
+ * anchor - widening - margin (window events: transmit window start -
+ * widening - LL_CONN_WIN_MARGIN_US) and lasts until the access address of a
+ * packet starting at anchor + widening + margin (window end + widening +
+ * margin) has been received. */
+#define LL_CONN_SYNC_US        40    /* preamble + access address at 1M */
+#define LL_CONN_RX_MARGIN_US   60    /* synced events (spike-proven) */
+#define LL_CONN_WIN_MARGIN_US  200   /* transmit window events */
+/* Alarm this long before the RX opens. Task 10: under traffic the stimer
+ * ISR often starts 150..270 us late (another ISR still running, often the
+ * USB ISR, which has a higher PLIC priority); with 300 us (180 us of
+ * tolerance above LL_CONN_MIN_PREP_US) about 0.4 % of the events at a 7.5
+ * ms interval were skipped as late, with 500 us none in 10 min. */
+#define LL_CONN_ARM_LEAD_US    500
+#define LL_CONN_MIN_PREP_US    120   /* alarm later than this before RX open: skip */
+/* Event length cap, passed to ll_radio_conn_event() as max_event_us (the
+ * radio's guard alarm fires at open + max_event_us and stops the BRX). It
+ * is derived from the interval: interval - the widening growth over one
+ * interval - LL_CONN_ARM_LEAD_US - LL_CONN_EVENT_SAFETY_US, so a long MD
+ * burst of the central (SMP image upload, rgb_mgmt writes) may use almost
+ * the whole interval but the guard always ends it before the next event's
+ * alarm. The safety covers the larger margin of a transmit-window event at
+ * an update instant (LL_CONN_WIN_MARGIN_US - LL_CONN_RX_MARGIN_US = 140 us)
+ * and the guard ISR's own latency. The cap never cuts into the first RX
+ * window: it is at least first_timeout_us + one exchange of PDUs of the
+ * link's effective maximum times (ll_conn_exchange_us, slice 6b Task 4:
+ * 328 + 150 + 328 + 150 = 956 us, rounded up to LL_CONN_GUARD_MIN_TAIL_US,
+ * for 27-octet PDUs, 2120 + 150 + 2120 + 150 = 4540 us at 251 / 2120). */
+#define LL_CONN_EVENT_SAFETY_US   300
+#define LL_CONN_GUARD_MIN_TAIL_US 1000
+/* Peripheral latency holdoff (slice 7): no event is skipped while its
+ * anchor lies less than this after the connection start (the CONNECT_IND
+ * end), so the central's early requests (feature exchange, encryption,
+ * connection update) are answered at once. Per link. */
+#define LL_CONN_LATENCY_HOLDOFF_MS 1000
+/* RX data holdoff: no event is skipped while its anchor lies less than
+ * this after the last non-empty data PDU (LLID 1 or 2) received from the
+ * central on the link, so a request / response exchange of the hosts
+ * (SMP pairing and key distribution, GATT discovery, ATT writes) runs at
+ * one round trip per 2 intervals instead of one per latency window (up to
+ * 465 ms at interval 12 / latency 30). LL control PDUs (LE Ping, channel
+ * map, ...) and empty PDUs do not start it, so the idle cadence stays
+ * latency + 1 events. 1 s covers the central host's think time between
+ * the steps of such an exchange (a phone's SMP / GATT layer answers within
+ * tens to a few hundred ms) with margin, and costs at most 1 s of
+ * listening at every interval after the last data, which an idle link
+ * (a keyboard sends, the central rarely writes) almost never pays. Worst
+ * case: a central that sends data more often than once per second keeps
+ * the link at effectively latency 0. L2CAP signaling (LLID 2, e.g. a
+ * Connection Parameter Update Response) also starts it. Per link. */
+#define LL_CONN_DATA_HOLDOFF_MS 1000
+/* Starvation bound (arbiter priority STARVING): a link that yielded this
+ * many events in a row (refused, displaced, or started without room)
+ * requests its next events above ACTIVE until one is started. Without it
+ * a busy link whose events overlap every event of an idle one starved the
+ * idle link up to its supervision priority (seconds), and an
+ * LL_CHANNEL_MAP_IND or LL_CONNECTION_UPDATE_IND of that link's central
+ * arrived after its instant (0x28, first multi-host test). With 2, a link
+ * listens at most 2 events beyond its latency window (latency + 3 events
+ * after its last listen), unless a SUPERVISION or MUST event or a running
+ * event is in the way. That is enough only because real centrals leave a
+ * margin: 5.1.1 / 5.1.2 say the central "should" allow at least 6 listened
+ * events before an instant, which is not a requirement; the phone measured
+ * put its instants latency + 6 or 7 events ahead, the PC 7 at latency 0. */
+#define LL_CONN_STARVE_YIELDS 2
+
+struct ll_conn_params {
+	uint16_t interval;   /* 1.25 ms units */
+	uint16_t latency;
+	uint16_t timeout;    /* 10 ms units */
+};
+
+enum ll_conn_evt {
+	/* arg: const struct ll_connect_ind * (the CONNECT_IND that started it).
+	 * Reported by ll_conn_start() when the connection is created. */
+	LL_CONN_EVT_CONNECTED,
+	/* arg: const uint8_t * pointing at the HCI reason code. The
+	 * connection is already torn down (no alarm, radio idle). */
+	LL_CONN_EVT_DISCONNECTED,
+	/* arg: const struct ll_conn_params * (new parameters, applied at the
+	 * instant). Only reported when interval, latency or timeout changed. */
+	LL_CONN_EVT_UPDATED,
+};
+
+/* ISR context (radio/stimer path), or thread context with ll_plat_lock()
+ * held when the event results from a thread call: ll_conn_start,
+ * ll_conn_end, ll_conn_update_at/chmap_at (an instant in the past, or a
+ * re-plan that applies the update), ll_conn_kick and ll_conn_flash_kick
+ * (a re-plan that yields: LL_CONN_EVT_UPDATED when it plans the instant
+ * event, LL_CONN_EVT_DISCONNECTED after YIELD_MAX yields or a supervision
+ * timeout). link: the link the event belongs to. */
+typedef void (*ll_conn_evt_cb_t)(uint8_t link, enum ll_conn_evt what, const void *arg);
+
+struct ll_conn_ops {
+	ll_conn_evt_cb_t evt;
+	/* ll_txq completions (ISR), forwarded unchanged after ll_conn's own
+	 * LL_TERMINATE_IND tracking. May be NULL. */
+	ll_txq_done_cb_t txq_done;
+	/* Queue one own LL control PDU (plaintext payload, opcode first),
+	 * encrypting it when the link is encrypted, via ll_txq_push(LL_TXQ_CTRL,
+	 * LL_LLID_CTRL, ..., ctrl_opcode = payload[0]). Thread context; takes
+	 * ll_plat_lock() itself. Returns 0 or a negative errno. NULL: ll_conn
+	 * pushes the plaintext PDU itself (fine while unencrypted). The glue's
+	 * hook (ll_llcp_ctrl_tx) also takes the ll_plat_tx_lock() mutex, so it
+	 * may block: never call it from an ISR or with ll_plat_lock() held. It
+	 * owes the PDU when the backlog is full and retries it (slice 7). */
+	int (*ctrl_tx)(uint8_t link, const uint8_t *payload, uint8_t len);
+	/* Peripheral latency: true while an LL control procedure waits on us
+	 * or on the central (encryption start, a response not queued yet).
+	 * Called from ISR context when the next event is planned, so it must
+	 * not block or take ll_plat_tx_lock(); reading a flag is enough (a
+	 * stale answer costs at most one skip window, the response itself
+	 * kicks via ll_conn_kick()). NULL: never busy. */
+	bool (*busy)(uint8_t link);
+};
+
+/* ops is copied; also ll_txq_init() (completions go to ops->txq_done).
+ * Frees every link; the stats stay cumulative. */
+void ll_conn_init(const struct ll_conn_ops *ops);
+/* Start following a connection on the lowest free link:
+ * ll_radio_conn_init() (one-time radio setup, a no-op while it is done),
+ * ll_txq_reset(link), plan the first event in the transmit window, report
+ * LL_CONN_EVT_CONNECTED. ll_rxq is NOT reset here (ISR context, the
+ * consumer thread may be inside ll_rxq_get()): the owner of the consumer
+ * thread resets the link's ll_rxq / ll_llcp when it handles
+ * LL_CONN_EVT_DISCONNECTED and then calls ll_conn_release(), and only then
+ * is the id free again (boot state is reset already).
+ * connect_ind_end_tick = end of the CONNECT_IND packet (LL_RADIO_RX_OK
+ * end_tick); the caller has stopped advertising. Returns the new link id
+ * (>= 0), or -EINVAL for unusable parameters (nothing started, the caller
+ * keeps advertising) or -EBUSY (no free link; checked first). ISR. */
+int ll_conn_start(const struct ll_connect_ind *ci, uint32_t connect_ind_end_tick);
+/* Radio callback in connection mode (same signature as ll_radio_cb_t). ISR.
+ * Handles LL_RADIO_CONN_RX / _RX_CRC_ERR / _RX_NODATA / _DONE for the link
+ * whose event is on air (the owner recorded when the BRX was issued),
+ * ignores the rest and everything while no event is on air. */
+void ll_conn_radio_evt(enum ll_radio_evt evt, const uint8_t *pdu, uint16_t len, uint32_t tick);
+/* Schedule LL_CONNECTION_UPDATE_IND / LL_CHANNEL_MAP_IND parameters for the
+ * event with counter == instant. rx_event: the connection event the PDU
+ * was received in (ll_rx_pdu.event). Return 0, or LL_ST_INSTANT_PASSED
+ * when (instant - rx_event) mod 65536 >= 32767 (Vol 6 Part B 5.5.1, "the
+ * instant is in the past"; the connection is then terminated with 0x28).
+ * An instant whose event has gone by since the reception (the controller
+ * thread handled the PDU late: the instant is before the planned event, is
+ * the event on air, which includes instant == rx_event, or is an event
+ * whose anchor has passed) is applied late: the map from the instant event
+ * on, the new timing from the instant's old anchor + WinOffset (transmit
+ * window repeated every new interval), and the first event that can still
+ * be prepared is listened to (stats: late_instants, catch_up_steps_max;
+ * the events in between count as missed unless they were latency skips).
+ * Without an active connection: LL_ST_DISALLOWED. ll_conn_update_at checks the
+ * parameters first (interval 6..3200, latency <= 499, timeout 10..3200 and
+ * > (1 + latency) * interval * 2, WinSize 1..min(8, interval - 1), WinOffset
+ * <= interval) and returns LL_ST_INVALID_LL_PARAM for invalid ones without
+ * changing anything (the caller, ll_llcp, decides how to end the link).
+ * Thread. */
+int ll_conn_update_at(uint8_t link, uint16_t rx_event, uint16_t instant, uint8_t win_size,
+		      uint16_t win_offset, const struct ll_conn_params *p);
+int ll_conn_chmap_at(uint8_t link, uint16_t rx_event, uint16_t instant, const uint8_t chm[5]);
+/* Local termination (HCI Disconnect via ll_llcp): queue LL_TERMINATE_IND
+ * with reason (via ops.ctrl_tx), then end with LL_ST_LOCAL_TERM once it is
+ * acked, or after connSupervisionTimeout without ack. Thread. */
+void ll_conn_terminate(uint8_t link, uint8_t reason);
+/* Immediate end with an HCI reason, no PDU sent: remote LL_TERMINATE_IND
+ * (reason from the PDU; our response in the receiving event already acked
+ * it), MIC failure (0x3D), LLCP response timeout (0x22). Deferred to the
+ * end of the current event if one is on air. Thread or ISR. */
+void ll_conn_end(uint8_t link, uint8_t reason);
+bool ll_conn_active(uint8_t link);
+/* ll_conn_end(link, reason) for every active link (one radio: a wedged
+ * radio ends all links, the glue's guard-streak rule). Returns the number of
+ * links ended (or whose end is pending). Thread or ISR. */
+uint8_t ll_conn_end_all(uint8_t reason);
+/* Links not free (active, or ended and awaiting ll_conn_release()). */
+uint8_t ll_conn_count(void);
+/* Thread: the consumer has reset the link's rxq and llcp after
+ * LL_CONN_EVT_DISCONNECTED; the id may be reused. No-op for a link that is
+ * not awaiting release. Takes ll_plat_lock(). */
+void ll_conn_release(uint8_t link);
+/* Test and diagnostic accessor (no production caller: instants are judged
+ * against the event their PDU was received in). Counter of the next
+ * connection event not yet completed (the one on air,
+ * if any). While a latency skip is planned this is the first skipped event
+ * (an instant for a skipped event re-plans the listen to the first
+ * reachable event, or to the instant if that comes first; slice 7: an
+ * instant event whose alarm time is gone but not its anchor is planned
+ * late, issued if it can still be prepared, else a late miss, and the
+ * instant is applied). After a re-plan (kick, instant, or a yield to the
+ * arbiter) it is the planned event. Instants are judged against the event
+ * their PDU was received in, not against this (ll_conn_update_at). */
+uint16_t ll_conn_event_counter(uint8_t link);
+/* Instants of the link not yet reached (slice 6d Task 2, procedure
+ * collisions, Vol 6 Part B 5.3): LL_CONN_PENDING_UPDATE while an
+ * LL_CONNECTION_UPDATE_IND waits for its instant event to be planned (an
+ * update is applied, and LL_CONN_EVT_UPDATED reported, when that event is
+ * planned, up to one old interval before its anchor; the central starts no
+ * new procedure before its own instant, so the difference does not show),
+ * LL_CONN_PENDING_CHMAP
+ * while an LL_CHANNEL_MAP_IND does (also while its instant was applied to a
+ * planned event of a skip window that has not come yet). 0 for an inactive
+ * or out-of-range link. ISR-safe; takes ll_plat_lock(). */
+#define LL_CONN_PENDING_UPDATE 0x01
+#define LL_CONN_PENDING_CHMAP  0x02
+uint8_t ll_conn_pending_instants(uint8_t link);
+/* New TX data was queued (call after a successful ll_txq_push; the
+ * ll_plat_lock() it takes nests, so the caller may hold it): if the planned
+ * event lies beyond the next regular event that can still be prepared
+ * (alarm LL_CONN_ARM_LEAD_US before its RX opens), re-plan to that event.
+ * No-op without a connection, during an event (the next plan sees the
+ * backlog) or when that event is already the planned one. An instant in
+ * the skip window re-plans to the first reachable event (see
+ * ll_conn_event_counter); no skip is planned while an update instant is
+ * pending within the latency window, and a listen planned at a map instant
+ * can still be pulled earlier, so a kick never waits for an instant.
+ * ISR-safe; takes ll_plat_lock(). */
+void ll_conn_kick(uint8_t link);
+/* The link whose connection event is on air (its BRX issued, CONN_DONE not
+ * yet handled), -1 between events. ISR (the radio callbacks of the event). */
+int ll_conn_event_owner(void);
+/* RX flow control (slice 7 Task 2c review): true when the link's ll_rxq is
+ * one maximum PDU short of the point where an event is stopped or not
+ * listened to, so the glue wakes the consumer first. False for an
+ * out-of-range link. ISR (producer side). */
+bool ll_conn_rx_wake_due(uint8_t link);
+/* Flash window (ll_flash.h). ll_conn_flash_ready: true when every active
+ * link can go without radio for one flash operation: it is established (a
+ * packet was received; before that, missed events count toward the 6-event
+ * establishment rule) and now - its last received packet +
+ * LL_FLASH_OP_MAX_US stays within half its connSupervisionTimeout. Links
+ * awaiting ll_conn_release() and free ids do not count. Pure; the caller
+ * holds ll_plat_lock(). ll_conn_flash_kick: ll_conn_kick() for every
+ * active link that is not ready, so its next event is listened to (no
+ * latency skip in between). While ll_flash_active(), events are not issued
+ * (stats.flash_paused, also in missed), and an event that ends while it is
+ * active was cut by ll_radio_flash_abort() (stats.flash_cut). */
+bool ll_conn_flash_ready(uint32_t now);
+void ll_conn_flash_kick(void);
+/* Slice 6b Task 4: the link's connEffectiveMaxRxTime / MaxTxTime (us), from
+ * ll_llcp whenever they change (328 / 328 at every connection start). One
+ * exchange of maximum PDUs, rx + T_IFS + tx + T_IFS, is the event length
+ * the arbiter reserves after the first RX window and the guard floor
+ * (ll_conn_exchange_us), at least LL_CONN_GUARD_MIN_TAIL_US; the TX part
+ * covers at least the longest PDU still queued (ll_txq_max_len: a PDU
+ * queued under a larger TX length stays valid when it shrinks, 4.5.10, so
+ * the reduced length applies to the span once those are acked). Any
+ * context; takes ll_plat_lock(); used from the next request on. */
+void ll_conn_set_dle_times(uint8_t link, uint16_t max_rx_time, uint16_t max_tx_time);
+/* The reserved tail of one exchange for these times (pure):
+ * max(LL_CONN_GUARD_MIN_TAIL_US, rx + 150 + tx + 150). */
+uint32_t ll_conn_exchange_us(uint16_t max_rx_time, uint16_t max_tx_time);
+
+struct ll_conn_stats {
+	uint32_t events;      /* events issued to the radio */
+	uint32_t rx_events;   /* events with at least one CRC-valid packet */
+	uint32_t missed;      /* events without a valid packet (incl. late) */
+	uint32_t late;        /* events skipped: alarm too late to issue BRX */
+	uint32_t rx_pkts;     /* CRC-valid packets */
+	uint32_t widen_max_us;
+	uint32_t first_bad;   /* events whose first packet had a bad CRC (no re-anchor) */
+	uint32_t first_nodata; /* events whose first packet was not delivered (no re-anchor) */
+	uint32_t first_outside; /* first delivered packet after the RX window (no re-anchor) */
+	/* Peripheral latency (slice 5). planned: listen alarms armed (a
+	 * re-plan of the same listen counts once); planned - listened = late
+	 * events + plans ended by the link end + events not listened to for
+	 * rx_paused / flash_paused + yields at start. listened: alias of events
+	 * (events issued to the radio), named for the power counters. skipped:
+	 * events skipped by latency, net of kick / instant re-plans; counted
+	 * when planned, so it may overstate by up to latency when the link ends
+	 * before the planned event. kicks: ll_conn_kick() calls that
+	 * re-planned. */
+	uint32_t planned;
+	uint32_t listened;
+	uint32_t skipped;
+	uint32_t kicks;
+	/* Slice 6a: events yielded to the arbiter (refused when planned,
+	 * displaced, or started with no room); counted neither in listened
+	 * nor missed nor skipped. planned - listened includes the yields at
+	 * start. */
+	uint32_t collisions;
+	/* Slice 7 Task 2c, RX flow control. rx_paused: events not listened
+	 * to because ll_rxq lacked room (also counted in missed).
+	 * rx_pause_streak_max: the longest run of consecutive paused events
+	 * (a maximum, also in the totals). rx_stops: stop requests
+	 * (ll_radio_conn_stop) for the same reason, at most one per event;
+	 * ll_radio_stats.conn_stopped counts the stops the radio executed,
+	 * fewer when the event had already ended in the same ISR (CMD_DONE). */
+	uint32_t rx_paused;
+	uint32_t rx_stops;
+	uint32_t rx_pause_streak_max;
+	/* Flash window (ll_flash.h): events not issued while it was set (also
+	 * counted in missed), and events that ended while it was set (cut by
+	 * ll_radio_flash_abort when the window opened). */
+	uint32_t flash_paused;
+	uint32_t flash_cut;
+	/* re-plans by ll_conn_flash_kick() (not counted in kicks, which are
+	 * the TX kicks) */
+	uint32_t flash_kicks;
+	/* Late instants (handled after their event went by, applied by
+	 * catch_up): how many, and the most open_of() evaluations one catch_up
+	 * needed (the bound of its work with the lock held; a maximum, also in
+	 * the totals). Events catch_up steps over count in missed, except
+	 * those that were latency skips of the planned window (they stay in
+	 * skipped). */
+	uint32_t late_instants;
+	uint32_t catch_up_steps_max;
+	/* Listen gaps (maxima since boot, per connection: the first event of
+	 * a connection has no gap): the longest distance between two events
+	 * issued to the radio, in events (gap_max) and in us between their RX
+	 * opens (gap_max_us), and the most events beyond the latency window
+	 * (gap - (latency + 1), gap_excess_max: what the arbiter cost on top
+	 * of peripheral latency). ev_len_max_us: the longest event, RX open
+	 * to CONN_DONE. */
+	uint32_t gap_max;
+	uint32_t gap_max_us;
+	uint32_t gap_excess_max;
+	uint32_t ev_len_max_us;
+};
+/* Per link, cumulative since boot (not reset per connection). Out-of-range
+ * link: all zero. */
+void ll_conn_get_stats(uint8_t link, struct ll_conn_stats *s);
+/* Sum over all links (widen_max_us: the maximum), as reported by the
+ * aggregate group 66 fields and the stats log. */
+void ll_conn_get_stats_total(struct ll_conn_stats *s);
+
+/* ll_arb owner callbacks for the links (the glue's ll_arb_ops dispatch ids
+ * < LL_MAX_CONN here). start: issue the BRX of the link's planned event
+ * with the arbiter's cap as max_event_us (stimer ISR). bumped: the planned
+ * event was displaced; re-plan (dodge, else yield) and request again. */
+void ll_conn_arb_start(uint8_t link, uint32_t cap_us);
+void ll_conn_arb_bumped(uint8_t link);
+
+#endif /* LL_CONN_H_ */

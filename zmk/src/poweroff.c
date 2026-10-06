@@ -20,6 +20,10 @@
 #include <zephyr/sys/poweroff.h>
 #include <zephyr/logging/log.h>
 
+#ifdef CONFIG_BT_HCI_B91
+#include "b91_bt.h"
+#endif
+
 LOG_MODULE_REGISTER(poweroff_b91, LOG_LEVEL_INF);
 
 /* -------------------------------------------------------------------------
@@ -111,6 +115,11 @@ static void analog_write(uint8_t addr, uint8_t val)
 void z_sys_poweroff(void)
 {
 	LOG_INF("Entering deep sleep (GPIO wakeup)");
+
+#ifdef CONFIG_BT_HCI_B91
+	/* Quiesce the BLE controller first: no RF/stimer IRQ during entry. */
+	b91_bt_controller_poweroff();
+#endif
 
 	/* Turn off RGB LED power (PC2 = MOSFET gate, active-high) */
 	sys_write8(sys_read8(GPIO_PC_OUT) & ~BIT(2), GPIO_PC_OUT);

@@ -32,4 +32,17 @@ config 2ND_LVL_ISR_TBL_OFFSET
 config NUM_IRQS
 	default 76
 
+# ---- Kernel tick rate ----
+# The machine timer (mtime) runs from the 32 kHz RC, so
+# SYS_CLOCK_HW_CYCLES_PER_SEC is 32000 (SoC default). The kernel default tick
+# rate for a tickless kernel is 10000, and the riscv machine timer driver uses
+# CYC_PER_TICK = 32000 / 10000, an integer division that gives 3 instead of
+# 3.2. Every kernel tick was then 93.75 us instead of 100 us: k_uptime_get(),
+# k_sleep() and every kernel timeout ran 6.67 % fast against mtime (measured
+# +6.6 % against host wall time; debounce, tap-hold, key repeat and the idle
+# sleep timeout were all 6.25 % short). One tick per mtime cycle makes the
+# division exact and gives the finest timeout resolution (31.25 us).
+config SYS_CLOCK_TICKS_PER_SEC
+	default 32000
+
 endif # BOARD_RAINY75

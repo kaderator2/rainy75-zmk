@@ -1,0 +1,52 @@
+From a77206deb05f6d4ae695e7868586bac62cb94bf2 Mon Sep 17 00:00:00 2001
+From: scholzri <33288574+scholzri@users.noreply.github.com>
+Date: Sun, 4 Oct 2026 11:17:32 +0200
+Subject: [PATCH] zmk: start BLE advertising from the workqueue after settings
+ load
+
+zmk_ble_ready() runs from the "ble" settings commit handler, i.e. inside
+settings_load() with the settings lock held, and started advertising
+there. bt_le_adv_start() sends synchronous HCI commands, which the
+Zephyr host transmits from the system workqueue.
+
+With CONFIG_BT_PRIVACY the host generates an IRK when none is stored
+yet and, in its own (earlier) commit handler, queues storing the
+identity and the IRK on the system workqueue. Those work items block on
+the settings lock, so the workqueue never transmits LE Set Random
+Address, the command times out after 10 s and BT_ASSERT oopses. On a
+board whose fatal handler reboots (MCUboot test image) the image is
+never confirmed and reverted, so privacy appears to "not work": the
+previous image keeps advertising the public address. Every boot
+regenerates the IRK (it was never stored), so it never recovers.
+
+Submit update_advertising_work instead: it runs on the workqueue after
+the pending stores, which proceed once settings_load() has returned.
+ZMK already starts advertising from this work item after a disconnect.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ app/src/ble.c | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/app/src/ble.c b/app/src/ble.c
+index 51b172b9..2a59f95a 100644
+--- a/app/src/ble.c
++++ b/app/src/ble.c
+@@ -686,7 +686,13 @@ static void zmk_ble_ready(int err) {
+         return;
+     }
+ 
+-    update_advertising();
++    // Called from the settings commit handler, i.e. while settings_load() holds the settings
++    // lock. Starting advertising here sends synchronous HCI commands, which the host transmits
++    // from the system workqueue. With CONFIG_BT_PRIVACY the host has just queued storing the
++    // freshly generated IRK on that same workqueue, and that work blocks on the settings lock:
++    // a deadlock until the HCI command timeout asserts. Start advertising from the workqueue
++    // instead, after the pending settings stores.
++    k_work_submit(&update_advertising_work);
+ }
+ 
+ static int zmk_ble_complete_startup(void) {
+-- 
+2.53.0
+

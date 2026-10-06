@@ -2,11 +2,13 @@ config BT_HCI_B91
 	bool "Telink B91 BLE HCI driver"
 	default y
 	depends on BT && DT_HAS_TELINK_B91_BT_HCI_ENABLED
-	select BT_HAS_HCI_VS
+	select BT_HAS_HCI_VS if BT_HCI_B91_CTLR_BLOB
 	help
-	  Bluetooth HCI driver for the Telink B91 (TLSR951x) SoC.
-	  Uses our own shim around the BLE controller blob
-	  (liblt_9518_zephyr.a) from telink-semi/zephyr_hal_telink_b91_ble_lib.
+	  Bluetooth HCI driver for the Telink B91 (TLSR951x) SoC. The
+	  controller behind it is chosen below: either our shim around the
+	  BLE controller blob (liblt_9518_zephyr.a) from
+	  telink-semi/zephyr_hal_telink_b91_ble_lib, or the open-source link
+	  layer in openll/ (the default, no binary blobs).
 
 config BT_HCI_B91_RX_STACK_SIZE
 	int "B91 BLE RX thread stack size"
@@ -17,3 +19,68 @@ config BT_HCI_B91_RX_PRIO
 	int "B91 BLE RX thread priority"
 	depends on BT_HCI_B91
 	default 2
+
+choice BT_HCI_B91_CONTROLLER
+	prompt "B91 BLE controller implementation"
+	depends on BT_HCI_B91
+	default BT_HCI_B91_CTLR_OPEN
+
+config BT_HCI_B91_CTLR_BLOB
+	bool "Telink binary controller (liblt_9518_zephyr.a)"
+	help
+	  Proprietary controller blob from telink-semi. Full peripheral
+	  feature set, but the resulting image may not be redistributed.
+
+config BT_HCI_B91_CTLR_OPEN
+	bool "Open-source link layer (default)"
+	help
+	  Our own peripheral-only link layer on hal_telink rf.c: legacy
+	  advertising (also while connected), up to
+	  BT_HCI_B91_OPENLL_MAX_CONN links (CSA#1/#2, 1M PHY, peripheral
+	  latency, Data Length Extension to 251 octets), responder LL
+	  control procedures incl. LE Ping and Connection Parameters
+	  Request, ACL data and LE link encryption (AES-CCM on the hal AES
+	  engine). No binary blobs are linked. See
+	  docs/open-ble-controller.md.
+
+endchoice
+
+config BT_HCI_B91_OPENLL_MAX_CONN
+	int "Open link layer: maximum number of peripheral connections"
+	depends on BT_HCI_B91_CTLR_OPEN
+	range 1 5
+	default 3
+	help
+	  Number of simultaneous peripheral links the open link layer keeps
+	  (link ids and HCI connection handles 0..N-1, one per ZMK profile
+	  that stays connected). The event arbiter (ll_arb) shares the radio
+	  between the links and advertising; advertising is allowed while a
+	  link is free (connectable advertising with all links taken is
+	  refused with Connection Limit Exceeded, 0x09). Each link costs about
+	  5 KB of RAM (TX and RX queues for 251-octet PDUs, slice 6b). 1
+	  behaves as the single-link controller of slice 5.
+
+config BT_HCI_B91_OPENLL_SCANRSP_SETTLE_US
+	int "Open link layer: SCAN_RSP TX settle (us)"
+	depends on BT_HCI_B91_CTLR_OPEN
+	range 40 87
+	default 63
+	help
+	  TX settle of the scheduled single TX that answers a SCAN_REQ
+	  (openll/ll_scanrsp.h). The trigger lies 150 - settle - 59 us
+	  after the request; the RX interrupt must decide before it, so a
+	  smaller settle answers more requests in time. The default 63 is
+	  the smallest TX settle hal_telink publishes for BLE 1M
+	  (ext_rf.h LL_SCAN_TX_SETTLE, LL_TX_STL_TIFS_1M). 40 and 50 worked
+	  with the sniffer and the tested scanner but are not spectrally
+	  verified: values below 63 are for experiments only and may
+	  violate regulatory emission limits. 40 is the lowest value tested
+	  on air.
+
+config BT_HCI_B91_OPENLL_STATS_LOG
+	bool "Open link layer: periodic radio/connection stats log"
+	depends on BT_HCI_B91_CTLR_OPEN
+	help
+	  Log the radio and connection counters every 2 s (INFO level).
+	  Development aid: the timer wakes the CPU and the log lines cost
+	  USB/CDC traffic. The counters themselves always exist.

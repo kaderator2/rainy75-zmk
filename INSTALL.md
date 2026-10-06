@@ -29,10 +29,11 @@ and how to build it yourself.
   **`build-bridge/bridge_ota.bin`** (the OTA transition image), produced by building from
   source — see [section 4](#4-build-from-source).
 
-> **Why no prebuilt download?** The firmware links the proprietary Telink BLE blob, so a
-> prebuilt binary would embed — and thus redistribute — it, which its license forbids
-> (see [NOTICE](NOTICE)). Everyone builds from source; the build fetches the blob from
-> Telink for you.
+> **Why no prebuilt download?** There is none yet, so everyone builds from source. The
+> default build uses the project's own open Bluetooth LE controller and contains no
+> proprietary code. Only the opt-in `./build.sh --blob` build links the proprietary Telink
+> BLE blob; such an image embeds the blob and must not be redistributed (see
+> [NOTICE](NOTICE)).
 
 ---
 
@@ -128,9 +129,10 @@ documented in **[docs/zmk-firmware.md](docs/zmk-firmware.md)**. In short:
 - A west workspace with this repo as the manifest (`zmk/west.yml` fetches ZMK,
   `hal_telink`, and MCUboot at pinned revisions), plus a Python venv (`.venv`).
 - The project is built inside an **Arch Linux distrobox** (`pacman`, not `dnf`).
-- The **Telink BLE blob** is **not in this repo** (proprietary — see [NOTICE](NOTICE));
-  `build.sh` auto-fetches it (`fetch_ble_blob.sh`, pinned + SHA-256 verified) on the first
-  build, so the initial build needs network access.
+- The default build uses the open Bluetooth LE controller and needs **no Telink BLE
+  blob**. The blob is **not in this repo** (proprietary, see [NOTICE](NOTICE)); only
+  `./build.sh --blob` fetches it (`fetch_ble_blob.sh`, pinned + SHA-256 verified), and that
+  build then needs network access the first time.
 - **One-time west setup** after `west update` — install the Python deps and export the
   Zephyr CMake package, or the build won't configure:
   ```bash
