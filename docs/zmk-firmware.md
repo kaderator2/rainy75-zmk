@@ -650,7 +650,7 @@ Status: advertising while connected and the multilink controller are device-test
 
 ### ZMK Studio over USB and BLE
 
-Studio runs over both transports. ZMK serves it on the transport of the selected output (USB output: USB, BLE output: BLE), and switching the output locks it.
+Studio runs over both transports, independent of the selected output (zmk-src patch 0008; upstream ZMK serves only the transport of the selected output). A request from another transport than the last one locks Studio first.
 
 **USB:** a second CDC ACM port (`conf/studio-usb.overlay`, added to the app build by `build.sh`, chosen as `zmk,studio-rpc-uart`), USB interface 3, next to the console/mcumgr port on interface 0. Budget in the 256 B USB SRAM for EP1-7: per port 64 B bulk OUT (the hardware maximum packet size register applies to every OUT EP) + 32 B bulk IN + 16 B notify, two ports + 16 B HID = 240 B. The board `Kconfig.defconfig` sets `CDC_ACM_BULK_EP_MPS` to 32 when the Studio port exists (the symbol has no prompt); builds without it (MCUboot, bridge) keep 64. The second port uses EP6 (OUT, the only other OUT EP) and EP7 (IN). Those two reset into isochronous mode (USB register `0x38` resets to `0xC0`, meant for audio): without handshakes the first packets got through, then the port went quiet. The driver now writes the ISO mode register from the endpoint types (bulk and interrupt EPs non-isochronous), from a shadow cleared at attach. Measured: 300 of 300 Studio requests at about 300 per second (median 2.5 ms), with mcumgr echoes on port 0 at the same time; 20 of 20 clean enumerations. `99-rainy75-zmk.rules` names the ports "Rainy 75 Pro Console" / "Rainy 75 Pro Studio" for Chrome's Web Serial picker on Linux (`ID_MODEL_ENC` per interface).
 
@@ -1049,6 +1049,7 @@ patches/
     0005-zmk-start-BLE-advertising-from-the-workqueue-after-s.patch
     0006-zmk-raise-BLE-auth-state-events.patch
     0007-zmk-keep-passkey-entry-keys-out-of-the-HID-reports.patch
+    0008-zmk-studio-serve-RPC-on-every-transport.patch
 ```
 
 `zmk-src/0005` is needed for `--privacy`: ZMK started advertising inside the
@@ -1157,18 +1158,16 @@ helps against a second program reading the port (see "MCUboot DFU").
 
 ### hal_telink (1 file, 2 patches)
 
-**`tlsr9/CMakeLists.txt`** — BT_HCI_B91 guard **[DEFERRED: Stage 2 BLE]**
+**`tlsr9/CMakeLists.txt`** (0001): build `sys.c` unless the BLE controller blob is selected
 
 ```diff
 -if (NOT CONFIG_PM AND NOT CONFIG_BT_B91)
-+if (NOT CONFIG_PM AND NOT CONFIG_BT_B91 AND NOT CONFIG_BT_HCI_B91)
++if (NOT CONFIG_PM AND NOT CONFIG_BT_B91 AND NOT CONFIG_BT_HCI_B91_CTLR_BLOB)
 ```
 
-BLE controller blob defines `sys_init()`, collides with hal_telink's `sys.c`. Required when `CONFIG_BT_HCI_B91=y`.
+The blob defines its own `sys_init()`, which collides with hal_telink's `sys.c`; the open controller needs the HAL's `sys.c`. hal_telink is pinned in `zmk/west.yml` to the commit this patch is made against.
 
-**0002** narrows this to the blob: `sys.c` is built unless `CONFIG_BT_HCI_B91_CTLR_BLOB` is selected, because the open controller needs the HAL's `sys_init`.
-
-### zmk-src (11 files, 7 patches)
+### zmk-src (14 files, 8 patches)
 
 **0001 — `app/Kconfig` + `app/src/activity.c`** — `ZMK_USB_NO_VBUS_DETECT` for boards without VBUS sensing
 
@@ -1185,6 +1184,8 @@ B91 has no USB VBUS detection pin. Without this patch, `is_usb_power_present()` 
 **0006, `app/src/ble.c` + new `app/include/zmk/events/ble_auth_state_changed.h`, `app/src/events/ble_auth_state_changed.c`, `app/CMakeLists.txt`:** a new event `zmk_ble_auth_state_changed { profile, state, digits }` for pairing indicators (rainy_rgb BLE slot LEDs). States: `PASSKEY_REQ` (`auth_passkey_entry`), `PASSKEY_DIGITS` (each digit typed, `digits` = count so far, 1..6; `PASSKEY_REQ` means 0; the profile is the one stored at `PASSKEY_REQ`), `PASSKEY_SUBMITTED` (Enter, queued before the passkey goes to the stack so the result always follows it), `PAIRED_OK` (`auth_pairing_complete`), `FAILED` (`auth_cancel`, `security_changed` with an error, `pairing_failed`, or a pairing completed on a taken profile) and `CLEARED` (`zmk_ble_clear_bonds()`, and every profile in `zmk_ble_clear_all_bonds()`). `profile` is the bonded profile of the peer, else the active profile, where new pairings happen. The BT callbacks run in the BT RX thread, so every event goes through a small message queue (8 entries) drained by a work item on the system workqueue; the thread-context sources take the same path so the order is kept. One failed pairing usually produces two or three `FAILED` events within the same RX callback chain (Zephyr calls `security_changed`, `pairing_failed` and sometimes `cancel`); consumers treat them as one. After `BT_CLR` the old host usually still tries to reconnect with its stale keys, which gives `CLEARED` and then `FAILED` on the same slot (a red flash); this is expected. Only peripheral-role connections raise events. The patch only reports: it changes no ZMK behaviour. The policy built on it (output switch on profile select, open profile timeout) lives in our module, see [BLE policy module](#ble-policy-module).
 
 **0007, `app/src/hid_listener.c` + `app/src/ble.c` + `app/include/zmk/ble.h`:** keys typed for a passkey no longer reach a host. ZMK event listeners run in link order (the `.event_subscription` linker section is not sorted), and `hid_listener.c` is linked before `ble.c`, so upstream ZMK reported every passkey key to the current endpoint before the passkey listener consumed it. On the device the digits appeared on the USB host, because the endpoint falls back to USB while the new BLE profile is not connected yet. `zmk_ble_passkey_entry_active()` (true while `auth_passkey_entry_conn` or `auth_pairing_keys_conn` is set) is checked at the top of the HID listener: while a passkey is entered it drops presses and drops releases of keys that are not in the report; releases of keys held from before the request still go out, so nothing gets stuck. The check does not depend on listener order. The ownership lasts beyond the Enter release: `auth_passkey_entry_conn` is cleared there, but the host still checks the passkey, and a second Enter typed meanwhile reached the PC. A separate reference (`auth_pairing_keys_conn`, atomic) is taken at the passkey request and released on `pairing_complete`, `pairing_failed`, `security_changed` with an error, `cancel` or the disconnect of that connection. `auth_passkey_entry_conn` is atomic too and is cleared on all the same paths: Zephyr calls the `cancel` callback only for a remote Pairing Failed, while Esc (a local `bt_conn_auth_cancel()`), the SMP timeout and a disconnect before Enter only reach `pairing_failed`/`security_changed`. Upstream left it set on those paths; with the check above that kept every key away from the hosts until the next pairing. Enter and Esc take it with an atomic exchange, so it is never dropped twice. A disconnect that ends a pairing nothing else ended raises `FAILED`. A digit raises `PASSKEY_DIGITS` only while the entry is still open, so a digit typed while the RX thread ends the pairing does not restart the guidance after its `FAILED`. Corner case kept: a usage held from before the request and pressed again on another key during the entry is released early by that key's release.
+
+**0008, `app/src/studio/rpc.c` + `uart_rpc_transport.c` + `gatt_rpc_transport.c` + `app/include/zmk/studio/rpc.h`:** ZMK Studio on every transport. Upstream served Studio only on the transport of the selected output (USB output: USB, BLE output: BLE) and locked it on every output change, so with the cable plugged in a Bluetooth client got no answer. Every transport now listens all the time. A transport claims the shared RX buffer (`zmk_rpc_rx_claim()`) before writing request bytes into it, so two clients never interleave; another transport can take over once the owner has been quiet for 200 ms (`RX_CLAIM_IDLE_MS`), and a request that arrives inside that window is dropped (the client retries). Responses and notifications go out over the transport of the last request; the USB transport only drains the shared TX buffer while it is selected. With `CONFIG_ZMK_STUDIO_LOCK_ON_DISCONNECT` a change of transport locks Studio first, so a client on another transport never inherits an unlock. Measured: BLE 234/234, USB 49/50 right after (the first request inside the 200 ms window), BLE 113/113, output untouched. Upstreamable.
 
 **Updating an older zmk-src tree.** Until October 2026 the series had 8 patches: 0006 also switched the output in `zmk_ble_prof_select()` and 0008 carried the open profile timeout. A tree that still has those commits lacks the new 0006 subject while 0007 is applied, so `build.sh` stops with the gap message (see [Applying the patches](#applying-the-patches)). Move the tree back to the manifest revision (`git -C zmk-src checkout --detach manifest-rev`, or `west update`) and run `./build.sh` again, which applies the series.
 

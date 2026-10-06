@@ -257,3 +257,16 @@ patches:
     comments: >-
       Keep passkey entry keys out of the HID reports (listener order bug) and end a stale
       passkey entry on every pairing end. Real upstream bug.
+
+  - path: zmk-src/0008-zmk-studio-serve-RPC-on-every-transport.patch
+    sha256sum: 1da350d6d16521f7d8be01b79e2344d09acf6815d8f4127d1da87cae7f647798
+    module: zmk-src
+    author: scholzri
+    email: 33288574+scholzri@users.noreply.github.com
+    date: 2026-10-06
+    upstreamable: true
+    apply-command: git -c "user.name=rainy75 build" -c user.email=build@localhost am --3way
+    comments: >-
+      ZMK Studio served on every transport (USB and BLE) instead of only the one of the
+      selected output; RX claim against interleaving, responses over the transport of the
+      last request, lock on a change of transport.

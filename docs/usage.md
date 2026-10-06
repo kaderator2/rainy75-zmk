@@ -116,11 +116,10 @@ reconnects to the selected host within a few seconds (about 5 s measured).
 **over USB and over Bluetooth**, in **Chrome or Edge** (Firefox supports neither Web Serial
 nor Web Bluetooth).
 
-**Studio follows the output** (ZMK behaviour): with the output on USB (hold Fn, F4 white) it
-answers over USB, with the output on Bluetooth (F4 cyan) over Bluetooth. Switching the output
-locks Studio again.
+Studio answers over both, whatever the output is set to (F4). Switching from a Bluetooth
+client to a USB client or back locks Studio again: press `Fn + ESC` to unlock.
 
-**Over USB** (output USB):
+**Over USB:**
 1. Open **[zmk.studio](https://zmk.studio)**, choose **Connect → USB**.
 2. The keyboard has two serial ports. Pick the **Studio** one: with the included udev rules
    (`99-rainy75-zmk.rules`) Linux shows it as **"Rainy 75 Pro Studio"**; without them, or on
@@ -132,7 +131,7 @@ locks Studio again.
 
 Over USB Studio is fast: about 300 requests per second (about 25 over Bluetooth).
 
-**Over Bluetooth** (output Bluetooth):
+**Over Bluetooth:**
 1. Open **[zmk.studio](https://zmk.studio)**, choose **Connect → Bluetooth**, and pick the
    keyboard in the browser's device picker.
 2. Press **`Fn + ESC`** on the keyboard to **unlock** editing.
