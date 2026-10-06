@@ -1233,8 +1233,11 @@ stack to 1024 bytes for both controllers.
 Link at 12 / 30 / 400: we answer every 31st event on air; kick to RX open of
 the listen 1.2 to 13.7 ms (below one interval); 30 min soak 60 / 60 echoes,
 0 disconnects; deep sleep stops advertising and detaches USB; wake by keypress
-is a cold boot, and the bonded host reconnected by itself about 13 s after
-boot (measured before the CCC change; a new measurement is pending).
+is a cold boot. The bonded host reconnected by itself about 13 s after boot
+in slice 5; with the CCC load at boot (slice 7) it takes about 5 s from the
+wake keypress until typing works: MCUboot cold boot about 1 to 2 s, Zephyr
+start to BLE ready 2.5 s (mostly the settings load), first advertising to
+connected and encrypted 0.22 s.
 
 ## Hardware findings
 
@@ -1308,8 +1311,9 @@ documentation. They may help anyone writing a B91 link layer.
   starvation fix): 4 s without a packet from the phone right after a map
   instant, while the link kept listening (gap within 33 events, then
   SUPERVISION priority). Not reproduced in the other three runs.
-- **Reconnect after wake not re-measured** with the CCC load at boot (slice 7
-  Task 2 item 4; 13 s was measured in slice 5 with lazy loading).
+- **Wake to typing about 5 s**, dominated by the MCUboot cold boot (it hashes
+  the whole image on every boot) and the ZMK settings load (about 1.4 s), not
+  by the link (0.22 s from the first advertising to encrypted).
 - **Slice 5b: battery and suspend.** The CPU idles but the SoC is not suspended
   between events. An overnight battery comparison with the blob is not done;
   SoC suspend (Zephyr PM states, timer recovery, GPIO wake, RGB DMA, USB) is the

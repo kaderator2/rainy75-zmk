@@ -589,7 +589,7 @@ Bottom 64KB of ILM SRAM retained — BLE controller state survives sleep.
 
 **Files**:
 - `zmk/src/poweroff.c` — `z_sys_poweroff()`: turns off RGB/USB, configures analog pull-downs on columns (100K) and pull-ups on rows (1M), configures row wakeup, enters `DEEPSLEEP_MODE` (cold boot on wakeup)
-- `patches/zephyr/0004-*` — adds `HAS_POWEROFF` to tlsr951x Kconfig
+- `zmk/boards/rainy75/Kconfig.rainy75`: the board selects `HAS_POWEROFF` (no Zephyr patch needed)
 
 **How it works**:
 1. ZMK activity.c detects 15min idle → calls `sys_poweroff()`
@@ -605,7 +605,7 @@ Using `DEEPSLEEP_MODE` (0x30, cold boot) instead.
 CONFIG_ZMK_SLEEP=y
 CONFIG_ZMK_IDLE_SLEEP_TIMEOUT=900000  # 15 minutes
 ```
-`CONFIG_POWEROFF=y` is auto-selected by `HAS_POWEROFF` in SoC Kconfig.
+`CONFIG_POWEROFF=y` is available because the board selects `HAS_POWEROFF`.
 
 Build with `./build.sh -pa`, upload via mcumgr, reset.
 
