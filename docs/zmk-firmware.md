@@ -967,7 +967,7 @@ mcumgr --conntype serial --connstring /dev/ttyACM0 reset
 5. **5s delayed work** — calls `boot_write_img_confirmed()` to make swap permanent, disables WDT
 6. **If crash occurs** — WDT fires after 10s, chip resets, MCUboot sees unconfirmed image → reverts
 
-**Risky test images:** `CONFIG_RAINY75_MCUBOOT_MANUAL_CONFIRM=y` (add it as an extra conf file, never in a release) skips step 5's confirmation and only disables the WDT. The image then runs as long as needed, and any reset or power cycle goes back to the previous image, even if USB and BLE no longer work (with USB unplugged, the wireless switch under CapsLock cuts the power). Confirm a good test image by hand with `mcumgr image confirm <hash>`. Do not upload another image while a test image runs unconfirmed: slot 1 holds the fallback; reset back to it first. Used for the USB Studio port bring-up.
+**Risky test images:** `./build.sh ... --test-image` (adds `conf/test-image.conf` = `CONFIG_RAINY75_MCUBOOT_MANUAL_CONFIRM=y`, never in a release) skips step 5's confirmation and only disables the WDT. The image then runs as long as needed, and any reset or power cycle goes back to the previous image, even if USB and BLE no longer work (with USB unplugged, the wireless switch under CapsLock cuts the power). Confirm a good test image by hand with `mcumgr image confirm <hash>`. Do not upload another image while a test image runs unconfirmed: slot 1 holds the fallback; reset back to it first. Used for the USB Studio port bring-up.
 
 **Future:** MCUboot v2.3.0+ supports starting WDT in the bootloader itself (`BOOT_WATCHDOG_SETUP_AT_BOOT`), covering the gap between MCUboot boot and app WDT init. This requires Zephyr 4.3+ (MCUboot v2.3.0 is incompatible with Zephyr 4.1 on RISC-V). When ZMK upgrades, we can simplify: MCUboot starts WDT → driver preserves it → app feeds/confirms/disables. The DTS `watchdog0` alias is already in place for this.
 
@@ -1036,6 +1036,7 @@ patches/
     0009-usb-device-do-not-re-init-transfer-slots-on-every-us.patch
     0010-mgmt-uart_mcumgr-keep-log-output-out-of-SMP-frames.patch
     0011-mgmt-uart_mcumgr-optionally-wait-for-TX-room-instead.patch
+    0012-usb-device-cdc_acm-set-the-call-management-data-inte.patch
   mcuboot/
     0001-b91-riscv-boot-fixes.patch
   hal_telink/
@@ -1059,7 +1060,7 @@ on advertising the public address. This is most likely also what the old
 "BT_PRIVACY hangs bt_enable() with the blob" note was (not retested with the
 blob).
 
-### Zephyr (11 patches)
+### Zephyr (12 patches)
 
 **`drivers/gpio/gpio_b91.c`** — WRITE_BIT double-BIT fix **[VERIFIED]**
 
@@ -1143,6 +1144,8 @@ follows the 4096 backlog bytes on a line of its own, 3 of 3; the first
 The two patches work together: 0011's frame write runs under 0010's mutex, so
 a waiting response cannot be interleaved with a log message either. Neither
 helps against a second program reading the port (see "MCUboot DFU").
+
+**`subsys/usb/device/class/cdc_acm.c`** (0012): the Call Management descriptor of a second CDC ACM port points at its own data interface. The legacy class renumbers a CDC ACM function that is not first in the configuration (interface numbers, union descriptor, IAD) but left `bDataInterface` at its static 1, so the Studio port (interfaces 3/4) pointed at data interface 1. Linux uses the union descriptor and did not notice; hosts that read Call Management would get the wrong interface. Upstreamable.
 
 ### MCUboot (1 file, 1 patch)
 

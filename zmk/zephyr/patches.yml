@@ -144,6 +144,18 @@ patches:
       uart_mcumgr: optional wait for CDC ACM TX room (CONFIG_UART_MCUMGR_TX_WAIT_MS), so the
       first response after boot is not dropped. Runs under the 0010 mutex.
 
+  - path: zephyr/0012-usb-device-cdc_acm-set-the-call-management-data-inte.patch
+    sha256sum: d0604c1c1cc32970a88e4dbbc4441e16a5cda0a3512608970c4eb0a2c8484606
+    module: zephyr
+    author: scholzri
+    email: 33288574+scholzri@users.noreply.github.com
+    date: 2026-10-06
+    upstreamable: true
+    apply-command: git -c "user.name=rainy75 build" -c user.email=build@localhost am --3way
+    comments: >-
+      cdc_acm (legacy): set the Call Management bDataInterface when a CDC ACM function is
+      renumbered; a second port (ZMK Studio, interfaces 3/4) pointed at data interface 1.
+
   # --- bootloader/mcuboot ---
   - path: mcuboot/0001-b91-riscv-boot-fixes.patch
     sha256sum: 7805e148536a9981e5c657815755d89b3570843c396f73638b798ef5e6e45bd9
