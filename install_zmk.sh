@@ -36,7 +36,7 @@ header() { echo -e "\n${BOLD}$*${NC}"; }
 # ── Defaults ─────────────────────────────────────────────────
 BRIDGE_IMAGE="build-bridge/bridge_ota.bin"
 ZMK_IMAGE="build/combined.bin"
-SERIAL_PORT="${SERIAL_PORT:-/dev/ttyACM0}"
+SERIAL_PORT="${SERIAL_PORT:-}"   # empty: found by USB name, see resolve_serial_port
 STOCK_VID="320f"
 STOCK_PID="5055"
 ZMK_VID="1d50"
@@ -97,6 +97,19 @@ wait_for_serial() {
     ok "Serial port ready"
 }
 
+# The keyboard's CDC ACM port: --port / SERIAL_PORT, else found by its USB
+# name (ZMK and the bridge both enumerate as "ZMK Project Rainy 75 ..."), so
+# another CDC ACM device (an nRF sniffer, a dev board) on /dev/ttyACM0 is
+# never written to.
+resolve_serial_port() {
+    [[ -n "$SERIAL_PORT" ]] && return 0
+    local link
+    for link in /dev/serial/by-id/usb-ZMK_Project_Rainy_75*; do
+        [[ -e "$link" ]] && { SERIAL_PORT=$(readlink -f "$link"); return 0; }
+    done
+    SERIAL_PORT=/dev/ttyACM0
+}
+
 # ── Recovery guidance on failure ─────────────────────────────
 cleanup_msg() {
     local rc=$?
@@ -105,6 +118,7 @@ cleanup_msg() {
     warn "Installation did not complete."
     if check_usb "$ZMK_VID" "$ZMK_PID"; then
         info "Bridge/ZMK firmware is running. You can retry Stage 2:"
+        resolve_serial_port
         info "  python3 reverse/tools/restore_original.py --yes --port $SERIAL_PORT $ZMK_IMAGE"
     else
         info "Try unplugging the keyboard, waiting 5s, and re-running this script."
@@ -119,6 +133,7 @@ header "=== Rainy 75 Pro: Install ZMK ==="
 
 if check_usb "$ZMK_VID" "$ZMK_PID"; then
     info "Keyboard is already running ZMK (or bridge) firmware."
+    resolve_serial_port
     info "To update ZMK, use mcumgr:"
     info "  mcumgr --conntype serial --connstring dev=$SERIAL_PORT,baud=115200 image upload build/zephyr/zmk.signed.bin"
     echo ""
@@ -151,6 +166,8 @@ python3 reverse/tools/ota_flasher.py --force --yes "$BRIDGE_IMAGE"
 
 info "Bridge flashed. Keyboard will reboot..."
 wait_for_usb "$ZMK_VID" "$ZMK_PID" "bridge firmware" 30
+sleep 1
+resolve_serial_port
 wait_for_serial "$SERIAL_PORT" 15
 
 # ── Stage 2: Write ZMK to flash 0x0 via bridge ──────────────
