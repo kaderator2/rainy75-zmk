@@ -66,7 +66,11 @@ static void confirm_work_handler(struct k_work *work)
 {
 	ARG_UNUSED(work);
 
-	if (!boot_is_img_confirmed()) {
+	if (!boot_is_img_confirmed() && IS_ENABLED(CONFIG_RAINY75_MCUBOOT_MANUAL_CONFIRM)) {
+		/* Test image: stay unconfirmed, so any reset reverts to the
+		 * previous image. Confirm by hand with mcumgr image confirm. */
+		LOG_WRN("Test image: not confirmed, any reset reverts");
+	} else if (!boot_is_img_confirmed()) {
 		int rc = boot_write_img_confirmed();
 		if (rc == 0) {
 			LOG_INF("Image confirmed — swap is now permanent");

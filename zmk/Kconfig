@@ -25,6 +25,16 @@ config BOOT_DIAG_GPIO
 	  Uses direct register access (works before GPIO driver init).
 	  PD7 is free on the Rainy 75 (not used by matrix, USB, or RGB).
 
+config RAINY75_MCUBOOT_MANUAL_CONFIRM
+	bool "Test image: do not confirm the image automatically"
+	depends on IMG_MANAGER
+	help
+	  For risky test images. The image does not confirm itself after boot;
+	  the watchdog is switched off instead, so it can be tested as long as
+	  needed. Any reset or power cycle then goes back to the previous image,
+	  even if USB and Bluetooth no longer work. Confirm a good test image by
+	  hand with "mcumgr image confirm". Never set this for release images.
+
 config FLASH_MGMT
 	bool "Raw flash management via mcumgr"
 	default n
