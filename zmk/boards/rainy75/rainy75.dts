@@ -168,6 +168,9 @@
 		compatible = "zmk,kscan-gpio-matrix";
 		diode-direction = "col2row";
 		wakeup-source;
+		// Press after two readings 1 ms apart: filters single glitches; release
+		// debounce stays at the 5 ms default and absorbs contact bounce.
+		debounce-press-ms = <1>;
 
 		col-gpios
 			= <&gpioe 4 GPIO_ACTIVE_LOW>
