@@ -160,9 +160,9 @@ lighting engine: [docs/rainy-rgb.md](docs/rainy-rgb.md).
   isn't reverse-engineered or implemented here. This firmware is **USB + BLE only**.
 - **Battery percentage** — the battery ADC (pin / divider / Vref) isn't hardware-validated,
   so the gauge is approximate.
-- **ANSI layout** — supported (`./build.sh --ansi`); keymap + matrix **and** per-key RGB
-  verified on real ANSI hardware by contributors (the ANSI strip has 81 LEDs and its own
-  calibrated map — [details](CONTRIBUTING.md#layout-variants-iso--ansi)).
+- **Open Bluetooth controller:** tested with Linux and Android hosts only (Windows, macOS
+  and iOS untested), no 2M PHY, and the battery drain is not yet compared with the blob.
+  Full list: [open-ble-controller.md](docs/open-ble-controller.md#known-limitations-and-open-items).
 
 ---
 
