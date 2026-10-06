@@ -199,6 +199,12 @@ The LEDs are driven via SPI+DMA — no CPU-intensive bit-bang. The PSPI module s
 | 2.4G dongle | Stored in magnetic slot on keyboard body |
 | Warranty | 6 months |
 
+**Provenance:** values in **bold** are first-hand from our unit (measured, photographed, or
+read off the PCB). The rest, including the per-variant plate and switch rows, are vendor
+specs from the [Wobkey wiki](https://wiki.wobkey.com/en/Products/Rainy-75/Specs) and are
+not independently verified. Note the wiki lists "81 keys", which is the ANSI count; the
+ISO variant has 83.
+
 ### Connection Modes (from manual)
 
 | Mode | Indicator | Switch via |
@@ -240,11 +246,11 @@ N-Key Rollover: supported on all keys, all modes.
 - **Power switch**: Must be ON for wireless mode and charging
 - Battery: 2x QS4541113 LiPo, 3.7V 3500mAh each (7000mAh total for Pro)
 
-**Advertised battery life** (from Wobkey wiki):
+**Advertised battery life** (from the [Wobkey wiki](https://wiki.wobkey.com/en/Products/Rainy-75/Specs)):
 
 | Variant | RGB Off | RGB On |
 |---------|---------|--------|
-| Lite/Standard (3500mAh) | ~200 hours | ~40 hours |
+| Lite/Standard (3500mAh) | ~450 hours | ~40 hours |
 | Pro (7000mAh) | ~900 hours | ~80 hours |
 
 **Charging**: approx. 3–4 hours to full. Recommended charger: 5V/1A–5V/2A. Avoid fast chargers (high voltage can damage battery/circuitry).
