@@ -112,22 +112,32 @@ reconnects to the selected host within a few seconds (about 5 s measured).
 
 ## ZMK Studio (live keymap editing)
 
-[ZMK Studio](https://zmk.studio) lets you edit the keymap live, without reflashing. This
-firmware exposes Studio **over Bluetooth only**, so that **mcumgr DFU stays available over
-USB** — on this MCU you can't have both, and keeping USB firmware updates wins.
+[ZMK Studio](https://zmk.studio) lets you edit the keymap live, without reflashing. It works
+**over USB and over Bluetooth**, in **Chrome or Edge** (Firefox supports neither Web Serial
+nor Web Bluetooth).
 
-Why: the B91 has just **256 B of USB SRAM** shared across all data endpoints, and a single
-USB serial port (CDC-ACM) already costs ~136 B of it. That leaves room for **exactly one**
-CDC-ACM, which this firmware spends on the **serial console *and* mcumgr DFU** (they share
-the one port). USB Studio would need a *second* CDC-ACM — that overflows the 256 B SRAM, an
-endpoint fails to allocate, and the **whole USB device stops enumerating**: no console, no
-DFU, *and* no Studio. The only way back from that is a hardware reflash with the Telink EVK.
-So Studio runs over BLE, which costs nothing from the USB budget.
+**Studio follows the output** (ZMK behaviour): with the output on USB (hold Fn, F4 white) it
+answers over USB, with the output on Bluetooth (F4 cyan) over Bluetooth. Switching the output
+locks Studio again.
 
-1. Open **[zmk.studio](https://zmk.studio)** in **Chrome or Edge** (Web Bluetooth — Firefox
-   is not supported).
-2. **Connect → Bluetooth**, and pick the keyboard in the browser's device picker.
+**Over USB** (output USB):
+1. Open **[zmk.studio](https://zmk.studio)**, choose **Connect → USB**.
+2. The keyboard has two serial ports. Pick the **Studio** one: with the included udev rules
+   (`99-rainy75-zmk.rules`) Linux shows it as **"Rainy 75 Pro Studio"**; without them, or on
+   other systems, it's the second Rainy port (USB interface 3, the higher port number). The
+   other port is the log console and firmware updates.
 3. Press **`Fn + ESC`** on the keyboard to **unlock** editing.
+
+Over USB Studio is fast: about 300 requests per second (about 25 over Bluetooth).
+
+**Over Bluetooth** (output Bluetooth):
+1. Open **[zmk.studio](https://zmk.studio)**, choose **Connect → Bluetooth**, and pick the
+   keyboard in the browser's device picker.
+2. Press **`Fn + ESC`** on the keyboard to **unlock** editing.
+
+> **"Failed to open the serial port"** on Linux with the udev rules installed usually means a
+> security policy blocks the browser, not the keyboard. On Fedora secureblue that's SELinux
+> in enforcing mode; Studio over Bluetooth works without changing it.
 
 ### Troubleshooting: "No Services matching UUID … found in Device"
 

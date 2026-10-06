@@ -78,6 +78,8 @@ conf/                            # build configuration overlays
   openll.conf                    # open BLE controller (default): CTLR_OPEN, group 66 counters, 251-octet ACL/ATT MTU 247, CCC load at boot
   blob.conf                      # Telink blob controller instead (./build.sh --blob)
   privacy.conf                   # BT_PRIVACY (RPA), open controller only (./build.sh --privacy); every host must pair again
+  mcumgr.overlay                 # console + mcumgr CDC ACM port (USB interface 0), also used by the OTA bridge
+  studio-usb.overlay             # second CDC ACM port for ZMK Studio over USB (interface 3, EP6/EP7, 32 B bulk IN), app build only
   ota-bridge.conf                # OTA bridge config (monolithic, USB+mcumgr+flash_mgmt)
   mcuboot.conf                   # MCUboot bootloader config
   mcuboot.overlay                # MCUboot DTS overlay (disables peripherals)

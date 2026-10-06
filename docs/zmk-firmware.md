@@ -648,9 +648,13 @@ The keymap binds three profiles (Fn+F1/F2/F3 = `&bt_sel_ble 0..2`, which also sw
 
 Status: advertising while connected and the multilink controller are device-tested with one real central; the switch between several real hosts is not tested yet (open item, see [open-ble-controller.md](open-ble-controller.md#known-limitations-and-open-items)).
 
-### ZMK Studio over BLE
+### ZMK Studio over USB and BLE
 
-Studio runs over BLE only (see `conf/app.conf`). With the open controller the ATT MTU is 247 (`CONFIG_BT_L2CAP_TX_MTU=247`, 251-octet ACL buffers, Data Length Extension), so a 244-byte RPC frame fits one PDU: 22.6 Studio RPCs per s instead of 10.3 with 27-octet PDUs and ATT MTU 65 (open controller before Data Length Extension; the blob build was not measured). "zmk_studio: Failed to select a transport!" at boot is normal: the BLE RPC transport is selected only once the BLE endpoint is ("Endpoint changed: BLE:0"); while the endpoint is USB, Studio over BLE pauses.
+Studio runs over both transports. ZMK serves it on the transport of the selected output (USB output: USB, BLE output: BLE), and switching the output locks it.
+
+**USB:** a second CDC ACM port (`conf/studio-usb.overlay`, added to the app build by `build.sh`, chosen as `zmk,studio-rpc-uart`), USB interface 3, next to the console/mcumgr port on interface 0. Budget in the 256 B USB SRAM for EP1-7: per port 64 B bulk OUT (the hardware maximum packet size register applies to every OUT EP) + 32 B bulk IN + 16 B notify, two ports + 16 B HID = 240 B. The board `Kconfig.defconfig` sets `CDC_ACM_BULK_EP_MPS` to 32 when the Studio port exists (the symbol has no prompt); builds without it (MCUboot, bridge) keep 64. The second port uses EP6 (OUT, the only other OUT EP) and EP7 (IN). Those two reset into isochronous mode (USB register `0x38` resets to `0xC0`, meant for audio): without handshakes the first packets got through, then the port went quiet. The driver now writes the ISO mode register from the endpoint types (bulk and interrupt EPs non-isochronous), from a shadow cleared at attach. Measured: 300 of 300 Studio requests at about 300 per second (median 2.5 ms), with mcumgr echoes on port 0 at the same time; 20 of 20 clean enumerations. `99-rainy75-zmk.rules` names the ports "Rainy 75 Pro Console" / "Rainy 75 Pro Studio" for Chrome's Web Serial picker on Linux (`ID_MODEL_ENC` per interface).
+
+**BLE:** With the open controller the ATT MTU is 247 (`CONFIG_BT_L2CAP_TX_MTU=247`, 251-octet ACL buffers, Data Length Extension), so a 244-byte RPC frame fits one PDU: 22.6 Studio RPCs per s instead of 10.3 with 27-octet PDUs and ATT MTU 65 (open controller before Data Length Extension; the blob build was not measured). "zmk_studio: Failed to select a transport!" at boot is normal: the BLE RPC transport is selected only once the BLE endpoint is ("Endpoint changed: BLE:0"); while the endpoint is USB, Studio over BLE pauses.
 
 ### Driver architecture
 
@@ -963,6 +967,8 @@ mcumgr --conntype serial --connstring /dev/ttyACM0 reset
 5. **5s delayed work** — calls `boot_write_img_confirmed()` to make swap permanent, disables WDT
 6. **If crash occurs** — WDT fires after 10s, chip resets, MCUboot sees unconfirmed image → reverts
 
+**Risky test images:** `CONFIG_RAINY75_MCUBOOT_MANUAL_CONFIRM=y` (add it as an extra conf file, never in a release) skips step 5's confirmation and only disables the WDT. The image then runs as long as needed, and any reset or power cycle goes back to the previous image, even if USB and BLE no longer work (with USB unplugged, the wireless switch under CapsLock cuts the power). Confirm a good test image by hand with `mcumgr image confirm <hash>`. Do not upload another image while a test image runs unconfirmed: slot 1 holds the fallback; reset back to it first. Used for the USB Studio port bring-up.
+
 **Future:** MCUboot v2.3.0+ supports starting WDT in the bootloader itself (`BOOT_WATCHDOG_SETUP_AT_BOOT`), covering the gap between MCUboot boot and app WDT init. This requires Zephyr 4.3+ (MCUboot v2.3.0 is incompatible with Zephyr 4.1 on RISC-V). When ZMK upgrades, we can simplify: MCUboot starts WDT → driver preserves it → app feeds/confirms/disables. The DTS `watchdog0` alias is already in place for this.
 
 ### Watchdog driver
@@ -1260,7 +1266,7 @@ GPIO patches 0001+0002 fix real bugs in Zephyr's B91 GPIO driver (`WRITE_BIT` do
 | BLE privacy opt-in only | Default builds keep the public identity address (bonds survive); `--privacy` (open controller) needs every host to pair again | Public MAC address visible during advertising by default |
 | 1M PHY only | Open controller: no open 2M register source exists. Blob: its 2M PHY loses packets, LL Response Timeout 0x22 after 40 s | Slightly lower throughput (irrelevant for HID) |
 | BLE links | Open controller: up to 3 links (one per profile). Blob: single connection (`blc_ll_setMaxConnectionNumber(0, 1)`) | Blob: only one profile connected at a time |
-| USB SRAM = 256 bytes | B91 hardware, 8-bit addressing only | Max 1 CDC ACM + HID |
+| USB SRAM = 256 bytes | B91 hardware, 8-bit addressing only | Two CDC ACM ports + HID only with 32 B bulk IN endpoints (240 B used) |
 | Cold boot wakeup (~1–2s) | Retention mode incompatible with MCUboot (boot ROM overwrites ILM) | Slower wake from deep sleep |
 | No 2.4 GHz wireless | Would need dongle firmware + proprietary RF protocol | Original has 3 modes; we have USB + BLE |
 | First BLE conn fails (0x3E) | Blob only: boot timing issue, the second attempt always succeeds | Benign, 300ms delay on first connect |

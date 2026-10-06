@@ -1,0 +1,20 @@
+/*
+ * ZMK Studio over USB: a second CDC ACM port, next to the console/mcumgr port
+ * of conf/mcumgr.overlay. It fits the B91's 256 B USB SRAM only with 32 B bulk
+ * endpoints (CONFIG_CDC_ACM_BULK_EP_MPS=32): per port 64 B bulk OUT (the
+ * hardware max packet size applies to every OUT EP) + 32 B bulk IN + 16 B
+ * notify = 112 B; two ports + 16 B HID = 240 B. The B91 has two OUT EPs (5 and
+ * 6), one per port.
+ */
+
+/ {
+	chosen {
+		zmk,studio-rpc-uart = &studio_cdc_acm;
+	};
+};
+
+&zephyr_udc0 {
+	studio_cdc_acm: studio_cdc_acm {
+		compatible = "zephyr,cdc-acm-uart";
+	};
+};

@@ -45,4 +45,15 @@ config NUM_IRQS
 config SYS_CLOCK_TICKS_PER_SEC
 	default 32000
 
+# ---- USB SRAM budget for ZMK Studio over USB ----
+# The B91 has 256 B of USB SRAM for EP1-7. A second CDC ACM port for Studio
+# (conf/studio-usb.overlay) fits only with 32 B bulk endpoints: per port 64 B
+# bulk OUT (the hardware max packet size applies to every OUT EP) + 32 B bulk
+# IN + 16 B notify, two ports + 16 B HID = 240 B. The symbol has no prompt, so
+# the board sets its default; builds without the Studio port keep 64 B.
+RAINY75_DT_CHOSEN_STUDIO_RPC_UART := zmk,studio-rpc-uart
+
+config CDC_ACM_BULK_EP_MPS
+	default 32 if $(dt_chosen_enabled,$(RAINY75_DT_CHOSEN_STUDIO_RPC_UART))
+
 endif # BOARD_RAINY75

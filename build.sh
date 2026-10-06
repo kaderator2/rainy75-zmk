@@ -306,7 +306,7 @@ if [ "$BUILD_APP" -eq 1 ]; then
         -DZMK_CONFIG="$(pwd)/zmk/boards/rainy75" \
         -DZMK_EXTRA_MODULES="$(pwd)/zmk" \
         -DEXTRA_CONF_FILE="$APP_CONF" \
-        -DEXTRA_DTC_OVERLAY_FILE="$(pwd)/zmk/boards/rainy75/rainy75.keymap;$(pwd)/conf/mcumgr.overlay" \
+        -DEXTRA_DTC_OVERLAY_FILE="$(pwd)/zmk/boards/rainy75/rainy75.keymap;$(pwd)/conf/mcumgr.overlay;$(pwd)/conf/studio-usb.overlay" \
         $ANSI_DTFLAG \
         $VERBOSE_CMAKE
 fi

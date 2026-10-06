@@ -58,7 +58,7 @@ one-click flasher:
   (`/dev/ttyACM*`, udev rules). macOS/Windows aren't covered yet.
 - **Comfortable in a terminal.** You'll build, install `mcumgr`, add udev rules, and run
   flashing scripts — there's no GUI.
-- **It replaces the stock experience.** No VIA — remap with **ZMK Studio** (over Bluetooth,
+- **It replaces the stock experience.** No VIA: remap with **ZMK Studio** (over USB or Bluetooth,
   in Chrome/Edge). No **2.4 GHz dongle** (USB + BLE only). 6-key rollover by default.
 - **Real risk.** A bad flash can leave the board needing **hardware** recovery (a Telink
   burning board on the SWS pads). Keep your stock image. Proceed at your own risk.
