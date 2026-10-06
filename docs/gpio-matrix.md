@@ -137,6 +137,13 @@ Key firmware functions:
 | Per-column slot | ~21.2 us |
 | Idle between bursts | ~1.63 ms (all columns LOW, MCU doing other work) |
 
+These are the **stock** firmware's numbers. The ZMK firmware uses ZMK's interrupt-driven
+matrix scan instead: idle until a key closes a contact, then a scan every 1 ms
+(`debounce-scan-period-ms`) while any key is active. A press counts after two readings 1 ms
+apart (`debounce-press-ms = <1>` in `rainy75.dts`, so about 1 ms instead of ZMK's default
+5 ms); a release needs 5 ms (the default), which also absorbs contact bounce. Tested
+without stray or double letters, with the RGB effect running.
+
 ## Column Scan Order Validation
 
 Probed specific keys at known matrix positions:
