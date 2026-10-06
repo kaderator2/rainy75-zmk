@@ -40,28 +40,34 @@ scratch for this keyboard. It is:
 ### Comparison
 
 "Not measured" and "unknown" mean that we have no own evidence for that cell.
+The blob and open columns were measured on 2026-10-05 in one session with
+the same ZMK code, host (Linux PC, BlueZ) and nRF52840 sniffer; image sizes
+are from the default builds.
 The stock column is based on the manual and our analysis of the stock firmware
-(see [architecture.md](architecture.md)), not on air captures, unless stated.
+(see [architecture.md](architecture.md)) where no on-air value is given; its
+on-air values come from captures of the official ISO firmware connected to
+the same PC on 2026-10-06.
 
 | | Stock Rainy firmware | ZMK + Telink blob | ZMK + open controller |
 |---|---|---|---|
 | Source and licence | Proprietary (Evision platform, no public source) | ZMK and drivers open; controller is a proprietary binary that cannot be committed or redistributed, every user builds locally | Fully open, Apache-2.0, no binary blob in the image |
-| Bluetooth hosts | 3 slots with separate names (`Rainy75-1` to `-3`), Fn+Tab then Fn+F1..F3; most likely one link at a time (not verified on air) | 3 ZMK profiles, but the blob is configured for 1 peripheral link; advertises in gaps while connected | Up to 3 links at once (Kconfig 1 to 5); 2 real hosts (PC + phone) tested connected at the same time, Fn+F1/F2 switches without reconnecting; 3 links not tested |
-| Channel Selection Algorithm #2 | Unknown | Yes (ChSel 1, seen on the sniffer) | Yes (179 of 179 sniffed events match CSA #2) |
-| Data Length Extension | Unknown | 27 octets as our shim configures it (Zephyr default host buffers); larger values not tried | 251 octets / 2120 us both ways, ATT MTU 247 |
-| LE Ping | Unknown | Not tested | Yes (responder and authenticated payload timeout) |
-| Connection Parameters Request | Unknown | Not tested | Responder (initiator not implemented) |
-| PHY | Unknown | 2M unusable: LL Response Timeout 0x22 40 s after the switch, so it is disabled; 1M | 1M only: no open register source for 2M exists |
-| Pairing security | Unknown | LE Secure Connections only with enforced MITM (passkey entry), security level 4: ZMK host configuration, same for both controllers | Same as the blob column |
+| Bluetooth hosts | 3 slots with separate names (`Rainy 75-1` to `-3`), each with its own random static address, Fn+Tab then Fn+F1..F3; most likely one link at a time (not verified on air) | 3 ZMK profiles, but the blob is configured for 1 peripheral link (`blc_ll_setMaxConnectionNumber(0, 1)`), so one host at a time | Up to 3 links at once (Kconfig 1 to 5); 2 real hosts (PC + phone) tested connected at the same time, Fn+F1/F2 switches without reconnecting; 3 links not tested |
+| Channel Selection Algorithm #2 | No (feature bit 14 not set) | Yes (feature bit 14, ChSel 1 in every CONNECT_IND) | Yes (179 of 179 sniffed events match CSA #2) |
+| Data Length Extension | No in practice: claims the feature but answers the PC's 251 octets / 2120 us with 27 / 328 both ways | No in practice: answers the PC's 251 octets / 2120 us with 27 / 328 both ways; ATT MTU 65 | 251 octets / 2120 us both ways, ATT MTU 247 |
+| LE Ping | Yes, responder | Yes, responder: answers the PC's ping (every 15 s) 3 events later, 10 of 10 | Yes (responder and authenticated payload timeout) |
+| Connection Parameters Request | Not supported (feature bit 1 not set) | Not supported (feature bit 1 not set); ZMK's requests go over L2CAP and the PC answers with a connection update | Responder (initiator not implemented); the PC sends LL_CONNECTION_PARAM_REQ |
+| PHY | 1M only (2M not offered) | 1M only: 2M ended links with LL Response Timeout 0x22 40 s after the switch, so it is disabled and not offered | 1M only: no open register source for 2M exists |
+| Pairing security | Just Works: the PC paired without a passkey (unauthenticated); Secure Connections or legacy not captured | ZMK host configuration, same for both controllers: LE Secure Connections only (no legacy pairing); hosts with a display or keyboard pair with passkey entry (authenticated, level 4), hosts without one with Just Works (level 2) | Same as the blob column |
 | Privacy (RPA) | Unknown | Not usable: `bt_enable()` hung; most likely the ZMK settings deadlock that zmk-src 0005 fixed, blob not retested, `build.sh` refuses `--privacy --blob` | Opt-in (`--privacy`), RPA rotation verified on air |
-| Firmware update | USB HID OTA (write-only); over BLE unknown | mcumgr over USB; BLE upload speed not measured | mcumgr over USB or BLE: 293 KB image over BLE in 25.0 s (27.1 to 27.4 s with the CPU hold) |
-| ZMK Studio over BLE | Not available (VIA over USB) | Not measured | 22.6 RPC per s (10.3 per s with 27-octet PDUs) |
-| Reconnect of a bonded host | Not measured | Not measured (the blob build keeps Zephyr's lazy CCC loading, which cost about 1 s per reconnect on the open build) | CONNECT_IND to Encryption Change 117 to 125 ms |
-| Idle link power | Vendor: about 900 h with RGB off (Pro), not measured by us | Not measured | 96 % of connection events skipped at 12 / 30 / 400 (answers every 31st event), 0.1 wakeups per s; battery drain vs the blob not compared yet |
-| T_IFS on air | Not measured | 96.8 / 97.2 % within 150 us (all peripheral responses, two captures) | 99.6 / 99.7 % within 150 us (first response per event, two runs) |
+| Firmware update | USB HID OTA (write-only); over BLE unknown | mcumgr over USB; over BLE not usable with our shim: uploads time out at the first request, with 20-byte writes the link dropped after 4.5 KB (cause not isolated: shim buffers or blob) | mcumgr over USB or BLE: 310 KB image over BLE in 28.4 s (10.7 KiB/s) |
+| ZMK Studio over BLE | Not available (VIA over USB) | 20.8 RPC per s | 24.8 RPC per s (10.3 per s with 27-octet PDUs) |
+| Reconnect of a bonded host | CONNECT_IND to encryption 83 ms median (78 to 105 ms, n 8) at the 7.5 ms interval the PC chose for it | CONNECT_IND to encryption 1.02 s median (n 9) as the blob build ships (lazy CCC loading stalls the blob's main loop); 163 ms median (n 6) with the CCC load moved to boot | 132 ms median on air (125 to 153 ms, n 11) |
+| Idle link power | Vendor: about 900 h with RGB off (Pro); on air no peripheral latency: answers 99.9 % of connection events at 7.5 ms / latency 44 / 3 s | No peripheral latency: answers 99.8 to 99.9 % of connection events at 12 / 30 / 400, with and without its power management module; battery not measured | 96.4 % of connection events skipped at 12 / 30 / 400 (answers every 31st event), 0.1 wakeups per s, CPU idle 99.1 %; battery drain vs the blob not compared yet |
+| T_IFS on air | First response per event within 150 us: 94.7 % in a 150 s idle capture (0.7 % above 152 us), 97.6 % in a 30 s capture | First response per event within 150 us: 97.8 to 98.4 % idle, 96.7 % under Studio load (93.4 % of all responses); up to 0.8 % above 152 us | First response per event: 100 % idle and under Studio load (99.94 % of all responses, max 151 us); 99.6 / 99.7 % under 251-octet echo load |
+| Connection reliability | Not measured | 15 of 44 connection attempts failed first (0x3E, the blob never answered the central); twice the BLE side went silent for about 4.5 min (once after a dropped upload, once after six failed connects, ending in a reset) | 0 of 16 attempts failed; 33 min encrypted soak and 10 uploads under load without a drop |
 | Pairing and connecting LEDs | F1..F3 blue indicator, long press pairs, 1 min pairing timeout (manual) | Slot status on F1..F4, passkey guidance on the number row (rainy_rgb, independent of the controller) | Same; device-tested with this controller |
 | Link counters for the host | None known | None | Power and arbiter counters over mcumgr group 66 (`openll_stats.py`, USB or BLE) |
-| Image size (ISO) | 120 KB stock image | ROM 328 KB, RAM 85 KB, ILM 40 KB | ROM 303 KB, RAM 106 KB (251-octet queues for 3 links), ILM 8 KB |
+| Image size (ISO) | 120 KB stock image | ROM 328 KiB, RAM 84 KiB, ILM 39 KiB | ROM 305 KiB, RAM 104 KiB (251-octet queues for 3 links), ILM 8 KiB |
 
 ### Technical highlights
 
