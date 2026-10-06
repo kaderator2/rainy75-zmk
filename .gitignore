@@ -1,5 +1,6 @@
 # Build output
 build/
+build-*/
 build-mcuboot/
 
 # West workspace (fetched by west update). Anchored to repo root so these never
