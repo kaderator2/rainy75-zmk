@@ -1,6 +1,6 @@
 #!/bin/bash
 # Build ZMK firmware for Rainy 75 Pro
-# Usage: ./build.sh [-p] [-v] [-m] [-c] [-o] [-b] [-a] (--iso | --ansi) [--blob | --privacy]
+# Usage: ./build.sh [-p] [-v] [-m] [-c] [-o] [-b] [-a] (--iso | --ansi) [--blob | --privacy] [--test-image]
 #   -p  pristine build (clean rebuild)
 #   -v  verbose output
 #   -m  build MCUboot bootloader
@@ -15,6 +15,9 @@
 #   --openll  accepted no-op alias (the open controller is the default)
 #   --privacy resolvable private address (BT_PRIVACY), open controller only. Every
 #             host must be paired again; refused with --blob.
+#   --test-image  risky test image: never confirms itself, so any reset or power
+#             cycle returns to the previous image (conf/test-image.conf). Flash with
+#             mcumgr image test, confirm a good one with mcumgr image confirm.
 # Environment: BUILD_DIR=<dir> puts the app build (and the combined/OTA images)
 #   there instead of build/.
 
@@ -37,6 +40,7 @@ ANSI_DTFLAG=""        # set when LAYOUT=ansi
 APP_CONF="$(pwd)/conf/app.conf"
 USE_BLOB=0            # set by --blob (default: open controller)
 USE_PRIVACY=0         # set by --privacy (refused with --blob)
+USE_TEST_IMAGE=0      # set by --test-image
 BUILD_DIR="${BUILD_DIR:-build}"   # app build directory
 
 # ── Apply upstream patches if needed ──────────────────────────
@@ -228,11 +232,12 @@ ARGS=(); for a in "$@"; do case "$a" in
     --openll) ARGS+=("-O");;
     --blob)   ARGS+=("-B");;
     --privacy) ARGS+=("-Y");;
+    --test-image) ARGS+=("-T");;
     *)        ARGS+=("$a");;
 esac; done
 set -- "${ARGS[@]}"
 
-while getopts "pvmcobaIAOYB" opt; do
+while getopts "pvmcobaIAOYBT" opt; do
     case $opt in
         p) PRISTINE="-p" ;;
         v) VERBOSE_CMAKE="-DCMAKE_VERBOSE_MAKEFILE=ON" ;;
@@ -246,7 +251,8 @@ while getopts "pvmcobaIAOYB" opt; do
         O) echo "Note: --openll is a no-op, the open controller is the default." >&2 ;;
         B) USE_BLOB=1 ;;
         Y) USE_PRIVACY=1 ;;
-        *) echo "Usage: $0 [-p] [-v] [-m] [-c] [-o] [-b] [-a] (--iso | --ansi) [--blob | --privacy]"; exit 1 ;;
+        T) USE_TEST_IMAGE=1 ;;
+        *) echo "Usage: $0 [-p] [-v] [-m] [-c] [-o] [-b] [-a] (--iso | --ansi) [--blob | --privacy] [--test-image]"; exit 1 ;;
     esac
 done
 
@@ -272,6 +278,10 @@ if [ "$USE_BLOB" -eq 1 ]; then
 else
     APP_CONF="$APP_CONF;$(pwd)/conf/openll.conf"
     [ "$USE_PRIVACY" -eq 1 ] && APP_CONF="$APP_CONF;$(pwd)/conf/privacy.conf"
+fi
+if [ "$USE_TEST_IMAGE" -eq 1 ]; then
+    APP_CONF="$APP_CONF;$(pwd)/conf/test-image.conf"
+    echo "Note: --test-image: the image will NOT confirm itself (mcumgr image confirm <hash>)." >&2
 fi
 
 # ── Fetch the (non-redistributable) Telink BLE blob, only for --blob ──
@@ -306,7 +316,7 @@ if [ "$BUILD_APP" -eq 1 ]; then
         -DZMK_CONFIG="$(pwd)/zmk/boards/rainy75" \
         -DZMK_EXTRA_MODULES="$(pwd)/zmk" \
         -DEXTRA_CONF_FILE="$APP_CONF" \
-        -DEXTRA_DTC_OVERLAY_FILE="$(pwd)/zmk/boards/rainy75/rainy75.keymap;$(pwd)/conf/mcumgr.overlay" \
+        -DEXTRA_DTC_OVERLAY_FILE="$(pwd)/zmk/boards/rainy75/rainy75.keymap;$(pwd)/conf/mcumgr.overlay;$(pwd)/conf/studio-usb.overlay" \
         $ANSI_DTFLAG \
         $VERBOSE_CMAKE
 fi

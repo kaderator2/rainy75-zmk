@@ -68,6 +68,22 @@ Keep this boundary: prefer a new file under `zmk/` over editing fetched sources 
   a real board, and the PR should say how (what you observed: USB enumerates, BLE pairs,
   LEDs render correctly, no regressions, etc.). If you can't test on hardware, say so —
   it can still be merged as clearly-marked, untested support.
+- **Flash untested images as test images.** Build with `--test-image`, then:
+
+  ```bash
+  mcumgr ... image upload build/zephyr/zmk.signed.bin
+  mcumgr ... image list            # note the slot 1 hash
+  mcumgr ... image test <hash>
+  mcumgr ... reset
+  ```
+
+  The image never confirms itself, so if it breaks USB, Bluetooth or both, any reset or
+  power cycle brings back the previous image. Test images also never sleep: waking from
+  deep sleep is a cold boot and would bring the previous image back too (with USB unplugged, the wireless switch under
+  the CapsLock keycap cuts the power). When everything works, make it permanent with
+  `mcumgr ... image confirm <hash>`. Don't upload another image while a test image runs
+  unconfirmed: slot 1 holds your fallback. Reset back to it first. With the open Bluetooth
+  controller, updates also work over BLE, a second way back if USB stops working.
 
 ## Pull requests
 

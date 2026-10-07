@@ -1,0 +1,34 @@
+From d473432a2f93398c55ad9524c41b59c06a3e21da Mon Sep 17 00:00:00 2001
+From: scholzri <33288574+scholzri@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 19:03:53 +0200
+Subject: [PATCH] usb: device: cdc_acm: set the call management data interface
+
+cdc_interface_config() renumbers a CDC ACM function when it is not the
+first one in the configuration: interface numbers, the union
+descriptor and the IAD. The Call Management functional descriptor kept
+its static bDataInterface = 1, so every CDC ACM port after the first
+pointed at the wrong data interface (seen as bDataInterface 1 on a
+second port at interfaces 3/4). Linux uses the union descriptor and
+does not notice; hosts that read the Call Management descriptor get a
+wrong data interface. Set it with the other interface numbers.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ subsys/usb/device/class/cdc_acm.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/subsys/usb/device/class/cdc_acm.c b/subsys/usb/device/class/cdc_acm.c
+index 66c098f933..02e9bd6e8d 100644
+--- a/subsys/usb/device/class/cdc_acm.c
++++ b/subsys/usb/device/class/cdc_acm.c
+@@ -486,6 +486,7 @@ static void cdc_interface_config(struct usb_desc_header *head,
+ 
+ 	desc->if0.bInterfaceNumber = bInterfaceNumber;
+ 	desc->if0_union.bControlInterface = bInterfaceNumber;
++	desc->if0_cm.bDataInterface = bInterfaceNumber + 1;
+ 	desc->if1.bInterfaceNumber = bInterfaceNumber + 1;
+ 	desc->if0_union.bSubordinateInterface0 = bInterfaceNumber + 1;
+ 	desc->iad_cdc.bFirstInterface = bInterfaceNumber;
+-- 
+2.53.0
+
