@@ -78,7 +78,8 @@ Keep this boundary: prefer a new file under `zmk/` over editing fetched sources 
   ```
 
   The image never confirms itself, so if it breaks USB, Bluetooth or both, any reset or
-  power cycle brings back the previous image (with USB unplugged, the wireless switch under
+  power cycle brings back the previous image. Test images also never sleep: waking from
+  deep sleep is a cold boot and would bring the previous image back too (with USB unplugged, the wireless switch under
   the CapsLock keycap cuts the power). When everything works, make it permanent with
   `mcumgr ... image confirm <hash>`. Don't upload another image while a test image runs
   unconfirmed: slot 1 holds your fallback. Reset back to it first. With the open Bluetooth
