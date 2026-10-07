@@ -216,6 +216,10 @@ Issues and pull requests are welcome — keymap tweaks, new RGB effects, sibling
 ports, driver fixes, and documentation all help. See **[CONTRIBUTING.md](CONTRIBUTING.md)**
 for the build/test/PR workflow and the code layout.
 
+Where this is heading: the pinned **[Road to 1.0](https://github.com/scholzri/rainy75-zmk/issues/42)**
+issue has the plan and the points where help is most welcome, especially test reports from
+Windows, macOS and iOS.
+
 - **Build before submitting:** `./build.sh -a --iso` (and `--ansi`) and run the engine host
   tests (`./zmk/src/rainy_rgb/tests/run_host_tests.sh`).
 - **Keep it out-of-tree:** new functionality lives under `zmk/`, so the ZMK pin can be
