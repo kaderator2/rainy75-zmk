@@ -942,11 +942,13 @@ USB-based firmware updates via mcumgr, with watchdog-based crash revert.
 
 ### Reflash workflow
 
+**Fast USB upload:** `reverse/tools/rainy75_dfu.py` speaks the same SMP image management as the mcumgr CLI, but writes the 127-byte serial lines back to back. The CLI waits about 20 ms after every line (pacing for real UARTs; its debug log shows the gaps), so each 295-byte request took about 100 ms: 313 KB in 85 s (3.6 KiB/s). Without the pauses, with 420 bytes per request: 12.7 s (24 KiB/s), the same with 295 to 460 bytes per request, so the next limit is the flash write. No firmware change (`UART_MCUMGR_RX_BUF_COUNT=2` keeps up; USB CDC ACM flow control holds the host back). Verified: slot 1 hash matches, test boot and revert, 8 of 8 uploads. `python3 reverse/tools/rainy75_dfu.py upload FILE --test --reset` is the one-shot update.
+
 ```bash
 # 1. Build new firmware
 ./build.sh -p --iso
 
-# 2. Upload via mcumgr (over USB serial)
+# 2. Upload via mcumgr (over USB serial; rainy75_dfu.py is about 6x faster)
 mcumgr --conntype serial --connstring /dev/ttyACM0,baud=115200 \
     image upload build/zephyr/zmk.signed.bin
 
