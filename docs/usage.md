@@ -165,12 +165,23 @@ screen /dev/ttyACM0 115200        # exit: Ctrl-A then K
 # or: minicom -D /dev/ttyACM0 -b 115200   /   cat /dev/ttyACM0
 ```
 
-**Update the firmware (mcumgr DFU).** Once you're on ZMK, flash a new build over USB with
-[mcumgr](https://github.com/apache/mynewt-mcumgr-cli) — no debugger, no bootloader button:
+**Update the firmware (mcumgr DFU).** Once you're on ZMK, flash a new build over USB, no
+debugger, no bootloader button. The included tool finds the keyboard by itself and takes
+about 13 s (Python 3, no extra packages):
+
+```bash
+python3 reverse/tools/rainy75_dfu.py upload build/zephyr/zmk.signed.bin --test --reset
+```
+
+It uploads the image, checks it arrived intact, marks it for a test boot and resets.
+`rainy75_dfu.py list` shows the images; `confirm` makes the running one permanent by hand.
+
+The [mcumgr CLI](https://github.com/apache/mynewt-mcumgr-cli) works too, but takes about 85 s
+over USB (it pauses after every serial line, which USB does not need):
 
 ```bash
 M='mcumgr --conntype serial --connstring dev=/dev/ttyACM0,baud=115200'
-$M image upload build/zephyr/zmk.signed.bin   # ~80 s
+$M image upload build/zephyr/zmk.signed.bin   # ~85 s
 $M image list                                 # note the slot-1 hash
 $M image test <hash>                          # mark it for swap
 $M reset                                      # MCUboot swaps on reboot
