@@ -150,7 +150,7 @@ Then:
 Outputs: `build/combined.bin`, `build-bridge/bridge_ota.bin`, and
 `build/zephyr/zmk.signed.bin` (for plain mcumgr DFU updates once you're already on ZMK).
 
-Updating an already-ZMK keyboard (no bridge needed), about 13 s:
+Updating an already-ZMK keyboard (no bridge needed), about 12 s:
 ```bash
 python3 reverse/tools/rainy75_dfu.py upload build/zephyr/zmk.signed.bin --test --reset
 ```

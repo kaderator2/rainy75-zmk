@@ -2,7 +2,7 @@
 """
 Firmware update for the Rainy 75 over USB (mcumgr SMP image management).
 
-About 6x faster than the mcumgr CLI over USB (313 KB in about 13 s instead of
+About 7x faster than the mcumgr CLI over USB (313 KB in about 12 s instead of
 85 s): the CLI pauses about 20 ms after every 127-byte serial line, a pacing
 meant for real UARTs. Over USB CDC ACM the bus has its own flow control, so
 the lines go out back to back. Same protocol, same firmware; zero
@@ -34,8 +34,9 @@ import restore_original as smp
 IMG_MGMT_STATE = 0
 IMG_MGMT_UPLOAD = 1
 OS_MGMT_RESET = 5
-CHUNK = 420          # image bytes per request; ~24 KiB/s, larger gains nothing
-                     # (flash write bound) and must fit the 512 B SMP buffer
+CHUNK = 420          # image bytes per request; ~26 KiB/s, larger gains nothing
+                     # (the firmware's receive path is CPU bound per byte, see
+                     # docs/zmk-firmware.md) and must fit the 512 B SMP buffer
 
 
 def image_hash(data):

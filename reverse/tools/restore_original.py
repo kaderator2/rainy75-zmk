@@ -27,6 +27,7 @@ import os
 import argparse
 import time
 import base64
+import binascii
 import termios
 
 # --------------------------------------------------------------------------
@@ -162,16 +163,10 @@ def cbor_decode(data, offset=0):
 # --------------------------------------------------------------------------
 
 def crc16_itu_t(data, init=0x0000):
-    crc = init
-    for byte in data:
-        crc ^= byte << 8
-        for _ in range(8):
-            if crc & 0x8000:
-                crc = (crc << 1) ^ 0x1021
-            else:
-                crc <<= 1
-            crc &= 0xFFFF
-    return crc
+    # Same CRC as CRC-16/XMODEM (no reflection, no final XOR), which binascii
+    # computes in C. The bitwise Python loop it replaces cost about 1.3 ms per
+    # 420-byte upload request (8 % of a USB firmware upload).
+    return binascii.crc_hqx(bytes(data), init)
 
 
 # --------------------------------------------------------------------------
