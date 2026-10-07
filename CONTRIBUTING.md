@@ -5,10 +5,12 @@ fixes, layout variants, and documentation are all welcome.
 
 ## Especially wanted
 
-- **ANSI per-key RGB.** This board ships in both ISO and ANSI variants. ANSI is supported,
-  and its keymap + matrix were verified on real hardware by a contributor; the one piece
-  still unconfirmed is the per-key **RGB** mapping around the Enter cluster — see [the
-  layout note below](#layout-variants-iso--ansi).
+The plan to 1.0 and the points where help is welcome are in the pinned
+**[Road to 1.0](https://github.com/scholzri/rainy75-zmk/issues/42)** issue. Most wanted
+right now:
+
+- **Test reports for the open Bluetooth controller** on Windows, macOS, iOS and other
+  phones (template in the roadmap issue). "Works for me" counts too.
 - **Other regional ISO layouts** (UK, Nordic, …) — mostly a keymap change.
 - **Sibling boards** on the same Evision/Telink platform (CIDOO, IQUNIX, Ajazz,
   EPOMAKER — see [docs/evision-platform.md](docs/evision-platform.md)).
