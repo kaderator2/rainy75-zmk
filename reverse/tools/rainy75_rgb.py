@@ -221,6 +221,10 @@ CMD_SET, CMD_FILL, CMD_CLEAR, CMD_INFO = 0, 1, 2, 3
 # those and write frames to it. Only a node whose USB device calls itself a
 # Rainy 75 counts. Rainy75(), and so this CLI and usb_stress.py, find the
 # keyboard through find_port().
+#
+# Since v0.3.2 the keyboard has two serial ports: USB interface 0 (console +
+# mcumgr, which these tools talk to) and interface 3 (ZMK Studio). Both carry
+# the same product name, so find_port() prefers interface 0.
 # --------------------------------------------------------------------------
 
 PORT_GLOBS = ("/dev/cu.usbmodem*", "/dev/ttyACM*")
@@ -239,12 +243,32 @@ def sysfs_product(dev):
         return ""
 
 
+def sysfs_interface(dev):
+    """Linux: the USB interface number behind /dev/ttyACMn, or None."""
+    try:
+        with open("/sys/class/tty/%s/device/bInterfaceNumber" % os.path.basename(dev)) as f:
+            return int(f.read().strip(), 16)
+    except (OSError, ValueError):
+        return None
+
+
+def pick_console(candidates):
+    """The console port from [(node, interface number or None)]: interface 0
+    first, then a port of unknown interface (older single-port firmware)."""
+    for want in (0, None):
+        for node, ifnum in candidates:
+            if ifnum == want:
+                return node
+    return candidates[0][0] if candidates else None
+
+
 def ioreg_rainy_ports():
     """macOS: callout devices that sit below a Rainy 75 in the IORegistry.
 
     macOS names the node after its USB location, not the device, so the product
     name is only in the registry. Each "+-o" line opens a node, indented by its
-    depth; properties follow the node they belong to. Takes a few hundred ms.
+    depth; properties follow the node they belong to. Returns (node, USB
+    interface number or None) pairs. Takes a few hundred ms.
     """
     try:
         out = subprocess.run(
@@ -252,21 +276,26 @@ def ioreg_rainy_ports():
             capture_output=True, text=True, timeout=5).stdout
     except (OSError, subprocess.SubprocessError):
         return []
-    stack, found = [], []               # [column, product] per open node
+    stack, found = [], []               # [column, product, interface] per open node
     for line in out.splitlines():
         col = line.find("+-o ")
         if col >= 0:
             while stack and stack[-1][0] >= col:
                 stack.pop()
-            stack.append([col, ""])
+            stack.append([col, "", None])
             continue
         m = re.search(r'"USB Product Name" = "(.*)"', line)
         if m and stack:
             stack[-1][1] = m.group(1)
             continue
+        m = re.search(r'"bInterfaceNumber" = (\d+)', line)
+        if m and stack:
+            stack[-1][2] = int(m.group(1))
+            continue
         m = re.search(r'"IOCalloutDevice" = "(.*)"', line)
-        if m and any(is_rainy(prod) for _, prod in stack):
-            found.append(m.group(1))
+        if m and any(is_rainy(prod) for _, prod, _ in stack):
+            ifnums = [i for _, _, i in stack if i is not None]
+            found.append((m.group(1), ifnums[-1] if ifnums else None))
     return found
 
 
@@ -276,14 +305,11 @@ def find_port():
     if env:
         return env if os.path.exists(env) else None
     nodes = sorted(n for pat in PORT_GLOBS for n in glob.glob(pat))
-    for node in nodes:
-        if node.startswith("/dev/ttyACM") and is_rainy(sysfs_product(node)):
-            return node
-    if any(n.startswith("/dev/cu.") for n in nodes):
-        hits = [p for p in ioreg_rainy_ports() if p in nodes]
-        if hits:
-            return hits[0]
-    return None
+    hits = [(n, sysfs_interface(n)) for n in nodes
+            if n.startswith("/dev/ttyACM") and is_rainy(sysfs_product(n))]
+    if not hits and any(n.startswith("/dev/cu.") for n in nodes):
+        hits = [(p, i) for p, i in ioreg_rainy_ports() if p in nodes]
+    return pick_console(hits)
 
 
 class Rainy75:
