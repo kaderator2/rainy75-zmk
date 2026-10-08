@@ -120,3 +120,6 @@ reverse/captures/
 .gitconfig
 .ripgreprc
 build-ansi/
+
+# Personal research notes and stock firmware copies (not part of the repository)
+extracontext/
