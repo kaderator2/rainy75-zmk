@@ -356,16 +356,32 @@
     /* ============================================================== flows */
     const flow = { combined: null };
 
+    /* Known stock OTA images (SHA-256), so the restore tab can say which board
+     * an image is for. Flashing the other layout's image is not a brick (the
+     * keymap is wrong), but it is a mistake the page can catch. */
+    const STOCK_IMAGES = {
+        '1c50213601fb1520eead96d8d3a841fd6cfe006ef5d7da35463e5073ce9d7c41': 'Rainy 75 Standard/Pro RGB, ANSI, 2024-01-21',
+        '37d2b846ef022721542cc795cc2258a3ec1652e0d21c79f6688642d09ec278bc': 'Rainy 75 Pro ISO, 2025-05-30',
+    };
+    /* combined.bin = MCUboot at 0, 0xFF padding, the signed app at 0x10000. */
+    const COMBINED_APP_OFFSET = 0x10000;
+    function checkCombined(file) {
+        const d = file.data;
+        if (P.isMcubootImage(d)) { throw new Error(file.name + ' is a signed app image, not combined.bin'); }
+        if (d.length <= COMBINED_APP_OFFSET + 32 || P.u32le(d, COMBINED_APP_OFFSET) !== P.IMG.MCUBOOT_MAGIC) {
+            throw new Error(file.name + ' has no MCUboot app image at 0x10000: not a combined.bin from ./build.sh -c / -a');
+        }
+        if (!P.parseTelinkImage(d).hasTlnk) { throw new Error(file.name + ' has no TLNK boot header at 0x20: the boot ROM would not start it'); }
+        if (d.length >= P.FLASH.PROTECTED_START) { throw new Error('combined image too large'); }
+    }
+
     async function installStage1() {
         const bridge = await readFile($('f-bridge'));
         const combined = await readFile($('f-combined'));
         const bi = P.parseTelinkImage(bridge.data);
         if (!bi.hasTlnk || !bi.crcOk) { throw new Error(bridge.name + ' is not a prepared OTA image (bridge_ota.bin from build-bridge/)'); }
         if (bridge.data.length > 256 * 1024) { throw new Error('bridge image too large for bank 1'); }
-        const ci = P.parseTelinkImage(combined.data);
-        if (!ci.hasTlnk) { warn(combined.name + ': no TLNK header at 0x20 (expected for combined.bin, MCUboot in front)'); }
-        if (P.isMcubootImage(combined.data)) { throw new Error(combined.name + ' is a signed app image, not combined.bin'); }
-        if (combined.data.length >= P.FLASH.PROTECTED_START) { throw new Error('combined image too large'); }
+        checkCombined(combined);
         flow.combined = combined;
         info('bridge ' + bridge.name + ' (' + kb(bridge.data.length) + '), ZMK ' + combined.name + ' (' + kb(combined.data.length) + ')');
         if (!hid.device) { await hidConnect(); }
@@ -378,7 +394,7 @@
     async function installStage2() {
         if (!flow.combined) {
             const combined = await readFile($('f-combined'));
-            if (P.isMcubootImage(combined.data)) { throw new Error(combined.name + ' is a signed app image, not combined.bin'); }
+            checkCombined(combined);
             flow.combined = combined;
         }
         if (!ser.port) { await serialConnect(); }
@@ -421,6 +437,13 @@
         if (fi.crcOk === false) { throw new Error(fw.name + ': CRC32 trailer does not match'); }
         if (fw.data.length >= P.FLASH.PROTECTED_START) { throw new Error('image too large'); }
         info(fw.name + ' (' + kb(fw.data.length) + '), version ' + hexN(fi.version || 0, 4) + ', CRC ok');
+        const digest = P.hex(await sha256(fw.data));
+        const known = STOCK_IMAGES[digest];
+        if (known) { ok('recognized stock image: ' + known); }
+        else { warn('unknown image (SHA-256 ' + digest.slice(0, 16) + '…): make sure it is the stock OTA image for YOUR board'); }
+        if (known && /ISO/.test(known) && !confirm('This is the ISO stock image. On an ANSI board the keys around Enter will be wrong (not a brick). Continue?')) {
+            throw new Error('cancelled');
+        }
         if (!ser.port) { await serialConnect(); }
         await stageAndCommit(fw.data, $('c-verify-stock').checked);
         ok('The keyboard comes back as the stock firmware (320F:5055) in a few seconds.');
