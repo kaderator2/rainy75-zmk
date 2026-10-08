@@ -51,5 +51,8 @@ is confirmed. An interrupted stage 2 leaves the bridge running; run stage 2 agai
 - `app.js`: WebHID / Web Serial glue and the three flows.
 - `index.html`: the page.
 
-Not yet verified on hardware from a browser; the protocol bytes are identical to the
-Linux tools that are.
+Hardware status (2026-10-08, Rainy 75 Standard ANSI, Windows 11, Chrome): the install
+path (stage 1 OTA over WebHID, stage 2 via the bridge) worked. Stage 2 once stalled
+during the verify (the bridge's small USB buffers); a replug and a second "Stage 2"
+resumed the verify and committed. The update and restore tabs use the same transport
+and requests as the Linux tools but have not been exercised from a browser yet.
