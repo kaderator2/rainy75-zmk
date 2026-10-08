@@ -16,14 +16,55 @@ combos below.
 | **Fn + F4** (or Fn + Home) | Toggle output **USB ↔ Bluetooth** |
 | **Fn + F5 … F12** | Media: prev · next · mute · vol− · vol+ · play/pause · bright− · bright+ |
 | **Fn + Del** | **Remove the selected Bluetooth profile's pairing** (then re-pair) |
+| **Fn + T** | **Snap Tap** on/off (W/A/S/D flash green = on, red = off; remembered across replugs) |
+| **Fn + Win (Left GUI)** | **Win key lock** on/off (the Win key LED glows dim red while locked) |
 | **Fn + Backspace** | RGB on/off |
-| **Fn + Enter** | RGB: next effect |
+| **Fn + Enter** | RGB: next effect (ANSI: Fn + Enter = next effect, Fn + \ = hue) |
 | **Fn + # (key left of Enter)** | RGB: cycle hue |
 | **Fn + ↑ / ↓** | RGB: brightness up/down |
 | **Fn + ← / →** | RGB: speed down/up |
 | **Fn + B** | Battery gauge (~3 s bar on the number row) |
 
 Full RGB details: [rainy-rgb.md](rainy-rgb.md).
+
+In the wired build (`./build.sh --wired`, no Bluetooth) the Fn + F1 … F4 and Fn + Del
+slots do nothing.
+
+## Snap Tap (last input wins)
+
+Snap Tap mimics Razer's feature of the same name for the two movement pairs **A/D** and
+**W/S**: while both keys of a pair are held, the game sees only the **last one pressed**.
+Release it and the other key comes back by itself. With one key of a pair held the pair
+behaves normally, and every other key is untouched.
+
+| You do | The host sees |
+|---|---|
+| hold A, then press D | A released and D pressed, in the same report |
+| … then release D (A still held) | D released and A pressed again, in the same report |
+| … then release A | A released |
+| hold A, press D, release A first | nothing changes (D stays), then D released when you let go |
+
+- **Fn + T** toggles it. W, A, S and D flash **green** (on) or **red** (off) for about a
+  second. The state is saved and survives a replug or reboot.
+- It starts **enabled** (`CONFIG_RAINY75_SNAP_TAP_DEFAULT_ON`), so turn it off before
+  typing prose if the key swap bothers you (holding A and tapping D normally gives "ad",
+  with Snap Tap it gives "ad" too, but A stops repeating while D is held).
+- It works with NKRO, with modifiers held (Shift + A/D for walking) and with ZMK Studio:
+  the W/A/S/D keys are bound to `&snap W` … `&snap D` in the base layer. `&snap KEY` is the
+  same as `&kp KEY` for any key outside the two pairs, so you can move the pairs to other
+  positions in Studio by binding `&snap` there. Switching it off is a clean pass-through.
+- Some games and anti-cheat systems forbid this kind of input processing (Counter-Strike 2
+  kicks players for it in official matchmaking). Turn it off with Fn + T where it is not
+  allowed.
+
+Implementation: `zmk/src/snap_tap/` (pure state machine, host tests) and
+`zmk/src/behaviors/behavior_snap_tap.c`.
+
+## Win key lock
+
+**Fn + Win** toggles the Win key lock (layer 1 of the keymap, "Win Lock" in Studio). While
+locked, the Left GUI key does nothing and its LED glows dim red. Fn + Win again unlocks.
+The lock is not persisted; it is off after every boot.
 
 ## Bluetooth and USB
 

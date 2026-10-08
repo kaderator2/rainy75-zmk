@@ -178,15 +178,21 @@ BLE controller options (app builds):
 
 | Option | Controller | Extra config |
 |---|---|---|
-| (default) | open link layer, no blob fetched or linked | `conf/openll.conf` |
-| `--blob` | Telink blob, `fetch_ble_blob.sh` runs first | `conf/blob.conf` (no openll.conf) |
-| `--privacy` | open link layer with a resolvable private address; every host must be paired again; refused with `--blob` | `conf/openll.conf` + `conf/privacy.conf` |
+| (default) | open link layer, no blob fetched or linked | `conf/ble.conf` + `conf/openll.conf` |
+| `--blob` | Telink blob, `fetch_ble_blob.sh` runs first | `conf/ble.conf` + `conf/blob.conf` (no openll.conf) |
+| `--privacy` | open link layer with a resolvable private address; every host must be paired again; refused with `--blob` | `conf/ble.conf` + `conf/openll.conf` + `conf/privacy.conf` |
 | `--openll` | accepted no-op alias (prints a note) | |
+| `--wired` | **no Bluetooth**: USB-only gaming build with NKRO (+ boot protocol), eager press debounce, no deep sleep, Snap Tap on by default, calm default lighting; the keymap drops the BT bindings (`RAINY75_WIRED`); refused with `--blob` / `--privacy` | `conf/wired.conf` + `conf/wired.overlay` (no controller overlay) |
 
 `grep -c liblt build/zephyr/zmk.map` gives 0 for the open controller and 48 for the blob.
 
 `build.sh` handles venv activation, SDK path, patch application, DTS overlays, and combined image creation.
-The layout flag passes `-DDTS_EXTRA_CPPFLAGS=-DRAINY75_ANSI` for ANSI; `mcuboot`/`bridge`-only builds need no flag.
+The layout flag passes `-DRAINY75_ANSI` (and `--wired` adds `-DRAINY75_WIRED`) via
+`DTS_EXTRA_CPPFLAGS`, a `;`-separated CMake list; `mcuboot`/`bridge`-only builds need no flag.
+
+```bash
+./build.sh -pa --ansi --wired   # USB-only gaming build, ANSI (build/, combined.bin, OTA)
+```
 
 ### Build (manual)
 
@@ -198,9 +204,10 @@ export ZEPHYR_SDK_INSTALL_DIR=$(pwd)/toolchain/zephyr-sdk-0.17.0
 west build -b rainy75 zmk-src/app -- \
   -DZMK_CONFIG="$(pwd)/zmk/boards/rainy75" \
   -DZMK_EXTRA_MODULES="$(pwd)/zmk" \
-  -DEXTRA_CONF_FILE="$(pwd)/conf/app.conf;$(pwd)/conf/openll.conf" \
+  -DEXTRA_CONF_FILE="$(pwd)/conf/app.conf;$(pwd)/conf/ble.conf;$(pwd)/conf/openll.conf" \
   -DEXTRA_DTC_OVERLAY_FILE="$(pwd)/zmk/boards/rainy75/rainy75.keymap;$(pwd)/conf/mcumgr.overlay"
-# (blob instead: conf/app.conf;conf/blob.conf, after ./fetch_ble_blob.sh)
+# (blob instead: conf/app.conf;conf/ble.conf;conf/blob.conf, after ./fetch_ble_blob.sh;
+#  wired: conf/app.conf;conf/wired.conf, plus conf/wired.overlay and -DDTS_EXTRA_CPPFLAGS=-DRAINY75_WIRED)
 
 # MCUboot
 west build -b rainy75 -d build-mcuboot bootloader/mcuboot/boot/zephyr -- \
@@ -218,7 +225,27 @@ west build -b rainy75 -d build-mcuboot bootloader/mcuboot/boot/zephyr -- \
 
 ### Config split
 
-Board defconfig (`rainy75_defconfig`) contains only hardware-essential configs (GPIO, flash, heap) shared by both MCUboot and the application. Application-specific configs (BLE, USB, ZMK, mcumgr, WDT, RGB) are in `conf/app.conf`, passed via `EXTRA_CONF_FILE` together with the controller overlay (`conf/openll.conf` or `conf/blob.conf`, plus `conf/privacy.conf` for `--privacy`). This allows MCUboot to build cleanly against the same board definition.
+Board defconfig (`rainy75_defconfig`) contains only hardware-essential configs (GPIO, flash, heap) shared by both MCUboot and the application. Application-specific configs (USB, ZMK, mcumgr, WDT, RGB, settings) are in `conf/app.conf`, passed via `EXTRA_CONF_FILE` together with the Bluetooth host config `conf/ble.conf` and the controller overlay (`conf/openll.conf` or `conf/blob.conf`, plus `conf/privacy.conf` for `--privacy`), or with `conf/wired.conf` instead of `ble.conf` and any controller overlay for `--wired` (so a build without Bluetooth never assigns a BT-dependent symbol, which Kconfig would warn about). This allows MCUboot to build cleanly against the same board definition.
+
+### Wired gaming build (`--wired`)
+
+`conf/wired.conf` + `conf/wired.overlay`, for a keyboard that lives on a USB cable:
+
+- `CONFIG_BT=n` / `CONFIG_ZMK_BLE=n`: no radio interrupts, no controller thread, no BLE
+  host; mcumgr DFU stays on the USB CDC port, ZMK Studio on its USB port.
+- `CONFIG_ZMK_HID_REPORT_TYPE_NKRO=y` + `CONFIG_ZMK_USB_BOOT=y`: N-key rollover (16-byte
+  report, the HID endpoint size in the B91's 256 B USB SRAM budget) with the boot protocol
+  fallback for BIOS/UEFI.
+- `debounce-press-ms = <0>` (eager press, the release debounce stays 5 ms), see the overlay
+  for why that is safe against contact bounce. The BLE build keeps 1 ms.
+- `CONFIG_ZMK_USB_NO_VBUS_DETECT=n`: the idle sleep check sees "USB power present" forever
+  (the B91 has no VBUS pin), so deep sleep never triggers (a wake would be a cold boot
+  through MCUboot).
+- Snap Tap on by default (`CONFIG_RAINY75_SNAP_TAP_DEFAULT_ON`), see
+  [usage.md](usage.md#snap-tap-last-input-wins); `CONFIG_RAINY_RGB_DEFAULT_*`: aurora at low
+  brightness and speed on first boot.
+
+The keymap sees `RAINY75_WIRED` and binds `&none` on the Fn+F1..F4 / Fn+Del slots.
 
 ## Hardware Bring-Up Checklist
 

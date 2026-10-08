@@ -34,6 +34,7 @@ Build and test:
 ./build.sh -a --iso                             # MCUboot + app + combined + OTA + bridge (--ansi for ANSI)
 ./build.sh -p --iso                             # pristine app rebuild
 ./zmk/src/rainy_rgb/tests/run_host_tests.sh     # host unit tests (color/effects/overlay)
+./zmk/src/snap_tap/tests/run_host_tests.sh      # host unit tests (Snap Tap rules)
 ```
 
 ## How the code is organized

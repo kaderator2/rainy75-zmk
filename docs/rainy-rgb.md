@@ -66,6 +66,8 @@ Spatial effects (ripple/wave/rain/heatmap) use the calibrated `led_positions[]` 
 | Fn+↑ / Fn+↓ | brightness |
 | Fn+→ / Fn+← | speed |
 | Fn+B | battery gauge (~3 s) |
+| Fn+T | Snap Tap toggle: W/A/S/D flash green (on) / red (off) ~1 s |
+| Fn+Win | Win key lock: LGUI dim red while locked |
 
 State (on/off, effect, hue, sat, val, speed) persists to NVS (subtree `rainy_rgb/`,
 2 s save debounce).
@@ -112,7 +114,7 @@ Rendered on top of the active effect — and **still shown when RGB is toggled o
 - **CapsLock** → the CapsLock key glows **white** (`hid_indicators_changed`, bit 1).
   Requires `CONFIG_ZMK_HID_INDICATORS=y`. Over BLE, some hosts never send the LED
   report, so caps may not update on BLE.
-- **Fn-highlight** → while Fn (layer 1) is held, only keys with an Fn binding light
+- **Fn-highlight** → while Fn (layer 2; layer 1 is the Win lock) is held, only keys with an Fn binding light
   white, rest dark (`zmk_keymap_layer_active(1)`). The whole top row lights because
   every top-row key is Fn-mapped (Studio/BT/output/media). Position set is
   hardcoded in `overlay.c` `fn_keys[]` — **keymap-coupled**, update if the Fn layer changes.

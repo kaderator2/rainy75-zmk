@@ -178,7 +178,7 @@ controller the firmware can be built and shipped without any binary blob.
 grep -c liblt build/zephyr/zmk.map    # 0 for the open controller, 48 for the blob
 ```
 
-The default build appends `conf/openll.conf` to `conf/app.conf`
+The default build appends `conf/ble.conf` (Bluetooth host) and `conf/openll.conf` to `conf/app.conf`
 (`CONFIG_BT_HCI_B91_CTLR_OPEN=y`, power counters, 251-octet host buffers, CCC
 load at boot) and never runs `fetch_ble_blob.sh`. `--blob` appends
 `conf/blob.conf` instead and is the only path that fetches the blob.

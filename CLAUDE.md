@@ -69,17 +69,21 @@ zmk/                             # Zephyr module — our custom firmware code
   src/rainy_rgb/                 # rainy_rgb lighting engine (color/effects/engine/reactive/overlay/led_map/state/zmk_adapter) — see docs/rainy-rgb.md
   src/behaviors/behavior_rainy_rgb.c  # &rgb keymap behavior (toggle/effect/hue/bright/speed/battery)
   src/behaviors/behavior_bt_sel_ble.c # &bt_sel_ble N: select BLE profile N and switch the output USB -> BLE (Fn+F1..F3)
+  src/behaviors/behavior_snap_tap.c   # &snap KEY / &snap_tog: Razer-style Snap Tap (A/D, W/S), toggle persisted, LED confirm (Fn+T)
+  src/snap_tap/                  # pure Snap Tap decisions (snap_tap.c) + host tests (tests/run_host_tests.sh)
   src/ble_open_profile/          # open profile timeout (RAINY75_BLE_OPEN_PROFILE_TIMEOUT): pure open_profile.c + Zephyr adapter + host tests
   include/rainy75/events/        # module ZMK events (rainy75_ble_open_profile_timeout)
-  dts/bindings/                  # DTS bindings: b91-usbd / b91-spi-led-strip / b91-battery-adc / b91-watchdog / rainy behaviors (rgb, bt-sel-ble)
+  dts/bindings/                  # DTS bindings: b91-usbd / b91-spi-led-strip / b91-battery-adc / b91-watchdog / rainy behaviors (rgb, bt-sel-ble, snap-tap, snap-tap-toggle)
   lib/liblt_9518_zephyr.a        # BLE controller blob (2.8 MB), opt-in (./build.sh --blob): proprietary/NDA, fetched by fetch_ble_blob.sh, gitignored (NOT committed)
 conf/                            # build configuration overlays
-  app.conf                       # ZMK app config (BLE, USB, mcumgr, WDT, RGB)
+  app.conf                       # ZMK app config (USB, mcumgr, WDT, RGB, settings); no BT symbols
+  ble.conf                       # Bluetooth host + HCI driver + BLE SMP transport, every build except --wired
   openll.conf                    # open BLE controller (default): CTLR_OPEN, group 66 counters, 251-octet ACL/ATT MTU 247, CCC load at boot
   blob.conf                      # Telink blob controller instead (./build.sh --blob)
   privacy.conf                   # BT_PRIVACY (RPA), open controller only (./build.sh --privacy); every host must pair again
   mcumgr.overlay                 # console + mcumgr CDC ACM port (USB interface 0), also used by the OTA bridge
   studio-usb.overlay             # second CDC ACM port for ZMK Studio over USB (interface 3, EP6/EP7, 32 B bulk IN), app build only
+  wired.conf + wired.overlay     # ./build.sh --wired: USB only (no ble.conf/controller), NKRO + boot protocol, eager press debounce, no sleep (USB_NO_VBUS_DETECT=n), Snap Tap on, calm RGB defaults
   ota-bridge.conf                # OTA bridge config (monolithic, USB+mcumgr+flash_mgmt)
   mcuboot.conf                   # MCUboot bootloader config
   mcuboot.overlay                # MCUboot DTS overlay (disables peripherals)
@@ -296,5 +300,5 @@ Own peripheral-only link layer behind the `b91_bt.h` seam on hal_telink `rf.c` (
 - For bigger research tasks, the user has an external deep-research LLM available — provide a prompt and the user will return the research results
 - Ghidra headless Java scripts are broken in 12.0.1 (OSGi error) — use PyGhidra instead
 - **Flashing untested images (default)**: build with `./build.sh ... --test-image` (conf/test-image.conf: the image never confirms itself, watchdog off, no deep sleep since a wake is a cold boot that reverts it), upload, `mcumgr image test <hash>`, `reset` (one shot over USB, about 12 s instead of 85 s with the mcumgr CLI: `python3 reverse/tools/rainy75_dfu.py upload FILE --test --reset`; `rainy75_dfu.py confirm` / `list` / `reset`). Any reset or power cycle then returns to the previous image, even if USB and BLE are broken. Confirm with `mcumgr image confirm <hash>` only after the user or a test verified it. Never upload while a test image runs unconfirmed (slot 1 is the fallback): reset to it first. Suggest this to the user for every risky flash (drivers, USB, BLE, boot); BLE DFU (open controller) is the second recovery path. Details: CONTRIBUTING.md "Testing & verification"
-- **ZMK build**: `./build.sh -p --iso` (open controller by default; `--blob` for the Telink blob, `--privacy` for RPA). Requires Zephyr SDK 0.17.0 (not 0.17.4), set `ZEPHYR_SDK_INSTALL_DIR=$(pwd)/toolchain/zephyr-sdk-0.17.0`; manual builds pass `-DEXTRA_CONF_FILE="$(pwd)/conf/app.conf;$(pwd)/conf/openll.conf"` (see [docs/zmk-firmware.md](docs/zmk-firmware.md)). `build.sh` applies missing upstream patches via `west patch` (`zmk/zephyr/patches.yml`); manual flow `west update && west patch -b ../patches apply`; `BUILD_DIR=<dir>` moves the app build out of `build/`
+- **ZMK build**: `./build.sh -p --iso` (open controller by default; `--blob` for the Telink blob, `--privacy` for RPA; `--wired` for the USB-only gaming build). Keymap layers: 0 base, 1 Win lock (Fn+LGUI), 2 Fn; `zmk_adapter.c` RRGB_LAYER_* and `overlay.c` fn_keys/snap_keys are keymap-coupled. Requires Zephyr SDK 0.17.0 (not 0.17.4), set `ZEPHYR_SDK_INSTALL_DIR=$(pwd)/toolchain/zephyr-sdk-0.17.0`; manual builds pass `-DEXTRA_CONF_FILE="$(pwd)/conf/app.conf;$(pwd)/conf/ble.conf;$(pwd)/conf/openll.conf"` (see [docs/zmk-firmware.md](docs/zmk-firmware.md)). `build.sh` applies missing upstream patches via `west patch` (`zmk/zephyr/patches.yml`); manual flow `west update && west patch -b ../patches apply`; `BUILD_DIR=<dir>` moves the app build out of `build/`
 - **Environment**: Arch Linux distrobox, use `pacman` not `dnf`

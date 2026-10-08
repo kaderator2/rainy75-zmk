@@ -75,6 +75,9 @@ read on their own.
 - **Wired + wireless** — USB-C and Bluetooth LE (HID-over-GATT, bonding). 6-key rollover
   (the ZMK default; NKRO can be enabled in config). *The stock 2.4 GHz dongle uses a
   proprietary protocol and is **not** ported — see [Known limitations](#known-limitations).*
+- **Gaming** — Razer-style **Snap Tap** for A/D and W/S (Fn+T, persisted), a **Win key lock**
+  (Fn+Win), and a USB-only **`--wired` build** with NKRO, eager debounce and no deep sleep —
+  see [docs/usage.md](docs/usage.md#snap-tap-last-input-wins).
 - **`rainy_rgb` lighting engine** — a custom, out-of-tree engine driving all 83 per-key
   WS2812 LEDs: 11 animated effects, reactive ripple/heatmap, an opt-in walker diagnostic, FPS-independent speed, and
   *functional* indicators (CapsLock, Fn-layer highlight, battery gauge) — see
@@ -131,6 +134,7 @@ read on their own.
 | **Open the case / service the battery** | Photo teardown walkthrough — [docs/teardown.md](docs/teardown.md). |
 | **Customize the keymap / RGB** | Edit `zmk/boards/rainy75/rainy75.keymap`; RGB controls in [docs/rainy-rgb.md](docs/rainy-rgb.md). |
 | **Use the ANSI layout** | `./build.sh -a --ansi` — keymap **and** per-key RGB verified on real ANSI hardware, see [INSTALL.md](INSTALL.md#ansi-layout). |
+| **Build a USB-only gaming image** | `./build.sh -a --ansi --wired` — no Bluetooth, NKRO, Snap Tap on, see [docs/zmk-firmware.md](docs/zmk-firmware.md#wired-gaming-build---wired). |
 | **Contribute** | [CONTRIBUTING.md](CONTRIBUTING.md). |
 
 ---
