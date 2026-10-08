@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rainy 75 Web Flasher</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --fg: #1b1f24; --muted: #5b6470; --card: #ffffff; --line: #d8dde3;
+    --accent: #2563eb; --ok: #15803d; --warn: #b45309; --err: #b91c1c; --logbg: #0f172a; --logfg: #e2e8f0;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #0f1216; --fg: #e6e8eb; --muted: #9aa4b1; --card: #171b21; --line: #2a313a;
+            --accent: #60a5fa; --ok: #4ade80; --warn: #fbbf24; --err: #f87171; --logbg: #05080d; --logfg: #d6dde6; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.45 system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+  main { max-width: 980px; margin: 0 auto; padding: 16px; }
+  h1 { font-size: 22px; margin: 8px 0 4px; }
+  h2 { font-size: 16px; margin: 0 0 8px; }
+  p { margin: 6px 0; }
+  .sub { color: var(--muted); margin-bottom: 12px; }
+  .env { padding: 8px 12px; border-radius: 8px; border: 1px solid var(--line); margin-bottom: 12px; }
+  .env.good { border-color: var(--ok); }
+  .env.bad { border-color: var(--err); color: var(--err); }
+  .warnbox { border: 1px solid var(--warn); border-radius: 8px; padding: 10px 12px; margin-bottom: 12px; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  @media (max-width: 720px) { .grid { grid-template-columns: 1fr; } }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
+  .state { color: var(--muted); font-size: 13px; }
+  button { font: inherit; padding: 7px 12px; border-radius: 8px; border: 1px solid var(--line); background: var(--card); color: var(--fg); cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button:disabled { opacity: .5; cursor: default; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 8px 0; }
+  label.file { display: block; margin: 8px 0; }
+  label.file span { display: block; font-size: 13px; color: var(--muted); }
+  input[type=file] { max-width: 100%; }
+  input[type=text] { font: inherit; padding: 6px 8px; border-radius: 6px; border: 1px solid var(--line); background: var(--card); color: var(--fg); width: 120px; }
+  .tabs { display: flex; gap: 6px; margin: 16px 0 8px; flex-wrap: wrap; }
+  .tabs button.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .tab { display: none; }
+  .tab.on { display: block; }
+  ol { padding-left: 20px; }
+  .progress { height: 10px; background: var(--line); border-radius: 5px; overflow: hidden; margin-top: 12px; }
+  #bar { height: 100%; width: 0; background: var(--accent); transition: width .2s; }
+  #bartext { font-size: 13px; color: var(--muted); margin: 4px 0 8px; min-height: 18px; }
+  #log { background: var(--logbg); color: var(--logfg); font: 12.5px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; padding: 10px 12px; border-radius: 8px; height: 280px; overflow: auto; white-space: pre-wrap; }
+  #log .ok { color: var(--ok); } #log .warn { color: var(--warn); } #log .err { color: var(--err); }
+  code { font-family: ui-monospace, Consolas, monospace; font-size: 13px; }
+  body.busy { cursor: progress; }
+  footer { color: var(--muted); font-size: 13px; margin: 16px 0; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Rainy 75 Web Flasher</h1>
+  <p class="sub">Install ZMK, update it, or go back to the stock firmware, from Chrome or Edge. No drivers, no Python.</p>
+  <div id="env" class="env">checking the browser…</div>
+  <div class="warnbox">
+    <strong>Do not unplug the keyboard while a task runs.</strong> Keep the stock OTA image for your board
+    (ANSI Standard/Pro: <code>rainy75_rgb_20240121_standard_pro_ota.bin</code>) to be able to go back.
+    Flashing the wrong image can brick the board; recovery then needs the SWS pads (docs/recovery.md).
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <h2>Stock keyboard (WebHID)</h2>
+      <p class="state">Stock firmware, VID 320F PID 5055, OTA channel. Only needed to install ZMK the first time.</p>
+      <div class="row">
+        <button id="btn-hid-conn" data-task>Connect</button>
+        <button id="btn-hid-ver" data-task>Read version</button>
+        <button id="btn-hid-disc">Disconnect</button>
+      </div>
+      <div class="state" id="hid-state">not connected</div>
+    </div>
+    <div class="card">
+      <h2>ZMK / bridge port (Web Serial)</h2>
+      <p class="state">ZMK and the bridge show up as 1D50:615E. ZMK has two COM ports: pick the console/mcumgr one (usually the lower number); the tool tells you if you got the Studio port.</p>
+      <div class="row">
+        <button id="btn-ser-conn" data-task>Connect</button>
+        <button id="btn-ser-disc">Disconnect</button>
+      </div>
+      <div class="state" id="ser-state">not connected</div>
+    </div>
+  </div>
+
+  <div class="tabs">
+    <button class="on" data-tab="tab-install">Install ZMK</button>
+    <button data-tab="tab-update">Update ZMK</button>
+    <button data-tab="tab-restore">Restore stock</button>
+    <button data-tab="tab-tools">Tools</button>
+  </div>
+
+  <div class="tab card on" id="tab-install">
+    <h2>Stock firmware → ZMK (two stages)</h2>
+    <ol>
+      <li>Build everything first: <code>./build.sh -a --ansi</code> (or <code>--iso</code>, add <code>--wired</code> for the USB-only gaming build).</li>
+      <li>Keyboard in wired mode on USB with the stock firmware.</li>
+      <li>Stage 1 sends the OTA bridge (<code>build-bridge/bridge_ota.bin</code>) over the stock OTA protocol. The keyboard reboots as "Rainy 75 Bridge".</li>
+      <li>Stage 2 connects to the bridge's COM port and writes MCUboot + ZMK (<code>build/combined.bin</code>) to flash 0 through the bridge. The keyboard reboots into ZMK.</li>
+    </ol>
+    <label class="file"><span>Bridge OTA image (build-bridge/bridge_ota.bin)</span><input type="file" id="f-bridge"></label>
+    <label class="file"><span>Combined image (build/combined.bin)</span><input type="file" id="f-combined"></label>
+    <div class="row">
+      <label><input type="checkbox" id="c-verify-install" checked> read back and verify before committing</label>
+    </div>
+    <div class="row">
+      <button id="btn-install-1" class="primary" data-task>Stage 1: flash the bridge</button>
+      <button id="btn-install-2" class="primary" data-task>Stage 2: write ZMK via the bridge</button>
+    </div>
+    <p class="state">Already on the bridge (for example after an interrupted install)? Choose the combined image and run Stage 2 alone.</p>
+  </div>
+
+  <div class="tab card" id="tab-update">
+    <h2>Update a running ZMK (mcumgr image upload)</h2>
+    <p>Uploads <code>build/zephyr/zmk.signed.bin</code> to slot 1. With "test boot" the new image runs once and
+      reverts on the next reset unless you confirm it (Tools → Confirm running image), so a broken image can never lock you out.</p>
+    <label class="file"><span>Signed app image (build/zephyr/zmk.signed.bin)</span><input type="file" id="f-signed"></label>
+    <div class="row">
+      <label><input type="checkbox" id="c-test" checked> test boot (recommended, build with <code>--test-image</code>)</label>
+      <label><input type="checkbox" id="c-reset" checked> reset after upload</label>
+    </div>
+    <div class="row"><button id="btn-update" class="primary" data-task>Upload</button></div>
+  </div>
+
+  <div class="tab card" id="tab-restore">
+    <h2>ZMK → stock firmware</h2>
+    <p>Writes the stock OTA image to flash 0 through ZMK's flash_mgmt (staging at 0x80000, verify, commit). The calibration
+      data above 0xFE000 is never touched. Use the image for <em>your</em> board (ANSI vs ISO).</p>
+    <label class="file"><span>Stock OTA image (…_ota.bin)</span><input type="file" id="f-stock"></label>
+    <div class="row"><label><input type="checkbox" id="c-verify-stock" checked> read back and verify before committing</label></div>
+    <div class="row"><button id="btn-restore" class="primary" data-task>Restore stock firmware</button></div>
+  </div>
+
+  <div class="tab card" id="tab-tools">
+    <h2>Tools (ZMK port)</h2>
+    <div class="row">
+      <button id="btn-list" data-task>List images</button>
+      <button id="btn-confirm" data-task>Confirm running image</button>
+      <button id="btn-reset" data-task>Reset keyboard</button>
+    </div>
+    <div class="row">
+      <input type="text" id="i-readoff" value="0" placeholder="hex offset">
+      <button id="btn-readflash" data-task>Read 32 bytes of flash</button>
+    </div>
+  </div>
+
+  <div class="progress"><div id="bar"></div></div>
+  <div id="bartext"></div>
+  <div class="row"><strong>Log</strong><button id="btn-clear">Clear</button></div>
+  <div id="log"></div>
+  <footer>Rainy 75 Web Flasher, part of rainy75-zmk. Same protocols as reverse/tools (ota_flasher.py, restore_original.py, rainy75_dfu.py).</footer>
+</main>
+<script src="proto.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

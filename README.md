@@ -127,6 +127,7 @@ read on their own.
 | I want to… | How |
 |------------|-----|
 | **Install this ZMK firmware** | `./install_zmk.sh` — two-stage OTA → mcumgr, no debugger. Full guide: [INSTALL.md](INSTALL.md). |
+| **Flash from Windows / macOS, in the browser** | Open [`webflash/index.html`](webflash/README.md) in Chrome or Edge — install, update and restore over WebHID + Web Serial, no Python. |
 | **Use it — controls, Bluetooth, Studio** | [docs/usage.md](docs/usage.md) — Fn-layer, BT profiles + reset, live keymap editing via ZMK Studio. |
 | **Go back to stock** | `./restore_stock.sh` — see [INSTALL.md](INSTALL.md#3-go-back-to-stock). |
 | **Build from source** | `./build.sh -a --iso` (or `--ansi`; Zephyr SDK 0.17.0 + west). See [INSTALL.md](INSTALL.md#4-build-from-source). |

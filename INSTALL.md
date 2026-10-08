@@ -198,3 +198,11 @@ LEDs, so `--ansi` also selects an ANSI-calibrated LED map
 | `mcumgr: command not found` | Install it and ensure `~/go/bin` is on `PATH`. |
 | Install stalls mid-step | Re-plug and re-run — the two stages are each idempotent. |
 | Keyboard won't enumerate at all after a bad flash | Hardware recovery: [docs/recovery.md](docs/recovery.md). |
+
+## 5. Flash from a browser (Windows, macOS)
+
+The Linux-only tools (`hidraw`, `termios`) have a browser twin in
+[`webflash/`](webflash/README.md): open `webflash/index.html` in Chrome or Edge (a local
+file works, as does GitHub Pages of your fork) and it does the same two-stage install,
+the mcumgr update with test boot, and the stock restore over WebHID and Web Serial. Build
+in WSL, pick the images from `\\wsl.localhost\...` in the file dialogs.

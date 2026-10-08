@@ -92,6 +92,7 @@ zephyr/                          # Zephyr upstream (fetched by west)
 modules/hal/hal_telink/          # Telink HAL (fetched by west, pinned in west.yml; patches/hal_telink/0001 builds sys.c unless the blob is selected)
 bootloader/mcuboot/              # MCUboot v2.2.0 (fetched by west)
 install_zmk.sh                   # stock → ZMK one-command installer (OTA bridge + flash_mgmt)
+webflash/                        # browser flasher (Chrome/Edge, WebHID + Web Serial): proto.js (pure, node tests vs the Python tools), app.js, index.html
 restore_stock.sh                 # ZMK → stock one-command restorer (flash_mgmt + reset)
 build/zephyr/zmk.elf             # app build output (open controller: ~296 KB ROM, ~103 KB RAM; blob: ~320 KB ROM, ~83 KB RAM)
 build-mcuboot/zephyr/zephyr.elf  # MCUboot build output (~51 KB ROM, 64KB boot partition)
