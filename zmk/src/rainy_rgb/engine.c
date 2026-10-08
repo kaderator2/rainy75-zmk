@@ -125,8 +125,15 @@ struct rrgb_runtime {
     uint32_t last_press_tick;
 };
 
+/* First-boot state (CONFIG_RAINY_RGB_DEFAULT_*); the persisted settings
+ * replace it as soon as they are loaded (rrgb_set_persist). */
 static struct rrgb_runtime rt = {
-    .on = true, .effect = 0, .hue = 0, .sat = 255, .val = 200, .speed = 32,
+    .on = IS_ENABLED(CONFIG_RAINY_RGB_DEFAULT_ON),
+    .effect = CONFIG_RAINY_RGB_DEFAULT_EFFECT,
+    .hue = CONFIG_RAINY_RGB_DEFAULT_HUE,
+    .sat = CONFIG_RAINY_RGB_DEFAULT_SAT,
+    .val = CONFIG_RAINY_RGB_DEFAULT_VAL,
+    .speed = CONFIG_RAINY_RGB_DEFAULT_SPEED,
 };
 static struct rrgb pixels[RRGB_N];
 static uint32_t anim_phase_q8;   /* .8 fixed-point animation phase accumulator */
@@ -463,10 +470,14 @@ void rrgb_on_key(uint32_t position, bool pressed) {
 }
 
 void rrgb_battery_gauge_show(void) { rrgb_overlay_battery_show(rt.tick); }
+void rrgb_snap_tap_show(bool on) { rrgb_overlay_snap_tap_show(on, rt.tick); }
 
 uint32_t rrgb_now(void) { return rt.tick; }
 
 void rrgb_engine_init(void) {
+    /* CONFIG_RAINY_RGB_DEFAULT_EFFECT may name the opt-in walker (12) in a
+     * build without it. */
+    if (rt.effect >= rrgb_effect_count) { rt.effect = 0; }
     if (rrgb_strip_init() != 0) { return; }
     /* Persisted state is restored by state.c's SETTINGS_STATIC_HANDLER when ZMK
      * runs settings_load() in main() (after this SYS_INIT). No load here. */

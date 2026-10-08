@@ -1,6 +1,6 @@
 #!/bin/bash
 # Build ZMK firmware for Rainy 75 Pro
-# Usage: ./build.sh [-p] [-v] [-m] [-c] [-o] [-b] [-a] (--iso | --ansi) [--blob | --privacy] [--test-image]
+# Usage: ./build.sh [-p] [-v] [-m] [-c] [-o] [-b] [-a] (--iso | --ansi) [--wired | --blob | --privacy] [--test-image]
 #   -p  pristine build (clean rebuild)
 #   -v  verbose output
 #   -m  build MCUboot bootloader
@@ -13,6 +13,9 @@
 #   (default) the open BLE link layer (issue #13), no binary blob is fetched or linked
 #   --blob    opt in to the proprietary Telink BLE blob instead (fetched on demand)
 #   --openll  accepted no-op alias (the open controller is the default)
+#   --wired   USB-only gaming build: no Bluetooth, NKRO, eager press debounce, no deep
+#             sleep, calm default lighting (conf/wired.conf + conf/wired.overlay, the
+#             keymap sees RAINY75_WIRED). Refused with --blob / --privacy.
 #   --privacy resolvable private address (BT_PRIVACY), open controller only. Every
 #             host must be paired again; refused with --blob.
 #   --test-image  risky test image: never confirms itself, so any reset or power
@@ -36,11 +39,12 @@ BUILD_OTA=0
 BUILD_BRIDGE=0
 BUILD_APP=1
 LAYOUT=""             # "iso" or "ansi" — REQUIRED for app builds, no default
-ANSI_DTFLAG=""        # set when LAYOUT=ansi
+ANSI_KCONFIG=""       # set when LAYOUT=ansi (the DTS symbol goes via DTS_CPPFLAGS)
 APP_CONF="$(pwd)/conf/app.conf"
 USE_BLOB=0            # set by --blob (default: open controller)
 USE_PRIVACY=0         # set by --privacy (refused with --blob)
 USE_TEST_IMAGE=0      # set by --test-image
+USE_WIRED=0           # set by --wired (USB only, no BLE controller overlay)
 BUILD_DIR="${BUILD_DIR:-build}"   # app build directory
 
 # ── Apply upstream patches if needed ──────────────────────────
@@ -233,11 +237,12 @@ ARGS=(); for a in "$@"; do case "$a" in
     --blob)   ARGS+=("-B");;
     --privacy) ARGS+=("-Y");;
     --test-image) ARGS+=("-T");;
+    --wired)  ARGS+=("-W");;
     *)        ARGS+=("$a");;
 esac; done
 set -- "${ARGS[@]}"
 
-while getopts "pvmcobaIAOYBT" opt; do
+while getopts "pvmcobaIAOYBTW" opt; do
     case $opt in
         p) PRISTINE="-p" ;;
         v) VERBOSE_CMAKE="-DCMAKE_VERBOSE_MAKEFILE=ON" ;;
@@ -247,12 +252,13 @@ while getopts "pvmcobaIAOYBT" opt; do
         b) BUILD_BRIDGE=1; BUILD_APP=0 ;;
         a) BUILD_MCUBOOT=1; BUILD_COMBINED=1; BUILD_OTA=1; BUILD_BRIDGE=1; BUILD_APP=1 ;;
         I) [ "$LAYOUT" = ansi ] && { echo "Error: --iso and --ansi are mutually exclusive" >&2; exit 1; }; LAYOUT="iso" ;;
-        A) [ "$LAYOUT" = iso  ] && { echo "Error: --iso and --ansi are mutually exclusive" >&2; exit 1; }; LAYOUT="ansi"; ANSI_DTFLAG="-DDTS_EXTRA_CPPFLAGS=-DRAINY75_ANSI -DCONFIG_RAINY_RGB_ANSI_LEDMAP=y" ;;
+        A) [ "$LAYOUT" = iso  ] && { echo "Error: --iso and --ansi are mutually exclusive" >&2; exit 1; }; LAYOUT="ansi"; ANSI_KCONFIG="-DCONFIG_RAINY_RGB_ANSI_LEDMAP=y" ;;
         O) echo "Note: --openll is a no-op, the open controller is the default." >&2 ;;
         B) USE_BLOB=1 ;;
         Y) USE_PRIVACY=1 ;;
         T) USE_TEST_IMAGE=1 ;;
-        *) echo "Usage: $0 [-p] [-v] [-m] [-c] [-o] [-b] [-a] (--iso | --ansi) [--blob | --privacy] [--test-image]"; exit 1 ;;
+        W) USE_WIRED=1 ;;
+        *) echo "Usage: $0 [-p] [-v] [-m] [-c] [-o] [-b] [-a] (--iso | --ansi) [--wired | --blob | --privacy] [--test-image]"; exit 1 ;;
     esac
 done
 
@@ -265,18 +271,32 @@ if [ "$BUILD_APP" -eq 1 ] && [ -z "$LAYOUT" ]; then
     exit 1
 fi
 
+# Bluetooth builds: conf/ble.conf (host, HCI driver, BLE SMP) plus the controller.
 # The open controller is the default: conf/openll.conf (controller choice, power
 # counters, long-PDU buffers) is part of its configuration. --blob keeps the
 # blob build exactly as before (no openll.conf, blob selected explicitly).
-if [ "$USE_BLOB" -eq 1 ]; then
+# --wired drops Bluetooth entirely: no ble.conf, no controller overlay, conf/wired.conf
+# on top of app.conf, conf/wired.overlay for the kscan, RAINY75_WIRED for the keymap.
+APP_OVERLAYS="$(pwd)/zmk/boards/rainy75/rainy75.keymap;$(pwd)/conf/mcumgr.overlay;$(pwd)/conf/studio-usb.overlay"
+DTS_CPPFLAGS=""
+[ "$LAYOUT" = ansi ] && DTS_CPPFLAGS="-DRAINY75_ANSI"
+if [ "$USE_WIRED" -eq 1 ]; then
+    if [ "$USE_BLOB" -eq 1 ] || [ "$USE_PRIVACY" -eq 1 ]; then
+        echo "Error: --wired has no Bluetooth; drop --blob / --privacy." >&2
+        exit 1
+    fi
+    APP_CONF="$APP_CONF;$(pwd)/conf/wired.conf"
+    APP_OVERLAYS="$APP_OVERLAYS;$(pwd)/conf/wired.overlay"
+    DTS_CPPFLAGS="${DTS_CPPFLAGS:+$DTS_CPPFLAGS;}-DRAINY75_WIRED"
+elif [ "$USE_BLOB" -eq 1 ]; then
     if [ "$USE_PRIVACY" -eq 1 ]; then
         echo "Error: --privacy cannot be combined with --blob (privacy is only tested with" >&2
         echo "       the open controller). Drop --blob to use the open controller." >&2
         exit 1
     fi
-    APP_CONF="$APP_CONF;$(pwd)/conf/blob.conf"
+    APP_CONF="$APP_CONF;$(pwd)/conf/ble.conf;$(pwd)/conf/blob.conf"
 else
-    APP_CONF="$APP_CONF;$(pwd)/conf/openll.conf"
+    APP_CONF="$APP_CONF;$(pwd)/conf/ble.conf;$(pwd)/conf/openll.conf"
     [ "$USE_PRIVACY" -eq 1 ] && APP_CONF="$APP_CONF;$(pwd)/conf/privacy.conf"
 fi
 if [ "$USE_TEST_IMAGE" -eq 1 ]; then
@@ -311,13 +331,15 @@ fi
 
 # ── App build ──────────────────────────────────────────────────
 if [ "$BUILD_APP" -eq 1 ]; then
-    echo "=== Building ZMK app ($(echo "$LAYOUT" | tr a-z A-Z) layout) ==="
+    echo "=== Building ZMK app ($(echo "$LAYOUT" | tr a-z A-Z) layout$([ "$USE_WIRED" -eq 1 ] && echo ', wired')) ==="
+    # DTS_EXTRA_CPPFLAGS is a CMake list (';'-separated), one -D per entry.
     west build $PRISTINE -b rainy75 -d "$BUILD_DIR" zmk-src/app -- \
         -DZMK_CONFIG="$(pwd)/zmk/boards/rainy75" \
         -DZMK_EXTRA_MODULES="$(pwd)/zmk" \
         -DEXTRA_CONF_FILE="$APP_CONF" \
-        -DEXTRA_DTC_OVERLAY_FILE="$(pwd)/zmk/boards/rainy75/rainy75.keymap;$(pwd)/conf/mcumgr.overlay;$(pwd)/conf/studio-usb.overlay" \
-        $ANSI_DTFLAG \
+        -DEXTRA_DTC_OVERLAY_FILE="$APP_OVERLAYS" \
+        ${DTS_CPPFLAGS:+-DDTS_EXTRA_CPPFLAGS="$DTS_CPPFLAGS"} \
+        $ANSI_KCONFIG \
         $VERBOSE_CMAKE
 fi
 

@@ -125,6 +125,50 @@ config RAINY_RGB_ANSI_LEDMAP
 	  Selects the ANSI-calibrated pos_to_led/XY tables in led_map.c.
 	  Set automatically by ./build.sh --ansi.
 
+config RAINY_RGB_DEFAULT_ON
+	bool "RGB on at first boot"
+	depends on RAINY_RGB
+	default y
+	help
+	  Lighting state before anything was persisted (first boot, or after
+	  the settings were erased). The Fn+RGB controls persist their changes,
+	  which then take precedence over all RAINY_RGB_DEFAULT_* values.
+
+config RAINY_RGB_DEFAULT_EFFECT
+	int "Default effect index"
+	depends on RAINY_RGB
+	range 0 12
+	default 0
+	help
+	  Index into the effect registry (effects.c): 0 solid, 1 rainbow,
+	  2 plasma, 3 twinkle, 4 comet, 5 aurora, 6 reactive, 7 ripple, 8 wave,
+	  9 rain, 10 heatmap, 11 speedcolour (12 walker, only with
+	  RAINY_RGB_WALKER; an index past the registry falls back to 0).
+
+config RAINY_RGB_DEFAULT_HUE
+	int "Default hue (0..255)"
+	depends on RAINY_RGB
+	range 0 255
+	default 0
+
+config RAINY_RGB_DEFAULT_SAT
+	int "Default saturation (0..255)"
+	depends on RAINY_RGB
+	range 0 255
+	default 255
+
+config RAINY_RGB_DEFAULT_VAL
+	int "Default brightness (16..255)"
+	depends on RAINY_RGB
+	range 16 255
+	default 200
+
+config RAINY_RGB_DEFAULT_SPEED
+	int "Default animation speed (1..255)"
+	depends on RAINY_RGB
+	range 1 255
+	default 32
+
 config RAINY_RGB_WALKER
 	bool "Walker diagnostic effect (LED-map calibration)"
 	depends on RAINY_RGB
@@ -148,3 +192,22 @@ config RAINY_RGB_IDLE_BLANK
 	  wireless during idle-but-awake stretches. Host direct mode (rgb_mgmt)
 	  overrides the blank so a host notification pulse still shows when the
 	  board is idle. Off by default (no behaviour change).
+
+config RAINY75_SNAP_TAP
+	bool "Snap Tap (Razer-style last-input priority for A/D and W/S)"
+	default y
+	depends on DT_HAS_RAINY_BEHAVIOR_SNAP_TAP_ENABLED
+	help
+	  Provides the &snap KEY and &snap_tog behaviors (dts/rainy_snap_tap.dtsi).
+	  While both keys of a pair are held, only the last pressed one is
+	  reported; releasing it brings the other back. The on/off state is
+	  toggled from the keymap (Fn+T) and persisted in settings. Pure logic
+	  with host tests in src/snap_tap/tests/. See docs/usage.md.
+
+config RAINY75_SNAP_TAP_DEFAULT_ON
+	bool "Snap Tap enabled on first boot"
+	default y
+	depends on RAINY75_SNAP_TAP
+	help
+	  The state before the user toggles it (nothing persisted yet). The
+	  persisted toggle takes precedence afterwards.

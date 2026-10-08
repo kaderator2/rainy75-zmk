@@ -1,0 +1,10 @@
+/*
+ * Wired gaming build (./build.sh --wired): eager press debounce. A key
+ * press is reported on the first scan that sees it; the 5 ms release
+ * debounce (default) still absorbs contact bounce, which only ever shows as
+ * short open gaps while the key stays down. The ISO/BLE build keeps 1 ms
+ * (two readings) to also filter a single-sample glitch on a row line.
+ */
+&kscan0 {
+	debounce-press-ms = <0>;
+};
