@@ -167,7 +167,7 @@ screen /dev/ttyACM0 115200        # exit: Ctrl-A then K
 
 **Update the firmware (mcumgr DFU).** Once you're on ZMK, flash a new build over USB, no
 debugger, no bootloader button. The included tool finds the keyboard by itself and takes
-about 13 s (Python 3, no extra packages):
+about 12 s (Python 3, no extra packages):
 
 ```bash
 python3 reverse/tools/rainy75_dfu.py upload build/zephyr/zmk.signed.bin --test --reset
