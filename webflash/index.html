@@ -45,7 +45,7 @@
   #bar { height: 100%; width: 0; background: var(--accent); transition: width .2s; }
   #bartext { font-size: 13px; color: var(--muted); margin: 4px 0 8px; min-height: 18px; }
   #log { background: var(--logbg); color: var(--logfg); font: 12.5px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; padding: 10px 12px; border-radius: 8px; height: 280px; overflow: auto; white-space: pre-wrap; }
-  #log .ok { color: var(--ok); } #log .warn { color: var(--warn); } #log .err { color: var(--err); }
+  #log .ok { color: var(--ok); } #log .warn { color: var(--warn); } #log .err { color: var(--err); } #log .con { color: #94a3b8; }
   code { font-family: ui-monospace, Consolas, monospace; font-size: 13px; }
   body.busy { cursor: progress; }
   footer { color: var(--muted); font-size: 13px; margin: 16px 0; }
@@ -138,6 +138,10 @@
       <button id="btn-list" data-task>List images</button>
       <button id="btn-confirm" data-task>Confirm running image</button>
       <button id="btn-reset" data-task>Reset keyboard</button>
+      <button id="btn-test1" data-task>Boot slot 1 for a test</button>
+    </div>
+    <div class="row">
+      <label><input type="checkbox" id="c-console"> console echo: show the keyboard's log lines from this port (boot log, USB, HID)</label>
     </div>
     <div class="row">
       <input type="text" id="i-readoff" value="0" placeholder="hex offset">

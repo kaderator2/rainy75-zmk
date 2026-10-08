@@ -163,6 +163,12 @@
 
     /* ========================================================= SMP serial */
     const ser = { port: null, reader: null, writer: null, parser: null, seq: 0, pending: null, readLoop: null };
+    /* Console echo: the mcumgr port is also ZMK's log console; with the box
+     * ticked every non-SMP line is shown (boot log, USB / HID messages). */
+    function consoleLine(text) {
+        if ($('c-console').checked && text.trim()) { log('  | ' + text, 'con'); }
+    }
+    function newParser() { return new P.SmpParser(consoleLine); }
 
     async function serialConnect() {
         if (!navigator.serial) { throw new Error('Web Serial is not available (use Chrome or Edge, https:// or file://)'); }
@@ -170,7 +176,7 @@
         await port.open({ baudRate: 115200, bufferSize: 16384 });
         try { await port.setSignals({ dataTerminalReady: true, requestToSend: true }); } catch (e) { /* optional */ }
         ser.port = port;
-        ser.parser = new P.SmpParser();
+        ser.parser = newParser();
         ser.writer = port.writable.getWriter();
         ser.readLoop = (async () => {
             try {
@@ -181,7 +187,7 @@
                             const { value, done } = await ser.reader.read();
                             if (done) { break; }
                             let pkts;
-                            try { pkts = ser.parser.feed(value); } catch (e) { warn('serial: ' + e.message); ser.parser = new P.SmpParser(); continue; }
+                            try { pkts = ser.parser.feed(value); } catch (e) { warn('serial: ' + e.message); ser.parser = newParser(); continue; }
                             for (const pkt of pkts) {
                                 if (ser.pending) { const p = ser.pending; ser.pending = null; p.resolve(pkt); }
                             }
@@ -228,7 +234,7 @@
         const seq = ser.seq; ser.seq = (ser.seq + 1) & 0xFF;
         const frames = P.smpSerialEncode(P.smpRequest(op, group, seq, id, payload || {}));
         for (let attempt = 0; ; attempt++) {
-            ser.parser = new P.SmpParser();
+            ser.parser = newParser();
             const waiting = smpWait(timeout);
             for (const f of frames) { await ser.writer.write(f); }
             try {
@@ -503,6 +509,18 @@
     bind('btn-list', 'list', async () => { if (!ser.port) { await serialConnect(); } printImages(await imgList()); });
     bind('btn-confirm', 'confirm', async () => { if (!ser.port) { await serialConnect(); } printImages(await imgSetState(null, true)); ok('running image confirmed'); });
     bind('btn-reset', 'reset', async () => { if (!ser.port) { await serialConnect(); } await osReset(); });
+    bind('btn-test1', 'test slot 1', async () => {
+        if (!ser.port) { await serialConnect(); }
+        const imgs = await imgList();
+        printImages(imgs);
+        const slot1 = imgs.find(i => i.slot === 1);
+        if (!slot1 || !slot1.hash) { throw new Error('no image in slot 1'); }
+        if (imgs.some(i => i.slot === 0 && !i.confirmed)) { throw new Error('the running image is not confirmed; confirm it or reset first'); }
+        await imgSetState(slot1.hash, false);
+        ok('slot 1 (' + P.hex(slot1.hash).slice(0, 16) + ') marked for one test boot; resetting');
+        await osReset();
+        info('after the swap (15-20 s), Connect again with "console echo" on to read its boot log');
+    });
     bind('btn-readflash', 'read flash', async () => {
         if (!ser.port) { await serialConnect(); }
         const off = parseInt($('i-readoff').value, 16) || 0;

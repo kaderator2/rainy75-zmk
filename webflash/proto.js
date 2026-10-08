@@ -240,9 +240,10 @@
 
     /* Incremental decoder for the serial side: feed() raw bytes, get complete
      * SMP packets back. Log lines on the shared console port are ignored. */
-    function SmpParser() {
+    function SmpParser(onOther) {
         this.lineBuf = [];
         this.frames = [];
+        this.onOther = onOther || null;   /* called with every non-SMP line (console output) */
     }
     SmpParser.prototype.feed = function (bytes) {
         const packets = [];
@@ -250,11 +251,14 @@
             const b = bytes[i];
             if (b !== 0x0A) { this.lineBuf.push(b); if (this.lineBuf.length > 4096) { this.lineBuf = []; } continue; }
             const line = this.lineBuf; this.lineBuf = [];
-            if (line.length < 2) { continue; }
-            const isFirst = line[0] === 0x06 && line[1] === 0x09;
-            const isCont = line[0] === 0x04 && line[1] === 0x14;
+            const isFirst = line.length >= 2 && line[0] === 0x06 && line[1] === 0x09;
+            const isCont = line.length >= 2 && line[0] === 0x04 && line[1] === 0x14;
+            if (!isFirst && !isCont) {
+                if (this.onOther && line.length) { this.onOther(String.fromCharCode.apply(null, line.filter(c => c !== 0x0D))); }
+                continue;
+            }
             if (isFirst) { this.frames = []; }
-            else if (!isCont || this.frames.length === 0) { continue; }
+            else if (this.frames.length === 0) { continue; }
             let text = '';
             for (let k = 2; k < line.length; k++) { if (line[k] !== 0x0D) { text += String.fromCharCode(line[k]); } }
             this.frames.push(text);
