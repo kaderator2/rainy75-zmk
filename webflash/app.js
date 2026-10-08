@@ -270,7 +270,9 @@
         if (rcOf(r) !== 0) { throw new Error('write failed at ' + hexN(off) + ' rc=' + rcOf(r)); }
     }
     async function flashRead(off, len) {
-        const r = await smp(S.OP_READ, S.GROUP_FLASH, S.FLASH_READ, { off, len });
+        /* restore_original.py waits 10 s per read; the bridge's serial ring
+         * is small and its mcumgr transport drops a reply it cannot queue. */
+        const r = await smp(S.OP_READ, S.GROUP_FLASH, S.FLASH_READ, { off, len }, { timeout: 10000, retries: 3 });
         if (rcOf(r) !== 0) { throw new Error('read failed at ' + hexN(off) + ' rc=' + rcOf(r)); }
         return r.data;
     }
@@ -280,38 +282,59 @@
     }
     /* Port of restore_original.restore_firmware(): stage at >= 0x80000,
      * verify, commit (RAM trampoline erases 0x0, copies, resets). */
+    /* What is in the staging area right now (this page session): lets a
+     * second run after a USB stall skip the write and continue the verify.
+     * Nothing is trusted from it: the verify reads every byte anyway. */
+    const staged = { hash: null, verified: 0 };
+
     async function stageAndCommit(fw, verify) {
         const plan = P.stagingPlan(fw.length);
         if (!plan.ok) { throw new Error('image too large for the staging area'); }
         if (fw.length >= P.FLASH.PROTECTED_START) { throw new Error('image too large'); }
+        const fwHash = P.hex(await sha256(fw));
+        const chunks = Math.ceil(fw.length / P.FLASH.WRITE_CHUNK);
         info('image ' + fw.length + ' bytes, erase 0..' + hexN(plan.eraseEnd) + ', staging at ' + hexN(plan.stg));
         const probe = await flashRead(0, 4);
         info('connected, flash[0..4] = ' + P.hex(probe));
-        info('erasing staging area (' + (plan.stgEraseSize / 1024) + ' KB, ~' + Math.ceil(plan.stgEraseSize / P.FLASH.SECTOR * 0.015 + 1) + ' s)');
-        progress(0, 'erasing');
-        await flashErase(plan.stg, plan.stgEraseSize);
-        const chunks = Math.ceil(fw.length / P.FLASH.WRITE_CHUNK);
-        const t0 = performance.now();
-        for (let i = 0; i < chunks; i++) {
-            const off = i * P.FLASH.WRITE_CHUNK;
-            await flashWrite(plan.stg + off, fw.subarray(off, off + P.FLASH.WRITE_CHUNK));
-            if (i % 8 === 0 || i === chunks - 1) {
-                const el = (performance.now() - t0) / 1000;
-                progress((i + 1) / chunks, 'writing ' + Math.round((i + 1) * 100 / chunks) + ' %  ' + el.toFixed(0) + ' s');
-            }
-        }
-        ok('staged in ' + ((performance.now() - t0) / 1000).toFixed(1) + ' s');
-        if (verify) {
-            const t1 = performance.now();
+        const resume = staged.hash === fwHash;
+        if (resume) {
+            info('this image was already staged in this session: skipping the write, verifying from chunk ' + staged.verified + '/' + chunks);
+        } else {
+            staged.hash = null; staged.verified = 0;
+            info('erasing staging area (' + (plan.stgEraseSize / 1024) + ' KB, ~' + Math.ceil(plan.stgEraseSize / P.FLASH.SECTOR * 0.015 + 1) + ' s)');
+            progress(0, 'erasing');
+            await flashErase(plan.stg, plan.stgEraseSize);
+            const t0 = performance.now();
             for (let i = 0; i < chunks; i++) {
                 const off = i * P.FLASH.WRITE_CHUNK;
+                await flashWrite(plan.stg + off, fw.subarray(off, off + P.FLASH.WRITE_CHUNK));
+                if (i % 8 === 0 || i === chunks - 1) {
+                    const el = (performance.now() - t0) / 1000;
+                    progress((i + 1) / chunks, 'writing ' + Math.round((i + 1) * 100 / chunks) + ' %  ' + el.toFixed(0) + ' s');
+                }
+            }
+            ok('staged in ' + ((performance.now() - t0) / 1000).toFixed(1) + ' s');
+            staged.hash = fwHash; staged.verified = 0;
+        }
+        if (verify) {
+            const t1 = performance.now();
+            for (let i = staged.verified; i < chunks; i++) {
+                const off = i * P.FLASH.WRITE_CHUNK;
                 const expect = fw.subarray(off, off + P.FLASH.WRITE_CHUNK);
-                const got = await flashRead(plan.stg + off, expect.length);
-                if (!P.bytesEqual(got, expect)) { throw new Error('verify mismatch at staging ' + hexN(plan.stg + off) + ' (nothing committed, the running firmware is intact, retry)'); }
+                let got;
+                try {
+                    got = await flashRead(plan.stg + off, expect.length);
+                } catch (e) {
+                    staged.verified = i;
+                    throw new Error(e.message + ' while verifying chunk ' + i + '/' + chunks + '. Nothing was committed and the staged data stays in flash: unplug the keyboard, plug it back in (the bridge boots again), Disconnect, Connect to its port and press Stage 2 again; the verify continues from here.');
+                }
+                if (!P.bytesEqual(got, expect)) { staged.hash = null; throw new Error('verify mismatch at staging ' + hexN(plan.stg + off) + ' (nothing committed, the running firmware is intact, run Stage 2 again to re-stage)'); }
+                staged.verified = i + 1;
                 if (i % 8 === 0 || i === chunks - 1) { progress((i + 1) / chunks, 'verifying ' + Math.round((i + 1) * 100 / chunks) + ' %'); }
             }
             ok('verified in ' + ((performance.now() - t1) / 1000).toFixed(1) + ' s');
         }
+        staged.hash = null; staged.verified = 0;
         info('committing: erase 0..' + hexN(plan.eraseEnd) + ', copy ' + hexN(plan.stg) + ' -> 0, reset');
         await flashCommit(plan.stg, fw.length);
         ok('commit accepted: the keyboard erases, copies and resets itself in a few seconds. Do not unplug.');
