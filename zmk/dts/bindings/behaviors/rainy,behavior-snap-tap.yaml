@@ -1,0 +1,21 @@
+# Copyright (c) 2026 rainy75-zmk contributors
+# SPDX-License-Identifier: Apache-2.0
+
+description: |
+  Snap Tap key press. `&snap KEY` is `&kp KEY` for any KEY that is not in
+  `pairs`; for a pair member the last pressed key of the pair wins while both
+  are held (Razer Snap Tap), see src/snap_tap/snap_tap.h. Toggle with
+  `&snap_tog` (rainy,behavior-snap-tap-toggle).
+
+compatible: "rainy,behavior-snap-tap"
+
+include: one_param.yaml
+
+properties:
+  pairs:
+    type: array
+    required: true
+    description: |
+      Exactly two pairs of opposing keycodes (dt-bindings/zmk/keys.h),
+      e.g. `<A D>, <W S>`. Matched by HID usage id, so `&snap A` and
+      `&snap LS(A)` are the same member.

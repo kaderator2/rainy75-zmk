@@ -87,6 +87,19 @@ if(CONFIG_ZMK_BLE)
   endif()
 endif()
 
+# Snap Tap: the &snap / &snap_tog behaviors over the pure decision module
+# (src/snap_tap/, host tests in src/snap_tap/tests/). See docs/usage.md.
+if(CONFIG_RAINY75_SNAP_TAP)
+  zephyr_library_named(rainy75_snap_tap)
+  zephyr_library_include_directories(
+    ${APPLICATION_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  zephyr_library_sources(
+    src/snap_tap/snap_tap.c
+    src/behaviors/behavior_snap_tap.c
+  )
+endif()
+
 # Embed git version at compile time
 execute_process(
   COMMAND git describe --always --dirty

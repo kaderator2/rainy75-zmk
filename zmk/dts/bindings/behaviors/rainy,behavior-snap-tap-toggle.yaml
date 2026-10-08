@@ -1,0 +1,8 @@
+# Copyright (c) 2026 rainy75-zmk contributors
+# SPDX-License-Identifier: Apache-2.0
+
+description: Toggle Snap Tap on/off (persisted in settings, LED confirmation)
+
+compatible: "rainy,behavior-snap-tap-toggle"
+
+include: zero_param.yaml

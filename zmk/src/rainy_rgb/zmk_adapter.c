@@ -33,6 +33,11 @@
 
 LOG_MODULE_REGISTER(rrgb_adapter, CONFIG_LOG_DEFAULT_LEVEL);
 
+/* Keymap layer ids (rainy75.keymap). KEYMAP-COUPLED: update if the layer
+ * order changes. */
+#define RRGB_LAYER_WINLOCK 1
+#define RRGB_LAYER_FN      2
+
 #define STRIP_NODE  DT_CHOSEN(zmk_underglow)
 #define STRIP_N     DT_PROP(STRIP_NODE, chain_length)
 
@@ -203,7 +208,10 @@ static int rrgb_event_listener(const zmk_event_t *eh) {
     }
 
     const struct zmk_layer_state_changed *lev = as_zmk_layer_state_changed(eh);
-    if (lev) { rrgb_overlay_set_fn(zmk_keymap_layer_active(1)); }
+    if (lev) {
+        rrgb_overlay_set_fn(zmk_keymap_layer_active(RRGB_LAYER_FN));
+        rrgb_overlay_set_winlock(zmk_keymap_layer_active(RRGB_LAYER_WINLOCK));
+    }
 
     const struct zmk_hid_indicators_changed *iev = as_zmk_hid_indicators_changed(eh);
     if (iev) { rrgb_overlay_set_caps((iev->indicators & BIT(1)) != 0); }
@@ -229,7 +237,8 @@ ZMK_SUBSCRIPTION(rrgb_listener, zmk_activity_state_changed);
 
 static int rrgb_overlay_seed(void) {
     rrgb_overlay_set_caps((zmk_hid_indicators_get_current_profile() & BIT(1)) != 0);
-    rrgb_overlay_set_fn(zmk_keymap_layer_active(1));
+    rrgb_overlay_set_fn(zmk_keymap_layer_active(RRGB_LAYER_FN));
+    rrgb_overlay_set_winlock(zmk_keymap_layer_active(RRGB_LAYER_WINLOCK));
     rrgb_overlay_set_battery(zmk_battery_state_of_charge());
     return 0;
 }

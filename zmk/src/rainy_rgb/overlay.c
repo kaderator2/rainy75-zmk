@@ -9,16 +9,24 @@
 #define BAT_SHOW_FRAMES  90   /* ~3s at 30fps */
 #define BAT_SEG_FIRST    16   /* number row keys 1..0 = positions 16..25 */
 #define BAT_SEG_COUNT    10
+#define LGUI_POS         74   /* keymap position of Left GUI (&kp LGUI) */
+#define SNAP_SHOW_FRAMES 60   /* ~1.2 s at 50 fps */
+/* Snap Tap pair keys (W, A, S, D), keymap positions. KEYMAP-COUPLED with
+ * the pairs of dts/rainy_snap_tap.dtsi and the default layer. */
+static const uint8_t snap_keys[] = { 32, 45, 46, 47 };
+#define SNAP_KEYS_COUNT (sizeof(snap_keys) / sizeof(snap_keys[0]))
 
-/* Fn-active keymap positions (non-&trans on layer 1). KEYMAP-COUPLED:
+/* Fn-active keymap positions (non-&trans on the Fn layer). KEYMAP-COUPLED:
  * update this if the Fn layer changes. */
 static const uint8_t fn_keys[] = {
     0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,   /* top row: studio/BT/output/media/BT_CLR */
     28,   /* BKSP  -> RGB_TOG */
-    43,   /* Enter -> RGB_EFF */
-    56,   /* NUHS  -> RGB_HUI */
+    35,   /* T     -> Snap Tap toggle */
+    43,   /* Enter -> RGB_EFF (ANSI: backslash -> RGB_HUI) */
+    56,   /* NUHS  -> RGB_HUI (ANSI: Enter -> RGB_EFF) */
     65,   /* B     -> RGB_BAT */
     72,   /* UP    -> RGB_BRI */
+    74,   /* LGUI  -> Win lock layer toggle */
     80, 81, 82,                            /* arrows -> speed/bright */
 };
 #define FN_KEYS_COUNT (sizeof(fn_keys) / sizeof(fn_keys[0]))
@@ -39,6 +47,9 @@ static volatile bool     s_caps;
 static volatile bool     s_fn;
 static volatile uint8_t  s_battery;
 static volatile uint32_t s_bat_until;
+static volatile bool     s_winlock;
+static volatile bool     s_snap_on;
+static volatile uint32_t s_snap_until;
 static bool              s_ble;   /* ble_status owns its keys (BLE build) */
 
 static uint8_t ble_led(uint8_t pos) {
@@ -65,6 +76,11 @@ void rrgb_overlay_set_caps(bool on)        { s_caps = on; }
 void rrgb_overlay_set_fn(bool active)      { s_fn = active; rrgb_ble_set_fn(active); }
 void rrgb_overlay_set_battery(uint8_t pct) { s_battery = pct; }
 void rrgb_overlay_battery_show(uint32_t tick) { s_bat_until = tick + BAT_SHOW_FRAMES; }
+void rrgb_overlay_set_winlock(bool on)     { s_winlock = on; }
+void rrgb_overlay_snap_tap_show(bool on, uint32_t tick) {
+    s_snap_on = on;
+    s_snap_until = tick + SNAP_SHOW_FRAMES;
+}
 
 bool rrgb_overlay_suppress_effect(uint32_t tick) {
     return s_ble && rrgb_ble_suppress_effect(tick);
@@ -96,7 +112,8 @@ bool rrgb_overlay_key_reactive(uint32_t position, uint32_t tick) {
 }
 
 bool rrgb_overlay_active(uint32_t tick) {
-    return s_caps || s_fn || (tick < s_bat_until) || (s_ble && rrgb_ble_active(tick));
+    return s_caps || s_fn || s_winlock || (tick < s_bat_until) || (tick < s_snap_until) ||
+           (s_ble && rrgb_ble_active(tick));
 }
 
 static void set_pos(struct rrgb *px, uint16_t n, uint8_t pos, struct rrgb c) {
@@ -113,9 +130,20 @@ void rrgb_overlay_render(struct rrgb *px, uint16_t n, uint32_t tick) {
             set_pos(px, n, fn_keys[k], (struct rrgb){255, 255, 255});
         }
     }
-    /* 2. CapsLock: white on the CapsLock key. */
+    /* 1b. Snap Tap confirmation: W/A/S/D green (on) or red (off), ~1 s. It
+     *     starts while Fn is held (Fn+T) and outlives the Fn highlight. */
+    if (tick < s_snap_until) {
+        struct rrgb c = s_snap_on ? (struct rrgb){0, 255, 0} : (struct rrgb){255, 0, 0};
+        for (unsigned k = 0; k < SNAP_KEYS_COUNT; k++) {
+            set_pos(px, n, snap_keys[k], c);
+        }
+    }
+    /* 2. CapsLock: white on the CapsLock key; Win lock: dim red on LGUI. */
     if (s_caps) {
         set_pos(px, n, CAPS_POS, (struct rrgb){255, 255, 255});
+    }
+    if (s_winlock) {
+        set_pos(px, n, LGUI_POS, (struct rrgb){96, 0, 0});
     }
     /* 3. Battery gauge: 10-segment bar on the number row, ~3s window. */
     if (tick < s_bat_until) {

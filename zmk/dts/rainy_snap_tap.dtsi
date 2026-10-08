@@ -1,0 +1,21 @@
+#include <dt-bindings/zmk/keys.h>
+
+/ {
+    behaviors {
+        /* &snap KEY: key press with Snap Tap for the pairs below
+         * (src/behaviors/behavior_snap_tap.c, CONFIG_RAINY75_SNAP_TAP) */
+        snap: snap_tap {
+            compatible = "rainy,behavior-snap-tap";
+            #binding-cells = <1>;
+            display-name = "Snap Tap";
+            pairs = <A D>, <W S>;
+        };
+
+        /* &snap_tog: Snap Tap on/off, persisted */
+        snap_tog: snap_tap_toggle {
+            compatible = "rainy,behavior-snap-tap-toggle";
+            #binding-cells = <0>;
+            display-name = "Snap Tap Toggle";
+        };
+    };
+};

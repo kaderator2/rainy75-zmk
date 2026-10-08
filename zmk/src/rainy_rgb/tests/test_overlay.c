@@ -265,6 +265,38 @@ int main(void) {
     rrgb_overlay_set_fn(false);
     CHECK(!rrgb_overlay_active(100));          /* nothing active */
 
+    /* Snap Tap confirmation: W/A/S/D green for ~1 s after show(on), red after
+       show(off); keeps the overlay active; expires. Starts under Fn. */
+    rrgb_overlay_set_fn(true);
+    rrgb_overlay_snap_tap_show(true, 100);     /* until tick 160 */
+    memset(px, 0, sizeof(px));
+    rrgb_overlay_render(px, 83, 110);
+    int led_w = rrgb_led_for_position(32);
+    int led_d = rrgb_led_for_position(47);
+    CHECK(px[led_w].g == 255 && px[led_w].r == 0);
+    CHECK(px[led_d].g == 255 && px[led_d].r == 0);
+    CHECK(px[led_esc].r == 255);               /* Fn highlight still there */
+    rrgb_overlay_set_fn(false);
+    CHECK(rrgb_overlay_active(159));
+    CHECK(!rrgb_overlay_active(160));
+    rrgb_overlay_snap_tap_show(false, 200);
+    memset(px, 0, sizeof(px));
+    rrgb_overlay_render(px, 83, 201);
+    CHECK(px[led_w].r == 255 && px[led_w].g == 0);
+    memset(px, 0, sizeof(px));
+    rrgb_overlay_render(px, 83, 260);          /* expired */
+    CHECK((px[led_w].r|px[led_w].g|px[led_w].b) == 0);
+
+    /* Win lock: dim red on LGUI (pos 74) while set, overlay active. */
+    memset(px, 0, sizeof(px));
+    rrgb_overlay_set_winlock(true);
+    rrgb_overlay_render(px, 83, 300);
+    int led_gui = rrgb_led_for_position(74);
+    CHECK(px[led_gui].r > 0 && px[led_gui].r < 255 && px[led_gui].g == 0);
+    CHECK(rrgb_overlay_active(300));
+    rrgb_overlay_set_winlock(false);
+    CHECK(!rrgb_overlay_active(300));
+
     test_ble();
     test_effect_gain();
     test_effect_gain_frame();
