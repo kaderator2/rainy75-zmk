@@ -68,22 +68,34 @@
     }
 
     /* ======================================================= stock OTA */
-    const hid = { device: null, pending: null };
+    /* Replies are queued as they arrive: the keyboard answers within a
+     * millisecond, so a reply can land before the sendReport() promise
+     * resolves. A waiter registered after the send would miss it. */
+    const hid = { device: null, pending: null, rx: [], trace: false };
 
     function hidOnReport(ev) {
-        if (ev.reportId !== P.OTA.REPORT_ID) { return; }
         const body = new Uint8Array(ev.data.buffer, ev.data.byteOffset, ev.data.byteLength);
+        if (hid.trace) { info('HID in: report ' + ev.reportId + ' ' + P.hex(body.subarray(0, 16))); }
+        if (ev.reportId !== P.OTA.REPORT_ID) { return; }
         if (hid.pending) { const p = hid.pending; hid.pending = null; p.resolve(body); }
+        else { hid.rx.push(body); if (hid.rx.length > 64) { hid.rx.shift(); } }
     }
     function hidWait(timeoutMs) {
+        if (hid.rx.length) { return Promise.resolve(hid.rx.shift()); }
         return new Promise(resolve => {
             const timer = setTimeout(() => { if (hid.pending && hid.pending.resolve === done) { hid.pending = null; } resolve(null); }, timeoutMs);
             const done = body => { clearTimeout(timer); resolve(body); };
             hid.pending = { resolve: done };
         });
     }
-    async function hidSend(report63) {
+    /* Send one command and return its reply (or null on timeout). Stale
+     * replies from before the send are discarded; the waiter is armed
+     * before the send so a fast reply cannot be missed. */
+    async function hidTransact(report63, timeoutMs) {
+        hid.rx = [];
+        const waiting = hidWait(timeoutMs);
         await hid.device.sendReport(P.OTA.REPORT_ID, report63);
+        return waiting;
     }
     async function hidConnect() {
         if (!navigator.hid) { throw new Error('WebHID is not available (use Chrome or Edge, https:// or file://)'); }
@@ -105,9 +117,10 @@
         hid.device = null;
     }
     async function otaVersion() {
-        await hidSend(P.otaVersionCmd());
-        const r = await hidWait(3000);
-        if (!r) { throw new Error('no version reply (is this the stock firmware?)'); }
+        hid.trace = true;
+        let r;
+        try { r = await hidTransact(P.otaVersionCmd(), 3000); } finally { hid.trace = false; }
+        if (!r) { throw new Error('no version reply within 3 s. Is the keyboard in USB mode (Fn+Tab on stock cycles the mode) and nothing else (VIA, the Wobkey updater) holding it?'); }
         const v = P.otaParseResponse(r);
         if (v.kind !== 'version') { throw new Error('unexpected reply ' + P.hex(r.subarray(0, 12))); }
         ok('stock firmware version ' + hexN(v.version, 8) + ', CRC ' + hexN(v.crc, 8));
@@ -117,15 +130,13 @@
     async function otaFlash(fw) {
         const nseg = P.otaSegmentCount(fw.length);
         info('OTA: ' + fw.length + ' bytes, ' + nseg + ' segments');
-        await hidSend(P.otaStartCmd());
-        const startAck = await hidWait(3000);
+        const startAck = await hidTransact(P.otaStartCmd(), 3000);
         if (!startAck) { warn('no start acknowledgment, continuing'); }
         const t0 = performance.now();
         let missed = 0;
         for (let idx = 0; idx < nseg; idx += P.OTA.SEGS_PER_PACKET) {
             const count = Math.min(P.OTA.SEGS_PER_PACKET, nseg - idx);
-            await hidSend(P.otaDataCmd(fw, idx, count));
-            const r = await hidWait(2000);
+            const r = await hidTransact(P.otaDataCmd(fw, idx, count), 2000);
             if (r) {
                 const a = P.otaParseResponse(r);
                 if (a.kind === 'ack' && !a.ok) {
@@ -139,9 +150,8 @@
             }
         }
         if (missed) { warn(missed + ' data packets got no acknowledgment'); }
-        await hidSend(P.otaEndCmd(nseg - 1));
+        const r = await hidTransact(P.otaEndCmd(nseg - 1), 10000);
         info('OTA end sent, waiting for the keyboard');
-        const r = await hidWait(10000);
         progress(1, 'OTA done');
         if (r) {
             const a = P.otaParseResponse(r);
