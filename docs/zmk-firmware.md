@@ -182,7 +182,7 @@ BLE controller options (app builds):
 | `--blob` | Telink blob, `fetch_ble_blob.sh` runs first | `conf/ble.conf` + `conf/blob.conf` (no openll.conf) |
 | `--privacy` | open link layer with a resolvable private address; every host must be paired again; refused with `--blob` | `conf/ble.conf` + `conf/openll.conf` + `conf/privacy.conf` |
 | `--openll` | accepted no-op alias (prints a note) | |
-| `--wired` | **no Bluetooth**: USB-only gaming build with NKRO (+ boot protocol), eager press debounce, no deep sleep, Snap Tap on by default, calm default lighting; the keymap drops the BT bindings (`RAINY75_WIRED`); refused with `--blob` / `--privacy` | `conf/wired.conf` + `conf/wired.overlay` (no controller overlay) |
+| `--wired` | **no Bluetooth**: USB-only gaming build with eager press debounce, no deep sleep, Snap Tap on by default, calm default lighting; the keymap drops the BT bindings (`RAINY75_WIRED`); refused with `--blob` / `--privacy`. NKRO is not enabled yet (see below) | `conf/wired.conf` + `conf/wired.overlay` (no controller overlay) |
 
 `grep -c liblt build/zephyr/zmk.map` gives 0 for the open controller and 48 for the blob.
 
@@ -233,9 +233,14 @@ Board defconfig (`rainy75_defconfig`) contains only hardware-essential configs (
 
 - `CONFIG_BT=n` / `CONFIG_ZMK_BLE=n`: no radio interrupts, no controller thread, no BLE
   host; mcumgr DFU stays on the USB CDC port, ZMK Studio on its USB port.
-- `CONFIG_ZMK_HID_REPORT_TYPE_NKRO=y` + `CONFIG_ZMK_USB_BOOT=y`: N-key rollover (16-byte
-  report, the HID endpoint size in the B91's 256 B USB SRAM budget) with the boot protocol
-  fallback for BIOS/UEFI.
+- 6-key rollover, like the Bluetooth build. **NKRO does not work yet**: with
+  `CONFIG_ZMK_HID_REPORT_TYPE_NKRO=y` the device enumerates and the serial ports work, but
+  Windows never starts the keyboard interface: the host never polls the HID IN endpoint
+  0x83 and every report write fails with `-EAGAIN` (verified 2026-10-08 with and without
+  `CONFIG_ZMK_USB_BOOT`). The NKRO report descriptor is exactly 96 bytes (a multiple of
+  the 8-byte control endpoint; 6KRO has 97) and the 16-byte report fills the 16-byte
+  interrupt endpoint; which of the two the B91 USB driver mishandles is being isolated
+  (a build with `CONFIG_HID_INTERRUPT_EP_MPS=32` separates them).
 - `debounce-press-ms = <0>` (eager press, the release debounce stays 5 ms), see the overlay
   for why that is safe against contact bounce. The BLE build keeps 1 ms.
 - `CONFIG_ZMK_USB_NO_VBUS_DETECT=n`: the idle sleep check sees "USB power present" forever
